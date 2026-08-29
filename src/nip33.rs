@@ -283,27 +283,43 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     }
 }
 
-fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    // `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
-    // state (Phase 1.5). On the wire it publishes as `pending` (per
-    // `create_status_tags`), so range-order min/max advertising must
-    // mirror the `Pending` branch — otherwise the bond window would
-    // expose a single `fiat_amount` and clients would think the order
-    // had moved out of the range-takeable state.
-    if order.status == Status::Pending.to_string()
+/// `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
+/// state (Phase 1.5). On the wire it publishes as `pending` (per
+/// `create_status_tags`), so every tag whose value depends on "is this
+/// order still openly takeable?" must treat it exactly like `Pending`.
+/// Encoding the predicate once keeps `fa` and `amt` from disagreeing
+/// about it — a range in `fa` next to a taker-specific quote in `amt`
+/// is the contradiction reported in issue #927.
+fn publishes_as_pending(order: &Order) -> bool {
+    order.status == Status::Pending.to_string()
         || order.status == Status::WaitingTakerBond.to_string()
-    {
-        match (order.min_amount, order.max_amount) {
-            (Some(min), Some(max)) => {
-                vec![min.to_string(), max.to_string()]
-            }
-            _ => {
-                vec![order.fiat_amount.to_string()]
-            }
+}
+
+fn create_fiat_amt_array(order: &Order) -> Vec<String> {
+    // While the order publishes as `pending`, a range order advertises
+    // its [min, max] — otherwise the bond window would expose a single
+    // `fiat_amount` and clients would think the order had moved out of
+    // the range-takeable state.
+    if publishes_as_pending(order) {
+        if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
+            return vec![min.to_string(), max.to_string()];
         }
-    } else {
-        vec![order.fiat_amount.to_string()]
     }
+    vec![order.fiat_amount.to_string()]
+}
+
+/// Sats amount as advertised in the `amt` tag. A range order that still
+/// publishes as `pending` has no agreed sats amount — the in-memory
+/// `Order` may already carry a prospective taker's quote (`take_sell` /
+/// `take_buy` mutate `amount` before `request_taker_bond` republishes),
+/// but that price is not binding until the taker's bond locks. `"0"` is
+/// what the DB row still holds and what the `Pending` event this one
+/// replaces already advertised (issue #927).
+fn create_amt_value(order: &Order) -> String {
+    if publishes_as_pending(order) && order.is_range_order() {
+        return "0".to_string();
+    }
+    order.amount.to_string()
 }
 
 pub(crate) fn create_platform_tag_values(instance_name: Option<&str>) -> Vec<String> {
@@ -497,7 +513,7 @@ pub fn order_to_tags(
             Tag::custom("k", vec![order.kind.to_string()]),
             Tag::custom("f", vec![order.fiat_code.to_string()]),
             Tag::custom("s", vec![status.to_string()]),
-            Tag::custom("amt", vec![order.amount.to_string()]),
+            Tag::custom("amt", vec![create_amt_value(order)]),
             Tag::custom("fa", create_fiat_amt_array(order)),
             Tag::custom("pm", payment_method),
             Tag::custom("premium", vec![order.premium.to_string()]),
@@ -1548,6 +1564,45 @@ mod tests {
         order.status = Status::Active.to_string();
         order.fiat_amount = 55;
         assert_eq!(super::create_fiat_amt_array(&order), vec!["55".to_string()]);
+    }
+
+    // ── create_amt_value ─────────────────────────────────────────────────
+
+    /// Regression for issue #927: taking a range order mutates the
+    /// in-memory `amount` with the taker's quote before the
+    /// `WaitingTakerBond` republish. The `amt` tag must keep publishing
+    /// `"0"` (like the `Pending` event it replaces) for the whole bond
+    /// window, or the event carries a range in `fa` next to a fixed sats
+    /// price in `amt` — a combination order creation explicitly forbids.
+    #[test]
+    fn amt_value_is_zero_while_range_order_publishes_as_pending() {
+        // Pending range order → "0".
+        let mut order = make_pending_order();
+        order.min_amount = Some(500_000);
+        order.max_amount = Some(2_000_000);
+        assert_eq!(super::create_amt_value(&order), "0");
+
+        // The reported bug: range order in `WaitingTakerBond` with the
+        // taker's quote already on the struct → still "0", and `fa`
+        // still advertises the range, so the two tags agree.
+        order.status = Status::WaitingTakerBond.to_string();
+        order.amount = 199_399;
+        assert_eq!(super::create_amt_value(&order), "0");
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["500000".to_string(), "2000000".to_string()]
+        );
+
+        // Single-amount order in `WaitingTakerBond` → real amount.
+        let mut single = make_pending_order();
+        single.status = Status::WaitingTakerBond.to_string();
+        single.amount = 1_000;
+        single.fiat_amount = 42;
+        assert_eq!(super::create_amt_value(&single), "1000");
+
+        // Range order once the trade is on → the price is real.
+        order.status = Status::Active.to_string();
+        assert_eq!(super::create_amt_value(&order), "199399");
     }
 
     // ── create_status_tags remaining arms ────────────────────────────────

@@ -1285,6 +1285,98 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     Ok(())
 }
 
+/// Scheduler sweep (issue #927 part 2): bound the taker-bond window
+/// independently of the LND cancel callback.
+///
+/// Normally LND's cancel of an expired bond hold invoice drives
+/// `on_bond_invoice_canceled` → [`maybe_drop_waiting_taker_bond`]
+/// within `hold_invoice_expiration_window` seconds. If that signal is
+/// missed (daemon restart before `resubscribe_active_bonds` re-attaches,
+/// dropped subscription, LND unreachable during the cancel), the order
+/// sits at `WaitingTakerBond` — publishing as `pending` — until the
+/// 24 h expiry sweep. This sweep releases the demonstrably stale
+/// `Requested` taker bonds and drops the order back to `Pending`. Safe
+/// to run redundantly with the LND path: every step no-ops when the
+/// order or bond has already moved on.
+pub async fn reconcile_stranded_taker_bonds(pool: &Pool<Sqlite>) {
+    // Margin past `hold_invoice_expiration_window` before a `Requested`
+    // bond counts as stale, so the sweep never races LND's own
+    // expiration cancel on a healthy subscription.
+    const STALE_GRACE_SECONDS: i64 = 60;
+    let window = Settings::get_ln().hold_invoice_expiration_window as i64;
+    let stale_cutoff = Utc::now().timestamp() - window - STALE_GRACE_SECONDS;
+    reconcile_stranded_taker_bonds_at(pool, stale_cutoff).await;
+}
+
+/// Testable core of [`reconcile_stranded_taker_bonds`]: the cutoff is
+/// injected so tests don't depend on global LN settings.
+pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale_cutoff: i64) {
+    let stale = match super::db::find_stale_waiting_taker_bond_orders(pool, stale_cutoff).await {
+        Ok(orders) => orders,
+        Err(e) => {
+            warn!("reconcile_taker_bonds: scan for stranded WaitingTakerBond orders failed: {e}");
+            return;
+        }
+    };
+    for order in stale {
+        sweep_stranded_taker_bond_order(pool, order.id, stale_cutoff).await;
+    }
+}
+
+/// Per-order sweep step of [`reconcile_stranded_taker_bonds_at`].
+///
+/// Re-checks each bond's state and age at action time. The finder's
+/// exclusions only hold at SELECT time, and a `WaitingTakerBond` order
+/// is still takeable — so between the scan and this point a concurrent
+/// take can add a fresh `Requested` bond, or one can lock. Releasing
+/// either would cancel a live hold invoice (in the locked case: refund
+/// the winner's bond mid-promotion). Only bonds matching the finder's
+/// own stale predicate — `Requested`, taker role, created before the
+/// cutoff — are released; anything fresher is skipped here and makes
+/// `maybe_drop_waiting_taker_bond`'s CAS no-op below.
+///
+/// The inverse race (a stale `Requested` bond locking between the fetch
+/// and the release) cannot happen: its hold invoice expired at least
+/// the grace margin ago, so LND no longer accepts payment on it. A
+/// transient LND failure during the cancel leaves the bond active and
+/// the CAS no-ops until the next tick — never a false release of a
+/// possibly-encumbered HTLC.
+async fn sweep_stranded_taker_bond_order(pool: &Pool<Sqlite>, order_id: Uuid, stale_cutoff: i64) {
+    match find_active_bonds_for_order(pool, order_id).await {
+        Ok(bonds) => {
+            let taker_role = BondRole::Taker.to_string();
+            let requested = BondState::Requested.to_string();
+            for bond in bonds.iter().filter(|b| {
+                b.role == taker_role && b.state == requested && b.created_at < stale_cutoff
+            }) {
+                if let Err(e) = release_bond(pool, bond).await {
+                    warn!(
+                        bond_id = %bond.id,
+                        order_id = %order_id,
+                        "reconcile_taker_bonds: could not release stale taker bond: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                order_id = %order_id,
+                "reconcile_taker_bonds: bond lookup failed: {e}"
+            );
+            return;
+        }
+    }
+    // Republishes from a fresh DB read, so the orderbook gets correct
+    // tags — not the taker-mutated in-memory struct the
+    // `WaitingTakerBond` event was built from at take-time.
+    if let Err(e) = maybe_drop_waiting_taker_bond(pool, order_id).await {
+        warn!(
+            order_id = %order_id,
+            "reconcile_taker_bonds: drop back to Pending failed: {e}"
+        );
+    }
+}
+
 /// Resume the take flow after the winning bond locks.
 ///
 /// The take handler deferred the trade hold-invoice step under
@@ -1898,6 +1990,213 @@ mod tests {
 
         let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
         assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    async fn insert_waiting_taker_bond_order(pool: &Pool<Sqlite>) -> Uuid {
+        let id = Uuid::new_v4();
+        insert_order(pool, id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Issue #927 part 2: the stale-order finder must select exactly the
+    /// orders whose taker-bond window has demonstrably closed — and
+    /// nothing else.
+    #[tokio::test]
+    async fn find_stale_waiting_taker_bond_orders_scopes_to_closed_windows() {
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+        let stale_cutoff = now - 360;
+
+        // (a) Stale Requested taker bond → returned.
+        let stale_requested = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(stale_requested, BondState::Requested);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        // (b) Fresh Requested taker bond (window still open) → not returned.
+        let fresh_requested = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(fresh_requested, BondState::Requested);
+        b.created_at = now;
+        create_bond(&pool, b).await.unwrap();
+
+        // (c) Locked taker bond, however old → not returned. The winner's
+        // sats are held; `on_bond_invoice_accepted` owns that transition.
+        let locked = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(locked, BondState::Locked);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        // (d) No bond rows at all → returned (pure stranded status).
+        let bondless = insert_waiting_taker_bond_order(&pool).await;
+
+        // (e) Stale Requested taker bond + Locked MAKER bond (apply_to =
+        // both) → returned: the role filter must ignore the maker bond.
+        let with_maker = insert_waiting_taker_bond_order(&pool).await;
+        let mut t = make_bond(with_maker, BondState::Requested);
+        t.created_at = stale_cutoff - 100;
+        create_bond(&pool, t).await.unwrap();
+        let mut m = Bond::new_requested(with_maker, "m".repeat(64), BondRole::Maker, 1_000);
+        m.state = BondState::Locked.to_string();
+        m.created_at = now;
+        create_bond(&pool, m).await.unwrap();
+
+        // (f) Pending order with a stale Requested bond → not returned
+        // (status filter).
+        let pending = Uuid::new_v4();
+        insert_order(&pool, pending).await;
+        let mut b = make_bond(pending, BondState::Requested);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        let found = super::super::db::find_stale_waiting_taker_bond_orders(&pool, stale_cutoff)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<Uuid> = found.iter().map(|o| o.id).collect();
+        assert!(ids.contains(&stale_requested), "stale Requested must match");
+        assert!(
+            ids.contains(&bondless),
+            "bondless stranded order must match"
+        );
+        assert!(
+            ids.contains(&with_maker),
+            "maker bond must not pin the order"
+        );
+        assert!(
+            !ids.contains(&fresh_requested),
+            "open window must not match"
+        );
+        assert!(!ids.contains(&locked), "Locked taker bond must not match");
+        assert!(
+            !ids.contains(&pending),
+            "non-WaitingTakerBond must not match"
+        );
+    }
+
+    /// Issue #927 part 2: the sweep releases the stale `Requested` taker
+    /// bond and drops the order back to `Pending` with no LND callback
+    /// involved. Uses a bond without a hash (the `request_taker_bond`
+    /// bailed-early shape) so `release_bond` skips the LND connection;
+    /// the NIP-33 republish inside `maybe_drop_waiting_taker_bond` may
+    /// fail without Nostr globals, but the status CAS commits before it
+    /// and the sweep swallows that error.
+    #[tokio::test]
+    async fn reconcile_stranded_taker_bonds_releases_stale_and_drops_order() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        reconcile_stranded_taker_bonds_at(&pool, now - 360).await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, BondState::Released.to_string());
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// Race regression (issue #927 part 2 review): the finder's
+    /// exclusions only hold at SELECT time, and a `WaitingTakerBond`
+    /// order is still takeable — a concurrent take can add a fresh
+    /// `Requested` bond (or a bond can lock) between the scan and the
+    /// release loop. The per-order sweep step must re-check state and
+    /// age at action time, or it would cancel a live hold invoice — in
+    /// the locked case refunding the winner's bond mid-promotion.
+    /// Simulates the post-scan state by invoking the step directly.
+    #[tokio::test]
+    async fn sweep_step_rechecks_bond_state_and_age_at_action_time() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+
+        // Fresh `Requested` taker bond: a concurrent take that landed
+        // after the scan. Must NOT be released.
+        let mut fresh = make_bond(order_id, BondState::Requested);
+        fresh.hash = None;
+        fresh.created_at = now;
+        let fresh_id = fresh.id;
+        create_bond(&pool, fresh).await.unwrap();
+
+        // Taker bond that locked after the scan (winner mid-promotion,
+        // stale by age). Must NOT be released either — state, not just
+        // age, gates the release. `hash = None` so a broken filter would
+        // actually mark it Released (with a hash, `release_bond` merely
+        // errors on the absent LND and the assert passes vacuously).
+        let mut locked = make_bond(order_id, BondState::Locked);
+        locked.hash = None;
+        locked.pubkey = "w".repeat(64);
+        locked.created_at = now - 1_000;
+        let locked_id = locked.id;
+        create_bond(&pool, locked).await.unwrap();
+
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360).await;
+
+        let fresh_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(fresh_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh_state,
+            BondState::Requested.to_string(),
+            "a fresh Requested bond must survive the sweep"
+        );
+        let locked_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(locked_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            locked_state,
+            BondState::Locked.to_string(),
+            "a Locked bond must survive the sweep regardless of age"
+        );
+        // And the drop CAS must no-op: the surviving bonds pin the order.
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    /// A fresh `Requested` bond keeps its order out of the sweep — the
+    /// racing taker still has time to pay the bond invoice.
+    #[tokio::test]
+    async fn reconcile_stranded_taker_bonds_leaves_open_windows_alone() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        bond.created_at = now;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        reconcile_stranded_taker_bonds_at(&pool, now - 360).await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, BondState::Requested.to_string());
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
     }
 
     /// Phase 1.5 P2 regression: `maybe_drop_waiting_taker_bond` must

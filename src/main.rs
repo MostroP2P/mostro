@@ -275,10 +275,36 @@ async fn main() -> Result<()> {
         let rpc_pool = get_db_pool();
         let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
 
+        // `[rpc].enabled = true` is an explicit request for the admin API, and
+        // every other misconfiguration in that block is startup-fatal (see
+        // `config::util::validate_rpc_settings`). `bind` resolves the listener
+        // and the TLS material here, before any of the startup below runs, so
+        // the daemon never advances past this point believing an admin
+        // interface is up that nothing is serving.
+        // `bind` logs the address it actually acquired, so it is not repeated
+        // here.
+        let (_bound, rpc_serving) = match rpc_server.bind(rpc_keys, rpc_pool, rpc_ln_client) {
+            Ok(bound) => bound,
+            Err(e) => {
+                tracing::error!("RPC server failed to start: {}", e);
+                exit(1);
+            }
+        };
+
+        // Only the accept loop is detached; it is already listening.
         tokio::spawn(async move {
-            match rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
-                Ok(_) => tracing::info!("RPC server started successfully"),
-                Err(e) => tracing::error!("RPC server failed to start: {}", e),
+            match rpc_serving.await {
+                // The listener stream never ends, so this arm is unreachable
+                // today; treat it like any other loss of the admin API rather
+                // than letting `enabled = true` silently become false.
+                Ok(()) => {
+                    tracing::error!("RPC server stopped accepting connections");
+                    exit(1);
+                }
+                Err(e) => {
+                    tracing::error!("RPC server error: {}", e);
+                    exit(1);
+                }
             }
         });
     }

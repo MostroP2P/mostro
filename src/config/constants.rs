@@ -36,3 +36,22 @@ pub const ENV_FILENAME: &str = ".env";
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
+
+/// Environment variable holding the shared bearer token that authenticates
+/// admin gRPC callers. Deliberately env-only (like `NSEC_ENV_VAR`): the token
+/// never lives in `settings.toml`, only in the process environment or
+/// `<settings_dir>/.env`.
+pub const RPC_TOKEN_ENV_VAR: &str = "MOSTRO_RPC_TOKEN";
+
+/// Minimum accepted length for `MOSTRO_RPC_TOKEN`. 32 characters is the
+/// shortest base64 encoding of 24 random bytes, well past the point where
+/// online guessing against a single daemon is meaningful.
+pub const MIN_RPC_TOKEN_LEN: usize = 32;
+
+/// Minimum number of distinct characters in `MOSTRO_RPC_TOKEN`. The length
+/// floor alone is satisfied by `"a"` repeated 32 times, and the decision not
+/// to rate-limit authentication (`crate::rpc::auth`) leans on the token being
+/// randomly generated, not merely long. Random tokens clear this easily —
+/// `openssl rand -base64 32` yields ~30 distinct characters on average —
+/// while hand-typed passphrases do not.
+pub const MIN_RPC_TOKEN_DISTINCT_CHARS: usize = 16;

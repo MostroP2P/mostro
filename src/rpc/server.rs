@@ -1,13 +1,19 @@
 //! RPC server implementation for admin operations
 
+use crate::config::constants::RPC_TOKEN_ENV_VAR;
+use crate::config::secret::read_rpc_token_env_var;
 use crate::config::settings::Settings;
+use crate::config::util::listen_socket_addr;
 use crate::lightning::LndConnector;
+use crate::rpc::auth::BearerAuth;
 use crate::rpc::service::AdminServiceImpl;
 use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tonic::transport::Server;
-use tracing::{error, info};
+use std::time::Duration;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tracing::info;
 
 use super::admin::admin_service_server::AdminServiceServer;
 
@@ -15,6 +21,9 @@ use super::admin::admin_service_server::AdminServiceServer;
 pub struct RpcServer {
     listen_address: String,
     port: u16,
+    /// Certificate and key, or plaintext. Pairing them here keeps
+    /// "both or neither" a property of the type rather than a runtime check.
+    tls: Option<(String, String)>,
 }
 
 impl RpcServer {
@@ -24,34 +33,95 @@ impl RpcServer {
         Self {
             listen_address: rpc_config.listen_address.clone(),
             port: rpc_config.port,
+            tls: rpc_config
+                .tls_paths()
+                .map(|(cert, key)| (cert.to_string(), key.to_string())),
         }
     }
 
-    /// Start the RPC server
-    pub async fn start(
+    /// Acquire the listener and return the bound address with the future that
+    /// serves it.
+    ///
+    /// Everything that can fail on the way up happens here, before the caller
+    /// gets anything to detach: a missing bearer token, unusable TLS material,
+    /// an address already in use. The returned future only accepts connections,
+    /// so a caller that awaits this function knows the admin API is listening
+    /// and gated before it lets the rest of the daemon proceed — `[rpc].enabled
+    /// = true` becomes an invariant rather than a hope.
+    ///
+    /// The address comes back from the listener rather than from the config, so
+    /// it is the port actually in use: `port = 0` reports the ephemeral port the
+    /// kernel picked instead of a literal `:0`.
+    ///
+    /// Refusing to serve without a token is deliberately redundant with
+    /// `config::util::validate_rpc_settings`: a code path that reached here
+    /// without one would expose an ungated admin API, and no RPC at all is the
+    /// safer failure.
+    pub fn bind(
         &self,
         my_keys: Keys,
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let addr = format!("{}:{}", self.listen_address, self.port)
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            impl std::future::Future<Output = Result<(), tonic::transport::Error>> + Send + 'static,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let addr = listen_socket_addr(&self.listen_address, self.port)?;
+
+        let token = read_rpc_token_env_var().ok_or_else(|| {
+            format!("Refusing to start the admin RPC server: {RPC_TOKEN_ENV_VAR} is not set")
+        })?;
 
         let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client);
 
-        info!("Starting RPC server on {}", addr);
+        // The admin surface is reachable off-host under `allow_remote`, and
+        // the interceptor rejects requests without closing connections, so the
+        // transport carries its own limits.
+        let mut builder = Server::builder()
+            .timeout(Duration::from_secs(30))
+            .max_concurrent_streams(Some(64))
+            .http2_keepalive_interval(Some(Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)));
+        let transport = match &self.tls {
+            Some((cert_path, key_path)) => {
+                let cert = std::fs::read(cert_path)
+                    .map_err(|e| format!("Failed to read {cert_path}: {e}"))?;
+                let key = std::fs::read(key_path)
+                    .map_err(|e| format!("Failed to read {key_path}: {e}"))?;
+                // Malformed PEM is rejected by `tls_config`, so it surfaces
+                // here rather than inside the detached serving future.
+                builder = builder
+                    .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))?;
+                "TLS"
+            }
+            None => "plaintext",
+        };
 
-        let server = Server::builder()
-            .add_service(AdminServiceServer::new(admin_service))
-            .serve(addr);
+        // Binds eagerly: an occupied port is a startup error, not a surprise
+        // discovered later by whoever happens to read the logs.
+        // `serve_with_incoming` ignores the builder's TCP settings, so the
+        // nodelay default `Server::serve` would have applied is set on the
+        // listener here — without it Nagle delays every small admin frame.
+        let incoming = TcpIncoming::bind(addr)
+            .map_err(|e| format!("Failed to bind {addr}: {e}"))?
+            .with_nodelay(Some(true));
+        let bound = incoming
+            .local_addr()
+            .map_err(|e| format!("Failed to read the address bound to {addr}: {e}"))?;
+        info!("RPC server listening on {} ({})", bound, transport);
 
-        if let Err(e) = server.await {
-            error!("RPC server error: {}", e);
-            return Err(Box::new(e));
-        }
-
-        Ok(())
+        Ok((
+            bound,
+            builder
+                .add_service(AdminServiceServer::with_interceptor(
+                    admin_service,
+                    BearerAuth::new(token),
+                ))
+                .serve_with_incoming(incoming),
+        ))
     }
 
     /// Check if RPC server is enabled
@@ -82,10 +152,7 @@ mod tests {
     #[test]
     fn test_rpc_server_structure() {
         // Test that RpcServer can be created with explicit values
-        let server = RpcServer {
-            listen_address: "localhost".to_string(),
-            port: 8080,
-        };
+        let server = server_at("localhost", 8080);
 
         assert_eq!(server.listen_address, "localhost");
         assert_eq!(server.port, 8080);
@@ -93,10 +160,7 @@ mod tests {
 
     #[test]
     fn test_address_formatting() {
-        let server = RpcServer {
-            listen_address: "127.0.0.1".to_string(),
-            port: 50051,
-        };
+        let server = server_at("127.0.0.1", 50051);
 
         let expected_addr = format!("{}:{}", server.listen_address, server.port);
         assert_eq!(expected_addr, "127.0.0.1:50051");
@@ -109,6 +173,51 @@ mod tests {
 
     fn init_test_settings() {
         let _ = MOSTRO_CONFIG.set(test_settings());
+    }
+
+    /// Plaintext server bound to an explicit address, so the tests below stay
+    /// readable as `RpcServer` grows optional fields.
+    fn server_at(listen_address: &str, port: u16) -> RpcServer {
+        RpcServer {
+            listen_address: listen_address.to_string(),
+            port,
+            tls: None,
+        }
+    }
+
+    // `MOSTRO_RPC_TOKEN` is process-wide state, so the tests that touch it
+    // serialize on the crate-wide environment lock. One lock for the whole
+    // environment, not one per variable: two tests holding two different locks
+    // would still race glibc's `setenv` against `getenv` elsewhere.
+    use crate::config::util::ENV_LOCK;
+
+    /// Sets `MOSTRO_RPC_TOKEN` for the duration of a test and restores the
+    /// previous value on drop.
+    struct RpcTokenGuard {
+        previous: Option<String>,
+    }
+
+    impl RpcTokenGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(RPC_TOKEN_ENV_VAR).ok();
+            std::env::set_var(RPC_TOKEN_ENV_VAR, value);
+            Self { previous }
+        }
+
+        fn unset() -> Self {
+            let previous = std::env::var(RPC_TOKEN_ENV_VAR).ok();
+            std::env::remove_var(RPC_TOKEN_ENV_VAR);
+            Self { previous }
+        }
+    }
+
+    impl Drop for RpcTokenGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(RPC_TOKEN_ENV_VAR, value),
+                None => std::env::remove_var(RPC_TOKEN_ENV_VAR),
+            }
+        }
     }
 
     /// Offline `LndConnector` (lazy connect, no network until first RPC).
@@ -146,33 +255,236 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_rejects_unparseable_address() {
+    async fn bind_rejects_unparseable_address() {
         init_test_settings();
-        let server = RpcServer {
-            listen_address: "not an address".to_string(),
-            port: 50051,
-        };
+        let _lock = ENV_LOCK.lock().await;
+        let _token = RpcTokenGuard::set(&"t".repeat(32));
+        // `localhost` and bare `::1` are in here on purpose: they read like
+        // valid loopback spellings, and `config::util` rejects them for exactly
+        // this reason — `SocketAddr` cannot parse either.
+        for address in ["not an address", "localhost", "::1"] {
+            let server = server_at(address, 50051);
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+            let error = server
+                .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+                .err()
+                .expect("an address that cannot be parsed must not serve");
+            assert!(
+                error.to_string().contains("Invalid address"),
+                "{address} should have been refused, got: {error}"
+            );
+        }
+    }
+
+    /// The startup invariant the daemon depends on: a listener that cannot be
+    /// acquired is reported by `bind` itself, so `main` learns about it before
+    /// it detaches anything or continues booting.
+    #[tokio::test]
+    async fn bind_surfaces_bind_failure_before_returning() {
+        init_test_settings();
+        let _lock = ENV_LOCK.lock().await;
+        let _token = RpcTokenGuard::set(&"t".repeat(32));
+        // 8.8.8.8 is not a local interface, so the bind fails immediately.
+        let server = server_at("8.8.8.8", 1);
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let result = server
-            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
-            .await;
-        assert!(result.is_err());
+        let error = server
+            .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .err()
+            .expect("an unavailable address must fail before serving");
+        assert!(error.to_string().contains("Failed to bind"));
     }
 
     #[tokio::test]
-    async fn start_surfaces_bind_failure() {
+    async fn bind_refuses_to_serve_without_a_token() {
         init_test_settings();
-        // 8.8.8.8 is not a local interface: the bind fails immediately, so
-        // the server error path is exercised without serving traffic.
+        let _lock = ENV_LOCK.lock().await;
+        let _token = RpcTokenGuard::unset();
+        // 127.0.0.1:0 would otherwise bind successfully, so reaching the error
+        // path proves the token check runs before anything starts listening.
+        let server = server_at("127.0.0.1", 0);
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let error = server
+            .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .err()
+            .expect("an admin RPC without a token must never serve");
+        assert!(error.to_string().contains(RPC_TOKEN_ENV_VAR));
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_malformed_tls_material() {
+        init_test_settings();
+        let _lock = ENV_LOCK.lock().await;
+        let _token = RpcTokenGuard::set(&"t".repeat(32));
+        // Readable files that are not valid PEM: config validation accepts
+        // them, so `bind` is the layer that has to catch this — and it must do
+        // so before returning, or the daemon boots without the API it was told
+        // to serve.
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-badtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, b"not a certificate").expect("write cert");
+        std::fs::write(&key, b"not a key").expect("write key");
+
         let server = RpcServer {
-            listen_address: "8.8.8.8".to_string(),
-            port: 1,
+            listen_address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: Some((
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            )),
         };
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let result = server
-            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
-            .await;
-        assert!(result.is_err());
+        assert!(server
+            .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .is_err());
+    }
+
+    /// End-to-end proof that the interceptor gates the service that is actually
+    /// served. The unit tests in `crate::rpc::auth` only cover the interceptor
+    /// in isolation, so they would stay green if a refactor registered the
+    /// service without it — which is precisely the regression that would
+    /// reopen the hole this module exists to close.
+    ///
+    /// `GetVersion` is the probe: it touches neither the database nor LND, so
+    /// the only thing under test is the authentication decision.
+    #[tokio::test]
+    async fn served_rpc_rejects_calls_without_the_token() {
+        use crate::rpc::admin::{admin_service_client::AdminServiceClient, GetVersionRequest};
+        use tonic::metadata::MetadataValue;
+        use tonic::transport::Channel;
+        use tonic::Request;
+
+        init_test_settings();
+        let _lock = ENV_LOCK.lock().await;
+        let token = "t".repeat(32);
+        let _guard = RpcTokenGuard::set(&token);
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let ln_client = offline_ln_client().await;
+        // Port 0: the listener `bind` returns owns the ephemeral port for as
+        // long as the test needs it. Reserving a port and releasing it first
+        // would leave a window in which the kernel can hand it to another
+        // process — a flake, not a failure of what is under test.
+        let server = server_at("127.0.0.1", 0);
+        let (bound, serving) = server
+            .bind(Keys::generate(), Arc::new(pool), ln_client)
+            .expect("bind must succeed on a free loopback port");
+        let serving = tokio::spawn(serving);
+
+        // No retry loop: `bind` returned, so the listener already exists and
+        // the connection below must succeed on the first attempt. A retry here
+        // would hide exactly the regression this asserts against.
+        let channel = Channel::from_shared(format!("http://{bound}"))
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("the listener is open as soon as bind returns");
+
+        let status = AdminServiceClient::new(channel.clone())
+            .get_version(GetVersionRequest {})
+            .await
+            .expect_err("an anonymous call must be refused");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        let credential: MetadataValue<_> = format!("Bearer {token}")
+            .parse()
+            .expect("token is a valid header value");
+        let mut authenticated =
+            AdminServiceClient::with_interceptor(channel, move |mut request: Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", credential.clone());
+                Ok(request)
+            });
+        let version = authenticated
+            .get_version(GetVersionRequest {})
+            .await
+            .expect("an authenticated call must go through")
+            .into_inner()
+            .version;
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+
+        serving.abort();
+    }
+
+    /// The mirror image of `bind_rejects_malformed_tls_material`: valid PEM
+    /// must produce a server that actually speaks TLS. The regression this
+    /// pins is "reads as TLS is on while serving plaintext" — for example
+    /// dropping the `builder = builder.tls_config(...)` reassignment — which
+    /// every plaintext test in this file would miss, and which the client
+    /// below turns into a failed handshake instead of a green run.
+    #[tokio::test]
+    async fn served_rpc_over_tls_authenticates_the_token() {
+        use crate::rpc::admin::{admin_service_client::AdminServiceClient, GetVersionRequest};
+        use tonic::metadata::MetadataValue;
+        use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+        use tonic::Request;
+
+        init_test_settings();
+        let _lock = ENV_LOCK.lock().await;
+        let token = "t".repeat(32);
+        let _guard = RpcTokenGuard::set(&token);
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate a self-signed certificate");
+        let dir = std::env::temp_dir().join(format!("mostro-rpc-tls-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, identity.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, identity.key_pair.serialize_pem()).expect("write key");
+
+        let server = RpcServer {
+            listen_address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: Some((
+                cert_path.to_string_lossy().into_owned(),
+                key_path.to_string_lossy().into_owned(),
+            )),
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let (bound, serving) = server
+            .bind(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .expect("bind must succeed with valid TLS material");
+        let serving = tokio::spawn(serving);
+
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(identity.cert.pem()))
+            .domain_name("localhost");
+        let channel = Channel::from_shared(format!("https://{bound}"))
+            .expect("valid endpoint")
+            .tls_config(tls)
+            .expect("client TLS config")
+            .connect()
+            .await
+            .expect("the TLS handshake must succeed against the served certificate");
+
+        let status = AdminServiceClient::new(channel.clone())
+            .get_version(GetVersionRequest {})
+            .await
+            .expect_err("an anonymous call must be refused over TLS too");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        let credential: MetadataValue<_> = format!("Bearer {token}")
+            .parse()
+            .expect("token is a valid header value");
+        let mut authenticated =
+            AdminServiceClient::with_interceptor(channel, move |mut request: Request<()>| {
+                request
+                    .metadata_mut()
+                    .insert("authorization", credential.clone());
+                Ok(request)
+            });
+        let version = authenticated
+            .get_version(GetVersionRequest {})
+            .await
+            .expect("an authenticated TLS call must go through")
+            .into_inner()
+            .version;
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+
+        serving.abort();
     }
 
     #[test]

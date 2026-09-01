@@ -10,6 +10,7 @@ Quick links to architecture and feature guides.
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - Anti-Abuse Bond: ANTI_ABUSE_BOND.md (opt-in maker/taker Lightning bond; off by default)
 - Payment-Account History / Anti-Triangulation: PAYER_HISTORY_ANTI_TRIANGULATION.md (opt-in buyer payer declaration + private success history; off by default)
+- Maintenance Mode & LN Node Migration: MAINTENANCE_MODE_LN_MIGRATION.md (drain mode spec: block new/take, drain escrow, switch node)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 

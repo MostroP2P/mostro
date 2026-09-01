@@ -51,10 +51,26 @@ the switch:
 | Set | Table / predicate | Why |
 |---|---|---|
 | A. Escrowed orders | `orders.hash IS NOT NULL AND status NOT IN (terminal)` | hold invoice must be settled or canceled on the node that issued it |
-| B. In‑flight buyer payouts | `orders.payout_payment_hash IS NOT NULL` | `job_reconcile_inflight_payouts` tracks the hash on the node that sent it |
+| B. In‑flight buyer payouts | `orders.payout_payment_hash IS NOT NULL AND status = 'settled-hold-invoice'` | `job_reconcile_inflight_payouts` tracks the hash on the node that sent it. Same predicate as `find_inflight_payouts` (`src/db.rs`); a subset of A, reported separately for visibility |
 | C. Unpaid dev fees | `orders.dev_fee > 0 AND dev_fee_paid = 0 AND status = 'success'` | `job_process_dev_fee_payment` pays from the node; harmless to re‑run on the new node but cleaner to drain |
-| D. Locked bonds | `bonds.hash IS NOT NULL AND status IN ('requested','locked','pending-payout')` | maker/taker bond hold invoices (`src/app/bond/flow.rs`) |
-| E. In‑flight bond payouts | `bonds.payout_payment_hash IS NOT NULL` | same as B |
+| D. Open bond hold invoices | `bonds.hash IS NOT NULL AND state IN ('requested','locked')` | maker/taker bond hold invoices (`src/app/bond/flow.rs`) |
+| E. Pending bond payouts | `bonds.state = 'pending-payout'` | payout not yet sent or in flight; `bonds.payout_payment_hash` is the idempotency record for it |
+
+Predicate notes, verified against the schema and jobs:
+
+- The bonds table column is `state`, not `status`
+  (`migrations/20260423120000_anti_abuse_bond.sql`). Its values are
+  `requested`, `locked`, `released`, `pending-payout`, `slashed`, `forfeited`,
+  `failed`.
+- `bonds.payout_payment_hash` is **never cleared**: `slash_after_success`
+  (`src/app/bond/payout.rs`) moves the row to `slashed` and keeps the hash as
+  its idempotency record. Counting `payout_payment_hash IS NOT NULL` alone
+  would therefore never reach zero on an instance that has ever paid a
+  slashed bond. E keys on `state` for that reason.
+- `orders.payout_payment_hash` can likewise be left behind on a terminal
+  order when the post‑finalisation clear loses to a DB error;
+  `find_inflight_payouts` ignores that residue unless the status is
+  `settled-hold-invoice`, and so does B.
 
 `terminal` for orders is: `canceled`, `canceled-by-admin`, `settled-by-admin`,
 `completed-by-admin`, `expired`, `success`, `cooperatively-canceled`.
@@ -198,11 +214,18 @@ if ctx.maintenance().is_enabled()
 The existing error path (`manage_errors` → `enqueue_cant_do_msg`) already
 delivers the `CantDo` to the sender, so no new messaging code is needed.
 
-Placement note: the gate runs **after** `check_trade_index` and signature
-validation, never before. A rejected `NewOrder` must not consume a trade
-index; `check_trade_index` only *validates* (it does not bump the stored
-index — that happens in the order handler), so ordering the gate after it is
-safe and keeps the anti‑replay checks intact.
+Placement note: the gate runs in `accept_event` **before**
+`check_trade_index`, and after PoW, the spam gate, the outer signature check
+and decryption. The reason is that `check_trade_index` is not read‑only: for
+an identity it has never seen that carries a trade index it calls
+`add_new_user` and persists that index (`src/app.rs`, the `Err(_)` arm of
+`is_user_present`). A first‑time user whose `NewOrder` is rejected by a gate
+placed *after* that call would have their first index burned, and the same
+signed request retried after maintenance ends would fail with
+`InvalidTradeIndex`. Gating first means a rejected request persists nothing.
+The gate still needs the decrypted action and the sender key, both of which
+`accept_event` has at that point; it does not need the inner signature, since
+the only side effect is a `CantDo` reply to the visible sender.
 
 What the gate deliberately does **not** block:
 
@@ -265,9 +288,17 @@ The counters are one SQL function `drain_counters(pool) -> DrainCounters` in
 predicates in §1.3 literally. `drained` is `A+B+C+D+E == 0`; `pending_orders`
 is reported but not part of `drained` because pending orders hold no escrow.
 
-The RPC surface inherits the existing transport (loopback by default,
-`[rpc]` settings) and the existing rate limiter. No extra auth is introduced
-— `[rpc]` is already the operator‑only surface.
+**Authorisation.** The admin gRPC has no authentication interceptor today,
+and the `RateLimiter` in `AdminServiceImpl` is applied only inside
+`validate_db_password`, not to every method. The existing mutating RPCs
+(`CancelOrder`, `SettleOrder`, `AddSolver`) already run under that model,
+relying on the default loopback bind. `SetMaintenanceMode` must not widen
+the exposure: the handler rejects any call whose `remote_addr` is not a
+loopback address with `PermissionDenied`, using the same `remote_addr`
+extraction `validate_db_password` already does. `GetMaintenanceStatus` is
+read‑only and is not restricted. A proper authenticated interceptor for the
+whole admin service is a pre‑existing gap and is tracked separately; it is
+not a prerequisite for this feature.
 
 ### 3.5 Info event tag
 
@@ -275,7 +306,7 @@ The RPC surface inherits the existing transport (loopback by default,
 (`src/scheduler.rs`), which currently takes only `&LnStatus`. Add a
 `maintenance: bool` argument and emit:
 
-```
+```text
 ["maintenance_mode", "true" | "false"]
 ```
 
@@ -300,9 +331,14 @@ In `main.rs`, after `LN_STATUS.set(ln_status)`:
 
 Override: `[lightning].allow_node_change = true` (default `false`, added to
 `settings.tpl.toml` and `LightningSettings`) skips step 4's exit and only
-logs. It exists for disaster recovery (old node is gone for good and the
-operator will resolve stuck orders by hand with `AdminCancel`/`AdminSettle`).
-It must never be left on in normal operation; the wizard does not ask for it.
+logs. It exists for disaster recovery only: the old node is gone for good and
+the operator accepts that the affected rows **cannot be resolved by the
+daemon**. `AdminCancel` and `AdminSettle` are not a recovery path here: both
+call `cancel_hold_invoice` / `settle_hold_invoice` on the *currently
+configured* node before touching the order, so they fail with an
+unknown‑invoice error against the new node. See §5.1 for the manual
+procedure. The flag must never be left on in normal operation; the wizard
+does not ask for it.
 
 ### 3.7 Behaviour matrix while enabled
 
@@ -371,7 +407,12 @@ depends on Phase N unless stated otherwise.
   is the regression net here.
 - `drain_counters_reflects_each_predicate` — insert one fixture row per §1.3
   set and assert the matching counter is exactly 1 while the others are 0;
-  add a terminal‑status row with `hash` set and assert it is *not* counted.
+  add a terminal‑status order with `hash` and `payout_payment_hash` set and a
+  `slashed` bond with `payout_payment_hash` set, and assert neither is
+  counted.
+- `gate_rejects_first_time_user_without_creating_it` — unknown identity with
+  trade index 1 sends `NewOrder` under maintenance; assert the `CantDo` and
+  that no `users` row was inserted.
 
 **Exit criteria** — `cargo test`, `cargo clippy --all-targets --all-features`,
 `cargo fmt --check` green; coverage on the two new modules ≥ 80 %.
@@ -383,7 +424,8 @@ depends on Phase N unless stated otherwise.
 - `proto/admin.proto` additions (§3.4); `build.rs` already compiles the
   file.
 - `SetMaintenanceMode` / `GetMaintenanceStatus` handlers in
-  `src/rpc/service.rs`; `AdminServiceImpl::new` takes `MaintenanceState`.
+  `src/rpc/service.rs`; `AdminServiceImpl::new` takes `MaintenanceState`;
+  loopback‑only check on `SetMaintenanceMode` (§3.4).
 - `docs/RPC.md` and `docs/ADMIN_RPC_AND_DISPUTES.md`: new methods, example
   `grpcurl` invocations.
 
@@ -393,6 +435,9 @@ depends on Phase N unless stated otherwise.
   atomic and `daemon_state` changed.
 - `get_maintenance_status_reports_counters` — seed one escrowed order, assert
   `escrowed_orders == 1` and `drained == false`; settle it, assert `drained`.
+- `set_maintenance_mode_rejects_non_loopback_peer` — request with a
+  non‑loopback `remote_addr` returns `PermissionDenied` and leaves the flag
+  untouched; a loopback peer succeeds.
 - Existing `offline_service()` test scaffold in `src/rpc/service.rs` is
   reused.
 
@@ -486,13 +531,47 @@ orders work and the guard rejects a switch back with open escrow.
 Rollback at any step before 6: `SetMaintenanceMode{enabled: false}` re‑opens
 the book against the old node; nothing else changed.
 
+### 5.1 Disaster recovery — old node lost with open escrow
+
+This is the only situation in which `allow_node_change` should be used. The
+daemon cannot close the affected rows because every daemon‑side path goes
+through the node that no longer exists. The procedure is manual and must be
+done **before** enabling `allow_node_change`, with the daemon stopped:
+
+1. List the rows with the §1.3 predicates (A, D and E) and export them; they
+   are the trades the operator has to reconcile by hand.
+2. Funds: an unsettled hold invoice on a dead node is not paid out to anyone.
+   Its HTLCs time out at the CLTV delta and the sats return to the party that
+   paid it (the seller or the bonded user). If the old node's seed still
+   exists, restoring it elsewhere and closing channels recovers the balance;
+   otherwise nothing further can be done on chain. Sats that were already
+   `settled-hold-invoice` but not paid out (set B) belong to the buyer and
+   must be paid from the new node manually.
+3. Database: mark the affected orders terminal by hand
+   (`status = 'canceled-by-admin'` for unsettled escrow,
+   `'completed-by-admin'` after a manual payout) and the bonds `failed`, so
+   the counters reach zero and the guard accepts the new node.
+4. Notify the users involved through the usual admin channel; the daemon
+   sends no message for rows changed this way.
+5. Start the daemon with the new `[lightning]` block. With the counters at
+   zero the guard accepts the change without the override; set
+   `allow_node_change = true` only if a row could not be closed and the
+   operator knowingly leaves it unresolved.
+
+A daemon‑side `ForceCloseOrder` RPC that updates the row without a node call
+would make step 3 safer. It is deliberately **not** part of this spec; it can
+be proposed once the drain path has shipped and an operator has actually
+needed it.
+
 ---
 
 ## 6. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Drain never reaches zero because of a stuck dispute | `AdminSettle` / `AdminCancel` are not gated; counters name the exact rows (§3.4) so the operator can find them |
+| Drain never reaches zero because of a stuck dispute | `AdminSettle` / `AdminCancel` are not gated and work while the old node is up; counters name the exact rows (§3.4) so the operator can find them |
+| Old node lost before the drain finished | §5.1 manual procedure; `allow_node_change` documented as a knowing acceptance of unresolved rows, not a fix |
+| `SetMaintenanceMode` reachable from the network | loopback‑only check on the mutating RPC (§3.4); pre‑existing admin‑RPC auth gap tracked separately |
 | Operator forgets the flag and the book stays closed | `maintenance_since` in status; info tag visible to every client; log a warning at boot and every info‑event tick while enabled |
 | Restart during drain re‑opens the book | flag persisted in `daemon_state` (R2) |
 | Daemon started against the wrong node with open escrow | Phase 4 guard exits non‑zero (R8) |

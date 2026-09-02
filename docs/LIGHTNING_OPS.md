@@ -331,7 +331,7 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
 | `inflight_payouts` | buyer payouts in flight (`settled-hold-invoice` with a payout hash) |
 | `inflight_dev_fees` | dev-fee payouts claimed or in flight; a merely unpaid dev fee is paid by whichever node is connected and does not count |
 | `open_bonds` | bond hold invoices still open (`requested` / `locked`) |
-| `pending_bond_payouts` | bonds waiting for, or in the middle of, their payout |
+| `pending_bond_payouts` | slashed-bond payouts already dispatched and being tracked on the node; one still waiting for the winner's invoice does not count |
 | `pending_orders` | informational only: no escrow, does not block the switch |
 
 `drained` is `true` when every counter except `pending_orders` is zero.

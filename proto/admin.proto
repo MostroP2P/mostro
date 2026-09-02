@@ -123,7 +123,7 @@ message DrainCounters {
   uint32 inflight_dev_fees = 3;
   // D: bond hold invoices still open (requested / locked)
   uint32 open_bonds = 4;
-  // E: bonds waiting for, or in the middle of, their payout
+  // E: slashed-bond payouts in flight (pending-payout + payout hash)
   uint32 pending_bond_payouts = 5;
   // Informational: pending orders hold no escrow and do not block a switch
   uint32 pending_orders = 6;

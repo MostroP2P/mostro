@@ -1,8 +1,14 @@
 # Maintenance Mode & Lightning Node Migration — Implementation Spec
 
-**Status:** Draft for review · **Target:** `main` (`mostro-core 0.14.5` → needs a
-`mostro-core` minor release for Phase 0, see §4.1) · **Feature flag:** none
-at build time; the mode is a runtime switch, off by default
+**Status:** Implemented · **Target:** `main` (`mostro-core` ≥ 0.14.6) ·
+**Feature flag:** none at build time; the mode is a runtime switch, off by
+default
+
+Implementation trail: Phase 0 — mostro-core#166 (0.14.6), protocol#57 ·
+Phase 1 — #933 · Phase 2 — #934 · Phase 3 — #935 · Phase 4 — #936 ·
+Phase 5 — operator runbook in `docs/LIGHTNING_OPS.md` ("Migrating to a
+Different Lightning Node"). Where this document and the code differ, the
+code and `docs/RPC.md` / `docs/LIGHTNING_OPS.md` are authoritative.
 
 This document specifies a **maintenance ("drain") mode** for `mostrod` and the
 operational procedure that uses it to move a Mostro instance from one
@@ -499,7 +505,8 @@ from starting, the PR must include a rollback note (set
 - New section "Migrating to a different Lightning node" in
   `docs/LIGHTNING_OPS.md` (procedure below, §5).
 - `docs/README.md` index entry for this spec.
-- CHANGELOG entry; tag a `mostrod` release.
+- Tag a `mostrod` release (the repo's `CHANGELOG.md` is the release
+  verification guide, not a change log; the release notes carry the entry).
 
 **Exit criteria** — a full dry run on regtest/Polar: two LND nodes, several
 orders in every §1.3 state, enable maintenance, drain, switch, verify new

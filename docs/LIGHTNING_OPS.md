@@ -306,6 +306,115 @@ trade: `bond_enabled` (always emitted), and when enabled `bond_apply_to`,
 `bond_amount_pct`, `bond_base_amount_sats`, `bond_slash_on_waiting_timeout`,
 `bond_slash_node_share_pct`, and `bond_payout_claim_window_days`.
 
+## Migrating to a Different Lightning Node
+
+Hold invoices live only in the node that issued them, so a Mostro instance
+cannot simply be pointed at a new node while trades are open: every
+`release` / `cancel` on a pre-existing order would hit an unknown invoice.
+The daemon ships a **maintenance (drain) mode** for this. Full design in
+`docs/MAINTENANCE_MODE_LN_MIGRATION.md`; this is the operator procedure.
+
+### When this applies
+
+- **Same LND, new host** (same seed, same `channel.db`): hold invoices travel
+  with the node. Nothing here is needed; plan the downtime and go.
+- **Different node identity** (new seed, LND → CLN, hosted → self-hosted):
+  follow this procedure.
+
+### What is bound to the old node
+
+`GetMaintenanceStatus` (admin RPC, `docs/RPC.md` §8) reports it:
+
+| Counter | Meaning |
+|---|---|
+| `escrowed_orders` | orders with a hold invoice in a non-terminal status |
+| `inflight_payouts` | buyer payouts in flight (`settled-hold-invoice` with a payout hash) |
+| `unpaid_dev_fees` | successful orders whose dev fee is still unpaid |
+| `open_bonds` | bond hold invoices still open (`requested` / `locked`) |
+| `pending_bond_payouts` | bonds waiting for, or in the middle of, their payout |
+| `pending_orders` | informational only: no escrow, does not block the switch |
+
+`drained` is `true` when every counter except `pending_orders` is zero.
+
+### Procedure
+
+1. **Announce** the window to users. Allow at least
+   `max_expiration_days` plus time for open disputes.
+2. **Enable maintenance mode** (loopback only; add
+   `-H 'authorization: Bearer <token>'` if `[rpc].auth_token` is set):
+
+   ```bash
+   grpcurl -plaintext -import-path proto -proto admin.proto \
+     -d '{"enabled": true, "reason": "LN node migration"}' \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/SetMaintenanceMode
+   ```
+
+   From now on `new-order`, `take-buy` and `take-sell` are answered with
+   `cant-do` reason `maintenance_mode`; everything on existing orders keeps
+   working. The info event is republished at once with
+   `maintenance_mode = "true"`, so up-to-date clients warn users before they
+   try. The flag is persisted in `daemon_state` and survives restarts.
+3. **Drain.** Poll until `drained` is `true`:
+
+   ```bash
+   grpcurl -plaintext -import-path proto -proto admin.proto \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/GetMaintenanceStatus
+   ```
+
+   Meanwhile: pending orders expire on their own (or ask makers to cancel);
+   close long-running disputes with `AdminSettle` / `AdminCancel`; keep the
+   **old node online the whole time** — it also has to finish in-flight
+   payouts and dev fees.
+4. **Stop `mostrod`** and back up `mostro.db`.
+5. **Edit `[lightning]`** (`lnd_cert_file`, `lnd_macaroon_file`,
+   `lnd_grpc_host`) to the new node. Leave `allow_node_change = false`.
+6. **Start `mostrod`.** The boot guard sees a new node pubkey with all
+   counters at zero, logs `Lightning node changed from … with no open
+   escrow; recorded` and stores the new pubkey. If it instead logs
+   `REFUSING TO START`, something is still bound to the old node: go back
+   to step 3 (see also "Disaster recovery" below).
+7. **Disable maintenance mode** (`"enabled": false`). Verify that a test
+   order can be created and taken and that the info event shows
+   `maintenance_mode = "false"`.
+8. Only now decommission the old node (close channels, sweep funds).
+
+Rollback at any step before 6: `SetMaintenanceMode {"enabled": false}`
+re-opens the book against the old node; nothing else changed.
+
+### Disaster recovery: old node lost with open escrow
+
+`[lightning].allow_node_change = true` exists for exactly one case: the old
+node is gone for good. The daemon **cannot** close the affected rows —
+`AdminCancel` / `AdminSettle` talk to the *configured* node and would hit an
+unknown invoice. With the daemon stopped:
+
+1. Export the rows behind the non-zero counters; these are the trades to
+   reconcile by hand.
+2. Funds: an unsettled hold invoice on a dead node pays nobody; its HTLCs
+   time out at the CLTV delta and the sats return to whoever paid it. If the
+   old seed still exists, restore it elsewhere and close channels. Sats that
+   were `settled-hold-invoice` but not paid out belong to the buyer and must
+   be paid from the new node manually.
+3. Database: mark the orders terminal by hand (`canceled-by-admin` for
+   unsettled escrow, `completed-by-admin` after a manual payout) and the
+   bonds `failed`, so the counters reach zero.
+4. Notify the users involved; the daemon sends nothing for rows changed this
+   way.
+5. Start against the new node. With the counters at zero the guard accepts
+   the change without the override; set `allow_node_change = true` only if a
+   row could not be closed and you knowingly leave it unresolved. Turn it
+   back off afterwards.
+
+### Reading what happened in the logs
+
+- `Maintenance mode is ON: new orders and takes are rejected` — at boot,
+  the persisted flag is set.
+- `Maintenance mode: rejecting NewOrder from <trade key>` — a gated request.
+- `Maintenance flag changed: republishing mostro info now` — the info
+  event went out ahead of its interval.
+- `Recorded Lightning node identity <pubkey>` — first boot of the guard.
+- `REFUSING TO START: Lightning node changed from …` — see step 6.
+
 ## Diagrams
 ```mermaid
 flowchart TD

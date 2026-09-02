@@ -237,7 +237,7 @@ async fn verify_confirmed_orders(
     for real_hash_order in real_hash_orders {
         let order_id = real_hash_order.id;
 
-        if confirmed.contains(&order_id) || unverifiable.contains(&order_id) {
+        if !needs_verification(&order_id, confirmed, unverifiable) {
             continue;
         }
 
@@ -274,7 +274,28 @@ async fn verify_confirmed_orders(
     }
 }
 
+/// The Phase 2 skip guard: an order is queried against LND only if it is
+/// neither confirmed nor parked as unverifiable. Kept as a function so the
+/// guard has a unit test that fails if either set stops being honoured
+/// (the flood of #946 was exactly "ask LND again every cycle").
+fn needs_verification(
+    order_id: &uuid::Uuid,
+    confirmed: &HashSet<uuid::Uuid>,
+    unverifiable: &HashSet<uuid::Uuid>,
+) -> bool {
+    !confirmed.contains(order_id) && !unverifiable.contains(order_id)
+}
+
 // ── Phase 3: Recover partial payments (hash stored, not yet confirmed) ──
+//
+// Scope note on the `unverifiable` cache: it is deliberately Phase 2 only.
+// Phase 2 rows are `dev_fee_paid = 1` — money already accounted for; an
+// unknown hash there changes nothing, so silencing it is safe. Phase 3 and
+// the send-timeout path deal with `dev_fee_paid = 0` rows that still carry
+// a hash: an unknown hash there means a dev fee whose fate is undecided
+// (sent by a previous node, or never registered by this one), i.e. an
+// operator problem. Those warnings stay per cycle on purpose so they are
+// not lost; resolving them is a separate decision (see #946 discussion).
 
 /// Orders that have a real payment hash but `dev_fee_paid=0` represent
 /// a crash between "store hash" and "receive LND confirmation". This is
@@ -1563,7 +1584,7 @@ mod tests {
     // ── LND-dependent phases against a lazily-connected dead client ──
 
     use super::{
-        dev_fee_comment, handle_payment_timeout, process_new_dev_fee_payments,
+        dev_fee_comment, handle_payment_timeout, needs_verification, process_new_dev_fee_payments,
         recover_partial_payments, resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment,
         verify_confirmed_orders,
     };
@@ -1805,6 +1826,22 @@ mod tests {
             .await
             .unwrap();
         verify_confirmed_orders(&pool, &mut ln, &mut confirmed, &mut unverifiable).await;
+    }
+
+    /// The skip guard must honour both sets; this is the assertion that
+    /// fails if the `unverifiable` check is removed again (the
+    /// `LndConnector` seam is concrete, so the call count cannot be
+    /// observed directly — the guard is tested as a function instead).
+    #[test]
+    fn needs_verification_honours_both_sets() {
+        let fresh = uuid::Uuid::new_v4();
+        let done = uuid::Uuid::new_v4();
+        let parked = uuid::Uuid::new_v4();
+        let confirmed: HashSet<_> = [done].into_iter().collect();
+        let unverifiable: HashSet<_> = [parked].into_iter().collect();
+        assert!(needs_verification(&fresh, &confirmed, &unverifiable));
+        assert!(!needs_verification(&done, &confirmed, &unverifiable));
+        assert!(!needs_verification(&parked, &confirmed, &unverifiable));
     }
 
     /// An order already parked in `unverifiable` is skipped without any LND

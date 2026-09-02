@@ -533,6 +533,13 @@ pub struct RpcSettings {
     /// Duration in seconds after which inactive rate-limiter entries are evicted
     #[serde(default = "default_rate_limiter_stale_duration")]
     pub rate_limiter_stale_duration: u64,
+    /// Optional shared secret for the mutating admin RPCs (`CancelOrder`,
+    /// `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`).
+    /// When set, those calls must carry `authorization: Bearer <token>`
+    /// metadata. Unset (default) keeps the historical bind-address-only
+    /// model. Never serialized back to disk.
+    #[serde(default, skip_serializing)]
+    pub auth_token: Option<secrecy::SecretString>,
 }
 
 fn default_rate_limiter_stale_duration() -> u64 {
@@ -546,6 +553,7 @@ impl Default for RpcSettings {
             listen_address: "127.0.0.1".to_string(),
             port: 50051,
             rate_limiter_stale_duration: default_rate_limiter_stale_duration(),
+            auth_token: None,
         }
     }
 }

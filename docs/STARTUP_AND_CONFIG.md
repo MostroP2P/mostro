@@ -152,6 +152,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `enabled` (bool): Enable RPC server (Rust Default: false)
 - `listen_address` (String): Bind address (Rust Default: "127.0.0.1")
 - `port` (u16): Listen port (Rust Default: 50051)
+- `auth_token` (String, optional): Shared secret required as `authorization: Bearer <token>` on the mutating admin RPCs; unset means no application-layer auth (see `docs/RPC.md`)
 - Note: These fields have a Rust Default implementation, but `settings.toml` must still include these keys. If a key is present but empty or omitted by tooling, the daemon falls back to the Rust Default value.
 
 ## Global Variables

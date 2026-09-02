@@ -17,6 +17,7 @@ use crate::rpc::admin::{
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::nip59::UnwrappedMessage;
 use nostr_sdk::prelude::Keys;
+use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,9 @@ pub struct AdminServiceImpl {
     /// Same clone the event loop's `AppContext` holds, so a flip here is
     /// observed by the escrow gate immediately.
     maintenance: MaintenanceState,
+    /// `[rpc].auth_token`. When set, every mutating RPC requires
+    /// `authorization: Bearer <token>`.
+    auth_token: Option<SecretString>,
 }
 
 impl AdminServiceImpl {
@@ -48,6 +52,38 @@ impl AdminServiceImpl {
             ln_client,
             password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
             maintenance,
+            auth_token: Settings::get_rpc().auth_token.clone(),
+        }
+    }
+
+    /// Application-layer check for the mutating RPCs. A no-op unless
+    /// `[rpc].auth_token` is configured; then the request must carry
+    /// `authorization: Bearer <token>` and it is compared in constant time.
+    /// This is what protects the book when the port is reached through a
+    /// forwarder (SSH tunnel, sidecar, reverse proxy) whose connection looks
+    /// like a loopback peer.
+    fn require_auth<T>(&self, request: &Request<T>, rpc: &str) -> Result<(), Status> {
+        let Some(expected) = &self.auth_token else {
+            return Ok(());
+        };
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim);
+        match presented {
+            Some(token)
+                if constant_time_eq(token.as_bytes(), expected.expose_secret().as_bytes()) =>
+            {
+                Ok(())
+            }
+            _ => {
+                warn!("{rpc} refused: missing or invalid bearer token");
+                Err(Status::permission_denied(
+                    "missing or invalid authorization bearer token",
+                ))
+            }
         }
     }
 
@@ -69,7 +105,18 @@ impl AdminServiceImpl {
             ))
         }
     }
+}
 
+/// Length-independent byte comparison: the whole input is always scanned.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (x, y) in a.iter().zip(b.iter().cycle()) {
+        diff |= x ^ y;
+    }
+    diff == 0 && !b.is_empty()
+}
+
+impl AdminServiceImpl {
     /// Convert admin actions to use existing handlers
     /// This creates the necessary structures to call existing admin handlers
     async fn call_admin_cancel(
@@ -303,6 +350,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CancelOrderRequest>,
     ) -> Result<Response<CancelOrderResponse>, Status> {
+        self.require_auth(&request, "CancelOrder")?;
         let req = request.into_inner();
         info!("Received cancel order request for order: {}", req.order_id);
 
@@ -325,6 +373,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SettleOrderRequest>,
     ) -> Result<Response<SettleOrderResponse>, Status> {
+        self.require_auth(&request, "SettleOrder")?;
         let req = request.into_inner();
         info!("Received settle order request for order: {}", req.order_id);
 
@@ -347,6 +396,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<AddSolverRequest>,
     ) -> Result<Response<AddSolverResponse>, Status> {
+        self.require_auth(&request, "AddSolver")?;
         let req = request.into_inner();
         info!(
             "Received add solver request for pubkey: {}",
@@ -375,6 +425,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<TakeDisputeRequest>,
     ) -> Result<Response<TakeDisputeResponse>, Status> {
+        self.require_auth(&request, "TakeDispute")?;
         let req = request.into_inner();
         info!(
             "Received take dispute request for dispute: {}",
@@ -414,6 +465,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<SetMaintenanceModeRequest>,
     ) -> Result<Response<SetMaintenanceModeResponse>, Status> {
         let ip = Self::require_loopback(&request)?;
+        self.require_auth(&request, "SetMaintenanceMode")?;
         let req = request.into_inner();
         info!(
             "Received SetMaintenanceMode(enabled={}) from {ip}, request_id: {:?}",
@@ -783,6 +835,128 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(resp.success);
+    }
+
+    fn with_token(mut service: AdminServiceImpl, token: &str) -> AdminServiceImpl {
+        service.auth_token = Some(SecretString::from(token.to_owned()));
+        service
+    }
+
+    fn bearer<T>(mut request: Request<T>, token: &str) -> Request<T> {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    fn enable_req() -> SetMaintenanceModeRequest {
+        SetMaintenanceModeRequest {
+            enabled: true,
+            reason: None,
+            request_id: None,
+        }
+    }
+
+    /// A forwarder (SSH tunnel, sidecar) shows up as a loopback peer; with a
+    /// token configured that is no longer enough.
+    #[tokio::test]
+    async fn forwarded_loopback_call_without_token_is_refused() {
+        let service = with_token(offline_service().await, "s3cret");
+        for request in [
+            request_with_addr(enable_req(), 1),
+            bearer(request_with_addr(enable_req(), 1), "wrong"),
+            bearer(request_with_addr(enable_req(), 1), "s3cre"),
+            bearer(request_with_addr(enable_req(), 1), "s3cret0"),
+        ] {
+            let err = service
+                .set_maintenance_mode(request)
+                .await
+                .expect_err("must be refused");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+        assert!(!service.maintenance.is_enabled(), "flag untouched");
+        assert!(!MaintenanceState::load(&service.pool)
+            .await
+            .unwrap()
+            .is_enabled());
+    }
+
+    #[tokio::test]
+    async fn correct_bearer_token_is_accepted() {
+        let service = with_token(offline_service().await, "s3cret");
+        let resp = service
+            .set_maintenance_mode(bearer(request_with_addr(enable_req(), 1), "s3cret"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert!(service.maintenance.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn token_also_guards_the_other_mutating_rpcs() {
+        let service = with_token(offline_service().await, "s3cret");
+        let deny = tonic::Code::PermissionDenied;
+        assert_eq!(
+            service
+                .cancel_order(Request::new(CancelOrderRequest {
+                    order_id: "x".into(),
+                    request_id: None,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            deny
+        );
+        assert_eq!(
+            service
+                .settle_order(Request::new(SettleOrderRequest {
+                    order_id: "x".into(),
+                    request_id: None,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            deny
+        );
+        assert_eq!(
+            service
+                .add_solver(Request::new(AddSolverRequest {
+                    solver_pubkey: "x".into(),
+                    request_id: None,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            deny
+        );
+        assert_eq!(
+            service
+                .take_dispute(Request::new(TakeDisputeRequest {
+                    dispute_id: "x".into(),
+                    request_id: None,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            deny
+        );
+        // Read-only calls stay open.
+        assert!(service
+            .get_maintenance_status(Request::new(GetMaintenanceStatusRequest {
+                request_id: None
+            }))
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn constant_time_eq_semantics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b""), "an empty token never matches");
     }
 
     #[tokio::test]

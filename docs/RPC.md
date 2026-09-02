@@ -113,7 +113,7 @@ Retrieve the Mostro daemon version.
 
 Enable or disable maintenance ("drain") mode. While enabled the daemon answers `new-order`, `take-buy` and `take-sell` with `cant-do` reason `maintenance_mode` and persists nothing for them; every action on an existing order, every admin action and every scheduler job keeps working so open escrow can finish on the current Lightning node. The flag is stored in the `daemon_state` table and survives restarts. See `docs/MAINTENANCE_MODE_LN_MIGRATION.md`.
 
-**Loopback only.** The admin service has no authentication interceptor, so this mutating call is refused with `PERMISSION_DENIED` unless the peer address is a loopback address (`127.0.0.0/8` or `::1`). Requests without peer information are refused with `INTERNAL`.
+**Loopback only.** This mutating call is refused with `PERMISSION_DENIED` unless the peer address is a loopback address (`127.0.0.0/8` or `::1`). Requests without peer information are refused with `INTERNAL`. A forwarder (SSH tunnel, sidecar, reverse proxy) shows up as a loopback peer, so if the port is reachable through one, configure `[rpc].auth_token` (see [Authentication](#authentication)).
 
 **Request:**
 
@@ -211,11 +211,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Authentication
+
+Optional. Set a shared secret in `settings.toml`:
+
+```toml
+[rpc]
+auth_token = "a-long-random-string"
+```
+
+When set, every mutating RPC (`CancelOrder`, `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`) must carry the gRPC metadata header `authorization: Bearer <token>`; a missing or wrong token is refused with `PERMISSION_DENIED` before anything is read or written. The comparison is constant-time. Read-only calls (`GetVersion`, `GetMaintenanceStatus`, `ValidateDbPassword`) are not affected. When unset, the historical bind-address-only model applies.
+
+```bash
+grpcurl -plaintext -import-path proto -proto admin.proto \
+  -H 'authorization: Bearer a-long-random-string' \
+  -d '{"enabled": true}' \
+  127.0.0.1:50051 mostro.admin.v1.AdminService/SetMaintenanceMode
+```
+
 ## Security Considerations
 
 - The RPC server listens on localhost by default for security
-- There is no authentication interceptor; `SetMaintenanceMode` additionally refuses non-loopback peers, the other mutating calls rely on the bind address alone
-- Consider implementing authentication/authorization for production use
+- Set `[rpc].auth_token` whenever the port is reachable through anything other than the local machine (tunnel, sidecar, non-loopback bind); the peer address alone is not authorization
+- `SetMaintenanceMode` additionally refuses non-loopback peers
 - The RPC interface provides the same admin capabilities as Nostr-based commands
 - Only enable the RPC server in trusted environments
 

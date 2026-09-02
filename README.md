@@ -676,6 +676,7 @@ bitcoin_price_api_url = "https://api.yadio.io"
 enabled = false              # Set to true to enable gRPC admin interface
 listen_address = "127.0.0.1"
 port = 50051
+# auth_token = "a-long-random-string"   # optional bearer token for mutating RPCs
 ```
 
 When enabled, exposes gRPC interface on `127.0.0.1:50051` for:

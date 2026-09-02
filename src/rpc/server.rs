@@ -6,6 +6,7 @@ use crate::lightning::LndConnector;
 use crate::rpc::service::AdminServiceImpl;
 use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -36,9 +37,7 @@ impl RpcServer {
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
         maintenance: MaintenanceState,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let addr = format!("{}:{}", self.listen_address, self.port)
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
+        let addr = listen_socket_addr(&self.listen_address, self.port)?;
 
         let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client, maintenance);
 
@@ -60,6 +59,22 @@ impl RpcServer {
     pub fn is_enabled() -> bool {
         Settings::get_rpc().enabled
     }
+}
+
+/// Build the bind address from `[rpc].listen_address` + `port`.
+///
+/// `listen_address` must be an IP literal (`Server::serve` needs a
+/// `SocketAddr`, so hostnames never worked). Going through `IpAddr` instead
+/// of `format!("{}:{}")` is what makes IPv6 work: `"::1:50051"` does not
+/// parse, `[::1]:50051` does.
+pub fn listen_socket_addr(listen_address: &str, port: u16) -> Result<SocketAddr, String> {
+    let ip: IpAddr = listen_address
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|e| format!("Invalid [rpc].listen_address {listen_address:?}: {e}"))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 impl Default for RpcServer {
@@ -102,6 +117,55 @@ mod tests {
 
         let expected_addr = format!("{}:{}", server.listen_address, server.port);
         assert_eq!(expected_addr, "127.0.0.1:50051");
+    }
+
+    #[test]
+    fn listen_socket_addr_handles_ipv4_ipv6_and_rejects_garbage() {
+        assert_eq!(
+            listen_socket_addr("127.0.0.1", 50051).unwrap().to_string(),
+            "127.0.0.1:50051"
+        );
+        assert_eq!(
+            listen_socket_addr("::1", 50051).unwrap().to_string(),
+            "[::1]:50051"
+        );
+        assert_eq!(
+            listen_socket_addr("[::1]", 50051).unwrap().to_string(),
+            "[::1]:50051"
+        );
+        assert!(listen_socket_addr("localhost", 50051).is_err());
+        assert!(listen_socket_addr("not an address", 50051).is_err());
+    }
+
+    /// `::1` used to be formatted as `::1:50051`, which `SocketAddr` rejects.
+    /// Binding it now works (the server is dropped right after the bind).
+    #[tokio::test]
+    async fn start_accepts_ipv6_loopback_listener() {
+        init_test_settings();
+        let server = RpcServer {
+            listen_address: "::1".to_string(),
+            port: 0,
+        };
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let start = server.start(
+            Keys::generate(),
+            Arc::new(pool),
+            offline_ln_client().await,
+            MaintenanceState::new(),
+        );
+        // A successful bind keeps serving forever; a failed one returns
+        // immediately. Give it a moment and treat "still serving" as success.
+        match tokio::time::timeout(std::time::Duration::from_millis(500), start).await {
+            Err(_elapsed) => {}
+            Ok(result) => {
+                // Only a missing IPv6 loopback on the host may fail the bind.
+                let msg = result.unwrap_err().to_string();
+                assert!(
+                    !msg.contains("Invalid [rpc].listen_address"),
+                    "::1 must parse: {msg}"
+                );
+            }
+        }
     }
 
     use crate::app::context::test_utils::test_settings;

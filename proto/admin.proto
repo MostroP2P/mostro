@@ -118,8 +118,9 @@ message DrainCounters {
   uint32 escrowed_orders = 1;
   // B: buyer payouts in flight (settled-hold-invoice + payout hash)
   uint32 inflight_payouts = 2;
-  // C: successful orders whose dev fee is still unpaid
-  uint32 unpaid_dev_fees = 3;
+  // C: dev-fee payouts claimed or in flight (marker set, not yet paid);
+  // a merely unpaid dev fee is not node-bound and is not counted
+  uint32 inflight_dev_fees = 3;
   // D: bond hold invoices still open (requested / locked)
   uint32 open_bonds = 4;
   // E: bonds waiting for, or in the middle of, their payout

@@ -530,7 +530,7 @@ impl AdminService for AdminServiceImpl {
             counters: Some(DrainCounters {
                 escrowed_orders: counters.escrowed_orders,
                 inflight_payouts: counters.inflight_payouts,
-                unpaid_dev_fees: counters.unpaid_dev_fees,
+                inflight_dev_fees: counters.inflight_dev_fees,
                 open_bonds: counters.open_bonds,
                 pending_bond_payouts: counters.pending_bond_payouts,
                 pending_orders: counters.pending_orders,

@@ -60,7 +60,7 @@ the switch:
 | B. In‑flight buyer payouts | `orders.payout_payment_hash IS NOT NULL AND status = 'settled-hold-invoice'` | `job_reconcile_inflight_payouts` tracks the hash on the node that sent it. Same predicate as `find_inflight_payouts` (`src/db.rs`); a subset of A, reported separately for visibility |
 | C. In‑flight dev fees | `orders.dev_fee_paid = 0 AND dev_fee_payment_hash IS NOT NULL` | `job_process_dev_fee_payment` sets the marker while it claims/sends and clears it on failure; only that window tracks a payment on the node. A merely unpaid dev fee is an outgoing payment to a Lightning address the new node makes just as well, so it is **not** counted (found in the regtest dry run: the address is mainnet‑only, the fee can never be paid there, and counting it blocked `drained` forever) |
 | D. Open bond hold invoices | `bonds.hash IS NOT NULL AND state IN ('requested','locked')` | maker/taker bond hold invoices (`src/app/bond/flow.rs`) |
-| E. Pending bond payouts | `bonds.state = 'pending-payout'` | payout not yet sent or in flight; `bonds.payout_payment_hash` is the idempotency record for it |
+| E. In‑flight bond payouts | `bonds.state = 'pending-payout' AND payout_payment_hash IS NOT NULL` | `run_bond_payout_cycle` (`src/app/bond/payout.rs`) reconciles the hash with `track_payment_v2` on the node that sent it. A `pending-payout` bond still waiting for the winner's invoice is out: its HTLC was settled at slash time and the payout can be sent from any node (the bond twin of B) |
 
 Predicate notes, verified against the schema and jobs:
 

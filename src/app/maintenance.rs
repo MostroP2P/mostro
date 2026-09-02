@@ -137,7 +137,12 @@ pub struct DrainCounters {
     pub inflight_dev_fees: u32,
     /// D — bond hold invoices still open (`requested` / `locked`).
     pub open_bonds: u32,
-    /// E — bonds waiting for (or in the middle of) their payout.
+    /// E — slashed-bond payouts in flight (`pending-payout` with a
+    /// `payout_payment_hash`): `run_bond_payout_cycle` reconciles that hash
+    /// with `track_payment_v2` on the node that sent it. A `pending-payout`
+    /// bond still waiting for the winner's invoice is not node-bound — its
+    /// HTLC was settled at slash time and the payout can go out from any
+    /// node — so it does not block the switch.
     pub pending_bond_payouts: u32,
     /// Informational: pending orders hold no escrow and do not block a switch.
     pub pending_orders: u32,
@@ -307,9 +312,11 @@ pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroEr
             ],
         )
         .await?,
+        // E is the bond twin of B: only a payout already dispatched is
+        // tracked on the old node.
         pending_bond_payouts: count(
             pool,
-            "SELECT COUNT(*) FROM bonds WHERE state = ?1",
+            "SELECT COUNT(*) FROM bonds WHERE state = ?1 AND payout_payment_hash IS NOT NULL",
             &[BondState::PendingPayout.to_string()],
         )
         .await?,
@@ -768,6 +775,12 @@ mod tests {
         // D / E: bonds.
         insert_bond(&pool, BondState::Locked, Some(&h), None).await;
         insert_bond(&pool, BondState::PendingPayout, Some(&h), Some(&h)).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.open_bonds, c.pending_bond_payouts), (1, 1));
+
+        // A slashed bond still waiting for the winner's invoice: HTLC already
+        // settled, payout not dispatched — payable from any node, not E.
+        insert_bond(&pool, BondState::PendingPayout, Some(&h), None).await;
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.open_bonds, c.pending_bond_payouts), (1, 1));
 

@@ -76,7 +76,7 @@ use nostr_sdk::prelude::{Keys, PublicKey};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── Public entry point ──────────────────────────────────────────────────
 
@@ -89,12 +89,13 @@ pub async fn run_dev_fee_cycle(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
+    unverifiable: &mut HashSet<uuid::Uuid>,
     keys: &Keys,
 ) {
     info!("Checking for unpaid development fees");
 
     cleanup_stale_pending_markers(pool).await;
-    verify_confirmed_orders(pool, ln_client, confirmed).await;
+    verify_confirmed_orders(pool, ln_client, confirmed, unverifiable).await;
     recover_partial_payments(pool, ln_client, confirmed).await;
     process_new_dev_fee_payments(pool, ln_client, confirmed, keys).await;
 }
@@ -202,10 +203,18 @@ async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
 /// For orders marked `dev_fee_paid=1` with a real hash, confirm the
 /// payment actually succeeded on the LN node. On daemon restart the
 /// `confirmed` set is empty so every paid order gets re‑checked once.
+///
+/// A hash the connected node has never seen (`NotOnThisNode` — after a
+/// Lightning node migration, every dev fee paid by the old node) cannot be
+/// verified by asking again: such orders go into `unverifiable` and are
+/// skipped for the rest of the process lifetime instead of costing one
+/// LND round-trip and one warning per cycle each (#946). They are re-tried
+/// once after the next restart, like everything else.
 async fn verify_confirmed_orders(
     pool: &SqlitePool,
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
+    unverifiable: &mut HashSet<uuid::Uuid>,
 ) {
     let real_hash_orders = match sqlx::query_as::<_, Order>(
         "SELECT * FROM orders
@@ -224,16 +233,21 @@ async fn verify_confirmed_orders(
         }
     };
 
+    let mut not_on_this_node = 0u32;
     for real_hash_order in real_hash_orders {
         let order_id = real_hash_order.id;
 
-        if confirmed.contains(&order_id) {
+        if !needs_verification(&order_id, confirmed, unverifiable) {
             continue;
         }
 
         match check_dev_fee_payment_status(&real_hash_order, ln_client).await {
             DevFeePaymentState::Succeeded => {
                 confirmed.insert(order_id);
+            }
+            DevFeePaymentState::NotOnThisNode => {
+                unverifiable.insert(order_id);
+                not_on_this_node += 1;
             }
             DevFeePaymentState::Failed => {
                 // Do NOT reset orders with real payment hashes. LND may report
@@ -250,9 +264,38 @@ async fn verify_confirmed_orders(
             DevFeePaymentState::InFlight | DevFeePaymentState::Unknown => {}
         }
     }
+    if not_on_this_node > 0 {
+        info!(
+            "{} paid dev fee(s) are unknown to the connected Lightning node (paid by a \
+             previous node, or payment history pruned); left as paid, not re-checked \
+             until restart",
+            not_on_this_node
+        );
+    }
+}
+
+/// The Phase 2 skip guard: an order is queried against LND only if it is
+/// neither confirmed nor parked as unverifiable. Kept as a function so the
+/// guard has a unit test that fails if either set stops being honoured
+/// (the flood of #946 was exactly "ask LND again every cycle").
+fn needs_verification(
+    order_id: &uuid::Uuid,
+    confirmed: &HashSet<uuid::Uuid>,
+    unverifiable: &HashSet<uuid::Uuid>,
+) -> bool {
+    !confirmed.contains(order_id) && !unverifiable.contains(order_id)
 }
 
 // ── Phase 3: Recover partial payments (hash stored, not yet confirmed) ──
+//
+// Scope note on the `unverifiable` cache: it is deliberately Phase 2 only.
+// Phase 2 rows are `dev_fee_paid = 1` — money already accounted for; an
+// unknown hash there changes nothing, so silencing it is safe. Phase 3 and
+// the send-timeout path deal with `dev_fee_paid = 0` rows that still carry
+// a hash: an unknown hash there means a dev fee whose fate is undecided
+// (sent by a previous node, or never registered by this one), i.e. an
+// operator problem. Those warnings stay per cycle on purpose so they are
+// not lost; resolving them is a separate decision (see #946 discussion).
 
 /// Orders that have a real payment hash but `dev_fee_paid=0` represent
 /// a crash between "store hash" and "receive LND confirmation". This is
@@ -377,7 +420,7 @@ async fn recover_partial_payments(
                     order_id, existing_hash
                 );
             }
-            DevFeePaymentState::Unknown => {
+            DevFeePaymentState::Unknown | DevFeePaymentState::NotOnThisNode => {
                 warn!(
                     "Order {} payment status unknown (hash {}), skipping to avoid duplicate",
                     order_id, existing_hash
@@ -721,7 +764,7 @@ async fn handle_payment_timeout(
                 );
             }
         }
-        DevFeePaymentState::Unknown => {
+        DevFeePaymentState::Unknown | DevFeePaymentState::NotOnThisNode => {
             warn!(
                 "Cannot determine payment status for order {}, keeping hash to avoid duplicate",
                 order_id
@@ -759,7 +802,14 @@ enum DevFeePaymentState {
     InFlight,
     /// Payment definitively failed — safe to retry.
     Failed,
-    /// Could not determine status (LN node unreachable, unknown hash, etc.)
+    /// The connected node has no record of this payment hash (gRPC
+    /// `NotFound`, or an empty track stream). Asking again will not change
+    /// the answer:
+    /// the payment was sent by another node (Lightning node migration) or
+    /// the node's payment history was pruned.
+    NotOnThisNode,
+    /// Could not determine status (LN node unreachable, timeout, undecodable
+    /// hash). Transient: worth asking again next cycle.
     Unknown,
 }
 
@@ -795,18 +845,28 @@ async fn check_dev_fee_payment_status(
         }
     };
 
+    // `lookup_payment_status` folds both ways LND says "never seen this
+    // hash" — a gRPC `NotFound` and a track stream that ends without a
+    // payment — into `Ok(None)`; only transport / gRPC failures are `Err`.
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        ln_client.check_payment_status(&payment_hash_bytes),
+        ln_client.lookup_payment_status(&payment_hash_bytes),
     )
     .await
     {
-        Ok(Ok(status)) => match status {
+        Ok(Ok(Some(status))) => match status {
             PaymentStatus::Succeeded => DevFeePaymentState::Succeeded,
             PaymentStatus::InFlight => DevFeePaymentState::InFlight,
             PaymentStatus::Failed => DevFeePaymentState::Failed,
             _ => DevFeePaymentState::Unknown,
         },
+        Ok(Ok(None)) => {
+            debug!(
+                "LN node has no record of dev fee payment for order {} (hash {})",
+                order.id, payment_hash_str
+            );
+            DevFeePaymentState::NotOnThisNode
+        }
         Ok(Err(e)) => {
             warn!(
                 "LN status check failed for order {} (hash {}): {:?}",
@@ -1524,7 +1584,7 @@ mod tests {
     // ── LND-dependent phases against a lazily-connected dead client ──
 
     use super::{
-        dev_fee_comment, handle_payment_timeout, process_new_dev_fee_payments,
+        dev_fee_comment, handle_payment_timeout, needs_verification, process_new_dev_fee_payments,
         recover_partial_payments, resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment,
         verify_confirmed_orders,
     };
@@ -1581,7 +1641,14 @@ mod tests {
         let pool = setup_orders_db().await;
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        run_dev_fee_cycle(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
+        run_dev_fee_cycle(
+            &pool,
+            &mut ln,
+            &mut confirmed,
+            &mut HashSet::new(),
+            &Keys::generate(),
+        )
+        .await;
         assert!(confirmed.is_empty());
     }
 
@@ -1742,20 +1809,59 @@ mod tests {
 
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
+        let mut unverifiable = HashSet::new();
         confirmed.insert(cached);
-        verify_confirmed_orders(&pool, &mut ln, &mut confirmed).await;
+        verify_confirmed_orders(&pool, &mut ln, &mut confirmed, &mut unverifiable).await;
 
-        // Unknown outcomes must not add to (or remove from) the set.
+        // Unknown outcomes (dead node = transient) must not add to (or
+        // remove from) either set: they are worth asking again next cycle.
         assert!(confirmed.contains(&cached));
         assert!(!confirmed.contains(&unknown_rpc));
         assert!(!confirmed.contains(&unknown_hex));
+        assert!(unverifiable.is_empty());
 
         // Query-error arm: drop the table and re-run.
         sqlx::query("DROP TABLE orders")
             .execute(&pool)
             .await
             .unwrap();
-        verify_confirmed_orders(&pool, &mut ln, &mut confirmed).await;
+        verify_confirmed_orders(&pool, &mut ln, &mut confirmed, &mut unverifiable).await;
+    }
+
+    /// The skip guard must honour both sets; this is the assertion that
+    /// fails if the `unverifiable` check is removed again (the
+    /// `LndConnector` seam is concrete, so the call count cannot be
+    /// observed directly — the guard is tested as a function instead).
+    #[test]
+    fn needs_verification_honours_both_sets() {
+        let fresh = uuid::Uuid::new_v4();
+        let done = uuid::Uuid::new_v4();
+        let parked = uuid::Uuid::new_v4();
+        let confirmed: HashSet<_> = [done].into_iter().collect();
+        let unverifiable: HashSet<_> = [parked].into_iter().collect();
+        assert!(needs_verification(&fresh, &confirmed, &unverifiable));
+        assert!(!needs_verification(&done, &confirmed, &unverifiable));
+        assert!(!needs_verification(&parked, &confirmed, &unverifiable));
+    }
+
+    /// An order already parked in `unverifiable` is skipped without any LND
+    /// call (#946): with a dead node a call would leave a warning and, more
+    /// importantly, the set must be honoured so the per-cycle flood stops.
+    #[tokio::test]
+    async fn verify_confirmed_skips_unverifiable_orders() {
+        let pool = setup_orders_db().await;
+        let parked = uuid::Uuid::new_v4();
+        insert_test_order(&pool, parked, "success", 100, true, Some(VALID_HEX_HASH)).await;
+
+        let mut ln = dead_lnd().await;
+        let mut confirmed = HashSet::new();
+        let mut unverifiable = HashSet::new();
+        unverifiable.insert(parked);
+        verify_confirmed_orders(&pool, &mut ln, &mut confirmed, &mut unverifiable).await;
+
+        assert!(!confirmed.contains(&parked));
+        assert!(unverifiable.contains(&parked), "stays parked until restart");
+        assert_eq!(unverifiable.len(), 1);
     }
 
     #[tokio::test]

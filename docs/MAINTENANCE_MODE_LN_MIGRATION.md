@@ -537,7 +537,9 @@ orders work and the guard rejects a switch back with open escrow.
 5. Edit `[lightning]` (`lnd_cert_file`, `lnd_macaroon_file`,
    `lnd_grpc_host`) to the new node. Leave `allow_node_change = false`.
 6. Start `mostrod`. The node guard sees a new pubkey with all counters at
-   zero, logs the change and stores the new pubkey.
+   zero, logs the change and stores the new pubkey. The dev-fee job will
+   report the historically paid dev fees as unknown to the new node once
+   (they stay paid; see `LIGHTNING_OPS.md` step 6).
 7. `SetMaintenanceMode{enabled: false}`. Verify a test order can be created
    and taken, and that the info event shows `maintenance_mode = false`.
 8. Only now decommission the old node (close channels, sweep funds).

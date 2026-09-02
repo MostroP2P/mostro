@@ -1448,14 +1448,25 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
         return error!("Failed to create LND client for dev fee payment job");
     };
 
-    // On daemon restart the set is empty so each order gets re-checked once.
+    // On daemon restart both sets are empty so each order gets re-checked
+    // once. `unverifiable` parks paid dev fees the connected node has never
+    // seen (paid by a previous node after a migration) so they are not
+    // re-queried every cycle (#946).
     let mut confirmed: HashSet<uuid::Uuid> = HashSet::new();
+    let mut unverifiable: HashSet<uuid::Uuid> = HashSet::new();
 
     tokio::spawn(async move {
         let pool = ctx.pool();
         let keys = ctx.keys();
         loop {
-            run_dev_fee_cycle(pool, &mut ln_client, &mut confirmed, keys).await;
+            run_dev_fee_cycle(
+                pool,
+                &mut ln_client,
+                &mut confirmed,
+                &mut unverifiable,
+                keys,
+            )
+            .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

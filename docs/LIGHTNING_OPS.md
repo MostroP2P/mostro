@@ -379,6 +379,11 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
    escrow; recorded` and stores the new pubkey. If it instead logs
    `REFUSING TO START`, something is still bound to the old node: go back
    to step 3 (see also "Disaster recovery" below).
+   Expect one `info` line on the first dev-fee cycle after the restart
+   saying *N paid dev fee(s) are unknown to the connected Lightning node*:
+   the job re-verifies every historically paid dev fee once per restart, and
+   the new node has never seen those hashes. They stay marked paid and are
+   not re-queried until the next restart. Not a failed migration.
 7. **Disable maintenance mode** (`"enabled": false`). Verify that a test
    order can be created and taken and that the info event shows
    `maintenance_mode = "false"`.

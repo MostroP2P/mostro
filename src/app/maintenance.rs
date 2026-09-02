@@ -15,7 +15,7 @@ use mostro_core::prelude::{Action, Status};
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub const KEY_ENABLED: &str = "maintenance_mode";
 pub const KEY_REASON: &str = "maintenance_reason";
@@ -34,6 +34,11 @@ pub const KEY_LN_NODE_PUBKEY: &str = "ln_node_pubkey";
 pub struct MaintenanceState {
     enabled: Arc<AtomicBool>,
     write_lock: Arc<Mutex<()>>,
+    /// Signalled after every successful `set`, so the info-event job can
+    /// republish the `maintenance_mode` tag at once instead of waiting a
+    /// full `publish_mostro_info_interval`. One consumer, so `notify_one`
+    /// (which stores a permit) is used rather than `notify_waiters`.
+    changed: Arc<Notify>,
 }
 
 impl MaintenanceState {
@@ -52,6 +57,7 @@ impl MaintenanceState {
         Ok(Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
             write_lock: Arc::default(),
+            changed: Arc::default(),
         })
     }
 
@@ -98,7 +104,14 @@ impl MaintenanceState {
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         self.enabled.store(enabled, Ordering::Release);
+        self.changed.notify_one();
         Ok(())
+    }
+
+    /// Resolves after the next successful `set` (or immediately if one
+    /// happened since the last call). Used by the info-event job.
+    pub async fn changed(&self) {
+        self.changed.notified().await
     }
 }
 
@@ -337,6 +350,39 @@ mod tests {
             since.is_empty(),
             !persisted,
             "since must match the final mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_wakes_a_changed_waiter_and_stores_a_permit() {
+        let pool = pool().await;
+        let state = MaintenanceState::load(&pool).await.unwrap();
+
+        // Waiter registered before the change.
+        let waiter = state.clone();
+        let woke = tokio::spawn(async move { waiter.changed().await });
+        tokio::task::yield_now().await;
+        state.set(&pool, true, None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), woke)
+            .await
+            .expect("changed() must resolve after set")
+            .unwrap();
+
+        // Change before anyone waits: the permit is kept.
+        state.set(&pool, false, None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.changed())
+            .await
+            .expect("a change before the wait must still be observed");
+
+        // A failed write does not signal.
+        let closed = MaintenanceState::load(&pool).await.unwrap();
+        pool.close().await;
+        assert!(closed.set(&pool, true, None).await.is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), closed.changed())
+                .await
+                .is_err(),
+            "no notification on a failed set"
         );
     }
 

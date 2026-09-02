@@ -2,7 +2,10 @@ use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
 use crate::config::types::{BondApplyTo, MostroSettings};
 use crate::lightning::LnStatus;
-use crate::util::{get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp};
+use crate::util::{
+    get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp,
+    monotonic_info_event_timestamp,
+};
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
 use nostr::error::Error;
@@ -140,13 +143,18 @@ pub fn new_info_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
+    // Strictly increasing per `d` tag: a maintenance-mode flip republishes
+    // the info event at once, and a same-second tie with the previous
+    // publish would let the relay keep the stale revision (NIP-01 breaks
+    // ties by lowest event id).
+    let created_at = monotonic_info_event_timestamp(&identifier, Timestamp::now());
     create_event(
         keys,
         content,
         identifier,
         extra_tags,
         NOSTR_INFO_EVENT_KIND,
-        None,
+        Some(created_at),
     )
 }
 
@@ -569,7 +577,9 @@ fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
 /// # Arguments
 ///
 ///
-pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
+/// `maintenance` is the current maintenance (drain) flag; the tag is always
+/// emitted so clients can tell "maintenance off" from "older daemon".
+pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
     let bond_settings = Settings::get_bond();
@@ -658,6 +668,10 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     ];
 
     tags_vec.extend(bond_policy_tags(bond_settings));
+    tags_vec.push(Tag::custom(
+        "maintenance_mode",
+        vec![maintenance.to_string()],
+    ));
 
     Tags::from_list(tags_vec)
 }
@@ -966,7 +980,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -978,7 +992,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -986,6 +1000,53 @@ mod tests {
         assert_eq!(
             y_values, expected,
             "info_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    fn tag_value(tags: &Tags, name: &str) -> Option<String> {
+        tags.iter()
+            .find(|t| t.kind() == name)
+            .and_then(|t| t.content().map(str::to_string))
+    }
+
+    #[test]
+    fn info_to_tags_emits_maintenance_mode_false_by_default() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+        let tags = info_to_tags(&ln_status, false);
+        assert_eq!(
+            tag_value(&tags, "maintenance_mode").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn info_to_tags_emits_maintenance_mode_true_when_enabled() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+        let tags = info_to_tags(&ln_status, true);
+        assert_eq!(
+            tag_value(&tags, "maintenance_mode").as_deref(),
+            Some("true")
+        );
+    }
+
+    /// Two info events built in the same second must not tie on
+    /// `created_at`, or a relay keeps whichever has the lower id.
+    #[test]
+    fn consecutive_info_events_have_strictly_increasing_created_at() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let id = keys.public_key().to_string();
+        let ln_status = make_ln_status();
+        let first =
+            super::new_info_event(&keys, "", id.clone(), info_to_tags(&ln_status, false)).unwrap();
+        let second = super::new_info_event(&keys, "", id, info_to_tags(&ln_status, true)).unwrap();
+        assert!(
+            second.created_at > first.created_at,
+            "{} !> {}",
+            second.created_at,
+            first.created_at
         );
     }
 
@@ -1001,7 +1062,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         // Expectations come from the settings actually installed in
         // `MOSTRO_CONFIG`, never from this module's `test_settings()` copy:
@@ -1125,7 +1186,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         assert_eq!(
             get_tag_value(&tags, "bond_enabled").as_deref(),

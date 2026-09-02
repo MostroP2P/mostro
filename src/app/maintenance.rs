@@ -119,11 +119,14 @@ impl MaintenanceState {
 /// `drained()` is true when the node can be switched.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrainCounters {
-    /// A — orders whose hold invoice is still held on the node: `hash`
-    /// set and a non-terminal status other than `settled-hold-invoice`.
-    /// Once settled the sats are in Mostro's wallet and the buyer payout
-    /// (B when in flight) can be sent from any node; a settled order whose
-    /// payout failed waits for the buyer's new invoice, not for the node.
+    /// A — orders with a hold invoice in a non-terminal status, except a
+    /// `settled-hold-invoice` whose payout has durably failed
+    /// (`failed_payment = true`, no payout hash): its sats are already in
+    /// Mostro's wallet and the retry / buyer's replacement invoice can be
+    /// paid from any node. A freshly settled order still counts until
+    /// `do_payment` records its claim (B) or a failure — stopping the
+    /// daemon inside that window would strand the payout, since neither
+    /// `find_inflight_payouts` nor `find_failed_payment` would see it.
     pub escrowed_orders: u32,
     /// B — buyer payouts in flight (`settled-hold-invoice` + payout hash).
     pub inflight_payouts: u32,
@@ -254,13 +257,16 @@ async fn count(pool: &SqlitePool, sql: &'static str, binds: &[String]) -> Result
 pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroError> {
     let terminal = terminal_statuses();
     Ok(DrainCounters {
-        // One placeholder per entry of `terminal_statuses()`, plus
-        // `settled-hold-invoice`: the HTLC is already claimed, only the
-        // payout (B) can still be node-bound.
+        // One placeholder per entry of `terminal_statuses()`. A settled
+        // order whose payout durably failed (retry state persisted, no
+        // claim in flight) is not node-bound: the HTLC is already claimed
+        // and the payout can be sent from any node. The unsettled → settled
+        // → claimed/failed window stays counted (see `DrainCounters`).
         escrowed_orders: count(
             pool,
             "SELECT COUNT(*) FROM orders WHERE hash IS NOT NULL \
-             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             AND NOT (status = ?8 AND failed_payment = 1 AND payout_payment_hash IS NULL)",
             &[
                 terminal[0].clone(),
                 terminal[1].clone(),
@@ -688,23 +694,31 @@ mod tests {
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 0));
         assert!(!c.drained());
 
-        // B: in-flight buyer payout. The HTLC is already settled, so the
-        // order is NOT under A — only the in-flight payout binds the node.
+        // B: in-flight buyer payout (also counted under A, non-terminal).
         insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 1));
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
 
-        // A settled order whose payout is not in flight (payment failed,
-        // waiting for the buyer's new invoice) binds nothing: any node can
-        // pay it later.
-        insert_order(&pool, "settled-hold-invoice", Some(&h), None, 0, false).await;
+        // Freshly settled, payout not yet claimed nor failed: still under A —
+        // stopping the daemon here would strand the payout.
+        let fresh = insert_order(&pool, "settled-hold-invoice", Some(&h), None, 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 1));
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (3, 1));
+
+        // Payout durably failed (retry state persisted, waiting for the
+        // buyer's replacement invoice): binds nothing, any node can pay it.
+        sqlx::query("UPDATE orders SET failed_payment = 1, payment_attempts = 3 WHERE id = ?")
+            .bind(fresh)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
 
         // C: unpaid dev fee on a successful order.
         insert_order(&pool, "success", Some(&h), None, 50, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (1, 1));
+        assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (2, 1));
 
         // D / E: bonds.
         insert_bond(&pool, BondState::Locked, Some(&h), None).await;
@@ -716,7 +730,7 @@ mod tests {
         insert_order(&pool, "pending", None, None, 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!(c.pending_orders, 1);
-        assert_eq!(c.escrowed_orders, 1, "pending without hash is not escrow");
+        assert_eq!(c.escrowed_orders, 2, "pending without hash is not escrow");
     }
 
     #[tokio::test]

@@ -2,39 +2,101 @@ name: Build and Push Docker Images
 
 on:
   push:
+    # Filter patterns are anchored and support `+` and character ranges, so a
+    # pre-release or a suffixed tag never starts a run instead of starting one
+    # that is designed to fail.
     tags:
-      - 'v*.*.*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag (used when run manually; default: latest)'
+        description: 'Image tag for manual runs (cannot be "latest" or a vX.Y.Z release tag; default: dev-<short-sha>)'
         required: false
-        default: 'latest'
+        default: ''
+      dry_run:
+        description: 'Build without pushing and print the latest promotion target without writing it'
+        type: boolean
+        required: false
+        default: false
+
+# The images are pushed with the Docker Hub credentials and the layer cache
+# uses the runner's own token, so nothing here needs GITHUB_TOKEN beyond the
+# checkout. Narrow it rather than inheriting the repository default.
+permissions:
+  contents: read
+
+# Two runs of the same ref must never push to the registry at once: they would
+# race on the tags they share. The group is per-ref because GitHub keeps only one
+# pending run per group, so a single global group would drop an intermediate
+# version tag when several tag pushes arrive together.
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-push-plain:
+  # Both images publish the same tag, so it is resolved once for the whole run:
+  # a rejected ref or input fails here, before any QEMU and buildx setup, and
+  # the two builds cannot disagree on what they are about to push.
+  resolve-tag:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set_tag.outputs.tag }}
+    steps:
+      - name: Set image tag for metadata
+        id: set_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            # Defence in depth: the trigger pattern already keeps refs like
+            # v1.2.3foo or v1.2.3-rc.1 from reaching this workflow at all.
+            release_re='^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+            if [[ ! "$GITHUB_REF" =~ $release_re ]]; then
+              echo "::error::not a release tag, nothing is published: $GITHUB_REF"
+              exit 1
+            fi
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            # Anything that is not a tag push takes the guarded path, including a
+            # dispatch aimed at a tag: latest and vX.Y.Z name published images,
+            # so only a tag push is allowed to write them.
+            tag="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            release_re='^v[0-9]+\.[0-9]+\.[0-9]+'
+            if [[ "$tag" == "latest" || "$tag" =~ $release_re ]]; then
+              echo "::error::manual runs must not publish release tags (latest or vX.Y.Z); got '$tag'"
+              exit 1
+            fi
+          fi
+          # Anything outside the OCI tag charset is rejected before the write:
+          # a newline would append a second tag= line and silently override the
+          # value checked above.
+          oci_re='^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'
+          if [[ ! "$tag" =~ $oci_re ]]; then
+            echo "::error::not a valid OCI image tag: '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # The two images differ only in the repository they are pushed to and the
+  # Dockerfile they are built from. fail-fast stays off so one failing image
+  # does not cancel the other mid-push.
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: resolve-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plain
+            image: mostrop2p/mostro
+            dockerfile: ./docker/Dockerfile
+          - name: startos
+            image: mostrop2p/mostro-startos
+            dockerfile: ./docker/dockerfile-startos
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Set image tag for metadata
-        id: set_tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check if stable release
-        id: check_stable
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -52,76 +114,119 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: mostrop2p/mostro
+          images: ${{ matrix.image }}
           tags: |
-            type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
+            type=raw,value=${{ needs.resolve-tag.outputs.tag }}
 
-      - name: Build and push plain Docker image
+      - name: Build and push ${{ matrix.name }} Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
-          push: true
+          # A dry run exercises the whole chain without writing to the registry.
+          push: ${{ !inputs.dry_run }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped per image: a single shared scope makes the two matrix jobs
+          # evict each other's cache on every run.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-  build-and-push-startos:
+  # `latest` is moved after both images exist, not while they are being built:
+  # deciding at build time froze the answer for the length of a multi-arch
+  # build, so a release tagged during that window could be overwritten by the
+  # older run finishing later.
+  #
+  # The move is deliberately independent of the tag that triggered the run.
+  # GitHub keeps a single pending job per concurrency group, so a burst of
+  # releases can have its queued promotion replaced by a later one; because a
+  # promotion is only queued once its own images are pushed, whichever job
+  # survives the queue already sees the images of the ones that were dropped
+  # and repairs `latest` for all of them. Promoting the highest published
+  # version also never regresses (a backport run finds the newer images first)
+  # and covers a failed build of the highest tag, which would otherwise freeze
+  # `latest` until someone re-ran the job by hand.
+  promote-latest:
     runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' || inputs.dry_run
+    concurrency:
+      # A dry run resolves the target without writing it, so it must stay out of
+      # the real queue: taking a slot there would cancel a pending promotion.
+      group: docker-latest-promotion${{ inputs.dry_run && '-dry-run' || '' }}
+      cancel-in-progress: false
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Set image tag for metadata
-        id: set_tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check if stable release
-        id: check_stable
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v && "${{ github.ref }}" != *"-"* ]]; then
-            echo "is_stable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_stable=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: mostrop2p/mostro-startos
-          tags: |
-            type=raw,value=${{ steps.set_tag.outputs.tag }}
-            type=raw,value=latest,enable=${{ steps.check_stable.outputs.is_stable }}
+      - name: Move latest to the highest published release
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
 
-      - name: Build and push StartOS Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/dockerfile-startos
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `latest` belongs to one of the newest releases. Walking the whole
+          # tag list costs two registry calls per tag and is also the path that
+          # ends with an old version being promoted.
+          max_candidates=5
+          images=(mostrop2p/mostro mostrop2p/mostro-startos)
+
+          # Assigned before the pipeline so `set -e` sees a failing ls-remote:
+          # inside a process substitution its status is lost and an unreachable
+          # remote would end the step on the "nothing to promote" path.
+          # Only the tag list is needed, so it is read from the remote rather
+          # than from a checkout of the whole history.
+          tags="$(git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" 'v*')"
+          mapfile -t candidates < <(
+            grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" \
+              | cut -d/ -f3 \
+              | sort -rV \
+              | head -n "$max_candidates"
+          )
+
+          # A missing manifest is the only failure that means "not published
+          # yet". Reading a rate limit, a 5xx or an expired token as absence
+          # would skip the newest release and move `latest` back to an older
+          # one with the job green, which is a wrong publish rather than a
+          # recoverable no-op.
+          is_published() {
+            local ref="$1" out
+            if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown' <<<"$out"; then
+              return 1
+            fi
+            echo "::error::cannot tell whether $ref is published: $out"
+            exit 1
+          }
+
+          for candidate in "${candidates[@]}"; do
+            published=true
+            for image in "${images[@]}"; do
+              is_published "$image:$candidate" || {
+                published=false
+                break
+              }
+            done
+            [[ "$published" == true ]] || continue
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "dry run: latest would move to $candidate"
+              exit 0
+            fi
+            for image in "${images[@]}"; do
+              docker buildx imagetools create -t "$image:latest" "$image:$candidate"
+            done
+            echo "latest -> $candidate"
+            exit 0
+          done
+
+          # This job is the only thing that moves `latest`, and on a release it
+          # runs after its own images were pushed, so an empty result is a
+          # broken state and not a normal outcome.
+          echo "::error::no published version tag among the newest $max_candidates, latest left untouched"
+          exit 1

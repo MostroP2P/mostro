@@ -1,6 +1,6 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
-use crate::config::types::{BondApplyTo, MostroSettings};
+use crate::config::types::{BondApplyTo, LightningSettings, MostroSettings};
 use crate::lightning::LnStatus;
 use crate::util::{
     get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp,
@@ -641,18 +641,13 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         // `transport` setting so clients pick the right wire format before
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
-        Tag::custom(
-            "hold_invoice_expiration_window",
-            vec![ln_settings.hold_invoice_expiration_window.to_string()],
-        ),
-        Tag::custom(
-            "hold_invoice_cltv_delta",
-            vec![ln_settings.hold_invoice_cltv_delta.to_string()],
-        ),
-        Tag::custom(
-            "invoice_expiration_window",
-            vec![ln_settings.hold_invoice_expiration_window.to_string()],
-        ),
+    ];
+
+    // Spliced in at its original position: the extraction leaves the wire
+    // order of the info event unchanged.
+    tags_vec.extend(ln_policy_tags(ln_settings));
+
+    tags_vec.extend([
         Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
         Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
         Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
@@ -665,7 +660,7 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
             create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
         Tag::custom("z", vec!["info".to_string()]),
-    ];
+    ]);
 
     tags_vec.extend(bond_policy_tags(bond_settings));
     tags_vec.push(Tag::custom(
@@ -674,6 +669,28 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     ));
 
     Tags::from_list(tags_vec)
+}
+
+/// Build the Lightning policy tag block for the info event.
+///
+/// Split out from [`info_to_tags`] so unit tests can pin each window against
+/// a *distinct* value without mutating the `MOSTRO_CONFIG` OnceLock the
+/// parent reads from; the shared test settings leave both at `0`.
+fn ln_policy_tags(ln_settings: &LightningSettings) -> Vec<Tag> {
+    vec![
+        Tag::custom(
+            "hold_invoice_expiration_window",
+            vec![ln_settings.hold_invoice_expiration_window.to_string()],
+        ),
+        Tag::custom(
+            "hold_invoice_cltv_delta",
+            vec![ln_settings.hold_invoice_cltv_delta.to_string()],
+        ),
+        Tag::custom(
+            "invoice_expiration_window",
+            vec![ln_settings.invoice_expiration_window.to_string()],
+        ),
+    ]
 }
 
 /// Build the bond policy tag block for the info event.
@@ -734,6 +751,7 @@ mod tests {
     use super::create_status_tags;
     use super::{info_to_tags, order_to_tags};
     use crate::app::context::test_utils::test_settings;
+    use crate::config::types::LightningSettings;
     use crate::config::MOSTRO_CONFIG;
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
@@ -1174,6 +1192,31 @@ mod tests {
                 None
             }
         })
+    }
+
+    #[test]
+    fn ln_policy_tags_reports_each_window_from_its_own_field() {
+        // Regression for #895, where one window was published under the
+        // other's tag. The two values must differ for this to prove
+        // anything: driven by the global config, both would be `0`.
+        let ln_settings = LightningSettings {
+            invoice_expiration_window: 600,
+            hold_invoice_expiration_window: 120,
+            ..Default::default()
+        };
+
+        let tags = Tags::from_list(super::ln_policy_tags(&ln_settings));
+
+        assert_eq!(
+            get_tag_value(&tags, "invoice_expiration_window").as_deref(),
+            Some("600"),
+            "invoice_expiration_window must report the buyer payout window"
+        );
+        assert_eq!(
+            get_tag_value(&tags, "hold_invoice_expiration_window").as_deref(),
+            Some("120"),
+            "hold_invoice_expiration_window must report the hold invoice window"
+        );
     }
 
     #[test]

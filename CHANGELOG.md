@@ -33,33 +33,49 @@ gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.18.5
+## What's Changed in 0.18.6
 
 ### 🚀 Features
 
 
-* feat: default transport to nip44, keep gift-wrap as explicit opt-in by [@grunch](https://github.com/grunch) in [#880](https://github.com/MostroP2P/mostro/pull/880)
+* feat: boot node-identity guard for Lightning node changes (Phase 4) by [@grunch](https://github.com/grunch) in [#936](https://github.com/MostroP2P/mostro/pull/936)
+* feat: advertise maintenance mode in the info event, republish on change (Phase 3) by [@grunch](https://github.com/grunch) in [#935](https://github.com/MostroP2P/mostro/pull/935)
+* feat: admin RPC for maintenance mode — SetMaintenanceMode + GetMaintenanceStatus (Phase 2) by [@grunch](https://github.com/grunch) in [#934](https://github.com/MostroP2P/mostro/pull/934)
+* feat: maintenance (drain) mode — persistent flag + escrow gate (Phase 1) by [@grunch](https://github.com/grunch) in [#933](https://github.com/MostroP2P/mostro/pull/933)
+* feat(cashu): take flow escrow request + unblock creation — Track A TA-2 by [@grunch](https://github.com/grunch) in [#830](https://github.com/MostroP2P/mostro/pull/830)
 
 ### 🐛 Bug Fixes
 
 
-* fix: stop re-publishing the pending orderbook hourly and at startup by [@Catrya](https://github.com/Catrya) in [#888](https://github.com/MostroP2P/mostro/pull/888)
-* fix: non-blocking buyer payout with bounded send_payment waits by [@Catrya](https://github.com/Catrya) in [#883](https://github.com/MostroP2P/mostro/pull/883)
-* fix(bond): pay the timeout-slash winner instead of forfeiting to the node by [@Catrya](https://github.com/Catrya) in [#875](https://github.com/MostroP2P/mostro/pull/875)
-* fix: dispatch buyer payouts at most once per settled order by [@Catrya](https://github.com/Catrya) in [#881](https://github.com/MostroP2P/mostro/pull/881)
-* fix: wrongful maker bond slash, waiting-state timeout anchored on take-time taken_at by [@Catrya](https://github.com/Catrya) in [#879](https://github.com/MostroP2P/mostro/pull/879)
+* fix(ci): scope publishing to version tag pushes by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#909](https://github.com/MostroP2P/mostro/pull/909)
+* fix: compare-and-swap the trade-pubkey rotation (#811) by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#903](https://github.com/MostroP2P/mostro/pull/903)
+* fix: keep dev fee audit events (kind 8383) for one year by [@grunch](https://github.com/grunch) in [#924](https://github.com/MostroP2P/mostro/pull/924)
+* fix: verify the event signature before the spam gate by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#892](https://github.com/MostroP2P/mostro/pull/892)
+* fix(ci): make the release build toolchain verifiable and reproducible by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#905](https://github.com/MostroP2P/mostro/pull/905)
+* fix: clear next-trade fields on sell child orders by [@21Mill](https://github.com/21Mill) in [#891](https://github.com/MostroP2P/mostro/pull/891)
+* fix: stamp dispute events with a monotonic created_at by [@grunch](https://github.com/grunch) in [#899](https://github.com/MostroP2P/mostro/pull/899)
+* fix: follow-ups to the payout dispatch queue (post-merge audit of #883) by [@Catrya](https://github.com/Catrya) in [#893](https://github.com/MostroP2P/mostro/pull/893)
 
-### 💼 Other
+### 🚜 Refactor
 
 
-* Revert "fix(bond): pay the timeout-slash winner instead of forfeiting to the node" by [@grunch](https://github.com/grunch) in [#885](https://github.com/MostroP2P/mostro/pull/885)
-* Add created_at tag to kind-38386 dispute events by [@arkanoider](https://github.com/arkanoider) in [#878](https://github.com/MostroP2P/mostro/pull/878)
+* refactor: removed dead code identified in issue by [@Arowolokehinde](https://github.com/Arowolokehinde) in [#848](https://github.com/MostroP2P/mostro/pull/848)
+
+### 📚 Documentation
+
+
+* docs: operator runbook for migrating to a different Lightning node (Phase 5) by [@grunch](https://github.com/grunch) in [#937](https://github.com/MostroP2P/mostro/pull/937)
+* docs: maintenance mode / Lightning node migration spec by [@grunch](https://github.com/grunch) in [#932](https://github.com/MostroP2P/mostro/pull/932)
+* docs: payment-account history / anti-triangulation implementation spec by [@grunch](https://github.com/grunch) in [#917](https://github.com/MostroP2P/mostro/pull/917)
+* docs(cashu): specs for Tracks B/C/D (release, coop-cancel, dispute) by [@grunch](https://github.com/grunch) in [#833](https://github.com/MostroP2P/mostro/pull/833)
 
 ## Contributors
-* [@Catrya](https://github.com/Catrya) made their contribution in [#888](https://github.com/MostroP2P/mostro/pull/888)
-* [@grunch](https://github.com/grunch) made their contribution in [#885](https://github.com/MostroP2P/mostro/pull/885)
-* [@arkanoider](https://github.com/arkanoider) made their contribution in [#878](https://github.com/MostroP2P/mostro/pull/878)
+* [@grunch](https://github.com/grunch) made their contribution in [#937](https://github.com/MostroP2P/mostro/pull/937)
+* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#909](https://github.com/MostroP2P/mostro/pull/909)
+* [@Arowolokehinde](https://github.com/Arowolokehinde) made their contribution in [#848](https://github.com/MostroP2P/mostro/pull/848)
+* [@21Mill](https://github.com/21Mill) made their contribution in [#891](https://github.com/MostroP2P/mostro/pull/891)
+* [@Catrya](https://github.com/Catrya) made their contribution in [#893](https://github.com/MostroP2P/mostro/pull/893)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.4...0.18.5
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.5...0.18.6
 
 <!-- generated by git-cliff -->

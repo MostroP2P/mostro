@@ -119,7 +119,14 @@ impl MaintenanceState {
 /// `drained()` is true when the node can be switched.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrainCounters {
-    /// A — orders with a hold invoice in a non-terminal status.
+    /// A — orders with a hold invoice in a non-terminal status, except a
+    /// `settled-hold-invoice` whose payout has durably failed
+    /// (`failed_payment = true`, no payout hash): its sats are already in
+    /// Mostro's wallet and the retry / buyer's replacement invoice can be
+    /// paid from any node. A freshly settled order still counts until
+    /// `do_payment` records its claim (B) or a failure — stopping the
+    /// daemon inside that window would strand the payout, since neither
+    /// `find_inflight_payouts` nor `find_failed_payment` would see it.
     pub escrowed_orders: u32,
     /// B — buyer payouts in flight (`settled-hold-invoice` + payout hash).
     pub inflight_payouts: u32,
@@ -250,12 +257,26 @@ async fn count(pool: &SqlitePool, sql: &'static str, binds: &[String]) -> Result
 pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroError> {
     let terminal = terminal_statuses();
     Ok(DrainCounters {
-        // One placeholder per entry of `terminal_statuses()`.
+        // One placeholder per entry of `terminal_statuses()`. A settled
+        // order whose payout durably failed (retry state persisted, no
+        // claim in flight) is not node-bound: the HTLC is already claimed
+        // and the payout can be sent from any node. The unsettled → settled
+        // → claimed/failed window stays counted (see `DrainCounters`).
         escrowed_orders: count(
             pool,
             "SELECT COUNT(*) FROM orders WHERE hash IS NOT NULL \
-             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            &terminal,
+             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             AND NOT (status = ?8 AND failed_payment = 1 AND payout_payment_hash IS NULL)",
+            &[
+                terminal[0].clone(),
+                terminal[1].clone(),
+                terminal[2].clone(),
+                terminal[3].clone(),
+                terminal[4].clone(),
+                terminal[5].clone(),
+                terminal[6].clone(),
+                Status::SettledHoldInvoice.to_string(),
+            ],
         )
         .await?,
         inflight_payouts: count(
@@ -674,7 +695,34 @@ mod tests {
         assert!(!c.drained());
 
         // B: in-flight buyer payout (also counted under A, non-terminal).
-        insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
+        let inflight =
+            insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
+
+        // Freshly settled, payout not yet claimed nor failed: still under A —
+        // stopping the daemon here would strand the payout.
+        let fresh = insert_order(&pool, "settled-hold-invoice", Some(&h), None, 0, false).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (3, 1));
+
+        // A retry re-claimed the payout: `failed_payment` set but a hash in
+        // flight. Still node-bound, still under A and B.
+        sqlx::query("UPDATE orders SET failed_payment = 1, payment_attempts = 2 WHERE id = ?")
+            .bind(inflight)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (3, 1));
+
+        // Payout durably failed (retry state persisted, waiting for the
+        // buyer's replacement invoice): binds nothing, any node can pay it.
+        sqlx::query("UPDATE orders SET failed_payment = 1, payment_attempts = 3 WHERE id = ?")
+            .bind(fresh)
+            .execute(&pool)
+            .await
+            .unwrap();
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
 

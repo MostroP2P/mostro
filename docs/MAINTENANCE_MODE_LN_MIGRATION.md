@@ -56,7 +56,7 @@ the switch:
 
 | Set | Table / predicate | Why |
 |---|---|---|
-| A. Escrowed orders | `orders.hash IS NOT NULL AND status NOT IN (terminal)` | hold invoice must be settled or canceled on the node that issued it |
+| A. Escrowed orders | `orders.hash IS NOT NULL AND status NOT IN (terminal) AND NOT (status = 'settled-hold-invoice' AND failed_payment AND payout_payment_hash IS NULL)` | hold invoice must be settled or canceled on the node that issued it. A settled order whose payout durably failed is out: its sats are already in Mostro's wallet and the retry / buyer's replacement invoice can be paid from any node. A freshly settled order still counts until `do_payment` (`src/app/release.rs`) records a claim (B) or a failure, so the daemon is never stopped inside that window |
 | B. In‑flight buyer payouts | `orders.payout_payment_hash IS NOT NULL AND status = 'settled-hold-invoice'` | `job_reconcile_inflight_payouts` tracks the hash on the node that sent it. Same predicate as `find_inflight_payouts` (`src/db.rs`); a subset of A, reported separately for visibility |
 | C. Unpaid dev fees | `orders.dev_fee > 0 AND dev_fee_paid = 0 AND status = 'success'` | `job_process_dev_fee_payment` pays from the node; harmless to re‑run on the new node but cleaner to drain |
 | D. Open bond hold invoices | `bonds.hash IS NOT NULL AND state IN ('requested','locked')` | maker/taker bond hold invoices (`src/app/bond/flow.rs`) |

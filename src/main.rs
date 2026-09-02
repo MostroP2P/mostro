@@ -22,7 +22,7 @@ pub mod util;
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
-use crate::app::maintenance::MaintenanceState;
+use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
@@ -230,9 +230,45 @@ async fn main() -> Result<()> {
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;
     let ln_status = LnStatus::from_get_info_response(ln_status);
+    let node_pubkey = ln_status.node_pubkey.clone();
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
     };
+
+    // Node-identity guard: hold invoices live only in the node that issued
+    // them, so starting against a different node while escrow is still open
+    // on the old one would strand every release/cancel. Refuse loudly here
+    // instead of failing one order at a time (spec §3.6).
+    let allow_node_change = Settings::get_ln().allow_node_change;
+    match node_identity_guard(get_db_pool().as_ref(), &node_pubkey, allow_node_change).await? {
+        NodeIdentityDecision::FirstBoot => {
+            tracing::info!("Recorded Lightning node identity {node_pubkey}");
+        }
+        NodeIdentityDecision::Same => {}
+        NodeIdentityDecision::ChangedDrained { previous } => {
+            tracing::warn!(
+                "Lightning node changed from {previous} to {node_pubkey} with no open escrow; recorded"
+            );
+        }
+        NodeIdentityDecision::ChangedOverridden { previous, counters } => {
+            tracing::warn!(
+                "Lightning node changed from {previous} to {node_pubkey} with open escrow \
+                 ({counters:?}) — [lightning].allow_node_change = true, continuing; the affected \
+                 rows CANNOT be resolved by the daemon, see \
+                 docs/MAINTENANCE_MODE_LN_MIGRATION.md §5.1"
+            );
+        }
+        NodeIdentityDecision::ChangedWithOpenEscrow { previous, counters } => {
+            tracing::error!(
+                "REFUSING TO START: Lightning node changed from {previous} to {node_pubkey} but \
+                 escrow is still bound to the old node: {counters:?}. Reconnect the old node and \
+                 drain it (SetMaintenanceMode + GetMaintenanceStatus until drained == true), or \
+                 if it is gone for good follow docs/MAINTENANCE_MODE_LN_MIGRATION.md §5.1 and set \
+                 [lightning].allow_node_change = true."
+            );
+            std::process::exit(1);
+        }
+    }
 
     // A failure here means no in-flight hold invoice is resubscribed for the
     // whole run, which is indistinguishable from "there were none" unless it is

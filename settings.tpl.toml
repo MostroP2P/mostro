@@ -29,6 +29,13 @@ max_final_cltv_expiry_delta = 432
 # dispute (FiatSent) while the escrow still exists. Must comfortably
 # exceed your node's holdexpirydelta.
 escrow_deadline_margin_blocks = 24
+# Boot guard: mostrod refuses to start against a Lightning node whose
+# identity pubkey differs from the one it last ran with while escrow
+# (hold invoices, bonds, in-flight payouts) is still open on the old
+# node. Drain first (see docs/MAINTENANCE_MODE_LN_MIGRATION.md). Set to
+# true ONLY for disaster recovery when the old node is gone for good; it
+# knowingly leaves the affected trades unresolved.
+allow_node_change = false
 
 [nostr]
 nsec_privkey = 'nsec1...'

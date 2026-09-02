@@ -143,6 +143,84 @@ impl DrainCounters {
     }
 }
 
+/// Outcome of the boot node-identity guard (spec §3.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeIdentityDecision {
+    /// No pubkey stored yet: recorded, continue.
+    FirstBoot,
+    /// Same node as last run: continue.
+    Same,
+    /// Different node but nothing bound to the old one: recorded, continue.
+    ChangedDrained { previous: String },
+    /// Different node with escrow still open on the old one and no
+    /// override: the caller must refuse to start.
+    ChangedWithOpenEscrow {
+        previous: String,
+        counters: DrainCounters,
+    },
+    /// Different node with open escrow, but `allow_node_change = true`:
+    /// recorded, continue, affected rows knowingly left unresolved.
+    ChangedOverridden {
+        previous: String,
+        counters: DrainCounters,
+    },
+}
+
+impl NodeIdentityDecision {
+    /// Whether the daemon may proceed with boot.
+    pub fn allows_boot(&self) -> bool {
+        !matches!(self, Self::ChangedWithOpenEscrow { .. })
+    }
+}
+
+/// Pure decision rule of the guard, separated from IO so it can be tested
+/// without LND. `stored` is the pubkey from the last run (if any), `current`
+/// the connected node's, `counters` what is still bound to the old node.
+pub fn check_node_identity(
+    stored: Option<&str>,
+    current: &str,
+    counters: &DrainCounters,
+    allow_override: bool,
+) -> NodeIdentityDecision {
+    match stored {
+        None => NodeIdentityDecision::FirstBoot,
+        Some(prev) if prev == current => NodeIdentityDecision::Same,
+        Some(prev) if counters.drained() => NodeIdentityDecision::ChangedDrained {
+            previous: prev.to_owned(),
+        },
+        Some(prev) if allow_override => NodeIdentityDecision::ChangedOverridden {
+            previous: prev.to_owned(),
+            counters: counters.clone(),
+        },
+        Some(prev) => NodeIdentityDecision::ChangedWithOpenEscrow {
+            previous: prev.to_owned(),
+            counters: counters.clone(),
+        },
+    }
+}
+
+/// Run the guard against the database: compare the connected node's pubkey
+/// with the one persisted under `ln_node_pubkey`, compute the drain
+/// counters only when they differ, and persist the new pubkey in every
+/// case that allows boot. Never persists on refusal, so a later boot
+/// against the old node still sees its own pubkey.
+pub async fn node_identity_guard(
+    pool: &SqlitePool,
+    current: &str,
+    allow_override: bool,
+) -> Result<NodeIdentityDecision, MostroError> {
+    let stored = daemon_state::get(pool, KEY_LN_NODE_PUBKEY).await?;
+    let counters = match stored.as_deref() {
+        Some(prev) if prev != current => drain_counters(pool).await?,
+        _ => DrainCounters::default(),
+    };
+    let decision = check_node_identity(stored.as_deref(), current, &counters, allow_override);
+    if decision.allows_boot() && !matches!(decision, NodeIdentityDecision::Same) {
+        daemon_state::set(pool, KEY_LN_NODE_PUBKEY, current).await?;
+    }
+    Ok(decision)
+}
+
 /// Order statuses that no longer need the node that issued their hold invoice.
 fn terminal_statuses() -> [String; 7] {
     [
@@ -441,6 +519,139 @@ mod tests {
         ] {
             assert_eq!(counted.contains(&state), state.is_active(), "{state}");
         }
+    }
+
+    fn open() -> DrainCounters {
+        DrainCounters {
+            escrowed_orders: 2,
+            ..DrainCounters::default()
+        }
+    }
+
+    #[test]
+    fn node_guard_rule_covers_every_branch() {
+        let none = DrainCounters::default();
+        assert_eq!(
+            check_node_identity(None, "02aa", &none, false),
+            NodeIdentityDecision::FirstBoot
+        );
+        assert_eq!(
+            check_node_identity(Some("02aa"), "02aa", &open(), false),
+            NodeIdentityDecision::Same,
+            "same node never refuses, whatever the counters"
+        );
+        assert_eq!(
+            check_node_identity(Some("02aa"), "02bb", &none, false),
+            NodeIdentityDecision::ChangedDrained {
+                previous: "02aa".into()
+            }
+        );
+        let refused = check_node_identity(Some("02aa"), "02bb", &open(), false);
+        assert_eq!(
+            refused,
+            NodeIdentityDecision::ChangedWithOpenEscrow {
+                previous: "02aa".into(),
+                counters: open()
+            }
+        );
+        assert!(!refused.allows_boot());
+        let overridden = check_node_identity(Some("02aa"), "02bb", &open(), true);
+        assert_eq!(
+            overridden,
+            NodeIdentityDecision::ChangedOverridden {
+                previous: "02aa".into(),
+                counters: open()
+            }
+        );
+        assert!(overridden.allows_boot());
+    }
+
+    #[tokio::test]
+    async fn node_guard_stores_pubkey_on_first_boot_and_accepts_same() {
+        let pool = pool().await;
+        assert_eq!(
+            node_identity_guard(&pool, "02aa", false).await.unwrap(),
+            NodeIdentityDecision::FirstBoot
+        );
+        assert_eq!(
+            daemon_state::get(&pool, KEY_LN_NODE_PUBKEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("02aa")
+        );
+        // Open escrow does not matter while the node is the same.
+        insert_order(&pool, "active", Some(&"aa".repeat(32)), None, 0, false).await;
+        assert_eq!(
+            node_identity_guard(&pool, "02aa", false).await.unwrap(),
+            NodeIdentityDecision::Same
+        );
+    }
+
+    #[tokio::test]
+    async fn node_guard_rejects_new_pubkey_with_open_escrow_and_keeps_old_one() {
+        let pool = pool().await;
+        node_identity_guard(&pool, "02aa", false).await.unwrap();
+        insert_order(&pool, "active", Some(&"aa".repeat(32)), None, 0, false).await;
+
+        let decision = node_identity_guard(&pool, "02bb", false).await.unwrap();
+        assert!(matches!(
+            &decision,
+            NodeIdentityDecision::ChangedWithOpenEscrow { previous, counters }
+                if previous == "02aa" && counters.escrowed_orders == 1
+        ));
+        assert!(!decision.allows_boot());
+        assert_eq!(
+            daemon_state::get(&pool, KEY_LN_NODE_PUBKEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("02aa"),
+            "a refused boot must not overwrite the stored pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_guard_allows_new_pubkey_when_drained() {
+        let pool = pool().await;
+        node_identity_guard(&pool, "02aa", false).await.unwrap();
+        insert_order(&pool, "success", Some(&"aa".repeat(32)), None, 0, true).await;
+
+        let decision = node_identity_guard(&pool, "02bb", false).await.unwrap();
+        assert_eq!(
+            decision,
+            NodeIdentityDecision::ChangedDrained {
+                previous: "02aa".into()
+            }
+        );
+        assert_eq!(
+            daemon_state::get(&pool, KEY_LN_NODE_PUBKEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("02bb")
+        );
+    }
+
+    #[tokio::test]
+    async fn node_guard_override_records_new_pubkey_despite_open_escrow() {
+        let pool = pool().await;
+        node_identity_guard(&pool, "02aa", false).await.unwrap();
+        insert_order(&pool, "active", Some(&"aa".repeat(32)), None, 0, false).await;
+
+        let decision = node_identity_guard(&pool, "02bb", true).await.unwrap();
+        assert!(matches!(
+            decision,
+            NodeIdentityDecision::ChangedOverridden { .. }
+        ));
+        assert!(decision.allows_boot());
+        assert_eq!(
+            daemon_state::get(&pool, KEY_LN_NODE_PUBKEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("02bb")
+        );
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Admin-initiated order cancellation.
 ///
@@ -139,10 +139,13 @@ pub async fn admin_cancel_action(
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
-    if order.hash.is_some() {
-        // We return funds to seller
-        if let Some(hash) = order.hash.as_ref() {
-            ln_client.cancel_hold_invoice(hash).await?;
+    if let Some(hash) = order.hash.as_ref() {
+        // We return funds to seller. A hold invoice that LND already
+        // canceled (CLTV expiry refunded the seller long ago) or does not
+        // know at all (the daemon now runs against a different node) is
+        // not an error: the HTLC is verifiably gone and the dispute can
+        // still be closed. Only a transient LND failure aborts the cancel.
+        if tolerate_gone_hold_invoice(&order.id, ln_client.cancel_hold_invoice(hash).await)? {
             info!("Order Id {}: Funds returned to seller", &order.id);
         }
     }
@@ -274,6 +277,39 @@ pub async fn admin_cancel_action(
     }
 
     Ok(())
+}
+
+/// Map the result of `cancel_hold_invoice` on the escrow: an invoice that
+/// is already canceled / unknown to the node counts as done (the HTLC is
+/// not encumbered), the same classification the bond release uses
+/// (`bond::flow::classify_cancel_error`). Transient failures propagate so
+/// the solver retries once LND is back.
+///
+/// Returns `true` when this call actually canceled the invoice and `false`
+/// when it was already gone. In the unknown-invoice case after a node
+/// change ([lightning].allow_node_change = true) the seller's HTLC is still
+/// ACCEPTED on the old node and is refunded there at CLTV expiry, so the
+/// caller must not log "funds returned" as if it happened now.
+fn tolerate_gone_hold_invoice<T>(
+    order_id: &uuid::Uuid,
+    result: Result<T, MostroError>,
+) -> Result<bool, MostroError> {
+    use crate::app::bond::flow::{classify_cancel_error, CancelOutcome};
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) => match classify_cancel_error(&e) {
+            CancelOutcome::AlreadyDone => {
+                warn!(
+                    "Order Id {}: hold invoice already canceled or unknown to LND ({}); closing \
+                     anyway. If this daemon was moved to a different node the seller is refunded \
+                     by the old node at CLTV expiry, not now",
+                    order_id, e
+                );
+                Ok(false)
+            }
+            CancelOutcome::Transient => Err(e),
+        },
+    }
 }
 
 /// Operator cancel of a pre-trade (`Pending` / `WaitingTakerBond`) order
@@ -952,5 +988,49 @@ mod tests {
             .unwrap();
         assert_eq!(stored.status, Status::WaitingPayment.to_string());
         assert!(queued_actions_for(maker).await.is_empty());
+    }
+
+    // ── tolerate_gone_hold_invoice ───────────────────────────────────────
+
+    fn ln_err(msg: &str) -> MostroError {
+        MostroInternalErr(ServiceError::LnNodeError(msg.to_string()))
+    }
+
+    /// An escrow whose HTLC is already gone must not block the dispute
+    /// close: LND "not found" / "already canceled" are treated as done.
+    #[test]
+    fn gone_hold_invoice_is_not_an_error() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(tolerate_gone_hold_invoice(&id, Ok::<(), _>(())), Ok(true));
+        for msg in [
+            "code=NotFound message=unable to locate invoice",
+            "code=Unknown message=invoice already canceled",
+            "code=AlreadyExists message=duplicate",
+        ] {
+            assert_eq!(
+                tolerate_gone_hold_invoice(&id, Err::<(), _>(ln_err(msg))),
+                Ok(false),
+                "{msg} must be tolerated"
+            );
+        }
+    }
+
+    /// Anything that may leave the HTLC encumbered still aborts the cancel.
+    #[test]
+    fn transient_ln_failure_still_aborts() {
+        let id = uuid::Uuid::new_v4();
+        for msg in [
+            "code=Unavailable message=transport error",
+            "code=DeadlineExceeded message=timeout",
+            "code=Internal message=something broke",
+        ] {
+            assert!(
+                matches!(
+                    tolerate_gone_hold_invoice(&id, Err::<(), _>(ln_err(msg))),
+                    Err(MostroInternalErr(ServiceError::LnNodeError(_)))
+                ),
+                "{msg} must propagate"
+            );
+        }
     }
 }

@@ -339,11 +339,12 @@ Override: `[lightning].allow_node_change = true` (default `false`, added to
 `settings.tpl.toml` and `LightningSettings`) skips step 4's exit and only
 logs. It exists for disaster recovery only: the old node is gone for good and
 the operator accepts that the affected rows **cannot be resolved by the
-daemon**. `AdminCancel` and `AdminSettle` are not a recovery path here: both
-call `cancel_hold_invoice` / `settle_hold_invoice` on the *currently
-configured* node before touching the order, so they fail with an
-unknown‑invoice error against the new node. See §5.1 for the manual
-procedure. The flag must never be left on in normal operation; the wizard
+daemon**. `AdminSettle` is not a recovery path here: it calls
+`settle_hold_invoice` on the *currently configured* node before touching the
+order, so it fails with an unknown‑invoice error against the new node.
+`AdminCancel` on a disputed order tolerates that error (the HTLC is refunded
+by the old node at CLTV expiry) and closes the dispute. See §5.1 for the
+manual procedure. The flag must never be left on in normal operation; the wizard
 does not ask for it.
 
 ### 3.7 Behaviour matrix while enabled
@@ -563,9 +564,15 @@ done **before** enabling `allow_node_change`, with the daemon stopped:
 3. Database: mark the affected orders terminal by hand
    (`status = 'canceled-by-admin'` for unsettled escrow,
    `'completed-by-admin'` after a manual payout) and the bonds `failed`, so
-   the counters reach zero and the guard accepts the new node.
+   the counters reach zero and the guard accepts the new node. Disputed
+   orders with unsettled escrow may instead be closed with `AdminCancel`
+   after starting against the new node with `allow_node_change = true`: it
+   treats the unknown invoice as gone, closes the dispute, releases the
+   bonds and notifies both parties. A `slash_*` and the range maker bond
+   close need a settle on the old node and cannot run there: the bond stays
+   `locked`, keeps `open_bonds` non-zero and is marked `failed` by hand.
 4. Notify the users involved through the usual admin channel; the daemon
-   sends no message for rows changed this way.
+   sends no message for rows changed by hand.
 5. Start the daemon with the new `[lightning]` block. With the counters at
    zero the guard accepts the change without the override; set
    `allow_node_change = true` only if a row could not be closed and the

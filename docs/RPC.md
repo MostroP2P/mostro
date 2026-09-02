@@ -41,7 +41,10 @@ Cancel an order as an admin. Two cases are accepted:
   so stale disputes can still be closed; only a transient LND failure aborts
   the cancel. In the different-node case the seller's HTLC is still held by
   the old node and is refunded there when it expires, not by this call; the
-  daemon logs a warning saying so.
+  daemon logs a warning saying so. Bond releases tolerate the unknown invoice
+  the same way, but a `slash_*` (a settle) cannot be executed on a different
+  node: the bond stays `locked`, is counted by `GetMaintenanceStatus`
+  (`open_bonds`) and has to be marked `failed` by hand.
 - An order still pre-trade — `pending`, or `waiting-taker-bond` while a
   taker is mid-bond — with no escrow: an **operator** cancel.
   The row flips to `canceled-by-admin`, the maker and any bonded prospective

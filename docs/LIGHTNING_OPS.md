@@ -408,8 +408,12 @@ not by the call. With the daemon stopped:
    unsettled escrow, `completed-by-admin` after a manual payout) and the
    bonds `failed`, so the counters reach zero. Disputed orders can instead
    be closed with `AdminCancel` once the daemon runs against the new node
-   with `allow_node_change = true`; that path also resolves the dispute and
-   the bonds and notifies both parties.
+   with `allow_node_change = true`; that path also closes the dispute,
+   releases the bonds (their old-node HTLCs refund the users at expiry) and
+   notifies both parties. A `slash_*` in the `BondResolution`, and the
+   range maker bond close, need a settle on the old node and cannot run:
+   those bonds stay `locked`, keep `open_bonds` non-zero and must be
+   marked `failed` by hand as above.
 4. Notify the users involved; the daemon sends nothing for rows changed by
    hand.
 5. Start against the new node. With the counters at zero the guard accepts

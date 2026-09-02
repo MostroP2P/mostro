@@ -567,8 +567,10 @@ done **before** enabling `allow_node_change`, with the daemon stopped:
    the counters reach zero and the guard accepts the new node. Disputed
    orders with unsettled escrow may instead be closed with `AdminCancel`
    after starting against the new node with `allow_node_change = true`: it
-   treats the unknown invoice as gone, resolves the dispute and bonds and
-   notifies both parties.
+   treats the unknown invoice as gone, closes the dispute, releases the
+   bonds and notifies both parties. A `slash_*` and the range maker bond
+   close need a settle on the old node and cannot run there: the bond stays
+   `locked`, keeps `open_bonds` non-zero and is marked `failed` by hand.
 4. Notify the users involved through the usual admin channel; the daemon
    sends no message for rows changed by hand.
 5. Start the daemon with the new `[lightning]` block. With the counters at

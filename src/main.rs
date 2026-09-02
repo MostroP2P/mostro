@@ -22,6 +22,7 @@ pub mod util;
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
+use crate::app::maintenance::MaintenanceState;
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
@@ -206,6 +207,10 @@ async fn main() -> Result<()> {
                 .expect("MOSTRO_CONFIG not initialized")
                 .clone(),
         );
+        let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+        if maintenance.is_enabled() {
+            tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
+        }
         let ctx = AppContext::new(
             get_db_pool(),
             client.clone(),
@@ -213,7 +218,8 @@ async fn main() -> Result<()> {
             MESSAGE_QUEUES.queue_order_msg.clone(),
             mostro_keys.clone(),
         )
-        .with_cashu_client(cashu_client);
+        .with_cashu_client(cashu_client)
+        .with_maintenance(maintenance);
 
         start_scheduler(ctx.clone()).await;
 
@@ -295,13 +301,18 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
+    let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+    if maintenance.is_enabled() {
+        tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
+    }
     let ctx = AppContext::new(
         get_db_pool(),
         client.clone(),
         settings,
         MESSAGE_QUEUES.queue_order_msg.clone(),
         mostro_keys.clone(),
-    );
+    )
+    .with_maintenance(maintenance);
 
     // Start scheduler for tasks
     start_scheduler(ctx.clone()).await;

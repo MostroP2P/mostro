@@ -6,6 +6,7 @@
 //!
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
+use crate::app::maintenance::MaintenanceState;
 use crate::cashu::CashuClient;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
@@ -44,6 +45,10 @@ pub struct AppContext {
     /// it here; `None` in the default Lightning mode. Track A's lock handler
     /// reads it through [`AppContext::cashu_client`].
     cashu_client: Option<Arc<CashuClient>>,
+    /// Maintenance (drain) mode flag. Defaults to a disabled, unpersisted
+    /// flag; `main.rs` attaches the one loaded from `daemon_state` with
+    /// [`AppContext::with_maintenance`].
+    maintenance: MaintenanceState,
 }
 
 impl AppContext {
@@ -65,7 +70,20 @@ impl AppContext {
             order_msg_queue,
             keys,
             cashu_client: None,
+            maintenance: MaintenanceState::new(),
         }
+    }
+
+    /// Attach the maintenance flag loaded from the database. The same clone
+    /// must be handed to the admin RPC so both sides observe one flag.
+    pub fn with_maintenance(mut self, maintenance: MaintenanceState) -> Self {
+        self.maintenance = maintenance;
+        self
+    }
+
+    /// Maintenance (drain) mode flag.
+    pub fn maintenance(&self) -> &MaintenanceState {
+        &self.maintenance
     }
 
     /// Attach a connected Cashu mint client (Cashu mode, CF-5). Returns a new

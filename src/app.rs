@@ -3,6 +3,8 @@
 
 // Application context (dependency injection)
 pub mod context;
+pub mod daemon_state; // key/value operator state (maintenance mode)
+pub mod maintenance; // maintenance (drain) mode flag + drain counters
 
 // Submodules for different trading actions
 pub mod add_cashu_escrow; // Cashu escrow lock handler (Track A / CF-5 stub)
@@ -424,6 +426,26 @@ async fn accept_event(
 
     // Get inner message kind
     let inner_message = message.get_inner_message_kind();
+    // Maintenance (drain) mode: refuse to open new escrow. This runs BEFORE
+    // `check_trade_index` on purpose — that check registers a first-time
+    // identity and persists its trade index, so gating after it would burn
+    // the index of a request we are about to reject. Nothing is persisted on
+    // this path; the sender only gets a `CantDo(MaintenanceMode)`.
+    if ctx.maintenance().blocks(&inner_message.action) {
+        tracing::info!(
+            "Maintenance mode: rejecting {:?} from {}",
+            inner_message.action,
+            unwrapped.sender
+        );
+        manage_errors(
+            MostroError::MostroCantDo(CantDoReason::MaintenanceMode),
+            message.clone(),
+            unwrapped.clone(),
+            &inner_message.action,
+        )
+        .await;
+        return None;
+    }
     // Check if message is message with trade index
     if let Err(e) = check_trade_index(ctx, &unwrapped, &message).await {
         tracing::warn!("Error checking trade index: {}", e);
@@ -912,6 +934,204 @@ mod tests {
             // `SpamGate::global()` is `None` unless `install_spam_gate` ran, so
             // the v2 arm can only be pinned against the installed state.
             assert_eq!(gate_for(true).is_some(), SpamGate::global().is_some());
+        }
+    }
+
+    /// Maintenance (drain) mode gate in [`accept_event`]: the three actions
+    /// that open new escrow are answered with `CantDo(MaintenanceMode)` and
+    /// persist nothing; everything else passes through unchanged.
+    mod maintenance_gate_tests {
+        use super::*;
+        use crate::config::MESSAGE_QUEUES;
+        use crate::db::is_user_present;
+        use mostro_core::nip59::WrapOptions;
+        use mostro_core::prelude::Payload;
+        use mostro_core::transport::wrap_message_nip44;
+
+        /// A kind-14 event in full-privacy mode (trade key doubles as
+        /// identity) so no inner signature is needed.
+        fn v2_event(
+            mostro: &Keys,
+            trade: &Keys,
+            action: Action,
+            trade_index: Option<u32>,
+        ) -> Event {
+            let message = create_test_message(action, trade_index);
+            wrap_message_nip44(
+                &message,
+                trade,
+                trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event")
+        }
+
+        async fn accept(ctx: &AppContext, event: &Event, mostro: &Keys) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        /// The `CantDo` reasons queued for `to` (the queue is process-global,
+        /// so filter by destination).
+        async fn cant_do_reasons_for(to: &PublicKey) -> Vec<CantDoReason> {
+            MESSAGE_QUEUES
+                .queue_order_cantdo
+                .read()
+                .await
+                .iter()
+                .filter(|(_, dest)| dest == to)
+                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                    Some(Payload::CantDo(Some(r))) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn enabled_ctx() -> AppContext {
+            let ctx = create_migrated_ctx().await;
+            ctx.maintenance()
+                .set(ctx.pool(), true, Some("test"))
+                .await
+                .unwrap();
+            ctx
+        }
+
+        #[tokio::test]
+        async fn gate_rejects_new_order_take_buy_and_take_sell_when_enabled() {
+            let ctx = enabled_ctx().await;
+            let mostro = create_test_keys();
+            for action in [Action::NewOrder, Action::TakeBuy, Action::TakeSell] {
+                let trade = create_test_keys();
+                let event = v2_event(&mostro, &trade, action.clone(), None);
+                assert!(
+                    !accept(&ctx, &event, &mostro).await,
+                    "{action:?} must be rejected"
+                );
+                assert_eq!(
+                    cant_do_reasons_for(&trade.public_key()).await,
+                    vec![CantDoReason::MaintenanceMode],
+                    "{action:?} must be answered with MaintenanceMode"
+                );
+            }
+        }
+
+        /// Payload-less test messages only pass `inner_message.verify()` for
+        /// some actions (`FiatSent` does), so the positive acceptance is
+        /// pinned on that one and the rest are checked for the absence of a
+        /// `CantDo` — which is all the gate can produce.
+        #[tokio::test]
+        async fn gate_passes_actions_on_existing_orders_when_enabled() {
+            let ctx = enabled_ctx().await;
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+            let event = v2_event(&mostro, &trade, Action::FiatSent, None);
+            assert!(
+                accept(&ctx, &event, &mostro).await,
+                "FiatSent must be accepted"
+            );
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
+
+            for action in [
+                Action::Release,
+                Action::Cancel,
+                Action::AddInvoice,
+                Action::AddBondInvoice,
+                Action::Dispute,
+                Action::RateUser,
+                Action::Orders,
+                Action::RestoreSession,
+                Action::TradePubkey,
+                Action::LastTradeIndex,
+                Action::AdminCancel,
+                Action::AdminSettle,
+            ] {
+                let trade = create_test_keys();
+                let event = v2_event(&mostro, &trade, action.clone(), None);
+                accept(&ctx, &event, &mostro).await;
+                assert!(
+                    cant_do_reasons_for(&trade.public_key()).await.is_empty(),
+                    "{action:?} must not be answered by the gate"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn gate_is_noop_when_disabled() {
+            let ctx = create_migrated_ctx().await;
+            assert!(!ctx.maintenance().is_enabled());
+            let mostro = create_test_keys();
+            for action in [Action::NewOrder, Action::TakeBuy, Action::TakeSell] {
+                let trade = create_test_keys();
+                let event = v2_event(&mostro, &trade, action.clone(), None);
+                accept(&ctx, &event, &mostro).await;
+                assert!(
+                    cant_do_reasons_for(&trade.public_key()).await.is_empty(),
+                    "{action:?} must not be gated while disabled"
+                );
+            }
+        }
+
+        /// Dual-key event (identity signs the inner tuple, trade key authors
+        /// the event): the shape in which `check_trade_index` registers a
+        /// first-time identity.
+        fn dual_key_event(mostro: &Keys, identity: &Keys, trade: &Keys) -> Event {
+            let message = create_test_message(Action::NewOrder, Some(1));
+            let opts = WrapOptions {
+                signed: true,
+                ..WrapOptions::default()
+            };
+            wrap_message_nip44(&message, identity, trade, mostro.public_key(), opts)
+                .expect("wrap signed kind-14 event")
+        }
+
+        /// `check_trade_index` registers an unknown identity and persists its
+        /// trade index. The gate runs first so a rejected first-time user is
+        /// never created — otherwise the same request retried after
+        /// maintenance would fail with `InvalidTradeIndex`.
+        #[tokio::test]
+        async fn gate_rejects_first_time_user_without_creating_it() {
+            let mostro = create_test_keys();
+
+            // Control: with the gate off the same request registers the user
+            // (`check_trade_index` runs before the payload shape check, so
+            // the registration happens whether or not the message is later
+            // accepted — which is exactly why the gate must come first).
+            let open = create_migrated_ctx().await;
+            let (identity, trade) = (create_test_keys(), create_test_keys());
+            let event = dual_key_event(&mostro, &identity, &trade);
+            accept(&open, &event, &mostro).await;
+            assert!(
+                is_user_present(open.pool(), identity.public_key().to_string())
+                    .await
+                    .is_ok(),
+                "control: check_trade_index registers a first-time user"
+            );
+
+            // Under maintenance nothing is persisted.
+            let closed = enabled_ctx().await;
+            let (identity, trade) = (create_test_keys(), create_test_keys());
+            let event = dual_key_event(&mostro, &identity, &trade);
+            assert!(!accept(&closed, &event, &mostro).await);
+            assert!(
+                is_user_present(closed.pool(), identity.public_key().to_string())
+                    .await
+                    .is_err(),
+                "a rejected first-time user must not be registered"
+            );
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::MaintenanceMode]
+            );
         }
     }
 

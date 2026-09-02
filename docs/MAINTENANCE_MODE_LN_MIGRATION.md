@@ -353,6 +353,7 @@ does not ask for it.
 | Client sends `NewOrder` / `TakeBuy` / `TakeSell` | `CantDo(MaintenanceMode)`; nothing persisted |
 | Client releases / cancels an escrowed order | unchanged |
 | Pending order reaches `expiration` | `job_expire_pending_older_orders` expires it as today |
+| Operator sends `CancelOrder` for a `pending` / `waiting-taker-bond` order | `canceled-by-admin`; maker and bonded takers get `AdminCanceled`; taker bonds released, maker bond resolved at range close (`admin_cancel::admin_cancel_pending_order`) |
 | `waiting-payment` seller never pays | `job_cancel_orders` cancels the hold as today |
 | Dispute opened / resolved | unchanged; solver uses `AdminSettle`/`AdminCancel` |
 | Maker bond outstanding (`waiting-maker-bond`) | maker can still pay it; on payment the order is published as `pending` and simply cannot be taken |
@@ -522,7 +523,9 @@ orders work and the guard rejects a switch back with open escrow.
    Verify the info event now shows `maintenance_mode = true`.
 3. Poll `GetMaintenanceStatus` until `drained == true`. Meanwhile:
    - pending orders expire on their own, or the operator asks makers to
-     cancel;
+     cancel; to shorten the drain, cancel them yourself with `CancelOrder`
+     (`mostro-cli admcancel -o <id>`), which releases the maker's range
+     bond at once — announce it first, it is the user's order;
    - long‑running disputes are closed with `AdminSettle` / `AdminCancel`;
    - keep the **old** node online the entire time — it also has to finish
      in‑flight payouts (B/E) and dev fees (C).
@@ -591,9 +594,10 @@ needed it.
 ## 7. Open questions
 
 1. Should `SetMaintenanceMode` optionally expire all `pending` orders in one
-   call (`expire_pending: bool`) to shorten the drain? Proposed answer: no
-   for v1 — `job_expire_pending_older_orders` and makers cancelling cover
-   it, and an explicit bulk expiry is easy to add later.
+   call (`expire_pending: bool`) to shorten the drain? Answered: no bulk
+   switch; instead `CancelOrder` accepts `pending` orders from the daemon
+   key (operator via gRPC), one order per call, so the operator decides
+   which orders to close and users get an `AdminCanceled` notice each.
 2. Should the `maintenance_reason` be published in the info event? Proposed
    answer: no — free text from the operator in a public event is a footgun;
    clients can show a generic message.

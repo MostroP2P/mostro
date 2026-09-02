@@ -361,8 +361,12 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
      127.0.0.1:50051 mostro.admin.v1.AdminService/GetMaintenanceStatus
    ```
 
-   Meanwhile: pending orders expire on their own (or ask makers to cancel);
-   close long-running disputes with `AdminSettle` / `AdminCancel`; keep the
+   Meanwhile: pending orders expire on their own (or ask makers to cancel).
+   To shorten the drain, cancel them yourself — `CancelOrder` accepts a
+   `pending` order from the operator (`mostro-cli admcancel -o <id>`) and
+   releases the maker's range bond at once; announce it first, it is the
+   user's order. Close long-running disputes with `AdminSettle` /
+   `AdminCancel`; keep the
    **old node online the whole time** — it also has to finish in-flight
    payouts and dev fees.
 4. **Stop `mostrod`** and back up `mostro.db`.

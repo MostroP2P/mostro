@@ -329,7 +329,7 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
 |---|---|
 | `escrowed_orders` | orders with a hold invoice in a non-terminal status, minus settled ones whose payout durably failed (waiting for the buyer's new invoice, payable from any node) |
 | `inflight_payouts` | buyer payouts in flight (`settled-hold-invoice` with a payout hash) |
-| `unpaid_dev_fees` | successful orders whose dev fee is still unpaid |
+| `inflight_dev_fees` | dev-fee payouts claimed or in flight; a merely unpaid dev fee is paid by whichever node is connected and does not count |
 | `open_bonds` | bond hold invoices still open (`requested` / `locked`) |
 | `pending_bond_payouts` | bonds waiting for, or in the middle of, their payout |
 | `pending_orders` | informational only: no escrow, does not block the switch |

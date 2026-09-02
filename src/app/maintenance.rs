@@ -130,8 +130,11 @@ pub struct DrainCounters {
     pub escrowed_orders: u32,
     /// B — buyer payouts in flight (`settled-hold-invoice` + payout hash).
     pub inflight_payouts: u32,
-    /// C — successful orders whose dev fee is still unpaid.
-    pub unpaid_dev_fees: u32,
+    /// C — dev-fee payouts the daemon has claimed or sent and not yet
+    /// finalised (`dev_fee_payment_hash` marker set, `dev_fee_paid = 0`).
+    /// A merely *unpaid* dev fee is not node-bound: it is an outgoing
+    /// payment to a Lightning address the new node can make just as well.
+    pub inflight_dev_fees: u32,
     /// D — bond hold invoices still open (`requested` / `locked`).
     pub open_bonds: u32,
     /// E — bonds waiting for (or in the middle of) their payout.
@@ -144,7 +147,7 @@ impl DrainCounters {
     pub fn drained(&self) -> bool {
         self.escrowed_orders == 0
             && self.inflight_payouts == 0
-            && self.unpaid_dev_fees == 0
+            && self.inflight_dev_fees == 0
             && self.open_bonds == 0
             && self.pending_bond_payouts == 0
     }
@@ -285,10 +288,13 @@ pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroEr
             &[Status::SettledHoldInvoice.to_string()],
         )
         .await?,
-        unpaid_dev_fees: count(
+        // `dev_fee_payment_hash` is the claim marker / payment hash the
+        // dev-fee job sets while it works an order and clears on failure
+        // (`src/app/dev_fee.rs`); only that window is bound to the node.
+        inflight_dev_fees: count(
             pool,
-            "SELECT COUNT(*) FROM orders WHERE dev_fee > 0 AND dev_fee_paid = 0 AND status = ?1",
-            &[Status::Success.to_string()],
+            "SELECT COUNT(*) FROM orders WHERE dev_fee_paid = 0 AND dev_fee_payment_hash IS NOT NULL",
+            &[],
         )
         .await?,
         // D is exactly `BondState::is_active()`; keep the two in sync.
@@ -338,14 +344,27 @@ mod tests {
         dev_fee: i64,
         dev_fee_paid: bool,
     ) -> Uuid {
+        insert_order_with_dev_fee_hash(pool, status, hash, payout_hash, dev_fee, dev_fee_paid, None)
+            .await
+    }
+
+    async fn insert_order_with_dev_fee_hash(
+        pool: &SqlitePool,
+        status: &str,
+        hash: Option<&str>,
+        payout_hash: Option<&str>,
+        dev_fee: i64,
+        dev_fee_paid: bool,
+        dev_fee_payment_hash: Option<&str>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
                                    amount, fiat_code, fiat_amount, created_at, expires_at,
                                    failed_payment, payment_attempts, hash, payout_payment_hash,
-                                   dev_fee, dev_fee_paid)
+                                   dev_fee, dev_fee_paid, dev_fee_payment_hash)
                VALUES (?1, 'sell', 'ev', ?2, 0, 'lightning', 100000, 'USD', 100,
-                       1700000000, 1700086400, 0, 0, ?3, ?4, ?5, ?6)"#,
+                       1700000000, 1700086400, 0, 0, ?3, ?4, ?5, ?6, ?7)"#,
         )
         .bind(id)
         .bind(status)
@@ -353,6 +372,7 @@ mod tests {
         .bind(payout_hash)
         .bind(dev_fee)
         .bind(dev_fee_paid)
+        .bind(dev_fee_payment_hash)
         .execute(pool)
         .await
         .unwrap();
@@ -726,10 +746,24 @@ mod tests {
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
 
-        // C: unpaid dev fee on a successful order.
+        // C: dev fee claimed / in flight (marker set). A merely unpaid dev
+        // fee with no marker is NOT node-bound and must not count.
         insert_order(&pool, "success", Some(&h), None, 50, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (2, 1));
+        assert_eq!((c.escrowed_orders, c.inflight_dev_fees), (2, 0));
+        insert_order_with_dev_fee_hash(
+            &pool,
+            "success",
+            Some(&h),
+            None,
+            50,
+            false,
+            Some("PENDING-x"),
+        )
+        .await;
+        insert_order_with_dev_fee_hash(&pool, "success", Some(&h), None, 50, false, Some(&h)).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_dev_fees), (2, 2));
 
         // D / E: bonds.
         insert_bond(&pool, BondState::Locked, Some(&h), None).await;
@@ -750,7 +784,8 @@ mod tests {
         let h = "bb".repeat(32);
         // Terminal order that kept both hashes (post-finalisation clear lost).
         insert_order(&pool, "canceled-by-admin", Some(&h), Some(&h), 0, false).await;
-        insert_order(&pool, "success", Some(&h), Some(&h), 50, true).await;
+        insert_order_with_dev_fee_hash(&pool, "success", Some(&h), Some(&h), 50, true, Some(&h))
+            .await;
         // Slashed bond keeps payout_payment_hash as its idempotency record.
         insert_bond(&pool, BondState::Slashed, Some(&h), Some(&h)).await;
         insert_bond(&pool, BondState::Released, Some(&h), None).await;

@@ -58,7 +58,7 @@ the switch:
 |---|---|---|
 | A. Escrowed orders | `orders.hash IS NOT NULL AND status NOT IN (terminal) AND NOT (status = 'settled-hold-invoice' AND failed_payment AND payout_payment_hash IS NULL)` | hold invoice must be settled or canceled on the node that issued it. A settled order whose payout durably failed is out: its sats are already in Mostro's wallet and the retry / buyer's replacement invoice can be paid from any node. A freshly settled order still counts until `do_payment` (`src/app/release.rs`) records a claim (B) or a failure, so the daemon is never stopped inside that window |
 | B. In‑flight buyer payouts | `orders.payout_payment_hash IS NOT NULL AND status = 'settled-hold-invoice'` | `job_reconcile_inflight_payouts` tracks the hash on the node that sent it. Same predicate as `find_inflight_payouts` (`src/db.rs`); a subset of A, reported separately for visibility |
-| C. Unpaid dev fees | `orders.dev_fee > 0 AND dev_fee_paid = 0 AND status = 'success'` | `job_process_dev_fee_payment` pays from the node; harmless to re‑run on the new node but cleaner to drain |
+| C. In‑flight dev fees | `orders.dev_fee_paid = 0 AND dev_fee_payment_hash IS NOT NULL` | `job_process_dev_fee_payment` sets the marker while it claims/sends and clears it on failure; only that window tracks a payment on the node. A merely unpaid dev fee is an outgoing payment to a Lightning address the new node makes just as well, so it is **not** counted (found in the regtest dry run: the address is mainnet‑only, the fee can never be paid there, and counting it blocked `drained` forever) |
 | D. Open bond hold invoices | `bonds.hash IS NOT NULL AND state IN ('requested','locked')` | maker/taker bond hold invoices (`src/app/bond/flow.rs`) |
 | E. Pending bond payouts | `bonds.state = 'pending-payout'` | payout not yet sent or in flight; `bonds.payout_payment_hash` is the idempotency record for it |
 
@@ -268,7 +268,7 @@ message GetMaintenanceStatusRequest { optional string request_id = 1; }
 message DrainCounters {
   uint32 escrowed_orders        = 1; // §1.3 A
   uint32 inflight_payouts       = 2; // §1.3 B
-  uint32 unpaid_dev_fees        = 3; // §1.3 C
+  uint32 inflight_dev_fees      = 3; // §1.3 C
   uint32 locked_bonds           = 4; // §1.3 D
   uint32 inflight_bond_payouts  = 5; // §1.3 E
   uint32 pending_orders         = 6; // informational: pending, no escrow

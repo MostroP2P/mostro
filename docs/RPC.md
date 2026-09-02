@@ -161,7 +161,7 @@ The maintenance flag plus the counters of what is still bound to the connected L
 - `counters`:
   - `escrowed_orders`: orders with a hold invoice in a non-terminal status
   - `inflight_payouts`: buyer payouts in flight (`settled-hold-invoice` with a payout hash)
-  - `unpaid_dev_fees`: successful orders whose dev fee is still unpaid
+  - `inflight_dev_fees`: dev-fee payouts claimed or in flight (marker set, not yet paid); a merely unpaid dev fee is not node-bound and is not counted
   - `open_bonds`: bond hold invoices still open (`requested` / `locked`)
   - `pending_bond_payouts`: bonds waiting for, or in the middle of, their payout
   - `pending_orders`: informational — pending orders hold no escrow and do not block a switch

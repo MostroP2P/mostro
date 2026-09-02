@@ -274,15 +274,26 @@ async fn main() -> Result<()> {
         tracing::warn!("Failed to resubscribe active bonds: {e}");
     }
 
+    // Maintenance (drain) flag: one instance shared by the admin RPC (which
+    // flips it) and the event loop's AppContext (which gates on it).
+    let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+    if maintenance.is_enabled() {
+        tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
+    }
+
     // Start RPC server if enabled
     if RpcServer::is_enabled() {
         let rpc_server = RpcServer::new();
         let rpc_keys = mostro_keys.clone();
         let rpc_pool = get_db_pool();
         let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
+        let rpc_maintenance = maintenance.clone();
 
         tokio::spawn(async move {
-            match rpc_server.start(rpc_keys, rpc_pool, rpc_ln_client).await {
+            match rpc_server
+                .start(rpc_keys, rpc_pool, rpc_ln_client, rpc_maintenance)
+                .await
+            {
                 Ok(_) => tracing::info!("RPC server started successfully"),
                 Err(e) => tracing::error!("RPC server failed to start: {}", e),
             }
@@ -301,10 +312,6 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
-    let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
-    if maintenance.is_enabled() {
-        tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
-    }
     let ctx = AppContext::new(
         get_db_pool(),
         client.clone(),

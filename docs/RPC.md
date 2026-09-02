@@ -109,6 +109,47 @@ Retrieve the Mostro daemon version.
 
 - `version`: String containing the daemon version (from CARGO_PKG_VERSION)
 
+### 7. Set Maintenance Mode
+
+Enable or disable maintenance ("drain") mode. While enabled the daemon answers `new-order`, `take-buy` and `take-sell` with `cant-do` reason `maintenance_mode` and persists nothing for them; every action on an existing order, every admin action and every scheduler job keeps working so open escrow can finish on the current Lightning node. The flag is stored in the `daemon_state` table and survives restarts. See `docs/MAINTENANCE_MODE_LN_MIGRATION.md`.
+
+**Loopback only.** The admin service has no authentication interceptor, so this mutating call is refused with `PERMISSION_DENIED` unless the peer address is a loopback address (`127.0.0.0/8` or `::1`). Requests without peer information are refused with `INTERNAL`.
+
+**Request:**
+
+- `enabled`: `true` to enter maintenance mode, `false` to leave it
+- `reason`: Optional free text stored with the flag (shown by `GetMaintenanceStatus`, never published)
+- `request_id`: Optional request identifier for tracking
+
+**Response:**
+
+- `success`: Boolean indicating whether the flag was persisted and applied
+- `error_message`: Error details if the write failed
+
+### 8. Get Maintenance Status
+
+The maintenance flag plus the counters of what is still bound to the connected Lightning node. Poll it while draining: once `drained` is `true` the daemon can be stopped and pointed at a different node.
+
+**Request:**
+
+- `request_id`: Optional request identifier for tracking
+
+**Response:**
+
+- `enabled`: Current maintenance flag
+- `reason`: The text given on the last enable, if any
+- `since`: Unix seconds of the last enable; absent while disabled
+- `counters`:
+  - `escrowed_orders`: orders with a hold invoice in a non-terminal status
+  - `inflight_payouts`: buyer payouts in flight (`settled-hold-invoice` with a payout hash)
+  - `unpaid_dev_fees`: successful orders whose dev fee is still unpaid
+  - `open_bonds`: bond hold invoices still open (`requested` / `locked`)
+  - `pending_bond_payouts`: bonds waiting for, or in the middle of, their payout
+  - `pending_orders`: informational — pending orders hold no escrow and do not block a switch
+- `drained`: `true` when every counter except `pending_orders` is zero
+- `ln_node_pubkey`: identity pubkey of the connected Lightning node (empty if unknown)
+- `stored_ln_node_pubkey`: pubkey persisted by the boot node-identity guard, once that ships
+
 ## Protocol Details
 
 The RPC interface uses gRPC with Protocol Buffers. The service definition is:
@@ -121,7 +162,20 @@ service AdminService {
   rpc TakeDispute(TakeDisputeRequest) returns (TakeDisputeResponse);
   rpc ValidateDbPassword(ValidateDbPasswordRequest) returns (ValidateDbPasswordResponse);
   rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (SetMaintenanceModeResponse);
+  rpc GetMaintenanceStatus(GetMaintenanceStatusRequest) returns (GetMaintenanceStatusResponse);
 }
+```
+
+With [`grpcurl`](https://github.com/fullstorydev/grpcurl):
+
+```bash
+grpcurl -plaintext -import-path proto -proto admin.proto \
+  -d '{"enabled": true, "reason": "LN node migration"}' \
+  127.0.0.1:50051 mostro.admin.v1.AdminService/SetMaintenanceMode
+
+grpcurl -plaintext -import-path proto -proto admin.proto \
+  127.0.0.1:50051 mostro.admin.v1.AdminService/GetMaintenanceStatus
 ```
 
 ## Client Implementation Example
@@ -160,6 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Security Considerations
 
 - The RPC server listens on localhost by default for security
+- There is no authentication interceptor; `SetMaintenanceMode` additionally refuses non-loopback peers, the other mutating calls rely on the bind address alone
 - Consider implementing authentication/authorization for production use
 - The RPC interface provides the same admin capabilities as Nostr-based commands
 - Only enable the RPC server in trusted environments

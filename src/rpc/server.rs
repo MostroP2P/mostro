@@ -1,5 +1,6 @@
 //! RPC server implementation for admin operations
 
+use crate::app::maintenance::MaintenanceState;
 use crate::config::settings::Settings;
 use crate::lightning::LndConnector;
 use crate::rpc::service::AdminServiceImpl;
@@ -33,12 +34,13 @@ impl RpcServer {
         my_keys: Keys,
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
+        maintenance: MaintenanceState,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.listen_address, self.port)
             .parse()
             .map_err(|e| format!("Invalid address: {}", e))?;
 
-        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client);
+        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client, maintenance);
 
         info!("Starting RPC server on {}", addr);
 
@@ -154,7 +156,12 @@ mod tests {
         };
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let result = server
-            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .start(
+                Keys::generate(),
+                Arc::new(pool),
+                offline_ln_client().await,
+                MaintenanceState::new(),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -170,7 +177,12 @@ mod tests {
         };
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let result = server
-            .start(Keys::generate(), Arc::new(pool), offline_ln_client().await)
+            .start(
+                Keys::generate(),
+                Arc::new(pool),
+                offline_ln_client().await,
+                MaintenanceState::new(),
+            )
             .await;
         assert!(result.is_err());
     }

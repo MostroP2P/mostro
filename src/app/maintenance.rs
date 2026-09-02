@@ -20,6 +20,8 @@ use tokio::sync::Mutex;
 pub const KEY_ENABLED: &str = "maintenance_mode";
 pub const KEY_REASON: &str = "maintenance_reason";
 pub const KEY_SINCE: &str = "maintenance_since";
+/// Written by the boot node-identity guard (Phase 4); read by the status RPC.
+pub const KEY_LN_NODE_PUBKEY: &str = "ln_node_pubkey";
 
 /// Process-wide maintenance flag, backed by `daemon_state`.
 ///

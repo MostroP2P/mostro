@@ -390,9 +390,12 @@ re-opens the book against the old node; nothing else changed.
 ### Disaster recovery: old node lost with open escrow
 
 `[lightning].allow_node_change = true` exists for exactly one case: the old
-node is gone for good. The daemon **cannot** close the affected rows —
-`AdminCancel` / `AdminSettle` talk to the *configured* node and would hit an
-unknown invoice. With the daemon stopped:
+node is gone for good. `AdminSettle`, payouts and bond releases talk to the
+*configured* node and hit an unknown invoice, so the daemon **cannot** close
+those rows. `AdminCancel` on a disputed order is the exception: it treats an
+unknown invoice as already gone and closes the dispute (`canceled-by-admin`,
+`seller-refunded`); the seller is refunded by the old node's HTLC timeout,
+not by the call. With the daemon stopped:
 
 1. Export the rows behind the non-zero counters; these are the trades to
    reconcile by hand.
@@ -403,9 +406,12 @@ unknown invoice. With the daemon stopped:
    be paid from the new node manually.
 3. Database: mark the orders terminal by hand (`canceled-by-admin` for
    unsettled escrow, `completed-by-admin` after a manual payout) and the
-   bonds `failed`, so the counters reach zero.
-4. Notify the users involved; the daemon sends nothing for rows changed this
-   way.
+   bonds `failed`, so the counters reach zero. Disputed orders can instead
+   be closed with `AdminCancel` once the daemon runs against the new node
+   with `allow_node_change = true`; that path also resolves the dispute and
+   the bonds and notifies both parties.
+4. Notify the users involved; the daemon sends nothing for rows changed by
+   hand.
 5. Start against the new node. With the counters at zero the guard accepts
    the change without the override; set `allow_node_change = true` only if a
    row could not be closed and you knowingly leave it unresolved. Turn it

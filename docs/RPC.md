@@ -37,8 +37,11 @@ Cancel an order as an admin. Two cases are accepted:
   `seller-refunded`, both parties are notified, and the optional
   `BondResolution` is applied. A hold invoice LND already canceled (CLTV
   expiry refunded the seller) or does not know (the daemon now runs against a
-  different node) is treated as done, so stale disputes can still be closed;
-  only a transient LND failure aborts the cancel.
+  different node, `[lightning].allow_node_change = true`) is treated as done,
+  so stale disputes can still be closed; only a transient LND failure aborts
+  the cancel. In the different-node case the seller's HTLC is still held by
+  the old node and is refunded there when it expires, not by this call; the
+  daemon logs a warning saying so.
 - An order still pre-trade — `pending`, or `waiting-taker-bond` while a
   taker is mid-bond — with no escrow: an **operator** cancel.
   The row flips to `canceled-by-admin`, the maker and any bonded prospective

@@ -253,9 +253,10 @@ async fn main() -> Result<()> {
         NodeIdentityDecision::ChangedOverridden { previous, counters } => {
             tracing::warn!(
                 "Lightning node changed from {previous} to {node_pubkey} with open escrow \
-                 ({counters:?}) — [lightning].allow_node_change = true, continuing; the affected \
-                 rows CANNOT be resolved by the daemon, see \
-                 docs/MAINTENANCE_MODE_LN_MIGRATION.md §5.1"
+                 ({counters:?}) — [lightning].allow_node_change = true, continuing. Disputed \
+                 escrow can still be closed with AdminCancel (the old-node HTLC refunds the \
+                 seller at CLTV expiry); settled escrow and bonds bound to the old node CANNOT \
+                 be resolved by the daemon, see docs/MAINTENANCE_MODE_LN_MIGRATION.md §5.1"
             );
         }
         NodeIdentityDecision::ChangedWithOpenEscrow { previous, counters } => {

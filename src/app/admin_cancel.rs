@@ -12,7 +12,7 @@ use crate::util::{enqueue_order_msg, get_order, send_dm, update_order_event};
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Admin-initiated order cancellation.
 ///
@@ -145,8 +145,9 @@ pub async fn admin_cancel_action(
         // know at all (the daemon now runs against a different node) is
         // not an error: the HTLC is verifiably gone and the dispute can
         // still be closed. Only a transient LND failure aborts the cancel.
-        tolerate_gone_hold_invoice(&order.id, ln_client.cancel_hold_invoice(hash).await)?;
-        info!("Order Id {}: Funds returned to seller", &order.id);
+        if tolerate_gone_hold_invoice(&order.id, ln_client.cancel_hold_invoice(hash).await)? {
+            info!("Order Id {}: Funds returned to seller", &order.id);
+        }
     }
 
     // we check if there is a dispute
@@ -283,20 +284,28 @@ pub async fn admin_cancel_action(
 /// not encumbered), the same classification the bond release uses
 /// (`bond::flow::classify_cancel_error`). Transient failures propagate so
 /// the solver retries once LND is back.
+///
+/// Returns `true` when this call actually canceled the invoice and `false`
+/// when it was already gone. In the unknown-invoice case after a node
+/// change ([lightning].allow_node_change = true) the seller's HTLC is still
+/// ACCEPTED on the old node and is refunded there at CLTV expiry, so the
+/// caller must not log "funds returned" as if it happened now.
 fn tolerate_gone_hold_invoice<T>(
     order_id: &uuid::Uuid,
     result: Result<T, MostroError>,
-) -> Result<(), MostroError> {
+) -> Result<bool, MostroError> {
     use crate::app::bond::flow::{classify_cancel_error, CancelOutcome};
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(e) => match classify_cancel_error(&e) {
             CancelOutcome::AlreadyDone => {
-                info!(
-                    "Order Id {}: hold invoice already canceled or unknown to LND ({}); closing anyway",
+                warn!(
+                    "Order Id {}: hold invoice already canceled or unknown to LND ({}); closing \
+                     anyway. If this daemon was moved to a different node the seller is refunded \
+                     by the old node at CLTV expiry, not now",
                     order_id, e
                 );
-                Ok(())
+                Ok(false)
             }
             CancelOutcome::Transient => Err(e),
         },
@@ -992,14 +1001,15 @@ mod tests {
     #[test]
     fn gone_hold_invoice_is_not_an_error() {
         let id = uuid::Uuid::new_v4();
-        assert!(tolerate_gone_hold_invoice(&id, Ok::<(), _>(())).is_ok());
+        assert_eq!(tolerate_gone_hold_invoice(&id, Ok::<(), _>(())), Ok(true));
         for msg in [
             "code=NotFound message=unable to locate invoice",
             "code=Unknown message=invoice already canceled",
             "code=AlreadyExists message=duplicate",
         ] {
-            assert!(
-                tolerate_gone_hold_invoice(&id, Err::<(), _>(ln_err(msg))).is_ok(),
+            assert_eq!(
+                tolerate_gone_hold_invoice(&id, Err::<(), _>(ln_err(msg))),
+                Ok(false),
                 "{msg} must be tolerated"
             );
         }

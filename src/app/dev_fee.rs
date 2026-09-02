@@ -781,21 +781,15 @@ enum DevFeePaymentState {
     InFlight,
     /// Payment definitively failed — safe to retry.
     Failed,
-    /// The connected node has never seen this payment hash (`NotFound` /
-    /// "payment isn't initiated"). Asking again will not change the answer:
+    /// The connected node has no record of this payment hash (gRPC
+    /// `NotFound`, or an empty track stream). Asking again will not change
+    /// the answer:
     /// the payment was sent by another node (Lightning node migration) or
     /// the node's payment history was pruned.
     NotOnThisNode,
     /// Could not determine status (LN node unreachable, timeout, undecodable
     /// hash). Transient: worth asking again next cycle.
     Unknown,
-}
-
-/// Classify an LND `TrackPayment` error: a `NotFound` gRPC status (LND's
-/// "payment isn't initiated") means the node does not know the hash at all.
-fn is_payment_not_on_this_node(err: &MostroError) -> bool {
-    let s = err.to_string();
-    s.contains("NotFound") || s.contains("payment isn't initiated")
 }
 
 /// Check the actual payment status on the LN node for a dev fee payment.
@@ -830,22 +824,25 @@ async fn check_dev_fee_payment_status(
         }
     };
 
+    // `lookup_payment_status` folds both ways LND says "never seen this
+    // hash" — a gRPC `NotFound` and a track stream that ends without a
+    // payment — into `Ok(None)`; only transport / gRPC failures are `Err`.
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        ln_client.check_payment_status(&payment_hash_bytes),
+        ln_client.lookup_payment_status(&payment_hash_bytes),
     )
     .await
     {
-        Ok(Ok(status)) => match status {
+        Ok(Ok(Some(status))) => match status {
             PaymentStatus::Succeeded => DevFeePaymentState::Succeeded,
             PaymentStatus::InFlight => DevFeePaymentState::InFlight,
             PaymentStatus::Failed => DevFeePaymentState::Failed,
             _ => DevFeePaymentState::Unknown,
         },
-        Ok(Err(e)) if is_payment_not_on_this_node(&e) => {
+        Ok(Ok(None)) => {
             debug!(
-                "LN node does not know dev fee payment for order {} (hash {}): {:?}",
-                order.id, payment_hash_str, e
+                "LN node has no record of dev fee payment for order {} (hash {})",
+                order.id, payment_hash_str
             );
             DevFeePaymentState::NotOnThisNode
         }
@@ -1566,13 +1563,11 @@ mod tests {
     // ── LND-dependent phases against a lazily-connected dead client ──
 
     use super::{
-        dev_fee_comment, handle_payment_timeout, is_payment_not_on_this_node,
-        process_new_dev_fee_payments, recover_partial_payments, resolve_dev_fee_invoice,
-        run_dev_fee_cycle, send_dev_fee_payment, verify_confirmed_orders,
+        dev_fee_comment, handle_payment_timeout, process_new_dev_fee_payments,
+        recover_partial_payments, resolve_dev_fee_invoice, run_dev_fee_cycle, send_dev_fee_payment,
+        verify_confirmed_orders,
     };
     use crate::lightning::LndConnector;
-    use mostro_core::error::MostroError::MostroInternalErr;
-    use mostro_core::error::ServiceError;
     use nostr_sdk::prelude::Keys;
 
     /// Real `LndConnector` against a dead endpoint: `connect` is lazy,
@@ -1810,26 +1805,6 @@ mod tests {
             .await
             .unwrap();
         verify_confirmed_orders(&pool, &mut ln, &mut confirmed, &mut unverifiable).await;
-    }
-
-    /// LND's `NotFound` / "payment isn't initiated" is the one answer that
-    /// never changes: the node has never seen the hash (paid by a previous
-    /// node after a migration, or history pruned). It must be told apart
-    /// from transient failures, which stay `Unknown`.
-    #[test]
-    fn not_found_is_classified_as_not_on_this_node() {
-        let nf = MostroInternalErr(ServiceError::LnPaymentError(
-            "status: NotFound, message: \"payment isn't initiated\", details: []".into(),
-        ));
-        assert!(is_payment_not_on_this_node(&nf));
-        for msg in [
-            "status: Unavailable, message: \"transport error\"",
-            "status: DeadlineExceeded, message: \"timeout\"",
-            "status: Internal, message: \"something broke\"",
-        ] {
-            let e = MostroInternalErr(ServiceError::LnPaymentError(msg.into()));
-            assert!(!is_payment_not_on_this_node(&e), "{msg}");
-        }
     }
 
     /// An order already parked in `unverifiable` is skipped without any LND

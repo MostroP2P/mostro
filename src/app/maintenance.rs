@@ -119,7 +119,11 @@ impl MaintenanceState {
 /// `drained()` is true when the node can be switched.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrainCounters {
-    /// A — orders with a hold invoice in a non-terminal status.
+    /// A — orders whose hold invoice is still held on the node: `hash`
+    /// set and a non-terminal status other than `settled-hold-invoice`.
+    /// Once settled the sats are in Mostro's wallet and the buyer payout
+    /// (B when in flight) can be sent from any node; a settled order whose
+    /// payout failed waits for the buyer's new invoice, not for the node.
     pub escrowed_orders: u32,
     /// B — buyer payouts in flight (`settled-hold-invoice` + payout hash).
     pub inflight_payouts: u32,
@@ -250,12 +254,23 @@ async fn count(pool: &SqlitePool, sql: &'static str, binds: &[String]) -> Result
 pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroError> {
     let terminal = terminal_statuses();
     Ok(DrainCounters {
-        // One placeholder per entry of `terminal_statuses()`.
+        // One placeholder per entry of `terminal_statuses()`, plus
+        // `settled-hold-invoice`: the HTLC is already claimed, only the
+        // payout (B) can still be node-bound.
         escrowed_orders: count(
             pool,
             "SELECT COUNT(*) FROM orders WHERE hash IS NOT NULL \
-             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            &terminal,
+             AND status NOT IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                terminal[0].clone(),
+                terminal[1].clone(),
+                terminal[2].clone(),
+                terminal[3].clone(),
+                terminal[4].clone(),
+                terminal[5].clone(),
+                terminal[6].clone(),
+                Status::SettledHoldInvoice.to_string(),
+            ],
         )
         .await?,
         inflight_payouts: count(
@@ -673,15 +688,23 @@ mod tests {
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 0));
         assert!(!c.drained());
 
-        // B: in-flight buyer payout (also counted under A, non-terminal).
+        // B: in-flight buyer payout. The HTLC is already settled, so the
+        // order is NOT under A — only the in-flight payout binds the node.
         insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 1));
+
+        // A settled order whose payout is not in flight (payment failed,
+        // waiting for the buyer's new invoice) binds nothing: any node can
+        // pay it later.
+        insert_order(&pool, "settled-hold-invoice", Some(&h), None, 0, false).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (1, 1));
 
         // C: unpaid dev fee on a successful order.
         insert_order(&pool, "success", Some(&h), None, 50, false).await;
         let c = drain_counters(&pool).await.unwrap();
-        assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (2, 1));
+        assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (1, 1));
 
         // D / E: bonds.
         insert_bond(&pool, BondState::Locked, Some(&h), None).await;
@@ -693,7 +716,7 @@ mod tests {
         insert_order(&pool, "pending", None, None, 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!(c.pending_orders, 1);
-        assert_eq!(c.escrowed_orders, 2, "pending without hash is not escrow");
+        assert_eq!(c.escrowed_orders, 1, "pending without hash is not escrow");
     }
 
     #[tokio::test]

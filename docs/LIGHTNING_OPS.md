@@ -327,7 +327,7 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
 
 | Counter | Meaning |
 |---|---|
-| `escrowed_orders` | orders with a hold invoice in a non-terminal status |
+| `escrowed_orders` | orders whose hold invoice is still held on the node (non-terminal, not yet settled) |
 | `inflight_payouts` | buyer payouts in flight (`settled-hold-invoice` with a payout hash) |
 | `unpaid_dev_fees` | successful orders whose dev fee is still unpaid |
 | `open_bonds` | bond hold invoices still open (`requested` / `locked`) |

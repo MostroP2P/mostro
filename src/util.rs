@@ -1147,6 +1147,29 @@ pub(crate) fn monotonic_dispute_event_timestamp(d_tag: &str, candidate: Timestam
     ))
 }
 
+/// Same registry for the kind-38385 Mostro info event, keyed by its `d`
+/// tag (the node pubkey). Normally one publish per
+/// `publish_mostro_info_interval`, but a maintenance-mode flip republishes
+/// immediately, and if that lands in the same second as the previous
+/// publish the two revisions would tie on `created_at` and the relay would
+/// keep the lower event id — possibly the stale `maintenance_mode` value.
+static INFO_EVENT_TIMESTAMPS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Next `created_at` for a kind-38385 info event revision identified by
+/// `d_tag`: `candidate`, bumped to strictly after the last revision
+/// published under that tag when both land in the same second.
+pub(crate) fn monotonic_info_event_timestamp(d_tag: &str, candidate: Timestamp) -> Timestamp {
+    let mut last_ts = INFO_EVENT_TIMESTAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Timestamp::from(monotonic_created_at(
+        &mut last_ts,
+        d_tag.to_owned(),
+        candidate.as_secs(),
+    ))
+}
+
 /// Orders whose latest kind-38383 publish failed (a relay rejected the
 /// event, the send errored, or no Nostr client existed), so the DB state
 /// and the advertised orderbook diverged. The scheduler's orderbook
@@ -2363,6 +2386,18 @@ mod tests {
     /// Two revisions of the same order in the same Unix second must not tie:
     /// NIP-01 breaks same-timestamp ties by lowest event id, which can keep a
     /// dead `pending` revision as the winning state on relays.
+    #[test]
+    fn info_event_timestamp_bumps_same_second_republish() {
+        let d_tag = format!("info-{}", Uuid::new_v4());
+        let now = Timestamp::from(1_700_000_000);
+        let first = monotonic_info_event_timestamp(&d_tag, now);
+        let republish = monotonic_info_event_timestamp(&d_tag, now);
+        assert_eq!(first.as_secs(), 1_700_000_000);
+        assert_eq!(republish.as_secs(), 1_700_000_001, "must be strictly later");
+        let later = monotonic_info_event_timestamp(&d_tag, Timestamp::from(1_700_000_100));
+        assert_eq!(later.as_secs(), 1_700_000_100, "wall clock wins once ahead");
+    }
+
     #[test]
     fn monotonic_timestamp_bumps_same_second_revisions() {
         let order_id = Uuid::new_v4();

@@ -14,6 +14,7 @@ use mostro_core::prelude::{Action, Status};
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const KEY_ENABLED: &str = "maintenance_mode";
 pub const KEY_REASON: &str = "maintenance_reason";
@@ -23,10 +24,13 @@ pub const KEY_SINCE: &str = "maintenance_since";
 ///
 /// Cheap to clone; every clone observes the same flag. The persisted value is
 /// authoritative: `set` writes the DB first and flips the atomic second, so a
-/// crash in between is resolved by the next `load`.
+/// crash in between is resolved by the next `load`. Writers are serialised by
+/// `write_lock` for the whole DB-then-atomic sequence, so two concurrent
+/// `set` calls cannot leave the row reflecting one and the flag the other.
 #[derive(Clone, Debug, Default)]
 pub struct MaintenanceState {
     enabled: Arc<AtomicBool>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl MaintenanceState {
@@ -44,6 +48,7 @@ impl MaintenanceState {
             .unwrap_or(false);
         Ok(Self {
             enabled: Arc::new(AtomicBool::new(enabled)),
+            write_lock: Arc::default(),
         })
     }
 
@@ -63,20 +68,32 @@ impl MaintenanceState {
 
     /// Persist and apply a new value. `reason` is stored verbatim (or cleared)
     /// and `maintenance_since` is stamped on every enable.
+    ///
+    /// The three rows are written in one transaction and the in-memory flag
+    /// flips only after it commits, all under `write_lock`. A failed commit
+    /// leaves both the rows and the flag untouched.
     pub async fn set(
         &self,
         pool: &SqlitePool,
         enabled: bool,
         reason: Option<&str>,
     ) -> Result<(), MostroError> {
-        daemon_state::set(pool, KEY_ENABLED, if enabled { "1" } else { "0" }).await?;
-        daemon_state::set(pool, KEY_REASON, reason.unwrap_or_default()).await?;
+        let _guard = self.write_lock.lock().await;
         let since = if enabled {
             chrono::Utc::now().timestamp().to_string()
         } else {
             String::new()
         };
-        daemon_state::set(pool, KEY_SINCE, &since).await?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        daemon_state::set_in(&mut tx, KEY_ENABLED, if enabled { "1" } else { "0" }).await?;
+        daemon_state::set_in(&mut tx, KEY_REASON, reason.unwrap_or_default()).await?;
+        daemon_state::set_in(&mut tx, KEY_SINCE, &since).await?;
+        tx.commit()
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         self.enabled.store(enabled, Ordering::Release);
         Ok(())
     }
@@ -271,6 +288,43 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_leaves_flag_and_rows_untouched_when_the_write_fails() {
+        let pool = pool().await;
+        let state = MaintenanceState::load(&pool).await.unwrap();
+        pool.close().await;
+        assert!(state.set(&pool, true, Some("x")).await.is_err());
+        assert!(!state.is_enabled(), "a failed write must not flip the flag");
+    }
+
+    /// Concurrent writers: whatever order they land in, the persisted row and
+    /// the in-memory flag must agree at the end.
+    #[tokio::test]
+    async fn concurrent_sets_keep_row_and_flag_consistent() {
+        let pool = pool().await;
+        let state = MaintenanceState::load(&pool).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32u32 {
+            let (state, pool) = (state.clone(), pool.clone());
+            tasks.spawn(async move { state.set(&pool, i % 2 == 0, None).await.unwrap() });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.unwrap();
+        }
+        let persisted = daemon_state::get(&pool, KEY_ENABLED)
+            .await
+            .unwrap()
+            .unwrap()
+            == "1";
+        assert_eq!(state.is_enabled(), persisted);
+        let since = daemon_state::get(&pool, KEY_SINCE).await.unwrap().unwrap();
+        assert_eq!(
+            since.is_empty(),
+            !persisted,
+            "since must match the final mode"
         );
     }
 

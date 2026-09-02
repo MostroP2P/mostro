@@ -64,6 +64,12 @@ Any other status is refused with `NotAllowedByStatus`.
 
 - `order_id`: UUID of the order to cancel
 - `request_id`: Optional request identifier
+- `pretrade_only`: Optional. When `true` the daemon refuses any order that is
+  not still `pending` / `waiting-taker-bond` (`success = false` with the
+  order's status in `error_message`) instead of falling through to the
+  dispute-resolution cancel. Operator tooling that means "cancel this pending
+  order" — `mostro-cli admcancelpending` — sets it, so a mistyped id can never
+  close a dispute.
 
 **Response:**
 

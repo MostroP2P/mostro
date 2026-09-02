@@ -181,6 +181,30 @@ impl AdminServiceImpl {
         Ok(())
     }
 
+    /// `CancelOrderRequest.pretrade_only`: refuse anything that is not
+    /// still `pending` / `waiting-taker-bond`, so operator tooling that
+    /// means "cancel this pending order" can never resolve a dispute by a
+    /// mistyped id. Returns the operator-facing reason on refusal.
+    async fn ensure_pretrade(&self, order_id: &str) -> Result<(), String> {
+        use mostro_core::db::Crud;
+        use mostro_core::order::{Order, Status as OrderStatus};
+        let id = uuid::Uuid::parse_str(order_id).map_err(|e| format!("invalid order id: {e}"))?;
+        let order = Order::by_id(self.pool.as_ref(), id)
+            .await
+            .map_err(|e| format!("order lookup failed: {e}"))?
+            .ok_or_else(|| format!("order {order_id} not found"))?;
+        let pretrade = order.status == OrderStatus::Pending.to_string()
+            || order.status == OrderStatus::WaitingTakerBond.to_string();
+        if pretrade {
+            Ok(())
+        } else {
+            Err(format!(
+                "order {order_id} is {} and pretrade_only was requested; use the dispute flow (AdminCancel / AdminSettle) instead",
+                order.status
+            ))
+        }
+    }
+
     async fn call_admin_settle(
         &self,
         order_id: String,
@@ -353,6 +377,16 @@ impl AdminService for AdminServiceImpl {
         self.require_auth(&request, "CancelOrder")?;
         let req = request.into_inner();
         info!("Received cancel order request for order: {}", req.order_id);
+
+        if req.pretrade_only.unwrap_or(false) {
+            if let Err(msg) = self.ensure_pretrade(&req.order_id).await {
+                warn!("CancelOrder refused: {msg}");
+                return Ok(Response::new(CancelOrderResponse {
+                    success: false,
+                    error_message: Some(msg),
+                }));
+            }
+        }
 
         match self.call_admin_cancel(req.order_id, req.request_id).await {
             Ok(()) => Ok(Response::new(CancelOrderResponse {
@@ -598,6 +632,7 @@ mod tests {
         let cancel_req = CancelOrderRequest {
             order_id: "test-order-id".to_string(),
             request_id: Some("test-request-id".to_string()),
+            pretrade_only: None,
         };
 
         let cancel_resp = CancelOrderResponse {
@@ -902,6 +937,7 @@ mod tests {
                 .cancel_order(Request::new(CancelOrderRequest {
                     order_id: "x".into(),
                     request_id: None,
+                    pretrade_only: None,
                 }))
                 .await
                 .unwrap_err()
@@ -1025,6 +1061,7 @@ mod tests {
             .cancel_order(Request::new(CancelOrderRequest {
                 order_id: "not-a-uuid".to_string(),
                 request_id: Some("7".to_string()),
+                pretrade_only: None,
             }))
             .await
             .expect("RPC surface always answers with a response");
@@ -1040,6 +1077,7 @@ mod tests {
             .cancel_order(Request::new(CancelOrderRequest {
                 order_id: uuid::Uuid::new_v4().to_string(),
                 request_id: None,
+                pretrade_only: None,
             }))
             .await
             .expect("RPC surface always answers with a response");
@@ -1182,14 +1220,85 @@ mod tests {
         let req_with_request_id = CancelOrderRequest {
             order_id: "order1".to_string(),
             request_id: Some("req1".to_string()),
+            pretrade_only: None,
         };
 
         let req_without_request_id = CancelOrderRequest {
             order_id: "order2".to_string(),
             request_id: None,
+            pretrade_only: None,
         };
 
         assert!(req_with_request_id.request_id.is_some());
         assert!(req_without_request_id.request_id.is_none());
+    }
+
+    /// `pretrade_only` must never fall through to the dispute cancel: a
+    /// disputed order is refused with an explanatory message and nothing
+    /// is touched.
+    #[tokio::test]
+    async fn cancel_order_pretrade_only_refuses_a_dispute() {
+        let service = offline_service().await;
+        let id = insert_escrowed_order(service.pool.as_ref(), "dispute").await;
+        let response = service
+            .cancel_order(Request::new(CancelOrderRequest {
+                order_id: id.to_string(),
+                request_id: None,
+                pretrade_only: Some(true),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        let msg = response.error_message.unwrap_or_default();
+        assert!(
+            msg.contains("is dispute") && msg.contains("pretrade_only"),
+            "{msg}"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(service.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(status, "dispute");
+    }
+
+    /// A pending order passes the guard and reaches the cancel handler
+    /// (which then fails on the uninitialised Nostr client in this offline
+    /// test — the point is that the refusal reason is not the guard's).
+    #[tokio::test]
+    async fn cancel_order_pretrade_only_lets_a_pending_order_through() {
+        let service = offline_service().await;
+        let id = insert_escrowed_order(service.pool.as_ref(), "pending").await;
+        let response = service
+            .cancel_order(Request::new(CancelOrderRequest {
+                order_id: id.to_string(),
+                request_id: None,
+                pretrade_only: Some(true),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let msg = response.error_message.unwrap_or_default();
+        assert!(!msg.contains("pretrade_only was requested"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn cancel_order_pretrade_only_reports_unknown_order() {
+        let service = offline_service().await;
+        let response = service
+            .cancel_order(Request::new(CancelOrderRequest {
+                order_id: uuid::Uuid::new_v4().to_string(),
+                request_id: None,
+                pretrade_only: Some(true),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        assert!(response
+            .error_message
+            .unwrap_or_default()
+            .contains("not found"));
     }
 }

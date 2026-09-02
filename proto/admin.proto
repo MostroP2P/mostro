@@ -36,6 +36,11 @@ service AdminService {
 message CancelOrderRequest {
   string order_id = 1;
   optional string request_id = 2;
+  // When true the daemon refuses any order that is not still pre-trade
+  // (pending / waiting-taker-bond) instead of falling through to the
+  // dispute-resolution cancel. Operator tooling that means "cancel this
+  // pending order" must set it so a mistyped id can never close a dispute.
+  optional bool pretrade_only = 3;
 }
 
 // Response for order cancellation

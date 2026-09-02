@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cancel_request = tonic::Request::new(CancelOrderRequest {
         order_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         request_id: Some("12345".to_string()),
+        pretrade_only: None,
     });
 
     match client.cancel_order(cancel_request).await {

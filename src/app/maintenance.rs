@@ -7,6 +7,7 @@
 //! `drain_counters` reports what is still bound to that node.
 //! Spec: `docs/MAINTENANCE_MODE_LN_MIGRATION.md` §3.2 / §3.4.
 
+use crate::app::bond::types::BondState;
 use crate::app::daemon_state;
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
@@ -176,16 +177,20 @@ pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroEr
             &[Status::Success.to_string()],
         )
         .await?,
+        // D is exactly `BondState::is_active()`; keep the two in sync.
         open_bonds: count(
             pool,
             "SELECT COUNT(*) FROM bonds WHERE hash IS NOT NULL AND state IN (?1, ?2)",
-            &["requested".to_string(), "locked".to_string()],
+            &[
+                BondState::Requested.to_string(),
+                BondState::Locked.to_string(),
+            ],
         )
         .await?,
         pending_bond_payouts: count(
             pool,
             "SELECT COUNT(*) FROM bonds WHERE state = ?1",
-            &["pending-payout".to_string()],
+            &[BondState::PendingPayout.to_string()],
         )
         .await?,
         pending_orders: count(
@@ -242,7 +247,12 @@ mod tests {
 
     /// Bonds carry a FK to `orders`, so each one gets its own parent order
     /// in a status that contributes nothing to the counters.
-    async fn insert_bond(pool: &SqlitePool, state: &str, hash: Option<&str>, payout: Option<&str>) {
+    async fn insert_bond(
+        pool: &SqlitePool,
+        state: BondState,
+        hash: Option<&str>,
+        payout: Option<&str>,
+    ) {
         let order_id = insert_order(pool, "canceled", None, None, 0, false).await;
         let mut b = Bond::new_requested(order_id, "ab".repeat(32), BondRole::Maker, 1000);
         b.state = state.to_string();
@@ -368,6 +378,23 @@ mod tests {
         }
     }
 
+    /// Predicate D must stay the SQL twin of `BondState::is_active()`.
+    #[test]
+    fn open_bond_predicate_matches_bond_state_is_active() {
+        let counted = [BondState::Requested, BondState::Locked];
+        for state in [
+            BondState::Requested,
+            BondState::Locked,
+            BondState::Released,
+            BondState::PendingPayout,
+            BondState::Slashed,
+            BondState::Forfeited,
+            BondState::Failed,
+        ] {
+            assert_eq!(counted.contains(&state), state.is_active(), "{state}");
+        }
+    }
+
     #[tokio::test]
     async fn drain_counters_are_zero_on_an_empty_database() {
         let pool = pool().await;
@@ -398,8 +425,8 @@ mod tests {
         assert_eq!((c.escrowed_orders, c.unpaid_dev_fees), (2, 1));
 
         // D / E: bonds.
-        insert_bond(&pool, "locked", Some(&h), None).await;
-        insert_bond(&pool, "pending-payout", Some(&h), Some(&h)).await;
+        insert_bond(&pool, BondState::Locked, Some(&h), None).await;
+        insert_bond(&pool, BondState::PendingPayout, Some(&h), Some(&h)).await;
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.open_bonds, c.pending_bond_payouts), (1, 1));
 
@@ -418,8 +445,8 @@ mod tests {
         insert_order(&pool, "canceled-by-admin", Some(&h), Some(&h), 0, false).await;
         insert_order(&pool, "success", Some(&h), Some(&h), 50, true).await;
         // Slashed bond keeps payout_payment_hash as its idempotency record.
-        insert_bond(&pool, "slashed", Some(&h), Some(&h)).await;
-        insert_bond(&pool, "released", Some(&h), None).await;
+        insert_bond(&pool, BondState::Slashed, Some(&h), Some(&h)).await;
+        insert_bond(&pool, BondState::Released, Some(&h), None).await;
 
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!(c, DrainCounters::default());

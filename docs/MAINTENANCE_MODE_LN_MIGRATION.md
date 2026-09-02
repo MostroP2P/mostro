@@ -523,9 +523,12 @@ orders work and the guard rejects a switch back with open escrow.
    Verify the info event now shows `maintenance_mode = true`.
 3. Poll `GetMaintenanceStatus` until `drained == true`. Meanwhile:
    - pending orders expire on their own, or the operator asks makers to
-     cancel; to shorten the drain, cancel them yourself with `CancelOrder`
-     (`mostro-cli admcancel -o <id>`), which releases the maker's range
-     bond at once — announce it first, it is the user's order;
+     cancel; to shorten the drain, cancel them yourself with the
+     `CancelOrder` gRPC (e.g. `grpcurl … AdminService/CancelOrder`, see
+     `docs/RPC.md`), which releases the maker's bond at once — announce it
+     first, it is the user's order. Note `mostro-cli admcancel` goes over
+     Nostr signed with `ADMIN_NSEC` and only reaches this path when that
+     key is the daemon's own;
    - long‑running disputes are closed with `AdminSettle` / `AdminCancel`;
    - keep the **old** node online the entire time — it also has to finish
      in‑flight payouts (B/E) and dev fees (C).

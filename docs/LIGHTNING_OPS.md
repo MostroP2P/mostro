@@ -362,10 +362,12 @@ The daemon ships a **maintenance (drain) mode** for this. Full design in
    ```
 
    Meanwhile: pending orders expire on their own (or ask makers to cancel).
-   To shorten the drain, cancel them yourself — `CancelOrder` accepts a
-   `pending` order from the operator (`mostro-cli admcancel -o <id>`) and
-   releases the maker's range bond at once; announce it first, it is the
-   user's order. Close long-running disputes with `AdminSettle` /
+   To shorten the drain, cancel them yourself — the `CancelOrder` gRPC
+   accepts a `pending` order from the operator and releases the maker's
+   bond at once (`grpcurl … AdminService/CancelOrder`, see `docs/RPC.md`;
+   `mostro-cli admcancel` goes over Nostr with `ADMIN_NSEC` and only
+   works here when that key is the daemon's own). Announce it first, it
+   is the user's order. Close long-running disputes with `AdminSettle` /
    `AdminCancel`; keep the
    **old node online the whole time** — it also has to finish in-flight
    payouts and dev fees.

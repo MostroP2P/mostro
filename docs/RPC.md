@@ -195,7 +195,17 @@ grpcurl -plaintext -import-path proto -proto admin.proto \
 
 grpcurl -plaintext -import-path proto -proto admin.proto \
   127.0.0.1:50051 mostro.admin.v1.AdminService/GetMaintenanceStatus
+
+# Operator cancel of a pending order (add -H only when auth_token is set)
+grpcurl -plaintext -import-path proto -proto admin.proto \
+  -H 'authorization: Bearer <token>' \
+  -d '{"order_id": "<uuid>"}' \
+  127.0.0.1:50051 mostro.admin.v1.AdminService/CancelOrder
 ```
+
+`mostro-cli admcancel` is **not** this RPC: it sends `AdminCancel` over Nostr
+signed with `ADMIN_NSEC`, so it reaches the pending-order path only when that
+key is the daemon's own.
 
 ## Client Implementation Example
 

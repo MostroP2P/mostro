@@ -695,13 +695,24 @@ mod tests {
         assert!(!c.drained());
 
         // B: in-flight buyer payout (also counted under A, non-terminal).
-        insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
+        let inflight =
+            insert_order(&pool, "settled-hold-invoice", Some(&h), Some(&h), 0, false).await;
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (2, 1));
 
         // Freshly settled, payout not yet claimed nor failed: still under A —
         // stopping the daemon here would strand the payout.
         let fresh = insert_order(&pool, "settled-hold-invoice", Some(&h), None, 0, false).await;
+        let c = drain_counters(&pool).await.unwrap();
+        assert_eq!((c.escrowed_orders, c.inflight_payouts), (3, 1));
+
+        // A retry re-claimed the payout: `failed_payment` set but a hash in
+        // flight. Still node-bound, still under A and B.
+        sqlx::query("UPDATE orders SET failed_payment = 1, payment_attempts = 2 WHERE id = ?")
+            .bind(inflight)
+            .execute(&pool)
+            .await
+            .unwrap();
         let c = drain_counters(&pool).await.unwrap();
         assert_eq!((c.escrowed_orders, c.inflight_payouts), (3, 1));
 

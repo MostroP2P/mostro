@@ -193,16 +193,22 @@ impl AdminServiceImpl {
             .await
             .map_err(|e| format!("order lookup failed: {e}"))?
             .ok_or_else(|| format!("order {order_id} not found"))?;
-        let pretrade = order.status == OrderStatus::Pending.to_string()
-            || order.status == OrderStatus::WaitingTakerBond.to_string();
-        if pretrade {
-            Ok(())
-        } else {
-            Err(format!(
-                "order {order_id} is {} and pretrade_only was requested; use the dispute flow (AdminCancel / AdminSettle) instead",
-                order.status
-            ))
+        if order.check_status(OrderStatus::Pending).is_ok()
+            || order.check_status(OrderStatus::WaitingTakerBond).is_ok()
+        {
+            return Ok(());
         }
+        // The dispute-flow hint is only right when the order really is in
+        // dispute; for any other status that flow would be refused too.
+        let hint = if order.check_status(OrderStatus::Dispute).is_ok() {
+            "; use the dispute flow (AdminCancel / AdminSettle) instead"
+        } else {
+            ""
+        };
+        Err(format!(
+            "order {order_id} is {} and pretrade_only was requested{hint}",
+            order.status
+        ))
     }
 
     async fn call_admin_settle(
@@ -1261,6 +1267,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "dispute");
+    }
+
+    /// The "use the dispute flow" hint is only right when the order really
+    /// is in dispute; for any other non-pretrade status that flow would be
+    /// refused too, so the message must not send the operator there.
+    #[tokio::test]
+    async fn cancel_order_pretrade_only_hints_dispute_flow_only_for_disputes() {
+        let service = offline_service().await;
+        let disputed = insert_escrowed_order(service.pool.as_ref(), "dispute").await;
+        let active = insert_escrowed_order(service.pool.as_ref(), "active").await;
+        let msg_for = |id: uuid::Uuid| {
+            let service = &service;
+            async move {
+                service
+                    .cancel_order(Request::new(CancelOrderRequest {
+                        order_id: id.to_string(),
+                        request_id: None,
+                        pretrade_only: Some(true),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .error_message
+                    .unwrap_or_default()
+            }
+        };
+        let disputed_msg = msg_for(disputed).await;
+        assert!(disputed_msg.contains("dispute flow"), "{disputed_msg}");
+        let active_msg = msg_for(active).await;
+        assert!(active_msg.contains("is active"), "{active_msg}");
+        assert!(!active_msg.contains("dispute flow"), "{active_msg}");
     }
 
     /// A pending order passes the guard and reaches the cancel handler

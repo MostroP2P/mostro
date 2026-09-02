@@ -7,6 +7,7 @@ Admin capabilities and dispute resolution paths.
 - Enable: `settings.toml` → `[rpc] enabled = true`
 - Binds `listen_address:port`; injects Keys, `Arc<Pool<Sqlite>>`, `Arc<Mutex<LndConnector>>`.
 - Uses `tonic`; see `docs/RPC.md` and `proto/admin.proto`.
+- Also carries the maintenance (drain) mode switch: `SetMaintenanceMode` (loopback peers only) and `GetMaintenanceStatus`; the flag is the same `MaintenanceState` the event loop gates on. See `docs/MAINTENANCE_MODE_LN_MIGRATION.md`.
 
 ## Dispute Lifecycle
 - Open: `src/app/dispute.rs` (Action=Dispute) → mark order as `Dispute` and notify.

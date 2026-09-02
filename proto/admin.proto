@@ -21,6 +21,15 @@ service AdminService {
 
   // Get Mostro version
   rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+  // Enable/disable maintenance (drain) mode. Loopback peers only.
+  // While enabled the daemon rejects new-order/take-buy/take-sell with
+  // CantDo(maintenance_mode); everything on existing orders keeps working.
+  rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (SetMaintenanceModeResponse);
+
+  // Maintenance flag plus the counters of what is still bound to the
+  // connected Lightning node (docs/MAINTENANCE_MODE_LN_MIGRATION.md §1.3).
+  rpc GetMaintenanceStatus(GetMaintenanceStatusRequest) returns (GetMaintenanceStatusResponse);
 }
 
 // Request to cancel an order
@@ -86,4 +95,49 @@ message GetVersionRequest {}
 
 message GetVersionResponse {
   string version = 1;
+}
+
+message SetMaintenanceModeRequest {
+  bool enabled = 1;
+  optional string reason = 2;
+  optional string request_id = 3;
+}
+
+message SetMaintenanceModeResponse {
+  bool success = 1;
+  optional string error_message = 2;
+}
+
+message GetMaintenanceStatusRequest {
+  optional string request_id = 1;
+}
+
+// What is still bound to the connected Lightning node.
+message DrainCounters {
+  // A: orders with a hold invoice in a non-terminal status
+  uint32 escrowed_orders = 1;
+  // B: buyer payouts in flight (settled-hold-invoice + payout hash)
+  uint32 inflight_payouts = 2;
+  // C: successful orders whose dev fee is still unpaid
+  uint32 unpaid_dev_fees = 3;
+  // D: bond hold invoices still open (requested / locked)
+  uint32 open_bonds = 4;
+  // E: bonds waiting for, or in the middle of, their payout
+  uint32 pending_bond_payouts = 5;
+  // Informational: pending orders hold no escrow and do not block a switch
+  uint32 pending_orders = 6;
+}
+
+message GetMaintenanceStatusResponse {
+  bool enabled = 1;
+  optional string reason = 2;
+  // unix seconds of the last enable; absent while disabled
+  optional int64 since = 3;
+  DrainCounters counters = 4;
+  // true when counters A..E are all zero
+  bool drained = 5;
+  // identity pubkey of the connected Lightning node (empty if unknown)
+  string ln_node_pubkey = 6;
+  // pubkey persisted by the boot guard (Phase 4); absent until first written
+  optional string stored_ln_node_pubkey = 7;
 }

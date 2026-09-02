@@ -138,6 +138,11 @@ listen_address = "127.0.0.1"
 port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
+# Optional shared secret for the mutating admin RPCs (CancelOrder, SettleOrder,
+# AddSolver, TakeDispute, SetMaintenanceMode). Clients send it as gRPC
+# metadata `authorization: Bearer <token>`. Set it whenever the port is
+# reachable through a tunnel, sidecar or non-loopback bind.
+# auth_token = ""
 
 # Multi-source price providers (see docs/PRICE_PROVIDERS.md).
 # Absent section ≡ legacy single-source behaviour synthesised from

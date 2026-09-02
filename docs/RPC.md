@@ -35,7 +35,10 @@ Cancel an order as an admin. Two cases are accepted:
 - An order in `dispute`: the assigned solver's resolution. The escrow hold
   invoice is cancelled (funds return to the seller), the dispute is closed as
   `seller-refunded`, both parties are notified, and the optional
-  `BondResolution` is applied.
+  `BondResolution` is applied. A hold invoice LND already canceled (CLTV
+  expiry refunded the seller) or does not know (the daemon now runs against a
+  different node) is treated as done, so stale disputes can still be closed;
+  only a transient LND failure aborts the cancel.
 - An order still pre-trade — `pending`, or `waiting-taker-bond` while a
   taker is mid-bond — with no escrow: an **operator** cancel.
   The row flips to `canceled-by-admin`, the maker and any bonded prospective

@@ -477,6 +477,15 @@ pub struct LightningSettings {
     /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
+    /// Disaster-recovery override for the boot node-identity guard. By
+    /// default the daemon refuses to start against a Lightning node whose
+    /// identity pubkey differs from the one it last ran with while escrow
+    /// is still open on the old node (hold invoices cannot move between
+    /// nodes). `true` turns that refusal into a warning and knowingly
+    /// leaves the affected rows unresolved. See
+    /// docs/MAINTENANCE_MODE_LN_MIGRATION.md §3.6 / §5.1.
+    #[serde(default)]
+    pub allow_node_change: bool,
 }
 
 /// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
@@ -508,6 +517,7 @@ impl Default for LightningSettings {
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
+            allow_node_change: false,
         }
     }
 }

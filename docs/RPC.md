@@ -30,7 +30,26 @@ The RPC interface supports the following admin operations:
 
 ### 1. Cancel Order
 
-Cancel an order as an admin.
+Cancel an order as an admin. Two cases are accepted:
+
+- An order in `dispute`: the assigned solver's resolution. The escrow hold
+  invoice is cancelled (funds return to the seller), the dispute is closed as
+  `seller-refunded`, both parties are notified, and the optional
+  `BondResolution` is applied.
+- An order still pre-trade — `pending`, or `waiting-taker-bond` while a
+  taker is mid-bond — with no escrow: an **operator** cancel.
+  The row flips to `canceled-by-admin`, the maker and any bonded prospective
+  taker receive `AdminCanceled`, taker bonds are released and the maker bond
+  is resolved at range close (released, or settled once if a slice was
+  slashed). Only the daemon key is allowed — i.e. this RPC; a solver sending
+  `AdminCancel` over Nostr for a pending order is refused with
+  `NotAuthorized`. Use it to drain open range-order maker bonds ahead of a
+  Lightning node migration instead of waiting for `max_expiration_days`
+  (see `docs/MAINTENANCE_MODE_LN_MIGRATION.md` §5). A take that commits
+  concurrently wins: the cancel then fails with `NotAllowedByStatus` and the
+  order continues.
+
+Any other status is refused with `NotAllowedByStatus`.
 
 **Request:**
 

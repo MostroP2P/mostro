@@ -307,6 +307,12 @@ pub async fn request_taker_bond(
                 );
             }
         }
+    } else {
+        // Lost the CAS. If it was to a cancel/expiry rather than to a
+        // sibling take or a fast lock, this bond will never be promoted:
+        // release it now instead of stranding the hold invoice (and the
+        // taker) until CLTV expiry.
+        release_bond_if_order_closed(pool, &bond).await;
     }
 
     Ok(bond)
@@ -1057,6 +1063,61 @@ async fn notify_loser(bond: &Bond) {
         )
         .await;
     }
+}
+
+/// Called when the `Pending → WaitingTakerBond` CAS in
+/// [`request_taker_bond`] is lost. Decides whether the bond just created
+/// still backs anything. A sibling take or a fast `Accepted` callback moved
+/// the order forward: the bond stays in play. A cancel (maker, operator,
+/// cooperative) or an expiry landed in the window between the take
+/// handler's status read and the bond insert: nobody will ever promote this
+/// bond, so release it now and tell the taker instead of leaving a
+/// `Requested` hold invoice the taker could still pay open until CLTV
+/// expiry — which also pins the maintenance drain's `open_bonds` counter.
+/// Returns `true` when the order was found closed (release attempted,
+/// taker notified).
+pub async fn release_bond_if_order_closed(pool: &Pool<Sqlite>, bond: &Bond) -> bool {
+    let order = match Order::by_id(pool, bond.order_id).await {
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "release_bond_if_order_closed: order row missing; leaving bond for the exit paths"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "release_bond_if_order_closed: order lookup failed ({}); leaving bond for the exit paths",
+                e
+            );
+            return false;
+        }
+    };
+    if !matches!(
+        order.get_order_status(),
+        Ok(Status::Canceled
+            | Status::CooperativelyCanceled
+            | Status::CanceledByAdmin
+            | Status::Expired)
+    ) {
+        return false;
+    }
+    info!(
+        "Bond {} requested on order {} that closed ({}) under the take — releasing and notifying taker",
+        bond.id, order.id, order.status
+    );
+    if let Err(e) = release_bond(pool, bond).await {
+        warn!(
+            bond_id = %bond.id,
+            "release_bond on closed order failed ({}); the next exit path retries", e
+        );
+    }
+    notify_loser(bond).await;
+    true
 }
 
 /// Copy the winning bond's deferred taker context onto the order row.
@@ -3282,5 +3343,75 @@ mod tests {
             !order.event_id.is_empty(),
             "event_id must be persisted after a successful republish"
         );
+    }
+
+    // ── release_bond_if_order_closed (CAS lost to a cancel) ─────────────
+
+    async fn set_status(pool: &Pool<Sqlite>, order_id: Uuid, status: Status) {
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn queued_actions_for(pubkey: &str) -> Vec<Action> {
+        let pk = PublicKey::from_str(pubkey).unwrap();
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, dest)| *dest == pk)
+            .map(|(m, _)| m.get_inner_message_kind().action.clone())
+            .collect()
+    }
+
+    /// The operator (or the maker) cancelled between the take handler's
+    /// status read and the bond insert: the `Requested` bond is released
+    /// and the taker told, instead of an open hold invoice lingering until
+    /// CLTV expiry.
+    #[tokio::test]
+    async fn cas_lost_to_admin_cancel_releases_requested_bond_and_notifies_taker() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let taker = Keys::generate().public_key().to_string();
+        let mut bond = Bond::new_requested(order_id, taker.clone(), BondRole::Taker, 1_500);
+        bond.hash = None; // no LND in unit tests; release is a DB flip
+        let bond = bond.create(&pool).await.unwrap();
+        set_status(&pool, order_id, Status::CanceledByAdmin).await;
+
+        let closed = release_bond_if_order_closed(&pool, &bond).await;
+
+        assert!(closed);
+        let stored = Bond::by_id(&pool, bond.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, BondState::Released.to_string());
+        assert!(queued_actions_for(&taker).await.contains(&Action::Canceled));
+    }
+
+    /// Lost to a sibling take (order parked at `WaitingTakerBond`) or to a
+    /// fast lock (`WaitingPayment`): the bond is still a live candidate and
+    /// must be left alone.
+    #[tokio::test]
+    async fn cas_lost_to_a_live_transition_keeps_the_bond() {
+        let pool = setup_pool().await;
+        for status in [Status::WaitingTakerBond, Status::WaitingPayment] {
+            let order_id = Uuid::new_v4();
+            insert_order(&pool, order_id).await;
+            let taker = Keys::generate().public_key().to_string();
+            let mut bond = Bond::new_requested(order_id, taker.clone(), BondRole::Taker, 1_500);
+            bond.hash = None;
+            let bond = bond.create(&pool).await.unwrap();
+            set_status(&pool, order_id, status).await;
+
+            let closed = release_bond_if_order_closed(&pool, &bond).await;
+
+            assert!(!closed, "{status}: order is live, bond must stay");
+            let stored = Bond::by_id(&pool, bond.id).await.unwrap().unwrap();
+            assert_eq!(stored.state, BondState::Requested.to_string());
+            assert!(queued_actions_for(&taker).await.is_empty());
+        }
     }
 }

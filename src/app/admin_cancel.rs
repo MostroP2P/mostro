@@ -17,7 +17,10 @@ use tracing::{error, info};
 /// Admin-initiated order cancellation.
 ///
 /// Allows authorized dispute solvers or admins to cancel an order and refund
-/// any held Lightning invoice back to the seller.
+/// any held Lightning invoice back to the seller. A still-`Pending` order
+/// (no taker, no escrow) may instead be cancelled by the operator through
+/// the daemon key — the gRPC `CancelOrder` path — see
+/// [`admin_cancel_pending_order`].
 ///
 /// # Parameters
 ///
@@ -40,6 +43,8 @@ use tracing::{error, info};
 ///
 /// Returns `MostroError` if:
 /// - Solver is not assigned to the dispute
+/// - A pre-trade (`Pending` / `WaitingTakerBond`) order is cancelled by
+///   anything but the daemon key
 /// - Order/dispute not found
 /// - Lightning invoice cancellation fails
 /// - Database update fails
@@ -56,6 +61,26 @@ pub async fn admin_cancel_action(
     let request_id = msg.get_inner_message_kind().request_id;
     // Get order
     let order = get_order(&msg, pool).await?;
+
+    // Operator cancel of a pre-trade order (`Pending`, or parked at
+    // `WaitingTakerBond` while a taker is mid-bond — the same window the
+    // maker's own cancel covers, see `cancel::cancel_action_generic`). There
+    // is no dispute to be assigned to and no escrow to refund, so the solver
+    // gates below do not apply; instead only the daemon key may do this —
+    // which is exactly what the gRPC `CancelOrder` path synthesises as
+    // `identity`. A solver acting over Nostr never carries the daemon key and
+    // is refused. Used to drain the book (open range-order maker bonds)
+    // ahead of a Lightning node migration instead of waiting for
+    // `max_expiration_days`.
+    if order.check_status(Status::Pending).is_ok()
+        || order.check_status(Status::WaitingTakerBond).is_ok()
+    {
+        if event.identity != my_keys.public_key() {
+            return Err(MostroCantDo(CantDoReason::NotAuthorized));
+        }
+        return admin_cancel_pending_order(pool, &order, my_keys, ln_client).await;
+    }
+
     // Check if the solver is assigned to the order
     match is_assigned_solver(pool, &event.identity.to_string(), order.id).await {
         Ok(false) => {
@@ -245,6 +270,89 @@ pub async fn admin_cancel_action(
         tracing::warn!(
             order_id = %order.id,
             "admin_cancel: maker bond close failed: {}", e
+        );
+    }
+
+    Ok(())
+}
+
+/// Operator cancel of a pre-trade (`Pending` / `WaitingTakerBond`) order
+/// (see the gate in [`admin_cancel_action`]). Mirrors the maker's own pending cancel
+/// (`cancel::cancel_pending_order_from_maker`): publish the replaceable
+/// event with `CanceledByAdmin`, persist it with a pre-trade CAS so a take
+/// that commits concurrently wins, then notify the maker and any bonded
+/// prospective taker, release the taker bonds and resolve the maker bond at
+/// range close.
+async fn admin_cancel_pending_order(
+    pool: &sqlx::SqlitePool,
+    order: &Order,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+) -> Result<(), MostroError> {
+    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let won = crate::db::cas_pretrade_order_status(
+        pool,
+        order_updated.id,
+        Status::CanceledByAdmin,
+        &order_updated.event_id,
+    )
+    .await?;
+    if !won {
+        // A take committed while we were publishing: the order has left the
+        // pre-trade window and now carries escrow. Put the winning state back
+        // on Nostr and tell the operator to look again.
+        crate::util::republish_winning_state_after_cas_miss(pool, my_keys, order_updated.id).await;
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    info!("Order Id {}: pending order cancelled by operator", order.id);
+
+    let maker = order.get_creator_pubkey().map_err(MostroInternalErr)?;
+    enqueue_order_msg(
+        None,
+        Some(order.id),
+        Action::AdminCanceled,
+        None,
+        maker,
+        None,
+    )
+    .await;
+
+    // Prospective takers with a bond in flight must not keep waiting on an
+    // order that will never be taken. A lookup failure is logged, not
+    // propagated: the release below still runs.
+    match bond::db::find_active_bonds_for_order(pool, order.id).await {
+        Ok(active_bonds) => {
+            for active in active_bonds.iter() {
+                if let Ok(taker_pk) = PublicKey::from_str(&active.pubkey) {
+                    if taker_pk != maker {
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            Action::AdminCanceled,
+                            None,
+                            taker_pk,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                order_id = %order.id,
+                "admin_cancel_pending: failed to look up active bonds for taker notification: {}",
+                err
+            );
+        }
+    }
+    bond::release_taker_bonds_for_order_or_warn(pool, order.id, "admin_cancel_pending").await;
+    if let Err(e) = bond::resolve_range_maker_bond_at_close(pool, ln_client, order).await {
+        tracing::warn!(
+            order_id = %order.id,
+            "admin_cancel_pending: maker bond close failed: {}", e
         );
     }
 
@@ -625,5 +733,224 @@ mod tests {
             stored_dispute.status,
             DisputeStatus::SellerRefunded.to_string()
         );
+    }
+
+    // ── Operator cancel of a still-Pending order ─────────────────────────
+
+    fn pending_sell_order(maker: PublicKey) -> Order {
+        Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::Pending.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: maker.to_string(),
+            seller_pubkey: Some(maker.to_string()),
+            buyer_pubkey: None,
+            amount: 21_000,
+            fee: 210,
+            ..Default::default()
+        }
+    }
+
+    /// The daemon key (what the gRPC `CancelOrder` path synthesises as
+    /// `identity`) may cancel a `Pending` order: no dispute, no escrow,
+    /// no counterparty. The row flips to `CanceledByAdmin` and the maker
+    /// is told via `AdminCanceled`.
+    #[tokio::test]
+    async fn daemon_key_cancels_pending_order_and_notifies_maker() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+
+        let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+        admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(daemon.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await
+        .expect("operator cancel of a pending order succeeds");
+
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
+        assert!(
+            queued_actions_for(maker)
+                .await
+                .contains(&Action::AdminCanceled),
+            "maker must be told their order was cancelled by the operator"
+        );
+    }
+
+    /// A solver (any identity other than the daemon key) has no business
+    /// cancelling a Pending order: there is no dispute to be assigned to.
+    /// Refused with `NotAuthorized`, and the row is untouched.
+    #[tokio::test]
+    async fn pending_cancel_refuses_non_daemon_identity() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let solver = Keys::generate();
+        let maker = Keys::generate().public_key();
+
+        let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(solver.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Pending.to_string());
+        assert!(queued_actions_for(maker).await.is_empty());
+    }
+
+    /// A prospective taker who has a bond in flight on the Pending order
+    /// is released and notified, so no HTLC is left waiting on an order
+    /// that will never be taken.
+    #[tokio::test]
+    async fn pending_cancel_releases_and_notifies_bonded_taker() {
+        use crate::app::bond::{db::create_bond, model::Bond, BondRole, BondState};
+
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let order = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+        let bond = create_bond(
+            ctx.pool(),
+            Bond {
+                id: uuid::Uuid::new_v4(),
+                order_id: order.id,
+                pubkey: taker.to_string(),
+                role: BondRole::Taker.to_string(),
+                amount_sats: 1_000,
+                state: BondState::Requested.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(daemon.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await
+        .expect("operator cancel of a pending order succeeds");
+
+        let stored_bond = crate::app::bond::db::find_bond_by_id(ctx.pool(), bond.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_bond.state, BondState::Released.to_string());
+        assert!(queued_actions_for(taker)
+            .await
+            .contains(&Action::AdminCanceled));
+    }
+
+    /// `WaitingTakerBond` is the same pre-trade window as `Pending` (a
+    /// taker is mid-bond, still no escrow): the operator can cancel it too,
+    /// and the in-flight taker bond is released.
+    #[tokio::test]
+    async fn daemon_key_cancels_waiting_taker_bond_order_and_releases_bond() {
+        use crate::app::bond::{db::create_bond, model::Bond, BondRole, BondState};
+
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = pending_sell_order(maker);
+        order.status = Status::WaitingTakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        let bond = create_bond(
+            ctx.pool(),
+            Bond {
+                id: uuid::Uuid::new_v4(),
+                order_id: order.id,
+                pubkey: taker.to_string(),
+                role: BondRole::Taker.to_string(),
+                amount_sats: 1_000,
+                state: BondState::Locked.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(daemon.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await
+        .expect("operator cancel during the taker bond window succeeds");
+
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
+        let stored_bond = crate::app::bond::db::find_bond_by_id(ctx.pool(), bond.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_bond.state, BondState::Released.to_string());
+        assert!(queued_actions_for(taker)
+            .await
+            .contains(&Action::AdminCanceled));
+    }
+
+    /// A take that commits between the operator's read and the CAS wins:
+    /// the cancel reports `NotAllowedByStatus`, the escrowed row keeps its
+    /// status and nobody is told the order was cancelled.
+    #[tokio::test]
+    async fn pending_cancel_loses_cas_to_a_concurrent_take() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+
+        // The operator's snapshot says Pending, but the row has already
+        // moved on to `waiting-payment` (a take committed).
+        let snapshot = pending_sell_order(maker).create(ctx.pool()).await.unwrap();
+        let mut taken = snapshot.clone();
+        taken.status = Status::WaitingPayment.to_string();
+        taken.update(ctx.pool()).await.unwrap();
+
+        let result = admin_cancel_pending_order(ctx.pool(), &snapshot, &daemon, &mut ln).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        let stored = Order::by_id(ctx.pool(), snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, Status::WaitingPayment.to_string());
+        assert!(queued_actions_for(maker).await.is_empty());
     }
 }

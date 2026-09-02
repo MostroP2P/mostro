@@ -188,9 +188,31 @@ async fn job_relay_list(ctx: AppContext) {
     });
 }
 
+/// Why the info-event job woke up: the regular interval elapsed, or the
+/// maintenance flag changed and the `maintenance_mode` tag must go out now.
+#[derive(Debug, PartialEq, Eq)]
+enum InfoWake {
+    Interval,
+    MaintenanceChanged,
+}
+
+/// Wait for whichever comes first: the publish interval or a maintenance
+/// flag change. Split out of `job_info_event_send` so the wake-up rule is
+/// unit-testable without a nostr client.
+async fn wait_for_info_wake(
+    interval: tokio::time::Duration,
+    maintenance: &crate::app::maintenance::MaintenanceState,
+) -> InfoWake {
+    tokio::select! {
+        _ = tokio::time::sleep(interval) => InfoWake::Interval,
+        _ = maintenance.changed() => InfoWake::MaintenanceChanged,
+    }
+}
+
 async fn job_info_event_send(ctx: AppContext) {
     let mostro_keys = ctx.keys().clone();
     let client = ctx.nostr_client().clone();
+    let maintenance = ctx.maintenance().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
     // The info event embeds LN node stats (`info_to_tags`). In Cashu mode there
     // is no LND, so `LN_STATUS` is never set — skip the job rather than panic
@@ -201,9 +223,14 @@ async fn job_info_event_send(ctx: AppContext) {
     };
     tokio::spawn(async move {
         loop {
-            info!("Sending info about mostro");
+            let in_maintenance = maintenance.is_enabled();
+            if in_maintenance {
+                warn!("Sending info about mostro (maintenance mode ON: new orders and takes are rejected)");
+            } else {
+                info!("Sending info about mostro");
+            }
 
-            let tags = crate::nip33::info_to_tags(ln_status);
+            let tags = crate::nip33::info_to_tags(ln_status, in_maintenance);
             let id = mostro_keys.public_key().to_string();
 
             let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
@@ -213,7 +240,11 @@ async fn job_info_event_send(ctx: AppContext) {
 
             let _ = client.send_event(&info_ev).await;
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            if wait_for_info_wake(tokio::time::Duration::from_secs(interval), &maintenance).await
+                == InfoWake::MaintenanceChanged
+            {
+                info!("Maintenance flag changed: republishing mostro info now");
+            }
         }
     });
 }
@@ -2372,6 +2403,36 @@ mod tests {
                 .is_empty(),
             "undeliverable restore-session message must be dropped after retries"
         );
+    }
+
+    /// The info job must republish as soon as the maintenance flag flips,
+    /// not at the next interval tick.
+    #[tokio::test]
+    async fn info_wake_fires_on_maintenance_change_before_the_interval() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = crate::app::maintenance::MaintenanceState::load(&pool)
+            .await
+            .unwrap();
+        let interval = tokio::time::Duration::from_secs(3600);
+
+        let waiter = state.clone();
+        let wake = tokio::spawn(async move { wait_for_info_wake(interval, &waiter).await });
+        tokio::task::yield_now().await;
+        state.set(&pool, true, None).await.unwrap();
+        let reason = tokio::time::timeout(tokio::time::Duration::from_secs(1), wake)
+            .await
+            .expect("must not wait for the interval")
+            .unwrap();
+        assert_eq!(reason, InfoWake::MaintenanceChanged);
+    }
+
+    #[tokio::test]
+    async fn info_wake_falls_back_to_the_interval() {
+        tokio::time::pause();
+        let state = crate::app::maintenance::MaintenanceState::new();
+        let reason = wait_for_info_wake(tokio::time::Duration::from_secs(10), &state).await;
+        assert_eq!(reason, InfoWake::Interval);
     }
 
     #[tokio::test]

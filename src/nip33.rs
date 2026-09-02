@@ -569,7 +569,9 @@ fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
 /// # Arguments
 ///
 ///
-pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
+/// `maintenance` is the current maintenance (drain) flag; the tag is always
+/// emitted so clients can tell "maintenance off" from "older daemon".
+pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
     let bond_settings = Settings::get_bond();
@@ -658,6 +660,10 @@ pub fn info_to_tags(ln_status: &LnStatus) -> Tags {
     ];
 
     tags_vec.extend(bond_policy_tags(bond_settings));
+    tags_vec.push(Tag::custom(
+        "maintenance_mode",
+        vec![maintenance.to_string()],
+    ));
 
     Tags::from_list(tags_vec)
 }
@@ -966,7 +972,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -978,7 +984,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -986,6 +992,34 @@ mod tests {
         assert_eq!(
             y_values, expected,
             "info_to_tags must wire create_platform_tag_values correctly into the y tag"
+        );
+    }
+
+    fn tag_value(tags: &Tags, name: &str) -> Option<String> {
+        tags.iter()
+            .find(|t| t.kind() == name)
+            .and_then(|t| t.content().map(str::to_string))
+    }
+
+    #[test]
+    fn info_to_tags_emits_maintenance_mode_false_by_default() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+        let tags = info_to_tags(&ln_status, false);
+        assert_eq!(
+            tag_value(&tags, "maintenance_mode").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn info_to_tags_emits_maintenance_mode_true_when_enabled() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+        let tags = info_to_tags(&ln_status, true);
+        assert_eq!(
+            tag_value(&tags, "maintenance_mode").as_deref(),
+            Some("true")
         );
     }
 
@@ -1001,7 +1035,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         // Expectations come from the settings actually installed in
         // `MOSTRO_CONFIG`, never from this module's `test_settings()` copy:
@@ -1125,7 +1159,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status);
+        let tags = info_to_tags(&ln_status, false);
 
         assert_eq!(
             get_tag_value(&tags, "bond_enabled").as_deref(),

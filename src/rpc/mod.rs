@@ -25,6 +25,7 @@ mod tests {
         let cancel_request = CancelOrderRequest {
             order_id: "test-order".to_string(),
             request_id: Some("test-request".to_string()),
+            pretrade_only: None,
         };
 
         assert_eq!(cancel_request.order_id, "test-order");
@@ -45,6 +46,7 @@ mod tests {
         let _cancel_req = CancelOrderRequest {
             order_id: "order1".to_string(),
             request_id: None,
+            pretrade_only: None,
         };
 
         let _settle_req = SettleOrderRequest {

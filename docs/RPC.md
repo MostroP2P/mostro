@@ -64,6 +64,13 @@ Any other status is refused with `NotAllowedByStatus`.
 
 - `order_id`: UUID of the order to cancel
 - `request_id`: Optional request identifier
+- `pretrade_only`: Optional. When `true` the daemon refuses any order that is
+  not still `pending` / `waiting-taker-bond` (`success = false` with the
+  order's status in `error_message`) instead of falling through to the
+  dispute-resolution cancel. Operator tooling that means "cancel this pending
+  order" — `mostro-cli admcancelpending` — sets it, so a mistyped id is
+  refused instead of closing a dispute. Unknown fields are dropped on the
+  wire (proto3), so a daemon older than this field silently ignores it.
 
 **Response:**
 
@@ -235,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = tonic::Request::new(CancelOrderRequest {
         order_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         request_id: Some("12345".to_string()),
+        pretrade_only: None,
     });
     
     let response = client.cancel_order(request).await?;

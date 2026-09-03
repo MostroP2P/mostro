@@ -199,13 +199,28 @@ impl InboxKeeper {
                 message,
             } if subscription_id.as_ref() == self.subscription.id() => {
                 if is_provisional_closure(message) {
-                    // The REQ is not the keeper's to re-send: the SDK only
-                    // *marks* these two prefixes and re-sends it itself —
-                    // after the NIP-42 round-trip for `auth-required`, on the
-                    // next reconnect for `rate-limited`. Re-issuing it here
-                    // would drop the entry the SDK is about to re-send, race
-                    // its AUTH, and arm a backoff against a relay that is
-                    // behaving exactly as the protocol says it should.
+                    // The REQ is not the keeper's to re-send *on this frame*:
+                    // the SDK only *marks* these two prefixes and re-sends it
+                    // itself — after the NIP-42 round-trip for
+                    // `auth-required`, on the next reconnect for
+                    // `rate-limited`. Re-issuing it here, in the microseconds
+                    // after the frame arrives, would drop the entry the SDK is
+                    // about to re-send, cut across its AUTH, and arm a backoff
+                    // against a relay that is behaving exactly as the protocol
+                    // says it should.
+                    //
+                    // The stand-down is scoped to that window and no further.
+                    // `check_inbox_health` will re-send the REQ at the next
+                    // audit if the relay still has not answered, and that is
+                    // deliberate rather than an override of this branch: an
+                    // AUTH round-trip completes in well under
+                    // `INBOX_WATCHDOG_INTERVAL`, so a relay still
+                    // unacknowledged a full interval later is one the SDK's
+                    // own recovery did not reach — the `rate-limited` and
+                    // rejected-AUTH dead ends below. A relay that *did* answer
+                    // is acknowledged and the audit never touches it, so the
+                    // backstop costs a redundant REQ only in the case where
+                    // standing down permanently would mean silent deafness.
                     //
                     // The *health verdict* is another matter, and must not
                     // stand down with it. `MarkAsClosed` leaves the entry in
@@ -369,6 +384,14 @@ async fn resubscribe_relay(
 /// it answers, which costs one interval before recovery is declared and keeps
 /// the error on the safe side: the timeout clock stays frozen slightly longer
 /// than strictly needed rather than restarting too early.
+///
+/// The audit re-sends to every unacknowledged relay, including one
+/// [`InboxKeeper`] stood down on after a provisional `CLOSED`. That is the
+/// intended hand-off, not a bypass: the keeper stands down for the instant the
+/// frame arrives, so it does not cut across the SDK's own AUTH round-trip, and
+/// by the time an audit comes round that round-trip has either produced an
+/// `EOSE` — in which case the relay is acknowledged and left alone — or it
+/// never will, which is exactly when the REQ has to come from here.
 pub async fn check_inbox_health(client: &Client, subscription: &InboxSubscription) -> InboxStatus {
     check_inbox_health_with(client, subscription, InboxHealth::global()).await
 }

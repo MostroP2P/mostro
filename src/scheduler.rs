@@ -534,7 +534,7 @@ async fn reconfirm_timeout_eligibility(
     (still_waiting && still_expired).then_some(fresh)
 }
 
-/// Downtime credit for one order, bounded to one expiration window.
+/// Downtime credit for one order, bounded by the inbox pause ceiling.
 ///
 /// `blind_overlap` is the retained inbox downtime overlapping the order's
 /// wait (`InboxHealth::blind_seconds_since(taken_at)`), and it is what the
@@ -546,19 +546,35 @@ async fn reconfirm_timeout_eligibility(
 /// until CLTV expiry and the taker's bond stays `Locked`. That is the state
 /// `MAX_UNCONFIRMED_INBOX_PAUSE_SECS` exists to prevent, reached through a
 /// path its continuous-stretch measure never sees, so the credit itself has
-/// to carry a bound. One full window is the cap: past it the error is a
-/// hastened cancellation, which stops costing anything once the user
-/// re-sends, while the uncapped error is an escrow nothing ever unwinds.
+/// to carry a bound.
+///
+/// The bound is that same ceiling, and it cannot be tighter. One expiration
+/// window looks like the natural cap and is the wrong one: an order is
+/// spared only while `waited < exp + min(D, cap)`, and on the first tick
+/// after an outage of length `D` it has waited `pre + D`, where `pre` is
+/// what it had already waited when the outage began. A cap of `exp`
+/// therefore spares nobody once `D >= 2 * exp` — every order in
+/// `waiting-buyer-invoice` or `waiting-payment` is cancelled and the
+/// responsible bond slashed, for a silence that was the node's. `blameless`
+/// does not catch it: it arms only while the inbox is unconfirmed, and
+/// recovery clears that before the tick runs. The risk profile ends up
+/// inverted — a four-hour outage unwinds blamelessly and costs nobody
+/// anything, while a forty-five minute one slashes everyone who was waiting
+/// through it. Capping at `MAX_UNCONFIRMED_INBOX_PAUSE_SECS` keeps the
+/// flapping hazard just as bounded — worst case an escrow is held for one
+/// expiration window past the ceiling, against a CLTV horizon of about
+/// twenty-two hours — without ever charging a user for downtime they sat
+/// through.
 ///
 /// An order with no real anchor (`taken_at <= 0`; pre-trade CAS writes have
 /// been seen to drop the field, see #866) gets no credit: there is no wait
 /// to intersect the windows with, and its computed age is decades long,
 /// beyond any bounded credit anyway.
-fn downtime_credit(taken_at: i64, exp_seconds: u32, blind_overlap: i64) -> i64 {
+fn downtime_credit(taken_at: i64, blind_overlap: i64) -> i64 {
     if taken_at <= 0 {
         return 0;
     }
-    blind_overlap.min(exp_seconds as i64)
+    blind_overlap.min(MAX_UNCONFIRMED_INBOX_PAUSE_SECS)
 }
 
 async fn job_cancel_orders(ctx: AppContext) {
@@ -624,7 +640,7 @@ async fn job_cancel_orders(ctx: AppContext) {
             // the only place it is applied. `find_order_by_seconds` selects on
             // the nominal deadline alone — deliberately over-selecting — and
             // the exact figure, the downtime that overlaps *this* order's own
-            // wait (bounded to one expiration window, see `downtime_credit`),
+            // wait (bounded by the pause ceiling, see `downtime_credit`),
             // decides below. A single global allowance cannot do this:
             // it would either under-credit an order that waited through the
             // whole outage or hand the same credit to one taken long after it
@@ -643,7 +659,7 @@ async fn job_cancel_orders(ctx: AppContext) {
             let max_grace = health
                 .as_ref()
                 .filter(|_| !blameless)
-                .map(|h| h.max_blind_seconds().min(exp_seconds as i64))
+                .map(|h| h.max_blind_seconds().min(MAX_UNCONFIRMED_INBOX_PAUSE_SECS))
                 .unwrap_or(0);
             if max_grace > 0 {
                 info!(
@@ -670,7 +686,6 @@ async fn job_cancel_orders(ctx: AppContext) {
                     if let Some(health) = health.as_ref().filter(|_| !blameless) {
                         let owed = downtime_credit(
                             order.taken_at,
-                            exp_seconds,
                             health.blind_seconds_since(order.taken_at),
                         );
                         let waited =
@@ -1744,29 +1759,70 @@ mod tests {
 
     // ── downtime_credit ──────────────────────────────────────────────────
 
-    /// An outage shorter than the deadline is credited in full: the order
-    /// gets back exactly the downtime that overlapped its wait.
+    /// An outage the credit is not asked to bound is passed through in full:
+    /// the order gets back exactly the downtime that overlapped its wait.
     #[test]
     fn downtime_credit_passes_a_real_outage_through_unchanged() {
-        assert_eq!(downtime_credit(1_700_000_000, 900, 300), 300);
-        assert_eq!(downtime_credit(1_700_000_000, 900, 900), 900);
+        assert_eq!(downtime_credit(1_700_000_000, 300), 300);
+        assert_eq!(downtime_credit(1_700_000_000, 900), 900);
+        assert_eq!(
+            downtime_credit(1_700_000_000, MAX_UNCONFIRMED_INBOX_PAUSE_SECS),
+            MAX_UNCONFIRMED_INBOX_PAUSE_SECS
+        );
     }
 
     /// The flapping-inbox hazard: windows are retained for days, so their sum
     /// can exceed any deadline while `is_confirmed_listening` keeps the tick
     /// running. Uncapped, `waited < exp + owed` would hold on every tick and
     /// the order would never unwind — hold invoice encumbered until CLTV
-    /// expiry, taker's bond `Locked`. The credit is bounded to one expiration
-    /// window so the deadline always stays reachable.
+    /// expiry, taker's bond `Locked`. The credit is bounded by the ceiling
+    /// that already bounds the timeout pause, so the deadline always stays
+    /// reachable.
     #[test]
-    fn downtime_credit_is_capped_at_one_expiration_window() {
-        let exp: u32 = 900;
-        let owed = downtime_credit(1_700_000_000, exp, 7 * 24 * 3600);
-        assert_eq!(owed, exp as i64);
-        // An order that has waited two full windows is late even against the
-        // largest credit the cap allows.
-        let waited = 2 * exp as i64;
-        assert!(waited >= exp as i64 + owed);
+    fn downtime_credit_is_capped_at_the_inbox_pause_ceiling() {
+        let owed = downtime_credit(1_700_000_000, 7 * 24 * 3600);
+        assert_eq!(owed, MAX_UNCONFIRMED_INBOX_PAUSE_SECS);
+        // An order still waiting one full window past the ceiling is late
+        // even against the largest credit the cap allows.
+        let exp: i64 = 900;
+        let waited = exp + MAX_UNCONFIRMED_INBOX_PAUSE_SECS;
+        assert!(waited >= exp + owed);
+    }
+
+    /// The harm a tighter cap caused: an outage of two full expiration
+    /// windows, an order taken just as it began. On the first tick after
+    /// recovery the order has waited the whole outage, so capping the credit
+    /// at one window would have answered 1800s of enforced silence with 900s
+    /// of credit — cancelling the order and slashing the responsible bond for
+    /// a wait that was entirely the node's deafness. Every second of it is
+    /// owed back.
+    #[test]
+    fn an_outage_of_two_windows_spares_the_order_that_sat_through_it() {
+        let exp: i64 = 900;
+        let outage = 2 * exp;
+        let owed = downtime_credit(1_700_000_000, outage);
+        // Taken as the outage began, so its entire wait is downtime.
+        let waited = outage;
+        assert!(
+            waited < exp + owed,
+            "an order whose whole wait was inbox downtime must not be cancelled: \
+             waited {waited}s against a deadline of {exp}s plus {owed}s of credit"
+        );
+    }
+
+    /// The bound still has to bite: once an order has waited its window on
+    /// top of the longest credit the cap allows, it is genuinely late and
+    /// unwinds normally. This is the property the cap exists for — the
+    /// deadline must stay reachable no matter how much downtime accrued.
+    #[test]
+    fn the_cap_keeps_the_deadline_reachable_after_the_longest_outage() {
+        let exp: i64 = 900;
+        let owed = downtime_credit(1_700_000_000, 30 * 24 * 3600);
+        let waited = exp + MAX_UNCONFIRMED_INBOX_PAUSE_SECS + 1;
+        assert!(
+            waited >= exp + owed,
+            "no amount of accrued downtime may put the deadline out of reach"
+        );
     }
 
     /// An order whose `taken_at` was never persisted has no anchor to
@@ -1774,8 +1830,8 @@ mod tests {
     /// meaningless one.
     #[test]
     fn downtime_credit_gives_an_unanchored_order_nothing() {
-        assert_eq!(downtime_credit(0, 900, 300), 0);
-        assert_eq!(downtime_credit(-5, 900, 300), 0);
+        assert_eq!(downtime_credit(0, 300), 0);
+        assert_eq!(downtime_credit(-5, 300), 0);
     }
 
     // ── reconfirm_timeout_eligibility ────────────────────────────────────

@@ -35,6 +35,25 @@ max_final_cltv_expiry_delta = 144
 # dispute (FiatSent) while the escrow still exists. Must comfortably
 # exceed your node's holdexpirydelta.
 escrow_deadline_margin_blocks = 24
+# Upper bound (in blocks) on the TOTAL timelock of a payout route, handed to
+# LND as `cltv_limit`. max_final_cltv_expiry_delta bounds only the payee's own
+# hop; this bounds the whole path, which is what your channel is really locked
+# for when a hop force-closes and the HTLC resolves on-chain.
+#
+# Omit this line and you get 1008. Set it to 0 to send no ceiling at all and
+# let your node apply its own --max-cltv-expiry (2016 blocks by default).
+#
+# Two bounds to respect:
+#  - Not above your node's --max-cltv-expiry. LND refuses a larger cltv_limit
+#    outright instead of clamping it, so if you lowered that setting below
+#    1008, lower this one to match or set it to 0. Until then every payout
+#    retries without the ceiling and logs an error.
+#  - At least 576 blocks above max_final_cltv_expiry_delta, or there is no room
+#    left for a route and honest payouts fail with "no route". A smaller
+#    non-zero value is refused and deferred to the node, with an error logged;
+#    it is deliberately NOT raised to that floor, since inventing a ceiling
+#    could push it past your node's maximum.
+payment_cltv_limit = 1008
 # Boot guard: mostrod refuses to start against a Lightning node whose
 # identity pubkey differs from the one it last ran with while escrow
 # (hold invoices, bonds, in-flight payouts) is still open on the old

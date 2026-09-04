@@ -492,6 +492,24 @@ pub struct LightningSettings {
     /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
+    /// Upper bound, in blocks, on the *total* timelock of a payout route
+    /// (`SendPaymentRequest.cltv_limit`).
+    /// [`max_final_cltv_expiry_delta`](Self::max_final_cltv_expiry_delta)
+    /// bounds only the payee's own hop; this bounds the whole path, which is
+    /// what the node's channel is actually locked for when a hop force-closes
+    /// and the HTLC has to resolve on-chain.
+    ///
+    /// Omitted from `settings.toml`, it takes the 1008-block default below.
+    /// Set to `0` to send no ceiling at all and let the node apply its own
+    /// `--max-cltv-expiry` (2016 blocks by default).
+    ///
+    /// Must not exceed that node setting: LND refuses a larger `cltv_limit`
+    /// outright rather than clamping it. An operator who lowered
+    /// `--max-cltv-expiry` below this value needs to lower this one to match,
+    /// or set `0`; until then every payout falls back to a retry without the
+    /// ceiling and logs an error.
+    #[serde(default = "default_payment_cltv_limit")]
+    pub payment_cltv_limit: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
     /// default the daemon refuses to start against a Lightning node whose
     /// identity pubkey differs from the one it last ran with while escrow
@@ -520,6 +538,18 @@ fn default_max_final_cltv_expiry_delta() -> u32 {
     144
 }
 
+/// Half of LND's own `--max-cltv-expiry` default (2016), so it fits under a
+/// stock node without adjustment. A payout route never legitimately needs a
+/// week of timelock: the longest plausible path is a handful of hops of 144
+/// blocks each on top of the invoice's final delta, which
+/// [`MIN_ROUTE_CLTV_HEADROOM`](crate::lightning::MIN_ROUTE_CLTV_HEADROOM)
+/// already covers with room to spare. Halving the ceiling halves the
+/// worst-case on-chain resolution window without narrowing pathfinding to
+/// the point of failing honest payouts.
+fn default_payment_cltv_limit() -> u32 {
+    1008
+}
+
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
 /// `holdexpirydelta` (12) plus slack for block-time variance and the
 /// guardian job's tick.
@@ -542,6 +572,7 @@ impl Default for LightningSettings {
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
+            payment_cltv_limit: default_payment_cltv_limit(),
             allow_node_change: false,
         }
     }

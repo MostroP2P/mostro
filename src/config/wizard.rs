@@ -147,6 +147,7 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         payment_retries_interval: 60,
         max_final_cltv_expiry_delta: 144,
         escrow_deadline_margin_blocks: 24,
+        payment_cltv_limit: 1008,
         allow_node_change: false,
     })
 }

@@ -630,7 +630,7 @@ async fn pay_counterparty(
     // reason to strand a payout.
     let destination = decoded.get_payee_pub_key().to_string();
     let caps = PayoutCaps::from_settings(Settings::get_ln());
-    let _reservation = match claim_payout_slot(ln_client, &destination, caps).await {
+    let mut reservation = match claim_payout_slot(ln_client, &destination, caps).await {
         Ok(SlotVerdict::Reserved(reservation)) => Some(reservation),
         Ok(SlotVerdict::Held { counted, reason }) => {
             let (count, cap, what) = match reason {
@@ -732,6 +732,10 @@ async fn pay_counterparty(
     let drain_fut = async move {
         let mut outcome = StreamOutcome::Ended;
         while let Some(msg) = rx.recv().await {
+            // LND now reports this payment itself; the slot booked at the
+            // gate would count it a second time for the rest of the send.
+            // Same release point as the buyer payout's watcher.
+            reservation.take();
             if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
                 match status {
                     PaymentStatus::Succeeded => {

@@ -29,6 +29,14 @@ max_final_cltv_expiry_delta = 432
 # dispute (FiatSent) while the escrow still exists. Must comfortably
 # exceed your node's holdexpirydelta.
 escrow_deadline_margin_blocks = 24
+# Ceiling on how many payments the node may have in flight before a new payout
+# waits its turn instead of adding another unresolved HTLC. A payee that never
+# settles pins the sats, the routing liquidity behind them and an HTLC slot
+# until the CLTV expires, and a locked-in HTLC cannot be canceled by the
+# sender — so without a ceiling, cheap repeat trades can exhaust the node's
+# slots. A gated payout is delayed, never dropped: it goes out on its own once
+# the node has room. 0 disables the gate.
+max_inflight_payouts = 100
 # Boot guard: mostrod refuses to start against a Lightning node whose
 # identity pubkey differs from the one it last ran with while escrow
 # (hold invoices, bonds, in-flight payouts) is still open on the old

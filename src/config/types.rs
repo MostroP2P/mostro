@@ -477,6 +477,14 @@ pub struct LightningSettings {
     /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
+    /// Ceiling on how many payments the node may have in flight before a new
+    /// payout waits its turn instead of adding another unresolved HTLC. A
+    /// payee that never settles pins the sats, the routing liquidity behind
+    /// them and an HTLC slot until the CLTV expires, and the sender cannot
+    /// cancel a locked-in HTLC — so without a ceiling, cheap repeat trades
+    /// can exhaust the node's slots. `0` disables the gate.
+    #[serde(default = "default_max_inflight_payouts")]
+    pub max_inflight_payouts: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
     /// default the daemon refuses to start against a Lightning node whose
     /// identity pubkey differs from the one it last ran with while escrow
@@ -493,6 +501,14 @@ pub struct LightningSettings {
 /// cannot pin routing liquidity for weeks.
 fn default_max_final_cltv_expiry_delta() -> u32 {
     432
+}
+
+/// Far above what healthy operation reaches — a payout normally resolves in
+/// seconds, so in-flight payments are a handful at a time — and far below the
+/// 483 HTLCs a single channel can hold, so the gate stays invisible in normal
+/// use and only bites when payouts are genuinely piling up unresolved.
+fn default_max_inflight_payouts() -> u32 {
+    100
 }
 
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
@@ -517,6 +533,7 @@ impl Default for LightningSettings {
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
+            max_inflight_payouts: default_max_inflight_payouts(),
             allow_node_change: false,
         }
     }

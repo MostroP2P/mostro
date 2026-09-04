@@ -3,7 +3,9 @@ use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
-use crate::lightning::{LndConnector, PaymentMessage, PAYOUT_SEND_PAYMENT_TIMEOUT};
+use crate::lightning::{
+    payout_gate_should_wait, LndConnector, PaymentMessage, PAYOUT_SEND_PAYMENT_TIMEOUT,
+};
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
@@ -764,6 +766,71 @@ pub async fn do_payment(
                 }
             }
         };
+
+        // Slot gate. The dispatch semaphore bounds how many sends run at
+        // once, but a send returns after PAYOUT_SEND_PAYMENT_TIMEOUT while
+        // the HTLC it created stays locked in — a payee that never settles
+        // keeps it, and the slot behind it, until the CLTV expires. So the
+        // semaphore alone cannot stop unresolved payouts from accumulating
+        // until the node runs out of HTLC slots.
+        //
+        // Wait rather than fail: the claim is durable and heartbeated, so a
+        // gated payout is delayed, not lost, and it goes out by itself once
+        // the node has room. Failing here would burn the buyer's retry budget
+        // over a condition they did not cause.
+        //
+        // The count comes from LND, never from the payout rows: a row is
+        // claimed before its send, so counting rows would count payouts still
+        // queued behind this very gate and deadlock a backlog against itself.
+        //
+        // A node that cannot answer is not a reason to strand a payout, so
+        // the gate fails open — the same call the duplicate guard in
+        // `send_payment` makes for the same reason.
+        let inflight_cap = ctx.settings().lightning.max_inflight_payouts;
+        loop {
+            let inflight = match ln_client_payment.count_inflight_payments().await {
+                Ok(count) => count,
+                Err(e) => {
+                    warn!(
+                        "Order {}: in-flight payout count unavailable ({e}); dispatching hash {} without the slot gate",
+                        order.id, payout_hash
+                    );
+                    break;
+                }
+            };
+            if !payout_gate_should_wait(inflight, inflight_cap) {
+                break;
+            }
+            warn!(
+                "Order {}: {} payments already in flight (cap {}); holding payout of hash {} until the node has room",
+                order.id, inflight, inflight_cap, payout_hash
+            );
+            tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT).await;
+            match crate::db::touch_order_payout_claim(
+                ctx.pool(),
+                order.id,
+                &payout_hash,
+                Some(payout_claimed_at),
+            )
+            .await
+            {
+                Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
+                Ok(None) => {
+                    warn!(
+                        "Order {}: payout claim was re-armed or replaced while gated; dropping stale dispatch of hash {}",
+                        order.id, payout_hash
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Order {}: could not heartbeat payout claim while gated ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
+                        order.id, payout_hash
+                    );
+                    return;
+                }
+            }
+        }
 
         // Final re-validation now that the queue wait is over, refreshing
         // the timestamp in the same CAS (the last heartbeat may be up to a

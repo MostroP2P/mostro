@@ -63,6 +63,24 @@ pub struct PaymentMessage {
     pub payment: Payment,
 }
 
+/// How many of the most recent payments [`LndConnector::count_inflight_payments`]
+/// scans. `ListPayments` has no server-side status filter, so the count is
+/// taken over a bounded, newest-first window instead of the node's whole
+/// payment history — which on a busy node is expensive to walk on every
+/// dispatch. An in-flight payment is always recent (an HTLC cannot outlive
+/// its CLTV expiry), so the window only undercounts on a node that completed
+/// this many payments *since* the oldest still-stuck one.
+pub(crate) const PAYOUT_INFLIGHT_SCAN_LIMIT: u64 = 2_000;
+
+/// Whether a payout must wait rather than add another in-flight HTLC.
+///
+/// `cap == 0` disables the gate. Otherwise the payout waits once LND already
+/// holds `cap` in-flight payments, so the cap is a ceiling on simultaneously
+/// unresolved outgoing payments, not on payouts per unit of time.
+pub fn payout_gate_should_wait(inflight: u32, cap: u32) -> bool {
+    cap != 0 && inflight >= cap
+}
+
 /// Routing-fee cap (in sats) handed to LND as `fee_limit_sat` for a
 /// payment of `amount` sats.
 ///
@@ -403,6 +421,53 @@ impl LndConnector {
         Ok(())
     }
 
+    /// Number of payments LND currently holds in flight.
+    ///
+    /// This asks the node, not the database, and the difference matters: a
+    /// payout row is marked claimed *before* its send, so counting rows would
+    /// count payouts still queued behind the dispatch semaphore and let a
+    /// backlog gate itself into a standstill. LND only reports a payment once
+    /// it is really out on the wire, and it keeps reporting a locked-in HTLC
+    /// the sender can no longer cancel — which is exactly the resource the
+    /// cap protects.
+    ///
+    /// Scans the newest [`PAYOUT_INFLIGHT_SCAN_LIMIT`] payments; see that
+    /// constant for the bound this puts on accuracy.
+    pub async fn count_inflight_payments(&mut self) -> Result<u32, MostroError> {
+        let request = fedimint_tonic_lnd::lnrpc::ListPaymentsRequest {
+            // Pending *and* failed payments; the status filter below keeps
+            // only the pending ones.
+            include_incomplete: true,
+            // Newest first: in-flight payments are always among the recent
+            // ones, so this is where the bounded window pays off.
+            reversed: true,
+            max_payments: PAYOUT_INFLIGHT_SCAN_LIMIT,
+            // Walking the whole history just to produce a total would defeat
+            // the point of the bounded window.
+            count_total_payments: false,
+            ..Default::default()
+        };
+
+        let response = self
+            .client
+            .lightning()
+            .list_payments(request)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
+
+        let inflight = response
+            .into_inner()
+            .payments
+            .into_iter()
+            .filter(|payment| {
+                fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
+                    == Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight)
+            })
+            .count();
+
+        Ok(u32::try_from(inflight).unwrap_or(u32::MAX))
+    }
+
     /// Look up a payment by hash, distinguishing "LND has no record" from
     /// transport errors.
     ///
@@ -545,7 +610,7 @@ impl LnStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hash32, routing_fee_cap_sats};
+    use super::{decode_hash32, payout_gate_should_wait, routing_fee_cap_sats};
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::*;
@@ -569,6 +634,32 @@ mod tests {
             cashu: None,
             price: None,
         });
+    }
+
+    /// Under the cap the payout goes straight out: the gate must be
+    /// invisible in normal operation, where in-flight payments are a handful
+    /// at a time.
+    #[test]
+    fn payout_gate_lets_a_payout_through_below_the_cap() {
+        assert!(!payout_gate_should_wait(0, 100));
+        assert!(!payout_gate_should_wait(99, 100));
+    }
+
+    /// At the cap the payout waits — the cap is a ceiling on simultaneously
+    /// unresolved HTLCs, so the Nth+1 must not be added.
+    #[test]
+    fn payout_gate_holds_a_payout_at_and_above_the_cap() {
+        assert!(payout_gate_should_wait(100, 100));
+        assert!(payout_gate_should_wait(4_000, 100));
+        assert!(payout_gate_should_wait(u32::MAX, 1));
+    }
+
+    /// `0` is the documented opt-out. An operator who disables the gate must
+    /// never be gated, however many payments are stuck.
+    #[test]
+    fn payout_gate_is_disabled_by_a_zero_cap() {
+        assert!(!payout_gate_should_wait(0, 0));
+        assert!(!payout_gate_should_wait(u32::MAX, 0));
     }
 
     #[test]
@@ -783,6 +874,16 @@ mod offline_connector_tests {
         init_test_settings();
         let mut ln = offline_connector().await;
         assert!(ln.get_node_info().await.is_err());
+    }
+
+    /// The gate fails open on an unreachable node, so the error has to
+    /// surface as an error rather than a silent zero — a zero would read as
+    /// "nothing in flight" and wave every payout through.
+    #[tokio::test]
+    async fn count_inflight_payments_surfaces_transport_error() {
+        init_test_settings();
+        let mut ln = offline_connector().await;
+        assert!(ln.count_inflight_payments().await.is_err());
     }
 
     #[tokio::test]

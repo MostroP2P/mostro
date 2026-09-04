@@ -533,6 +533,18 @@ pub async fn find_order_by_date(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// Orders whose waiting deadline has passed and are therefore candidates for
+/// the timeout job.
+///
+/// The nominal deadline is the only thing this query knows about. Compensation
+/// for time the daemon spent unable to receive anything is **not** applied
+/// here: what an order is owed depends on which outages overlap its own wait,
+/// which this predicate cannot express. So the selection deliberately
+/// over-selects — every order past its wall-clock deadline — and the caller
+/// spares the ones it must, order by order (see `scheduler::job_cancel_orders`
+/// and [`crate::inbox::InboxHealth::blind_seconds_since`]). Narrowing the
+/// window here would put those rows out of reach and make the per-order credit
+/// unreachable.
 pub async fn find_order_by_seconds(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let mostro_settings = Settings::get_mostro();
     let exp_seconds = mostro_settings.expiration_seconds as u64;
@@ -5333,6 +5345,58 @@ mod migration_and_query_tests {
             stale.is_empty(),
             "a just-taken order must not be timeout-cancel eligible"
         );
+    }
+
+    /// Regression: the query must select on the nominal deadline alone.
+    ///
+    /// It used to subtract the largest outage the node had seen from the
+    /// cut-off, which narrows the selection rather than widening it — every
+    /// surviving row was then already past `deadline + max_blind_seconds`, so
+    /// the scheduler's per-order credit could never spare anything and the
+    /// global allowance the design rejects was what actually shipped. An order
+    /// one second past its deadline has to reach the caller for the per-order
+    /// figure to have anything to decide about.
+    #[tokio::test]
+    async fn find_order_by_seconds_selects_on_the_nominal_deadline_alone() {
+        init_test_settings();
+        let pool = migrated_pool().await;
+
+        let exp_seconds = Settings::get_mostro().expiration_seconds as i64;
+        let now = Timestamp::now().as_secs() as i64;
+
+        // Barely late: one second past the wall-clock deadline.
+        let late_id = Uuid::new_v4();
+        insert_order(
+            &pool,
+            late_id,
+            "sell",
+            "waiting-buyer-invoice",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_B,
+            now - exp_seconds - 1,
+        )
+        .await;
+        // Barely not late: one second short of it.
+        insert_order(
+            &pool,
+            Uuid::new_v4(),
+            "buy",
+            "waiting-payment",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            now - exp_seconds + 1,
+        )
+        .await;
+
+        let stale = find_order_by_seconds(&pool).await.unwrap();
+        assert_eq!(
+            stale.len(),
+            1,
+            "the cut-off is the nominal deadline, neither widened nor narrowed"
+        );
+        assert_eq!(stale[0].id, late_id);
     }
 
     #[tokio::test]

@@ -572,6 +572,32 @@ fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
     }
 }
 
+/// The two invoice windows the info event advertises, each under its own name.
+///
+/// They are different settings with different jobs and clients act on both:
+/// `invoice_expiration_window` is the remaining lifetime a payout invoice must
+/// still have for `validate_bolt11_invoice` to accept it, while
+/// `hold_invoice_expiration_window` is how long a taker has to pay or supply
+/// an invoice. Advertising one under the other's name makes clients build
+/// invoices mostrod then rejects.
+///
+/// Takes the settings and reads them by field name, so there is no argument
+/// order to get wrong at the call site, and a test can hand it distinct values
+/// instead of depending on which module wins the global-settings race in the
+/// test binary.
+fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 2] {
+    [
+        Tag::custom(
+            "invoice_expiration_window",
+            vec![ln_settings.invoice_expiration_window.to_string()],
+        ),
+        Tag::custom(
+            "hold_invoice_expiration_window",
+            vec![ln_settings.hold_invoice_expiration_window.to_string()],
+        ),
+    ]
+}
+
 /// Transform mostro info fields to tags
 ///
 /// # Arguments
@@ -642,16 +668,8 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         // sending anything. See docs/TRANSPORT_V2_SPEC.md.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
-            "hold_invoice_expiration_window",
-            vec![ln_settings.hold_invoice_expiration_window.to_string()],
-        ),
-        Tag::custom(
             "hold_invoice_cltv_delta",
             vec![ln_settings.hold_invoice_cltv_delta.to_string()],
-        ),
-        Tag::custom(
-            "invoice_expiration_window",
-            vec![ln_settings.hold_invoice_expiration_window.to_string()],
         ),
         Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
         Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
@@ -667,6 +685,7 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         Tag::custom("z", vec!["info".to_string()]),
     ];
 
+    tags_vec.extend(invoice_window_tags(ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
     tags_vec.push(Tag::custom(
         "maintenance_mode",
@@ -974,6 +993,49 @@ mod tests {
     }
 
     // ── info_to_tags: end-to-end y-tag emission (kind 38385) ────────────────────
+
+    /// `invoice_expiration_window` and `hold_invoice_expiration_window` are
+    /// different settings with different jobs, and clients act on both: the
+    /// first is the remaining lifetime a payout invoice must still have for
+    /// `validate_bolt11_invoice` to accept it, the second is how long a taker
+    /// has to pay or supply an invoice. Publishing one under the other's name
+    /// makes clients build invoices mostrod then rejects — which is exactly
+    /// what the info event did, advertising the hold window under both names.
+    ///
+    /// Distinct values on purpose: equal ones would let a swapped mapping
+    /// pass.
+    #[test]
+    fn invoice_window_tags_publish_each_window_under_its_own_name() {
+        let ln_settings = crate::config::LightningSettings {
+            invoice_expiration_window: 3600,
+            hold_invoice_expiration_window: 300,
+            ..Default::default()
+        };
+
+        let tags = Tags::from_list(super::invoice_window_tags(&ln_settings).to_vec());
+
+        assert_eq!(
+            get_tag_value(&tags, "invoice_expiration_window"),
+            Some("3600".to_string()),
+        );
+        assert_eq!(
+            get_tag_value(&tags, "hold_invoice_expiration_window"),
+            Some("300".to_string()),
+        );
+    }
+
+    /// The end-to-end event must still carry both names, so a refactor that
+    /// drops one is caught even though the mapping is guarded above.
+    #[test]
+    fn info_to_tags_emits_both_invoice_window_tags() {
+        init_test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = info_to_tags(&ln_status, false);
+
+        assert!(get_tag_value(&tags, "invoice_expiration_window").is_some());
+        assert!(get_tag_value(&tags, "hold_invoice_expiration_window").is_some());
+    }
 
     #[test]
     fn info_to_tags_emits_y_tag_with_mostro_as_first_value() {

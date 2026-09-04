@@ -377,6 +377,21 @@ mod tests {
         assert_eq!(s.effective_pow_first_contact(), 20);
     }
 
+    /// The bound is a security knob (it caps how long an abusive payee can
+    /// hold a payout HTLC), so pin both ends of it: low enough to be worth
+    /// something, and never below BOLT11's implicit 18 — at which point the
+    /// node would reject invoices that simply omit the field.
+    #[test]
+    fn max_final_cltv_expiry_delta_defaults_to_the_top_of_the_wallet_range() {
+        let bound = LightningSettings::default().max_final_cltv_expiry_delta;
+        assert_eq!(bound, 144);
+        assert!(
+            bound >= 18,
+            "a bound under BOLT11's implicit 18 rejects invoices that omit \
+             the field"
+        );
+    }
+
     #[test]
     fn active_pubkeys_refresh_interval_defaults_to_60() {
         assert_eq!(
@@ -494,6 +509,24 @@ pub struct LightningSettings {
     /// disables this arm of the gate.
     #[serde(default = "default_max_inflight_payouts_per_destination")]
     pub max_inflight_payouts_per_destination: u32,
+    /// Upper bound, in blocks, on the *total* timelock of a payout route
+    /// (`SendPaymentRequest.cltv_limit`).
+    /// [`max_final_cltv_expiry_delta`](Self::max_final_cltv_expiry_delta)
+    /// bounds only the payee's own hop; this bounds the whole path, which is
+    /// what the node's channel is actually locked for when a hop force-closes
+    /// and the HTLC has to resolve on-chain.
+    ///
+    /// Omitted from `settings.toml`, it takes the 1008-block default below.
+    /// Set to `0` to send no ceiling at all and let the node apply its own
+    /// `--max-cltv-expiry` (2016 blocks by default).
+    ///
+    /// Must not exceed that node setting: LND refuses a larger `cltv_limit`
+    /// outright rather than clamping it. An operator who lowered
+    /// `--max-cltv-expiry` below this value needs to lower this one to match,
+    /// or set `0`; until then every payout falls back to a retry without the
+    /// ceiling and logs an error.
+    #[serde(default = "default_payment_cltv_limit")]
+    pub payment_cltv_limit: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
     /// default the daemon refuses to start against a Lightning node whose
     /// identity pubkey differs from the one it last ran with while escrow
@@ -505,11 +538,33 @@ pub struct LightningSettings {
     pub allow_node_change: bool,
 }
 
-/// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
-/// the usual range) and low enough that a payee holding the outgoing HTLC
-/// cannot pin routing liquidity for weeks.
+/// ~1 day of blocks, and the top of the range real wallets ask for (18 to
+/// 144). A payee cannot settle the payout HTLC and simply sit on it: the
+/// delta it puts on its own invoice *is* the window it can hold the sats,
+/// and the node cannot cancel an HTLC once it is locked in (see
+/// `lightning::LND_PAYMENT_ROUTE_TIMEOUT_SECS`). Every block of headroom
+/// above what wallets actually use is a block of routing liquidity an
+/// abusive payee can pin for free, so the bound sits exactly at the top of
+/// the observed range rather than above it.
+///
+/// This is a ceiling, not a target: raise it only if a legitimate wallet is
+/// rejected, and never to 0 — the check is `delta > bound`, and BOLT11
+/// substitutes 18 when the invoice omits the field, so a 0 bound rejects
+/// every invoice.
 fn default_max_final_cltv_expiry_delta() -> u32 {
-    432
+    144
+}
+
+/// Half of LND's own `--max-cltv-expiry` default (2016), so it fits under a
+/// stock node without adjustment. A payout route never legitimately needs a
+/// week of timelock: the longest plausible path is a handful of hops of 144
+/// blocks each on top of the invoice's final delta, which
+/// [`MIN_ROUTE_CLTV_HEADROOM`](crate::lightning::MIN_ROUTE_CLTV_HEADROOM)
+/// already covers with room to spare. Halving the ceiling halves the
+/// worst-case on-chain resolution window without narrowing pathfinding to
+/// the point of failing honest payouts.
+fn default_payment_cltv_limit() -> u32 {
+    1008
 }
 
 /// Far above what healthy operation reaches — a payout normally resolves in
@@ -554,6 +609,7 @@ impl Default for LightningSettings {
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
             max_inflight_payouts: default_max_inflight_payouts(),
             max_inflight_payouts_per_destination: default_max_inflight_payouts_per_destination(),
+            payment_cltv_limit: default_payment_cltv_limit(),
             allow_node_change: false,
         }
     }

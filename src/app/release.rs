@@ -63,6 +63,75 @@ static PAYOUT_DISPATCH_SEMAPHORE: Semaphore = Semaphore::const_new(8);
 const PAYOUT_QUEUE_HEARTBEAT: Duration =
     Duration::from_secs(crate::scheduler::MIN_GRACE_SECS as u64 * 2 / 3);
 
+/// How many times a claim heartbeat retries a failed write before giving the
+/// dispatch up, and the delay it starts from (doubling each time, so five
+/// attempts span ~1.5s — comfortably inside the reconcile grace window).
+///
+/// SQLite answers a contended write with `SQLITE_BUSY`, and the slot gate
+/// makes contention routine: a payout can be gated for as long as an abusive
+/// payee holds its HTLCs, heartbeating all the while alongside every other
+/// gated payout and the reconciler. Treating that as fatal would drop a
+/// perfectly healthy payout, let reconciliation re-arm it as failed, and burn
+/// the buyer's retry budget over a lock that cleared in milliseconds — the
+/// exact outcome "a gated payout is delayed, not lost" promises not to have.
+const PAYOUT_HEARTBEAT_ATTEMPTS: u32 = 5;
+const PAYOUT_HEARTBEAT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What a claim heartbeat found.
+enum ClaimHeartbeat {
+    /// The claim is still ours, re-stamped at this timestamp.
+    Refreshed(i64),
+    /// Reconciliation re-armed or replaced the claim: a newer payout owns
+    /// this order and this dispatch must not go out.
+    Lost,
+    /// The claim could not be written after [`PAYOUT_HEARTBEAT_ATTEMPTS`]
+    /// tries. The marker is kept, so reconciliation can still resolve it.
+    Unwritable(MostroError),
+}
+
+/// Re-stamp a payout claim, retrying a failed write before giving up.
+///
+/// Only a write that keeps failing ends the dispatch; `Ok(None)` — the claim
+/// genuinely no longer ours — ends it immediately, because retrying that
+/// would send a payout a newer claim has superseded.
+async fn heartbeat_payout_claim(
+    ctx: &AppContext,
+    order_id: uuid::Uuid,
+    payout_hash: &str,
+    payout_claimed_at: i64,
+) -> ClaimHeartbeat {
+    let mut backoff = PAYOUT_HEARTBEAT_BACKOFF;
+    let mut last_error = None;
+    for attempt in 1..=PAYOUT_HEARTBEAT_ATTEMPTS {
+        match crate::db::touch_order_payout_claim(
+            ctx.pool(),
+            order_id,
+            payout_hash,
+            Some(payout_claimed_at),
+        )
+        .await
+        {
+            Ok(Some(refreshed_at)) => return ClaimHeartbeat::Refreshed(refreshed_at),
+            Ok(None) => return ClaimHeartbeat::Lost,
+            Err(e) => {
+                if attempt < PAYOUT_HEARTBEAT_ATTEMPTS {
+                    warn!(
+                        "Order {order_id}: payout claim heartbeat attempt {attempt} failed ({e}); retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+    ClaimHeartbeat::Unwritable(last_error.unwrap_or_else(|| {
+        MostroInternalErr(ServiceError::DbAccessError(
+            "claim heartbeat exhausted its attempts".to_string(),
+        ))
+    }))
+}
+
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
 async fn check_failure_retries_or_log(ctx: &AppContext, order: &Order, request_id: Option<u64>) {
@@ -800,23 +869,16 @@ pub async fn do_payment(
                 ),
             }
             tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT).await;
-            match crate::db::touch_order_payout_claim(
-                ctx.pool(),
-                order.id,
-                &payout_hash,
-                Some(payout_claimed_at),
-            )
-            .await
-            {
-                Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
-                Ok(None) => {
+            match heartbeat_payout_claim(&ctx, order.id, &payout_hash, payout_claimed_at).await {
+                ClaimHeartbeat::Refreshed(refreshed_at) => payout_claimed_at = refreshed_at,
+                ClaimHeartbeat::Lost => {
                     warn!(
                         "Order {}: payout claim was re-armed or replaced while gated; dropping stale dispatch of hash {}",
                         order.id, payout_hash
                     );
                     return;
                 }
-                Err(e) => {
+                ClaimHeartbeat::Unwritable(e) => {
                     warn!(
                         "Order {}: could not heartbeat payout claim while gated ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
                         order.id, payout_hash
@@ -847,23 +909,16 @@ pub async fn do_payment(
             tokio::select! {
                 permit = &mut acquire => break permit,
                 _ = tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT) => {
-                    match crate::db::touch_order_payout_claim(
-                        ctx.pool(),
-                        order.id,
-                        &payout_hash,
-                        Some(payout_claimed_at),
-                    )
-                    .await
-                    {
-                        Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
-                        Ok(None) => {
+                    match heartbeat_payout_claim(&ctx, order.id, &payout_hash, payout_claimed_at).await {
+                        ClaimHeartbeat::Refreshed(refreshed_at) => payout_claimed_at = refreshed_at,
+                        ClaimHeartbeat::Lost => {
                             warn!(
                                 "Order {}: payout claim was re-armed or replaced while queued; dropping stale dispatch of hash {}",
                                 order.id, payout_hash
                             );
                             return;
                         }
-                        Err(e) => {
+                        ClaimHeartbeat::Unwritable(e) => {
                             warn!(
                                 "Order {}: could not heartbeat payout claim while queued ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
                                 order.id, payout_hash
@@ -2759,6 +2814,74 @@ mod tests {
         assert!(
             marker_of(&pool, id).await.is_none(),
             "marker released after finalize"
+        );
+    }
+
+    /// The happy path: the claim is still ours and comes back re-stamped
+    /// with a token later dispatch can keep using.
+    #[tokio::test]
+    async fn claim_heartbeat_refreshes_a_claim_that_is_still_ours() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+
+        let beat = heartbeat_payout_claim(&ctx, id, &hash, token).await;
+
+        assert!(
+            matches!(beat, ClaimHeartbeat::Refreshed(_)),
+            "a live claim must come back refreshed"
+        );
+    }
+
+    /// A claim reconciliation re-armed belongs to a newer payout: retrying
+    /// the write would be retrying the wrong answer, so this ends the
+    /// dispatch at once rather than looping.
+    #[tokio::test]
+    async fn claim_heartbeat_reports_a_claim_that_is_no_longer_ours() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+
+        let beat = heartbeat_payout_claim(&ctx, id, &hash, token - 1).await;
+
+        assert!(
+            matches!(beat, ClaimHeartbeat::Lost),
+            "a stale token must not pass as a refresh"
+        );
+    }
+
+    /// The regression this retry exists for: SQLite answers a contended
+    /// write with `database is locked`, and the slot gate makes that
+    /// routine — a payout can be gated for hours, heartbeating alongside
+    /// every other gated payout and the reconciler. A database that cannot
+    /// be written at all must still terminate, and say so, rather than
+    /// spin; a database that is merely busy is retried, which is what keeps
+    /// a healthy gated payout from being dropped and re-armed as failed.
+    #[tokio::test]
+    async fn claim_heartbeat_gives_up_only_after_retrying_an_unwritable_database() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        // Every write from here on fails, the way a permanently locked
+        // database would answer.
+        pool.close().await;
+
+        let started = std::time::Instant::now();
+        let beat = heartbeat_payout_claim(&ctx, id, &hash, token).await;
+
+        assert!(
+            matches!(beat, ClaimHeartbeat::Unwritable(_)),
+            "an unwritable database must end the dispatch, not hang it"
+        );
+        // Five attempts at 100ms doubling: it really retried rather than
+        // giving up on the first error.
+        assert!(
+            started.elapsed() >= PAYOUT_HEARTBEAT_BACKOFF * 3,
+            "the heartbeat gave up without retrying: {:?}",
+            started.elapsed()
         );
     }
 

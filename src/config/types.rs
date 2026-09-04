@@ -482,8 +482,17 @@ pub struct LightningSettings {
     /// [`max_final_cltv_expiry_delta`](Self::max_final_cltv_expiry_delta)
     /// bounds only the payee's own hop; this bounds the whole path, which is
     /// what the node's channel is actually locked for when a hop force-closes
-    /// and the HTLC has to resolve on chain. Left unset, LND applies its own
-    /// `--max-cltv-expiry` (2016 blocks, ~2 weeks).
+    /// and the HTLC has to resolve on-chain.
+    ///
+    /// Omitted from `settings.toml`, it takes the 1008-block default below.
+    /// Set to `0` to send no ceiling at all and let the node apply its own
+    /// `--max-cltv-expiry` (2016 blocks by default).
+    ///
+    /// Must not exceed that node setting: LND refuses a larger `cltv_limit`
+    /// outright rather than clamping it. An operator who lowered
+    /// `--max-cltv-expiry` below this value needs to lower this one to match,
+    /// or set `0`; until then every payout falls back to a retry without the
+    /// ceiling and logs an error.
     #[serde(default = "default_payment_cltv_limit")]
     pub payment_cltv_limit: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
@@ -504,10 +513,10 @@ fn default_max_final_cltv_expiry_delta() -> u32 {
     432
 }
 
-/// Half of LND's own `--max-cltv-expiry` default (2016). A payout route
-/// never legitimately needs a week of timelock: the longest plausible path
-/// is a handful of hops of 144 blocks each on top of the invoice's final
-/// delta, which
+/// Half of LND's own `--max-cltv-expiry` default (2016), so it fits under a
+/// stock node without adjustment. A payout route never legitimately needs a
+/// week of timelock: the longest plausible path is a handful of hops of 144
+/// blocks each on top of the invoice's final delta, which
 /// [`MIN_ROUTE_CLTV_HEADROOM`](crate::lightning::MIN_ROUTE_CLTV_HEADROOM)
 /// already covers with room to spare. Halving the ceiling halves the
 /// worst-case on-chain resolution window without narrowing pathfinding to

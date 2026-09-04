@@ -64,42 +64,68 @@ pub struct PaymentMessage {
 }
 
 /// Blocks a route needs *on top of* the payout invoice's own final CLTV
-/// delta before [`payment_cltv_limit_blocks`] will honour an operator's
-/// ceiling. Six hops at 96 blocks each — comfortably above LND's default
+/// delta before [`payment_cltv_limit_blocks`] will hand an operator's ceiling
+/// to LND. Six hops at 96 blocks each — comfortably above LND's default
 /// forwarding delta and above what CLN and Eclair ask for — so an operator
 /// cannot quietly configure a ceiling that fails every honest payout while
 /// looking like a tighter security setting.
 pub(crate) const MIN_ROUTE_CLTV_HEADROOM: u32 = 576;
 
-/// Total-timelock ceiling handed to LND as `SendPaymentRequest.cltv_limit`.
+/// Total-timelock ceiling handed to LND as `SendPaymentRequest.cltv_limit`,
+/// or `0` to let the node apply its own `--max-cltv-expiry`.
 ///
 /// `max_final_cltv_expiry_delta` bounds only the payee's own hop: how long an
 /// unsettling payee can sit on the HTLC. This bounds the whole route, which
 /// is what the node's channel is really locked for if a hop force-closes and
-/// the HTLC has to resolve on chain. Left at zero, LND falls back to
-/// `--max-cltv-expiry` (2016 blocks).
+/// the HTLC has to resolve on-chain.
 ///
-/// A ceiling below `final_delta_bound + MIN_ROUTE_CLTV_HEADROOM` cannot be
-/// honoured: pathfinding would reject routes that honest wallets produce, and
-/// the payout would fail with "no route" while looking like a routing problem
-/// rather than a misconfiguration. Such a value is raised to that floor and
-/// logged loudly, mirroring how `util::escrow_guard_window_secs` treats an
-/// out-of-range escrow margin.
+/// Two ways a configured ceiling is unusable, and both defer to the node
+/// rather than substituting a number of our own:
+///
+/// - `0` is the operator asking for exactly that, and it is the escape hatch
+///   for a node whose `--max-cltv-expiry` sits below what Mostro would send.
+/// - Below `final_delta_bound + MIN_ROUTE_CLTV_HEADROOM` there is no room for
+///   a route, so pathfinding would reject paths honest wallets produce and
+///   every payout would fail with "no route" — looking like a routing problem
+///   rather than a misconfiguration.
+///
+/// The second case is logged at error level and then deferred, deliberately
+/// *not* raised to the floor: LND rejects a `cltv_limit` above its own
+/// `--max-cltv-expiry` outright, so inventing a ceiling to replace a bad one
+/// risks trading "no route" for "every payout rejected". Deferring restores
+/// the node's own bound, which is what applied before this setting existed.
 pub fn payment_cltv_limit_blocks(configured: u32, final_delta_bound: u32) -> i32 {
+    if configured == 0 {
+        return 0;
+    }
+
     let floor = final_delta_bound.saturating_add(MIN_ROUTE_CLTV_HEADROOM);
-    let effective = if configured < floor {
+    if configured < floor {
         tracing::error!(
             "payment_cltv_limit ({configured}) leaves no room for a route above \
-             max_final_cltv_expiry_delta ({final_delta_bound}); raising to {floor}"
+             max_final_cltv_expiry_delta ({final_delta_bound}); it needs to be at \
+             least {floor}. Deferring to the node's --max-cltv-expiry until it is \
+             fixed — payouts are unbounded by this setting in the meantime"
         );
-        floor
-    } else {
-        configured
-    };
+        return 0;
+    }
+
     // `cltv_limit` is an i32 on the wire. Saturating keeps an absurd
     // configuration from wrapping into a negative — which LND would read as a
     // ceiling far tighter than intended.
-    i32::try_from(effective).unwrap_or(i32::MAX)
+    i32::try_from(configured).unwrap_or(i32::MAX)
+}
+
+/// Whether LND turned a `SendPayment` down over the `cltv_limit` we asked for.
+///
+/// LND refuses a `cltv_limit` above its own `--max-cltv-expiry` (default 2016)
+/// before dispatching anything, so an operator who lowered that setting below
+/// `payment_cltv_limit` would otherwise see *every* payout — buyer, bond and
+/// dev fee — rejected. Matching the message lets the caller retry once without
+/// the ceiling instead, which is the behaviour that applied before the setting
+/// existed.
+fn is_cltv_limit_rejection(message: &str) -> bool {
+    message.to_lowercase().contains("cltv")
 }
 
 /// Routing-fee cap (in sats) handed to LND as `fee_limit_sat` for a
@@ -424,14 +450,32 @@ impl LndConnector {
             }
         }
 
-        let outer_stream = self
-            .client
-            .router()
-            .send_payment_v2(request)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())));
+        let mut outer_stream = self.client.router().send_payment_v2(request.clone()).await;
 
-        // We can safely unwrap here cause await was successful
+        // An operator whose node has a `--max-cltv-expiry` below our ceiling
+        // gets this request turned down before anything is dispatched, which
+        // would mean *every* payout failing after an upgrade. Retry once
+        // without the ceiling — the node's own bound then applies, exactly as
+        // it did before this setting existed — and make the misconfiguration
+        // loud. The retry cannot double-pay: LND refuses a second
+        // `SendPaymentV2` for a hash already in flight or settled, and this
+        // first call never got far enough to create one.
+        if cltv_limit != 0 {
+            if let Err(status) = &outer_stream {
+                if is_cltv_limit_rejection(status.message()) {
+                    tracing::error!(
+                        "LND refused payment_cltv_limit ({cltv_limit}) for hash {}: {}. \
+                         Retrying without it — set payment_cltv_limit at or below the \
+                         node's --max-cltv-expiry, or to 0 to defer to it",
+                        hash,
+                        status.message()
+                    );
+                    request.cltv_limit = 0;
+                    outer_stream = self.client.router().send_payment_v2(request).await;
+                }
+            }
+        }
+
         let mut stream = outer_stream
             .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?
             .into_inner();
@@ -596,7 +640,8 @@ impl LnStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_hash32, payment_cltv_limit_blocks, routing_fee_cap_sats, MIN_ROUTE_CLTV_HEADROOM,
+        decode_hash32, is_cltv_limit_rejection, payment_cltv_limit_blocks, routing_fee_cap_sats,
+        MIN_ROUTE_CLTV_HEADROOM,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
@@ -628,18 +673,19 @@ mod tests {
     /// value would make the knob meaningless.
     #[test]
     fn payment_cltv_limit_honours_a_ceiling_that_leaves_room_for_a_route() {
-        assert_eq!(payment_cltv_limit_blocks(1008, 144), 1008);
+        assert_eq!(payment_cltv_limit_blocks(1008, 432), 1008);
+        assert_eq!(payment_cltv_limit_blocks(2016, 144), 2016);
     }
 
     /// The shipped defaults must clear the floor on their own, or every node
-    /// would boot straight into the clamp path.
+    /// would boot straight into the defer path and run with no ceiling.
     #[test]
     fn payment_cltv_limit_defaults_clear_the_route_floor() {
         let defaults = crate::config::types::LightningSettings::default();
         assert!(
             defaults.payment_cltv_limit
                 >= defaults.max_final_cltv_expiry_delta + MIN_ROUTE_CLTV_HEADROOM,
-            "default payment_cltv_limit must not need clamping"
+            "default payment_cltv_limit must not need deferring"
         );
         assert_eq!(
             payment_cltv_limit_blocks(
@@ -650,22 +696,35 @@ mod tests {
         );
     }
 
-    /// A ceiling at or below the accepted final delta would reject every
-    /// route an honest wallet can produce. Raising it to the floor keeps
-    /// payouts working; the operator hears about it in the log.
+    /// The default must also fit under a stock LND, whose `--max-cltv-expiry`
+    /// is 2016: LND refuses a larger `cltv_limit` outright, so a default above
+    /// it would break every payout on an untouched node.
     #[test]
-    fn payment_cltv_limit_raises_a_ceiling_that_starves_the_route() {
-        assert_eq!(
-            payment_cltv_limit_blocks(100, 144),
-            144 + MIN_ROUTE_CLTV_HEADROOM as i32
-        );
-        assert_eq!(
-            payment_cltv_limit_blocks(0, 144),
-            144 + MIN_ROUTE_CLTV_HEADROOM as i32
-        );
-        // Exactly one block short still gets raised.
+    fn payment_cltv_limit_default_fits_under_a_stock_lnd_maximum() {
+        const LND_DEFAULT_MAX_CLTV_EXPIRY: u32 = 2016;
+        let defaults = crate::config::types::LightningSettings::default();
+        assert!(defaults.payment_cltv_limit <= LND_DEFAULT_MAX_CLTV_EXPIRY);
+    }
+
+    /// `0` means "send no ceiling", the documented escape hatch for a node
+    /// whose own `--max-cltv-expiry` sits below what Mostro would send.
+    #[test]
+    fn payment_cltv_limit_zero_defers_to_the_node() {
+        assert_eq!(payment_cltv_limit_blocks(0, 144), 0);
+        assert_eq!(payment_cltv_limit_blocks(0, u32::MAX), 0);
+    }
+
+    /// A ceiling with no room for a route would reject every path an honest
+    /// wallet produces. It defers to the node rather than being raised to the
+    /// floor: LND rejects a `cltv_limit` above its own `--max-cltv-expiry`
+    /// outright, so inventing a replacement could trade "no route" for "every
+    /// payout rejected".
+    #[test]
+    fn payment_cltv_limit_defers_a_ceiling_that_starves_the_route() {
+        assert_eq!(payment_cltv_limit_blocks(100, 144), 0);
+        // Exactly one block short still defers; exactly at the floor is kept.
         let floor = 144 + MIN_ROUTE_CLTV_HEADROOM;
-        assert_eq!(payment_cltv_limit_blocks(floor - 1, 144), floor as i32);
+        assert_eq!(payment_cltv_limit_blocks(floor - 1, 144), 0);
         assert_eq!(payment_cltv_limit_blocks(floor, 144), floor as i32);
     }
 
@@ -675,7 +734,21 @@ mod tests {
     #[test]
     fn payment_cltv_limit_saturates_instead_of_wrapping_negative() {
         assert_eq!(payment_cltv_limit_blocks(u32::MAX, 144), i32::MAX);
-        assert!(payment_cltv_limit_blocks(u32::MAX, u32::MAX) > 0);
+        assert!(payment_cltv_limit_blocks(u32::MAX, u32::MAX) >= 0);
+    }
+
+    /// The retry that saves an operator whose node caps timelocks lower than
+    /// Mostro asks for only fires on LND's own complaint about the ceiling —
+    /// never on an unrelated failure, which must surface as the error it is.
+    #[test]
+    fn cltv_limit_rejection_is_recognised_only_for_the_ceiling() {
+        assert!(is_cltv_limit_rejection(
+            "cltv limit 1008 should be less than 500"
+        ));
+        assert!(is_cltv_limit_rejection("CLTV limit exceeds maximum"));
+        assert!(!is_cltv_limit_rejection("no route to destination"));
+        assert!(!is_cltv_limit_rejection("insufficient local balance"));
+        assert!(!is_cltv_limit_rejection(""));
     }
 
     #[test]

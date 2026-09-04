@@ -377,6 +377,21 @@ mod tests {
         assert_eq!(s.effective_pow_first_contact(), 20);
     }
 
+    /// The bound is a security knob (it caps how long an abusive payee can
+    /// hold a payout HTLC), so pin both ends of it: low enough to be worth
+    /// something, and never below BOLT11's implicit 18 — at which point the
+    /// node would reject invoices that simply omit the field.
+    #[test]
+    fn max_final_cltv_expiry_delta_defaults_to_the_top_of_the_wallet_range() {
+        let bound = LightningSettings::default().max_final_cltv_expiry_delta;
+        assert_eq!(bound, 144);
+        assert!(
+            bound >= 18,
+            "a bound under BOLT11's implicit 18 rejects invoices that omit \
+             the field"
+        );
+    }
+
     #[test]
     fn active_pubkeys_refresh_interval_defaults_to_60() {
         assert_eq!(
@@ -488,11 +503,21 @@ pub struct LightningSettings {
     pub allow_node_change: bool,
 }
 
-/// ~3 days of blocks. High enough for every wallet we know of (18 to 144 is
-/// the usual range) and low enough that a payee holding the outgoing HTLC
-/// cannot pin routing liquidity for weeks.
+/// ~1 day of blocks, and the top of the range real wallets ask for (18 to
+/// 144). A payee cannot settle the payout HTLC and simply sit on it: the
+/// delta it puts on its own invoice *is* the window it can hold the sats,
+/// and the node cannot cancel an HTLC once it is locked in (see
+/// `lightning::LND_PAYMENT_ROUTE_TIMEOUT_SECS`). Every block of headroom
+/// above what wallets actually use is a block of routing liquidity an
+/// abusive payee can pin for free, so the bound sits exactly at the top of
+/// the observed range rather than above it.
+///
+/// This is a ceiling, not a target: raise it only if a legitimate wallet is
+/// rejected, and never to 0 — the check is `delta > bound`, and BOLT11
+/// substitutes 18 when the invoice omits the field, so a 0 bound rejects
+/// every invoice.
 fn default_max_final_cltv_expiry_delta() -> u32 {
-    432
+    144
 }
 
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default

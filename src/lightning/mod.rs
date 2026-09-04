@@ -18,6 +18,8 @@ use fedimint_tonic_lnd::Client;
 use mostro_core::prelude::*;
 use rand::{self, RngCore};
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::time::timeout;
@@ -72,6 +74,15 @@ pub struct PaymentMessage {
 /// this many payments *since* the oldest still-stuck one.
 pub(crate) const PAYOUT_INFLIGHT_SCAN_LIMIT: u64 = 2_000;
 
+/// Bound on the `ListPayments` call behind
+/// [`LndConnector::count_inflight_payments`]. The gate fails open on an
+/// error, so a node that accepts the connection and then never answers must
+/// surface as one within the caller's heartbeat cadence — otherwise the
+/// dispatch task neither heartbeats its claim nor reaches the fail-open
+/// branch, and sits there forever. `fedimint-tonic-lnd` sets no per-RPC
+/// deadline of its own.
+pub(crate) const PAYOUT_INFLIGHT_COUNT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// In-flight payments at LND, split into the two quantities the payout gate
 /// cares about: how many there are overall, and how many are headed for the
 /// same destination as the payout about to be sent.
@@ -114,6 +125,163 @@ pub fn payout_gate_reason(
         return Some(PayoutGateReason::Total);
     }
     None
+}
+
+/// The two payout ceilings, as configured. `0` disables a ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayoutCaps {
+    pub total: u32,
+    pub per_destination: u32,
+}
+
+impl PayoutCaps {
+    /// The ceilings from the `[lightning]` settings.
+    pub fn from_settings(settings: &crate::config::types::LightningSettings) -> Self {
+        Self {
+            total: settings.max_inflight_payouts,
+            per_destination: settings.max_inflight_payouts_per_destination,
+        }
+    }
+}
+
+/// Payout capacity already claimed by dispatchers that passed the gate but
+/// whose payment LND may not report yet.
+///
+/// The LND count is a snapshot, not a reservation: between a task reading
+/// it and `send_payment_v2` registering the payment there is a window in
+/// which every other task reads the same number, and up to a whole
+/// semaphore's worth of them would sail past a cap together. Whoever passes
+/// the gate therefore books a slot here first, and the slot is released
+/// once LND reports the payment — from then on the node's own count carries
+/// it. Node-wide and per-destination, mirroring the two ceilings.
+#[derive(Debug, Default)]
+pub struct PayoutReservations {
+    total: u32,
+    per_destination: HashMap<String, u32>,
+}
+
+/// Every reservation in this process. One registry, because the caps are
+/// about one node.
+static PAYOUT_RESERVATIONS: LazyLock<Arc<Mutex<PayoutReservations>>> = LazyLock::new(Arc::default);
+
+/// A booked payout slot; dropping it releases the slot.
+#[derive(Debug)]
+pub struct PayoutReservation {
+    registry: Arc<Mutex<PayoutReservations>>,
+    destination: String,
+}
+
+impl Drop for PayoutReservation {
+    fn drop(&mut self) {
+        // A poisoned registry still holds correct counts; nothing here can
+        // have panicked halfway through an update.
+        let mut registry = match self.registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.release(&self.destination);
+    }
+}
+
+impl PayoutReservations {
+    /// What LND reports plus what is booked here: the numbers the gate
+    /// actually has to judge.
+    fn with_reserved(&self, inflight: InflightPayments, destination: &str) -> InflightPayments {
+        InflightPayments {
+            total: inflight.total.saturating_add(self.total),
+            to_destination: inflight.to_destination.saturating_add(
+                self.per_destination
+                    .get(destination)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Book a slot for `destination` if the caps allow one on top of the
+    /// LND snapshot; otherwise say which ceiling refused.
+    fn try_reserve(
+        &mut self,
+        inflight: InflightPayments,
+        destination: &str,
+        caps: PayoutCaps,
+    ) -> Result<(), (InflightPayments, PayoutGateReason)> {
+        let counted = self.with_reserved(inflight, destination);
+        if let Some(reason) = payout_gate_reason(counted, caps.total, caps.per_destination) {
+            return Err((counted, reason));
+        }
+        self.total = self.total.saturating_add(1);
+        *self
+            .per_destination
+            .entry(destination.to_owned())
+            .or_default() += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, destination: &str) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(count) = self.per_destination.get_mut(destination) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_destination.remove(destination);
+            }
+        }
+    }
+}
+
+/// Book a slot in `registry` against the LND snapshot `inflight`.
+fn reserve_in(
+    registry: &Arc<Mutex<PayoutReservations>>,
+    inflight: InflightPayments,
+    destination: &str,
+    caps: PayoutCaps,
+) -> Result<PayoutReservation, (InflightPayments, PayoutGateReason)> {
+    let mut guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.try_reserve(inflight, destination, caps)?;
+    Ok(PayoutReservation {
+        registry: Arc::clone(registry),
+        destination: destination.to_owned(),
+    })
+}
+
+/// What one pass through the slot gate decided.
+#[derive(Debug)]
+pub enum SlotVerdict {
+    /// Capacity was booked; send, and keep the reservation until LND
+    /// reports the payment.
+    Reserved(PayoutReservation),
+    /// A ceiling is reached. `counted` is what the gate judged: the LND
+    /// snapshot plus the slots already booked in this process.
+    Held {
+        counted: InflightPayments,
+        reason: PayoutGateReason,
+    },
+}
+
+/// One pass through the payout slot gate for a payout to `destination`
+/// (hex node pubkey): ask LND what is in flight, add what this process has
+/// already booked, and book a slot if the caps leave room.
+///
+/// Errors are LND's — unreachable, or silent past
+/// [`PAYOUT_INFLIGHT_COUNT_TIMEOUT`] — and it is the caller's call whether
+/// to fail open on them. Waiting, and whatever bookkeeping a wait needs, is
+/// also the caller's: the buyer payout heartbeats its claim, the bond payout
+/// simply defers to the next scheduler tick.
+pub async fn claim_payout_slot(
+    ln_client: &mut LndConnector,
+    destination: &str,
+    caps: PayoutCaps,
+) -> Result<SlotVerdict, MostroError> {
+    let inflight = ln_client.count_inflight_payments(destination).await?;
+    Ok(
+        match reserve_in(&PAYOUT_RESERVATIONS, inflight, destination, caps) {
+            Ok(reservation) => SlotVerdict::Reserved(reservation),
+            Err((counted, reason)) => SlotVerdict::Held { counted, reason },
+        },
+    )
 }
 
 /// Routing-fee cap (in sats) handed to LND as `fee_limit_sat` for a
@@ -501,12 +669,18 @@ impl LndConnector {
             ..Default::default()
         };
 
-        let response = self
-            .client
-            .lightning()
-            .list_payments(request)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
+        let response = timeout(
+            PAYOUT_INFLIGHT_COUNT_TIMEOUT,
+            self.client.lightning().list_payments(request),
+        )
+        .await
+        .map_err(|_| {
+            MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "ListPayments did not answer within {}s",
+                PAYOUT_INFLIGHT_COUNT_TIMEOUT.as_secs()
+            )))
+        })?
+        .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
 
         let mut total: u32 = 0;
         let mut to_destination: u32 = 0;
@@ -675,11 +849,13 @@ impl LnStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_hash32, payout_gate_reason, routing_fee_cap_sats, InflightPayments, PayoutGateReason,
+        decode_hash32, payout_gate_reason, reserve_in, routing_fee_cap_sats, InflightPayments,
+        PayoutCaps, PayoutGateReason, PayoutReservations,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::*;
+    use std::sync::{Arc, Mutex};
 
     fn init_test_settings() {
         crate::config::init_test_nostr_keys();
@@ -770,6 +946,83 @@ mod tests {
             payout_gate_reason(inflight(100, u32::MAX), 100, 0),
             Some(PayoutGateReason::Total)
         );
+    }
+
+    fn caps(total: u32, per_destination: u32) -> PayoutCaps {
+        PayoutCaps {
+            total,
+            per_destination,
+        }
+    }
+
+    fn registry() -> Arc<Mutex<PayoutReservations>> {
+        Arc::default()
+    }
+
+    /// The regression the LND snapshot alone cannot pass: with a cap of one
+    /// and nothing in flight at LND, two dispatchers reading the same
+    /// snapshot must not both go out. The second is refused by the first's
+    /// booking, and only the first's release lets it through.
+    #[test]
+    fn a_cap_of_one_admits_one_dispatcher_at_a_time_on_the_same_snapshot() {
+        let registry = registry();
+        let snapshot = inflight(0, 0);
+
+        let first = reserve_in(&registry, snapshot, "02aa", caps(0, 1)).expect("first fits");
+        let refused = reserve_in(&registry, snapshot, "02aa", caps(0, 1))
+            .expect_err("second must wait behind the booking");
+        assert_eq!(refused.1, PayoutGateReason::Destination);
+        assert_eq!(refused.0, inflight(1, 1), "the booking is what it counted");
+
+        drop(first);
+        reserve_in(&registry, snapshot, "02aa", caps(0, 1)).expect("released slot is free again");
+    }
+
+    /// Bookings are per destination: one payee's booked slots do not gate
+    /// another payee under the per-destination ceiling.
+    #[test]
+    fn bookings_gate_their_own_destination_only() {
+        let registry = registry();
+        let _held = reserve_in(&registry, inflight(0, 0), "02aa", caps(0, 1)).unwrap();
+
+        reserve_in(&registry, inflight(0, 0), "02bb", caps(0, 1))
+            .expect("another destination has its own ceiling");
+    }
+
+    /// The node-wide ceiling counts every booking, whoever it is for.
+    #[test]
+    fn bookings_count_toward_the_node_wide_ceiling() {
+        let registry = registry();
+        let _a = reserve_in(&registry, inflight(0, 0), "02aa", caps(2, 0)).unwrap();
+        let _b = reserve_in(&registry, inflight(0, 0), "02bb", caps(2, 0)).unwrap();
+
+        let refused = reserve_in(&registry, inflight(0, 0), "02cc", caps(2, 0)).unwrap_err();
+        assert_eq!(refused.1, PayoutGateReason::Total);
+    }
+
+    /// What LND already reports and what is booked here add up: a snapshot
+    /// one short of the cap plus one booking is the cap.
+    #[test]
+    fn the_snapshot_and_the_bookings_add_up() {
+        let registry = registry();
+        let _booked = reserve_in(&registry, inflight(0, 0), "02aa", caps(0, 2)).unwrap();
+
+        let refused = reserve_in(&registry, inflight(1, 1), "02aa", caps(0, 2)).unwrap_err();
+        assert_eq!(refused.0, inflight(2, 2));
+        assert_eq!(refused.1, PayoutGateReason::Destination);
+    }
+
+    /// Releasing never underflows and clears an emptied destination, so a
+    /// long-running daemon does not accumulate dead entries.
+    #[test]
+    fn release_is_exact_and_leaves_no_trace() {
+        let registry = registry();
+        let booked = reserve_in(&registry, inflight(0, 0), "02aa", caps(0, 1)).unwrap();
+        drop(booked);
+
+        let inner = registry.lock().unwrap();
+        assert_eq!(inner.total, 0);
+        assert!(inner.per_destination.is_empty());
     }
 
     #[test]

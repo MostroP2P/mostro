@@ -4,7 +4,8 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
-    payout_gate_reason, LndConnector, PaymentMessage, PayoutGateReason, PAYOUT_SEND_PAYMENT_TIMEOUT,
+    claim_payout_slot, LndConnector, PaymentMessage, PayoutCaps, PayoutGateReason, SlotVerdict,
+    PAYOUT_SEND_PAYMENT_TIMEOUT,
 };
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
@@ -727,6 +728,104 @@ pub async fn do_payment(
         // The claim token; refreshed by every successful touch below.
         let mut payout_claimed_at = payout_claimed_at;
 
+        // Slot gate, BEFORE the dispatch semaphore. The semaphore bounds
+        // how many sends run at once, but a send returns after
+        // PAYOUT_SEND_PAYMENT_TIMEOUT while the HTLC it created stays
+        // locked in — a payee that never settles keeps it, and the slot
+        // behind it, until the CLTV expires. So the semaphore alone cannot
+        // stop unresolved payouts from accumulating until the node runs
+        // out of HTLC slots.
+        //
+        // Two ceilings, and the per-destination one does the real work:
+        // holding an HTLC requires controlling the node that receives it,
+        // so the HTLCs an abusive payee refuses to settle all share a
+        // destination. That makes a handful of unresolved payments to one
+        // pubkey a far sharper signal than a large node-wide total, and it
+        // prices the attack in funded channels — a new destination node per
+        // `max_inflight_payouts_per_destination` held HTLCs. The node-wide
+        // cap stays as a backstop for congestion with no single culprit.
+        //
+        // Wait rather than fail: the claim is durable and heartbeated, so a
+        // gated payout is delayed, not lost, and it goes out by itself once
+        // the node has room. Failing here would burn the buyer's retry budget
+        // over a condition they did not cause.
+        //
+        // The wait happens WITHOUT a dispatch permit. A gated payout can
+        // wait for as long as the held HTLCs take to expire; holding a
+        // permit through that would let one payee sitting at its cap park
+        // every permit with a few more cheap trades to itself, and no
+        // payout to anyone else would leave the node.
+        //
+        // The count comes from LND plus what this process has already
+        // booked (`claim_payout_slot`): LND alone is a snapshot, and every
+        // task reading the same snapshot would pass together; the payout
+        // rows are never counted, because a row is claimed before its send
+        // and a backlog would gate itself into a standstill.
+        //
+        // A node that cannot answer — or does not answer within
+        // PAYOUT_INFLIGHT_COUNT_TIMEOUT — is not a reason to strand a
+        // payout, so the gate fails open, the same call the duplicate guard
+        // in `send_payment` makes for the same reason.
+        let caps = PayoutCaps::from_settings(&ctx.settings().lightning);
+        let mut reservation = loop {
+            let held = match claim_payout_slot(
+                &mut ln_client_payment,
+                &payout_destination_pubkey,
+                caps,
+            )
+            .await
+            {
+                Ok(SlotVerdict::Reserved(reservation)) => break Some(reservation),
+                Ok(SlotVerdict::Held { counted, reason }) => (counted, reason),
+                Err(e) => {
+                    warn!(
+                        "Order {}: in-flight payout count unavailable ({e}); dispatching hash {} without the slot gate",
+                        order.id, payout_hash
+                    );
+                    break None;
+                }
+            };
+            match held {
+                (counted, PayoutGateReason::Destination) => warn!(
+                    "Order {}: {} payments already in flight to {} (cap {}); holding payout of hash {} — a destination sitting on unresolved HTLCs is not settling them",
+                    order.id,
+                    counted.to_destination,
+                    payout_destination_pubkey,
+                    caps.per_destination,
+                    payout_hash
+                ),
+                (counted, PayoutGateReason::Total) => warn!(
+                    "Order {}: {} payments already in flight node-wide (cap {}); holding payout of hash {} until the node has room",
+                    order.id, counted.total, caps.total, payout_hash
+                ),
+            }
+            tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT).await;
+            match crate::db::touch_order_payout_claim(
+                ctx.pool(),
+                order.id,
+                &payout_hash,
+                Some(payout_claimed_at),
+            )
+            .await
+            {
+                Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
+                Ok(None) => {
+                    warn!(
+                        "Order {}: payout claim was re-armed or replaced while gated; dropping stale dispatch of hash {}",
+                        order.id, payout_hash
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Order {}: could not heartbeat payout claim while gated ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
+                        order.id, payout_hash
+                    );
+                    return;
+                }
+            }
+        };
+
         // Bound concurrent sends (see PAYOUT_DISPATCH_SEMAPHORE). While
         // queued, heartbeat the claim: re-validate and re-stamp it every
         // PAYOUT_QUEUE_HEARTBEAT so it never ages past the reconcile grace
@@ -739,7 +838,9 @@ pub async fn do_payment(
         // unpermitted in that impossible case beats silently dropping a
         // claimed payout. The permit is then held for the send and the
         // RPC-error reconcile via RAII — the watcher is a sibling task and
-        // finishes its bookkeeping outside the bound.
+        // finishes its bookkeeping outside the bound. The slot reservation
+        // booked above is held through this wait on purpose: it is what
+        // keeps the gate honest for the tasks behind this one.
         let acquire = PAYOUT_DISPATCH_SEMAPHORE.acquire();
         tokio::pin!(acquire);
         let _permit = loop {
@@ -773,95 +874,6 @@ pub async fn do_payment(
                 }
             }
         };
-
-        // Slot gate. The dispatch semaphore bounds how many sends run at
-        // once, but a send returns after PAYOUT_SEND_PAYMENT_TIMEOUT while
-        // the HTLC it created stays locked in — a payee that never settles
-        // keeps it, and the slot behind it, until the CLTV expires. So the
-        // semaphore alone cannot stop unresolved payouts from accumulating
-        // until the node runs out of HTLC slots.
-        //
-        // Two ceilings, and the per-destination one does the real work:
-        // holding an HTLC requires controlling the node that receives it, so
-        // the HTLCs an abusive payee refuses to settle all share a
-        // destination. That makes a handful of unresolved payments to one
-        // pubkey a far sharper signal than a large node-wide total, and it
-        // prices the attack in funded channels — a new destination node per
-        // `max_inflight_payouts_per_destination` held HTLCs. The node-wide
-        // cap stays as a backstop for congestion with no single culprit.
-        //
-        // Wait rather than fail: the claim is durable and heartbeated, so a
-        // gated payout is delayed, not lost, and it goes out by itself once
-        // the node has room. Failing here would burn the buyer's retry budget
-        // over a condition they did not cause.
-        //
-        // The count comes from LND, never from the payout rows: a row is
-        // claimed before its send, so counting rows would count payouts still
-        // queued behind this very gate and deadlock a backlog against itself.
-        //
-        // A node that cannot answer is not a reason to strand a payout, so
-        // the gate fails open — the same call the duplicate guard in
-        // `send_payment` makes for the same reason.
-        let ln_settings = &ctx.settings().lightning;
-        let total_cap = ln_settings.max_inflight_payouts;
-        let destination_cap = ln_settings.max_inflight_payouts_per_destination;
-        loop {
-            let inflight = match ln_client_payment
-                .count_inflight_payments(&payout_destination_pubkey)
-                .await
-            {
-                Ok(counts) => counts,
-                Err(e) => {
-                    warn!(
-                        "Order {}: in-flight payout count unavailable ({e}); dispatching hash {} without the slot gate",
-                        order.id, payout_hash
-                    );
-                    break;
-                }
-            };
-            let Some(reason) = payout_gate_reason(inflight, total_cap, destination_cap) else {
-                break;
-            };
-            match reason {
-                PayoutGateReason::Destination => warn!(
-                    "Order {}: {} payments already in flight to {} (cap {}); holding payout of hash {} — a destination sitting on unresolved HTLCs is not settling them",
-                    order.id,
-                    inflight.to_destination,
-                    payout_destination_pubkey,
-                    destination_cap,
-                    payout_hash
-                ),
-                PayoutGateReason::Total => warn!(
-                    "Order {}: {} payments already in flight node-wide (cap {}); holding payout of hash {} until the node has room",
-                    order.id, inflight.total, total_cap, payout_hash
-                ),
-            }
-            tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT).await;
-            match crate::db::touch_order_payout_claim(
-                ctx.pool(),
-                order.id,
-                &payout_hash,
-                Some(payout_claimed_at),
-            )
-            .await
-            {
-                Ok(Some(refreshed_at)) => payout_claimed_at = refreshed_at,
-                Ok(None) => {
-                    warn!(
-                        "Order {}: payout claim was re-armed or replaced while gated; dropping stale dispatch of hash {}",
-                        order.id, payout_hash
-                    );
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "Order {}: could not heartbeat payout claim while gated ({e}); dropping dispatch of hash {} — reconciliation will resolve the kept marker",
-                        order.id, payout_hash
-                    );
-                    return;
-                }
-            }
-        }
 
         // Final re-validation now that the queue wait is over, refreshing
         // the timestamp in the same CAS (the last heartbeat may be up to a
@@ -911,9 +923,18 @@ pub async fn do_payment(
             let ctx = ctx.clone();
             let payout_hash = payout_hash.clone();
             let mut order = order.clone();
+            // The reservation rides with the watcher: it ends when LND
+            // first reports the payment, or with the watcher if it never
+            // does (the send errored before anything went out).
+            let mut reservation = reservation.take();
             async move {
                 // Receiving msgs from send_payment()
                 while let Some(msg) = rx.recv().await {
+                    // LND now reports this payment itself, so the slot
+                    // booked at the gate is no longer needed to keep the
+                    // count honest — and keeping it would count the
+                    // payment twice for as long as the send runs.
+                    reservation.take();
                     if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
                         match status {
                             PaymentStatus::Succeeded => {

@@ -74,8 +74,11 @@ const PAYOUT_QUEUE_HEARTBEAT: Duration =
 /// perfectly healthy payout, let reconciliation re-arm it as failed, and burn
 /// the buyer's retry budget over a lock that cleared in milliseconds — the
 /// exact outcome "a gated payout is delayed, not lost" promises not to have.
-const PAYOUT_HEARTBEAT_ATTEMPTS: u32 = 5;
+const PAYOUT_HEARTBEAT_ATTEMPTS: u32 = 8;
 const PAYOUT_HEARTBEAT_BACKOFF: Duration = Duration::from_millis(100);
+/// Ceiling on one backoff step, so eight attempts span ~10s rather than
+/// doubling into the reconcile grace window (`MIN_GRACE_SECS`, 30s).
+const PAYOUT_HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// What a claim heartbeat found.
 enum ClaimHeartbeat {
@@ -85,7 +88,8 @@ enum ClaimHeartbeat {
     /// this order and this dispatch must not go out.
     Lost,
     /// The claim could not be written after [`PAYOUT_HEARTBEAT_ATTEMPTS`]
-    /// tries. The marker is kept, so reconciliation can still resolve it.
+    /// tries (~10s, still inside the reconcile grace window). The marker is
+    /// kept, so reconciliation can still resolve it.
     Unwritable(MostroError),
 }
 
@@ -119,7 +123,7 @@ async fn heartbeat_payout_claim(
                         "Order {order_id}: payout claim heartbeat attempt {attempt} failed ({e}); retrying in {backoff:?}"
                     );
                     tokio::time::sleep(backoff).await;
-                    backoff *= 2;
+                    backoff = (backoff * 2).min(PAYOUT_HEARTBEAT_MAX_BACKOFF);
                 }
                 last_error = Some(e);
             }

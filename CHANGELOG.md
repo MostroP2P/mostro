@@ -33,49 +33,35 @@ gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.18.6
+## What's Changed in 0.18.7
 
 ### 🚀 Features
 
 
-* feat: boot node-identity guard for Lightning node changes (Phase 4) by [@grunch](https://github.com/grunch) in [#936](https://github.com/MostroP2P/mostro/pull/936)
-* feat: advertise maintenance mode in the info event, republish on change (Phase 3) by [@grunch](https://github.com/grunch) in [#935](https://github.com/MostroP2P/mostro/pull/935)
-* feat: admin RPC for maintenance mode — SetMaintenanceMode + GetMaintenanceStatus (Phase 2) by [@grunch](https://github.com/grunch) in [#934](https://github.com/MostroP2P/mostro/pull/934)
-* feat: maintenance (drain) mode — persistent flag + escrow gate (Phase 1) by [@grunch](https://github.com/grunch) in [#933](https://github.com/MostroP2P/mostro/pull/933)
-* feat(cashu): take flow escrow request + unblock creation — Track A TA-2 by [@grunch](https://github.com/grunch) in [#830](https://github.com/MostroP2P/mostro/pull/830)
+* feat: cap in-flight payouts per destination and node-wide by [@grunch](https://github.com/grunch) in [#951](https://github.com/MostroP2P/mostro/pull/951)
+* feat: bound the total timelock of a payout route, not just the last hop by [@grunch](https://github.com/grunch) in [#950](https://github.com/MostroP2P/mostro/pull/950)
+* feat: CancelOrderRequest.pretrade_only — refuse to fall through to the dispute cancel by [@grunch](https://github.com/grunch) in [#944](https://github.com/MostroP2P/mostro/pull/944)
+* feat: operator cancel of pre-trade orders via CancelOrder RPC by [@grunch](https://github.com/grunch) in [#939](https://github.com/MostroP2P/mostro/pull/939)
 
 ### 🐛 Bug Fixes
 
 
-* fix(ci): scope publishing to version tag pushes by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#909](https://github.com/MostroP2P/mostro/pull/909)
-* fix: compare-and-swap the trade-pubkey rotation (#811) by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#903](https://github.com/MostroP2P/mostro/pull/903)
-* fix: keep dev fee audit events (kind 8383) for one year by [@grunch](https://github.com/grunch) in [#924](https://github.com/MostroP2P/mostro/pull/924)
-* fix: verify the event signature before the spam gate by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#892](https://github.com/MostroP2P/mostro/pull/892)
-* fix(ci): make the release build toolchain verifiable and reproducible by [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) in [#905](https://github.com/MostroP2P/mostro/pull/905)
-* fix: clear next-trade fields on sell child orders by [@21Mill](https://github.com/21Mill) in [#891](https://github.com/MostroP2P/mostro/pull/891)
-* fix: stamp dispute events with a monotonic created_at by [@grunch](https://github.com/grunch) in [#899](https://github.com/MostroP2P/mostro/pull/899)
-* fix: follow-ups to the payout dispatch queue (post-merge audit of #883) by [@Catrya](https://github.com/Catrya) in [#893](https://github.com/MostroP2P/mostro/pull/893)
-
-### 🚜 Refactor
-
-
-* refactor: removed dead code identified in issue by [@Arowolokehinde](https://github.com/Arowolokehinde) in [#848](https://github.com/MostroP2P/mostro/pull/848)
+* fix: info event advertised the hold window as invoice_expiration_window by [@grunch](https://github.com/grunch) in [#952](https://github.com/MostroP2P/mostro/pull/952)
+* fix: cap user payout invoices at 144 blocks instead of 432 by [@grunch](https://github.com/grunch) in [#949](https://github.com/MostroP2P/mostro/pull/949)
+* fix: dev-fee verify parks hashes the connected node has never seen by [@grunch](https://github.com/grunch) in [#947](https://github.com/MostroP2P/mostro/pull/947)
+* fix: admin cancel tolerates a hold invoice LND already canceled or does not know by [@grunch](https://github.com/grunch) in [#941](https://github.com/MostroP2P/mostro/pull/941)
+* fix: drain counter E counts only in-flight bond payouts by [@grunch](https://github.com/grunch) in [#943](https://github.com/MostroP2P/mostro/pull/943)
+* fix: count only in-flight dev fees in the drain counters by [@grunch](https://github.com/grunch) in [#938](https://github.com/MostroP2P/mostro/pull/938)
+* fix: drain counter A no longer counts settled-hold-invoice orders by [@grunch](https://github.com/grunch) in [#940](https://github.com/MostroP2P/mostro/pull/940)
 
 ### 📚 Documentation
 
 
-* docs: operator runbook for migrating to a different Lightning node (Phase 5) by [@grunch](https://github.com/grunch) in [#937](https://github.com/MostroP2P/mostro/pull/937)
-* docs: maintenance mode / Lightning node migration spec by [@grunch](https://github.com/grunch) in [#932](https://github.com/MostroP2P/mostro/pull/932)
-* docs: payment-account history / anti-triangulation implementation spec by [@grunch](https://github.com/grunch) in [#917](https://github.com/MostroP2P/mostro/pull/917)
-* docs(cashu): specs for Tracks B/C/D (release, coop-cancel, dispute) by [@grunch](https://github.com/grunch) in [#833](https://github.com/MostroP2P/mostro/pull/833)
+* operator cancel goes through the gRPC, not mostro-cli admcancel by [@grunch](https://github.com/grunch)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#937](https://github.com/MostroP2P/mostro/pull/937)
-* [@AndreaDiazCorreia](https://github.com/AndreaDiazCorreia) made their contribution in [#909](https://github.com/MostroP2P/mostro/pull/909)
-* [@Arowolokehinde](https://github.com/Arowolokehinde) made their contribution in [#848](https://github.com/MostroP2P/mostro/pull/848)
-* [@21Mill](https://github.com/21Mill) made their contribution in [#891](https://github.com/MostroP2P/mostro/pull/891)
-* [@Catrya](https://github.com/Catrya) made their contribution in [#893](https://github.com/MostroP2P/mostro/pull/893)
+* [@grunch](https://github.com/grunch) made their contribution in [#951](https://github.com/MostroP2P/mostro/pull/951)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.5...0.18.6
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.18.6...0.18.7
 
 <!-- generated by git-cliff -->

@@ -72,13 +72,48 @@ pub struct PaymentMessage {
 /// this many payments *since* the oldest still-stuck one.
 pub(crate) const PAYOUT_INFLIGHT_SCAN_LIMIT: u64 = 2_000;
 
+/// In-flight payments at LND, split into the two quantities the payout gate
+/// cares about: how many there are overall, and how many are headed for the
+/// same destination as the payout about to be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InflightPayments {
+    /// Every payment LND currently reports as in flight, whatever its
+    /// destination — including any this daemon did not send.
+    pub total: u32,
+    /// Those whose route ends at the destination being gated.
+    pub to_destination: u32,
+}
+
+/// Which ceiling holds a payout back, when one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutGateReason {
+    /// The node as a whole has too much unresolved outgoing payment.
+    Total,
+    /// One destination is sitting on too many unresolved payments. This is
+    /// the sharper signal of the two: holding an HTLC requires controlling
+    /// the node that receives it, so HTLCs a payee refuses to settle all
+    /// share a destination by construction.
+    Destination,
+}
+
 /// Whether a payout must wait rather than add another in-flight HTLC.
 ///
-/// `cap == 0` disables the gate. Otherwise the payout waits once LND already
-/// holds `cap` in-flight payments, so the cap is a ceiling on simultaneously
-/// unresolved outgoing payments, not on payouts per unit of time.
-pub fn payout_gate_should_wait(inflight: u32, cap: u32) -> bool {
-    cap != 0 && inflight >= cap
+/// Either ceiling can hold it. A cap of `0` disables that ceiling; the
+/// destination ceiling is checked first, because it is the one that
+/// identifies an abusive payee rather than merely observing that the node is
+/// congested.
+pub fn payout_gate_reason(
+    inflight: InflightPayments,
+    total_cap: u32,
+    destination_cap: u32,
+) -> Option<PayoutGateReason> {
+    if destination_cap != 0 && inflight.to_destination >= destination_cap {
+        return Some(PayoutGateReason::Destination);
+    }
+    if total_cap != 0 && inflight.total >= total_cap {
+        return Some(PayoutGateReason::Total);
+    }
+    None
 }
 
 /// Routing-fee cap (in sats) handed to LND as `fee_limit_sat` for a
@@ -421,7 +456,22 @@ impl LndConnector {
         Ok(())
     }
 
-    /// Number of payments LND currently holds in flight.
+    /// Destination of a payment: the last hop of any attempt's route.
+    ///
+    /// Read from the route rather than by decoding `payment_request`, which
+    /// would mean parsing a BOLT11 invoice per in-flight payment on every
+    /// gate check. A payment LND reports as in flight has always been
+    /// attempted, so a route is present.
+    fn payment_destination(payment: &fedimint_tonic_lnd::lnrpc::Payment) -> Option<&str> {
+        payment
+            .htlcs
+            .iter()
+            .find_map(|attempt| attempt.route.as_ref()?.hops.last())
+            .map(|hop| hop.pub_key.as_str())
+    }
+
+    /// Payments LND currently holds in flight, overall and toward
+    /// `destination` (a hex-encoded node pubkey).
     ///
     /// This asks the node, not the database, and the difference matters: a
     /// payout row is marked claimed *before* its send, so counting rows would
@@ -433,7 +483,10 @@ impl LndConnector {
     ///
     /// Scans the newest [`PAYOUT_INFLIGHT_SCAN_LIMIT`] payments; see that
     /// constant for the bound this puts on accuracy.
-    pub async fn count_inflight_payments(&mut self) -> Result<u32, MostroError> {
+    pub async fn count_inflight_payments(
+        &mut self,
+        destination: &str,
+    ) -> Result<InflightPayments, MostroError> {
         let request = fedimint_tonic_lnd::lnrpc::ListPaymentsRequest {
             // Pending *and* failed payments; the status filter below keeps
             // only the pending ones.
@@ -455,17 +508,28 @@ impl LndConnector {
             .await
             .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?;
 
-        let inflight = response
-            .into_inner()
-            .payments
-            .into_iter()
-            .filter(|payment| {
+        let mut total: u32 = 0;
+        let mut to_destination: u32 = 0;
+        for payment in response.into_inner().payments {
+            let in_flight =
                 fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
-                    == Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight)
-            })
-            .count();
+                    == Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight);
+            if !in_flight {
+                continue;
+            }
+            total = total.saturating_add(1);
+            // An unattributable payment still counts toward the total. Only
+            // the per-destination tally needs to know where it is going, and
+            // guessing would be worse than leaving it out.
+            if Self::payment_destination(&payment) == Some(destination) {
+                to_destination = to_destination.saturating_add(1);
+            }
+        }
 
-        Ok(u32::try_from(inflight).unwrap_or(u32::MAX))
+        Ok(InflightPayments {
+            total,
+            to_destination,
+        })
     }
 
     /// Look up a payment by hash, distinguishing "LND has no record" from
@@ -610,7 +674,9 @@ impl LnStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hash32, payout_gate_should_wait, routing_fee_cap_sats};
+    use super::{
+        decode_hash32, payout_gate_reason, routing_fee_cap_sats, InflightPayments, PayoutGateReason,
+    };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::*;
@@ -636,30 +702,74 @@ mod tests {
         });
     }
 
-    /// Under the cap the payout goes straight out: the gate must be
+    fn inflight(total: u32, to_destination: u32) -> InflightPayments {
+        InflightPayments {
+            total,
+            to_destination,
+        }
+    }
+
+    /// Under both ceilings the payout goes straight out: the gate must be
     /// invisible in normal operation, where in-flight payments are a handful
-    /// at a time.
+    /// at a time and spread across destinations.
     #[test]
-    fn payout_gate_lets_a_payout_through_below_the_cap() {
-        assert!(!payout_gate_should_wait(0, 100));
-        assert!(!payout_gate_should_wait(99, 100));
+    fn payout_gate_lets_a_payout_through_below_both_caps() {
+        assert_eq!(payout_gate_reason(inflight(0, 0), 100, 10), None);
+        assert_eq!(payout_gate_reason(inflight(99, 9), 100, 10), None);
     }
 
-    /// At the cap the payout waits — the cap is a ceiling on simultaneously
-    /// unresolved HTLCs, so the Nth+1 must not be added.
+    /// The node-wide ceiling catches congestion with no single culprit.
     #[test]
-    fn payout_gate_holds_a_payout_at_and_above_the_cap() {
-        assert!(payout_gate_should_wait(100, 100));
-        assert!(payout_gate_should_wait(4_000, 100));
-        assert!(payout_gate_should_wait(u32::MAX, 1));
+    fn payout_gate_holds_a_payout_at_the_node_wide_cap() {
+        assert_eq!(
+            payout_gate_reason(inflight(100, 1), 100, 10),
+            Some(PayoutGateReason::Total)
+        );
+        assert_eq!(
+            payout_gate_reason(inflight(u32::MAX, 0), 1, 10),
+            Some(PayoutGateReason::Total)
+        );
     }
 
-    /// `0` is the documented opt-out. An operator who disables the gate must
-    /// never be gated, however many payments are stuck.
+    /// The per-destination ceiling is the one that identifies an abusive
+    /// payee, and it must fire long before the node-wide total is anywhere
+    /// near its own cap — that is the whole reason it exists.
     #[test]
-    fn payout_gate_is_disabled_by_a_zero_cap() {
-        assert!(!payout_gate_should_wait(0, 0));
-        assert!(!payout_gate_should_wait(u32::MAX, 0));
+    fn payout_gate_holds_a_destination_sitting_on_unresolved_payments() {
+        assert_eq!(
+            payout_gate_reason(inflight(10, 10), 100, 10),
+            Some(PayoutGateReason::Destination)
+        );
+        assert_eq!(
+            payout_gate_reason(inflight(4_000, 4_000), 100, 10),
+            Some(PayoutGateReason::Destination)
+        );
+    }
+
+    /// When both ceilings are breached the destination is the more
+    /// actionable diagnosis, so it must win the report.
+    #[test]
+    fn payout_gate_reports_the_destination_when_both_caps_are_breached() {
+        assert_eq!(
+            payout_gate_reason(inflight(500, 50), 100, 10),
+            Some(PayoutGateReason::Destination)
+        );
+    }
+
+    /// `0` is the documented opt-out, and each ceiling opts out on its own.
+    #[test]
+    fn payout_gate_caps_are_disabled_independently_by_zero() {
+        assert_eq!(payout_gate_reason(inflight(u32::MAX, u32::MAX), 0, 0), None);
+        // Node-wide off, per-destination still guarding.
+        assert_eq!(
+            payout_gate_reason(inflight(u32::MAX, 10), 0, 10),
+            Some(PayoutGateReason::Destination)
+        );
+        // Per-destination off, node-wide still guarding.
+        assert_eq!(
+            payout_gate_reason(inflight(100, u32::MAX), 100, 0),
+            Some(PayoutGateReason::Total)
+        );
     }
 
     #[test]
@@ -883,7 +993,7 @@ mod offline_connector_tests {
     async fn count_inflight_payments_surfaces_transport_error() {
         init_test_settings();
         let mut ln = offline_connector().await;
-        assert!(ln.count_inflight_payments().await.is_err());
+        assert!(ln.count_inflight_payments("02deadbeef").await.is_err());
     }
 
     #[tokio::test]

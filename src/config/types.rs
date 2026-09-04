@@ -485,6 +485,15 @@ pub struct LightningSettings {
     /// can exhaust the node's slots. `0` disables the gate.
     #[serde(default = "default_max_inflight_payouts")]
     pub max_inflight_payouts: u32,
+    /// Same ceiling, applied per payout destination, and the sharper of the
+    /// two: holding an HTLC requires controlling the node that receives it,
+    /// so the HTLCs an abusive payee refuses to settle all share a
+    /// destination pubkey. A handful of unresolved payments to one pubkey is
+    /// already abnormal, and capping there prices the attack in funded
+    /// channels — one more destination node per this many held HTLCs. `0`
+    /// disables this arm of the gate.
+    #[serde(default = "default_max_inflight_payouts_per_destination")]
+    pub max_inflight_payouts_per_destination: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
     /// default the daemon refuses to start against a Lightning node whose
     /// identity pubkey differs from the one it last ran with while escrow
@@ -511,6 +520,16 @@ fn default_max_inflight_payouts() -> u32 {
     100
 }
 
+/// Low enough that an abusive payee is caught long before the node-wide cap
+/// would notice, high enough to absorb the one benign way payouts pile up on
+/// a single pubkey: several buyers cashing out at once to the same custodial
+/// wallet, which shares one node. Those settle in seconds, so ten
+/// *simultaneously unresolved* payments to one destination already means that
+/// destination is not settling.
+fn default_max_inflight_payouts_per_destination() -> u32 {
+    10
+}
+
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
 /// `holdexpirydelta` (12) plus slack for block-time variance and the
 /// guardian job's tick.
@@ -534,6 +553,7 @@ impl Default for LightningSettings {
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
             max_inflight_payouts: default_max_inflight_payouts(),
+            max_inflight_payouts_per_destination: default_max_inflight_payouts_per_destination(),
             allow_node_change: false,
         }
     }

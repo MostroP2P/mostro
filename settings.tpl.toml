@@ -37,6 +37,15 @@ escrow_deadline_margin_blocks = 24
 # slots. A gated payout is delayed, never dropped: it goes out on its own once
 # the node has room. 0 disables the gate.
 max_inflight_payouts = 100
+# The same ceiling per payout destination, and the sharper of the two:
+# holding an HTLC requires controlling the node that receives it, so the HTLCs
+# an abusive payee refuses to settle all share a destination pubkey. Capping
+# here prices the attack in funded channels — one more destination node per
+# this many held HTLCs — and catches it long before the node-wide cap would.
+# Ten simultaneously unresolved payments to one pubkey already means that
+# destination is not settling; the benign case it leaves room for is several
+# buyers cashing out at once to the same custodial wallet. 0 disables this arm.
+max_inflight_payouts_per_destination = 10
 # Boot guard: mostrod refuses to start against a Lightning node whose
 # identity pubkey differs from the one it last ran with while escrow
 # (hold invoices, bonds, in-flight payouts) is still open on the old

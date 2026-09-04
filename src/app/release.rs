@@ -4,7 +4,7 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
-    payout_gate_should_wait, LndConnector, PaymentMessage, PAYOUT_SEND_PAYMENT_TIMEOUT,
+    payout_gate_reason, LndConnector, PaymentMessage, PayoutGateReason, PAYOUT_SEND_PAYMENT_TIMEOUT,
 };
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
@@ -692,6 +692,13 @@ pub async fn do_payment(
     let payout_hash = decode_invoice(&payment_request)
         .map(|inv| bytes_to_string(inv.payment_hash().as_ref()))
         .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
+    // Destination of this payout, for the per-destination arm of the slot
+    // gate below. `get_payee_pub_key` recovers the key from the signature
+    // when the invoice omits the `n` field, so this is always available, and
+    // it is hex-encoded to match the pubkeys LND reports on route hops.
+    let payout_destination_pubkey = decode_invoice(&payment_request)
+        .map(|inv| inv.get_payee_pub_key().to_string())
+        .map_err(|_| MostroInternalErr(ServiceError::InvoiceInvalidError))?;
     let Some(payout_claimed_at) =
         crate::db::claim_order_payout(ctx.pool(), order.id, &payout_hash).await?
     else {
@@ -774,6 +781,15 @@ pub async fn do_payment(
         // semaphore alone cannot stop unresolved payouts from accumulating
         // until the node runs out of HTLC slots.
         //
+        // Two ceilings, and the per-destination one does the real work:
+        // holding an HTLC requires controlling the node that receives it, so
+        // the HTLCs an abusive payee refuses to settle all share a
+        // destination. That makes a handful of unresolved payments to one
+        // pubkey a far sharper signal than a large node-wide total, and it
+        // prices the attack in funded channels — a new destination node per
+        // `max_inflight_payouts_per_destination` held HTLCs. The node-wide
+        // cap stays as a backstop for congestion with no single culprit.
+        //
         // Wait rather than fail: the claim is durable and heartbeated, so a
         // gated payout is delayed, not lost, and it goes out by itself once
         // the node has room. Failing here would burn the buyer's retry budget
@@ -786,10 +802,15 @@ pub async fn do_payment(
         // A node that cannot answer is not a reason to strand a payout, so
         // the gate fails open — the same call the duplicate guard in
         // `send_payment` makes for the same reason.
-        let inflight_cap = ctx.settings().lightning.max_inflight_payouts;
+        let ln_settings = &ctx.settings().lightning;
+        let total_cap = ln_settings.max_inflight_payouts;
+        let destination_cap = ln_settings.max_inflight_payouts_per_destination;
         loop {
-            let inflight = match ln_client_payment.count_inflight_payments().await {
-                Ok(count) => count,
+            let inflight = match ln_client_payment
+                .count_inflight_payments(&payout_destination_pubkey)
+                .await
+            {
+                Ok(counts) => counts,
                 Err(e) => {
                     warn!(
                         "Order {}: in-flight payout count unavailable ({e}); dispatching hash {} without the slot gate",
@@ -798,13 +819,23 @@ pub async fn do_payment(
                     break;
                 }
             };
-            if !payout_gate_should_wait(inflight, inflight_cap) {
+            let Some(reason) = payout_gate_reason(inflight, total_cap, destination_cap) else {
                 break;
+            };
+            match reason {
+                PayoutGateReason::Destination => warn!(
+                    "Order {}: {} payments already in flight to {} (cap {}); holding payout of hash {} — a destination sitting on unresolved HTLCs is not settling them",
+                    order.id,
+                    inflight.to_destination,
+                    payout_destination_pubkey,
+                    destination_cap,
+                    payout_hash
+                ),
+                PayoutGateReason::Total => warn!(
+                    "Order {}: {} payments already in flight node-wide (cap {}); holding payout of hash {} until the node has room",
+                    order.id, inflight.total, total_cap, payout_hash
+                ),
             }
-            warn!(
-                "Order {}: {} payments already in flight (cap {}); holding payout of hash {} until the node has room",
-                order.id, inflight, inflight_cap, payout_hash
-            );
             tokio::time::sleep(PAYOUT_QUEUE_HEARTBEAT).await;
             match crate::db::touch_order_payout_claim(
                 ctx.pool(),

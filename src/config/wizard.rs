@@ -148,6 +148,7 @@ fn prompt_lightning_settings() -> Result<LightningSettings, MostroError> {
         max_final_cltv_expiry_delta: 432,
         escrow_deadline_margin_blocks: 24,
         max_inflight_payouts: 100,
+        max_inflight_payouts_per_destination: 10,
         allow_node_change: false,
     })
 }

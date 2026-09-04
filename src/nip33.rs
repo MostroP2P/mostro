@@ -572,13 +572,6 @@ fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
     }
 }
 
-/// Transform mostro info fields to tags
-///
-/// # Arguments
-///
-///
-/// `maintenance` is the current maintenance (drain) flag; the tag is always
-/// emitted so clients can tell "maintenance off" from "older daemon".
 /// The two invoice windows the info event advertises, each under its own name.
 ///
 /// They are different settings with different jobs and clients act on both:
@@ -605,6 +598,13 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
     ]
 }
 
+/// Transform mostro info fields to tags
+///
+/// # Arguments
+///
+///
+/// `maintenance` is the current maintenance (drain) flag; the tag is always
+/// emitted so clients can tell "maintenance off" from "older daemon".
 pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();

@@ -87,7 +87,9 @@ pub(crate) const MIN_ROUTE_CLTV_HEADROOM: u32 = 576;
 /// - Below `final_delta_bound + MIN_ROUTE_CLTV_HEADROOM` there is no room for
 ///   a route, so pathfinding would reject paths honest wallets produce and
 ///   every payout would fail with "no route" — looking like a routing problem
-///   rather than a misconfiguration.
+///   rather than a misconfiguration. A `final_delta_bound` so large that this
+///   sum does not fit in a `u32` is the same verdict reached sooner: no
+///   ceiling exists that could clear it.
 ///
 /// The second case is logged at error level and then deferred, deliberately
 /// *not* raised to the floor: LND rejects a `cltv_limit` above its own
@@ -99,7 +101,21 @@ pub fn payment_cltv_limit_blocks(configured: u32, final_delta_bound: u32) -> i32
         return 0;
     }
 
-    let floor = final_delta_bound.saturating_add(MIN_ROUTE_CLTV_HEADROOM);
+    // `checked_add`, not `saturating_add`: a `final_delta_bound` within
+    // MIN_ROUTE_CLTV_HEADROOM of `u32::MAX` would saturate the floor back down
+    // to a value a configured ceiling can meet, and a ceiling that cannot
+    // leave room for any route would pass the guard meant to reject it. There
+    // is no such ceiling to be had, so this is the same "no room for a route"
+    // verdict as below, reached before the comparison rather than after it.
+    let Some(floor) = final_delta_bound.checked_add(MIN_ROUTE_CLTV_HEADROOM) else {
+        tracing::error!(
+            "max_final_cltv_expiry_delta ({final_delta_bound}) is so large that no \
+             payment_cltv_limit can leave {MIN_ROUTE_CLTV_HEADROOM} blocks above it \
+             for a route. Deferring to the node's --max-cltv-expiry until it is \
+             fixed — payouts are unbounded by this setting in the meantime"
+        );
+        return 0;
+    };
     if configured < floor {
         tracing::error!(
             "payment_cltv_limit ({configured}) leaves no room for a route above \
@@ -734,7 +750,26 @@ mod tests {
     #[test]
     fn payment_cltv_limit_saturates_instead_of_wrapping_negative() {
         assert_eq!(payment_cltv_limit_blocks(u32::MAX, 144), i32::MAX);
-        assert!(payment_cltv_limit_blocks(u32::MAX, u32::MAX) >= 0);
+    }
+
+    /// A final-delta bound too close to `u32::MAX` for the route headroom to
+    /// fit above it leaves no ceiling that could bound a route, so it defers
+    /// like any other starved ceiling. Computing the floor with saturating
+    /// arithmetic would instead pull it back down to a value the configured
+    /// ceiling meets, and the guard would pass the one case it cannot serve.
+    #[test]
+    fn payment_cltv_limit_defers_when_no_ceiling_can_clear_the_final_delta() {
+        assert_eq!(payment_cltv_limit_blocks(u32::MAX, u32::MAX), 0);
+        // The first bound whose floor no longer fits in a u32.
+        let unreachable = u32::MAX - MIN_ROUTE_CLTV_HEADROOM + 1;
+        assert_eq!(payment_cltv_limit_blocks(u32::MAX, unreachable), 0);
+        // One block lower the floor is exactly `u32::MAX`, which the largest
+        // ceiling does meet: the boundary is a real one, not a blanket refusal
+        // of large bounds.
+        assert_eq!(
+            payment_cltv_limit_blocks(u32::MAX, unreachable - 1),
+            i32::MAX
+        );
     }
 
     /// The retry that saves an operator whose node caps timelocks lower than

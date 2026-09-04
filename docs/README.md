@@ -13,6 +13,7 @@ Quick links to architecture and feature guides.
 - Maintenance Mode & LN Node Migration: MAINTENANCE_MODE_LN_MIGRATION.md (design spec; operator procedure lives in LIGHTNING_OPS.md)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
+- `y` Tag Compatibility Contract: Y_TAG_COMPATIBILITY.md (platform identifier plus optional instance name; guidance for indexers and clients)
 
 Tips
 - Run tests and lints before pushing: `cargo test`, `cargo fmt`, `cargo clippy --all-targets --all-features`.

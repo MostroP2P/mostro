@@ -272,6 +272,8 @@ client.send_event(&new_event).await?;
 
 ## Event Examples
 
+The `y` tag in the examples below shows the single-value form. Since #653 it may carry a second value with the configured instance name, `["y", "mostro", "<instance name>"]`. See `Y_TAG_COMPATIBILITY.md` for the contract.
+
 ### Order Event (Kind 38383 - Unchanged)
 
 ```json

@@ -206,7 +206,7 @@ mod tests {
         // picks up the bound from the serde default.
         assert_eq!(
             lightning_settings.lightning.max_final_cltv_expiry_delta,
-            432
+            144
         );
     }
 

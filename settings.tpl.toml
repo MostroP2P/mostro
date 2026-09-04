@@ -18,8 +18,14 @@ payment_attempts = 3
 # Retries interval for failed payments
 payment_retries_interval = 60
 # Maximum min_final_cltv_expiry_delta (in blocks) accepted on a payout invoice
-# supplied by a user. Bounds how long a payee can hold the outgoing HTLC.
-max_final_cltv_expiry_delta = 432
+# supplied by a user. This is the window in which that payee can hold the
+# outgoing HTLC — and the sats behind it — without settling; the node cannot
+# cancel a locked-in HTLC, it can only wait out the expiry. 144 blocks (~1
+# day) is the top of the range real wallets ask for. Raise it only if a
+# legitimate wallet is rejected. Never set it to 0: the check is
+# `delta > bound` and BOLT11 substitutes 18 when the invoice omits the
+# field, so a 0 bound rejects every invoice.
+max_final_cltv_expiry_delta = 144
 # Safety margin (in blocks) before the hold invoice's CLTV horizon. LND
 # auto-cancels an accepted hold invoice `invoices.holdexpirydelta` blocks
 # (default 12) before its HTLC expires, refunding the seller; once the

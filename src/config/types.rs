@@ -477,6 +477,15 @@ pub struct LightningSettings {
     /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
+    /// Upper bound, in blocks, on the *total* timelock of a payout route
+    /// (`SendPaymentRequest.cltv_limit`).
+    /// [`max_final_cltv_expiry_delta`](Self::max_final_cltv_expiry_delta)
+    /// bounds only the payee's own hop; this bounds the whole path, which is
+    /// what the node's channel is actually locked for when a hop force-closes
+    /// and the HTLC has to resolve on chain. Left unset, LND applies its own
+    /// `--max-cltv-expiry` (2016 blocks, ~2 weeks).
+    #[serde(default = "default_payment_cltv_limit")]
+    pub payment_cltv_limit: u32,
     /// Disaster-recovery override for the boot node-identity guard. By
     /// default the daemon refuses to start against a Lightning node whose
     /// identity pubkey differs from the one it last ran with while escrow
@@ -493,6 +502,18 @@ pub struct LightningSettings {
 /// cannot pin routing liquidity for weeks.
 fn default_max_final_cltv_expiry_delta() -> u32 {
     432
+}
+
+/// Half of LND's own `--max-cltv-expiry` default (2016). A payout route
+/// never legitimately needs a week of timelock: the longest plausible path
+/// is a handful of hops of 144 blocks each on top of the invoice's final
+/// delta, which
+/// [`MIN_ROUTE_CLTV_HEADROOM`](crate::lightning::MIN_ROUTE_CLTV_HEADROOM)
+/// already covers with room to spare. Halving the ceiling halves the
+/// worst-case on-chain resolution window without narrowing pathfinding to
+/// the point of failing honest payouts.
+fn default_payment_cltv_limit() -> u32 {
+    1008
 }
 
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
@@ -517,6 +538,7 @@ impl Default for LightningSettings {
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
+            payment_cltv_limit: default_payment_cltv_limit(),
             allow_node_change: false,
         }
     }

@@ -72,7 +72,10 @@ use uuid::Uuid;
 use crate::app::context::AppContext;
 use crate::config::settings::Settings;
 use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
-use crate::lightning::{routing_fee_cap_sats, LndConnector};
+use crate::lightning::{
+    claim_payout_slot, routing_fee_cap_sats, LndConnector, PayoutCaps, PayoutGateReason,
+    SlotVerdict,
+};
 use crate::util::{bytes_to_string, enqueue_order_msg};
 
 use super::db::{find_bond_by_id, find_bonds_by_state};
@@ -616,6 +619,45 @@ async fn pay_counterparty(
         }
     }
 
+    // Step 1b — the payout slot gate, same ceilings as the buyer payout
+    // (`do_payment`): a bond winner handing in a hold invoice pins an HTLC
+    // exactly as a buyer can, and a payout that skipped the gate would
+    // still count toward it at LND and keep honest buyers gated. Checked
+    // before the hash is persisted, so a held payout leaves no marker: the
+    // row stays `PendingPayout` and the next tick simply re-evaluates —
+    // deferring, not waiting, because this runs inside the scheduler job.
+    // Fails open like the buyer payout: a node that cannot answer is not a
+    // reason to strand a payout.
+    let destination = decoded.get_payee_pub_key().to_string();
+    let caps = PayoutCaps::from_settings(Settings::get_ln());
+    let mut reservation = match claim_payout_slot(ln_client, &destination, caps).await {
+        Ok(SlotVerdict::Reserved(reservation)) => Some(reservation),
+        Ok(SlotVerdict::Held { counted, reason }) => {
+            let (count, cap, what) = match reason {
+                PayoutGateReason::Destination => (
+                    counted.to_destination,
+                    caps.per_destination,
+                    "to this destination",
+                ),
+                PayoutGateReason::Total => (counted.total, caps.total, "node-wide"),
+            };
+            info!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "bond payout: {count} payments already in flight {what} (cap {cap}); deferring to next tick"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "bond payout: in-flight payout count unavailable ({e}); sending without the slot gate"
+            );
+            None
+        }
+    };
+
     // Step 2 — persist routing-fee cap + payment_hash *before*
     // `send_payment`. The CAS is the idempotency anchor: from this
     // point on, every re-entry into this function for this bond will
@@ -690,6 +732,10 @@ async fn pay_counterparty(
     let drain_fut = async move {
         let mut outcome = StreamOutcome::Ended;
         while let Some(msg) = rx.recv().await {
+            // LND now reports this payment itself; the slot booked at the
+            // gate would count it a second time for the rest of the send.
+            // Same release point as the buyer payout's watcher.
+            reservation.take();
             if let Ok(status) = PaymentStatus::try_from(msg.payment.status) {
                 match status {
                     PaymentStatus::Succeeded => {

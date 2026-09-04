@@ -492,6 +492,23 @@ pub struct LightningSettings {
     /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
+    /// Ceiling on how many payments the node may have in flight before a new
+    /// payout waits its turn instead of adding another unresolved HTLC. A
+    /// payee that never settles pins the sats, the routing liquidity behind
+    /// them and an HTLC slot until the CLTV expires, and the sender cannot
+    /// cancel a locked-in HTLC — so without a ceiling, cheap repeat trades
+    /// can exhaust the node's slots. `0` disables the gate.
+    #[serde(default = "default_max_inflight_payouts")]
+    pub max_inflight_payouts: u32,
+    /// Same ceiling, applied per payout destination, and the sharper of the
+    /// two: holding an HTLC requires controlling the node that receives it,
+    /// so the HTLCs an abusive payee refuses to settle all share a
+    /// destination pubkey. A handful of unresolved payments to one pubkey is
+    /// already abnormal, and capping there prices the attack in funded
+    /// channels — one more destination node per this many held HTLCs. `0`
+    /// disables this arm of the gate.
+    #[serde(default = "default_max_inflight_payouts_per_destination")]
+    pub max_inflight_payouts_per_destination: u32,
     /// Upper bound, in blocks, on the *total* timelock of a payout route
     /// (`SendPaymentRequest.cltv_limit`).
     /// [`max_final_cltv_expiry_delta`](Self::max_final_cltv_expiry_delta)
@@ -550,6 +567,24 @@ fn default_payment_cltv_limit() -> u32 {
     1008
 }
 
+/// Far above what healthy operation reaches — a payout normally resolves in
+/// seconds, so in-flight payments are a handful at a time — and far below the
+/// 483 HTLCs a single channel can hold, so the gate stays invisible in normal
+/// use and only bites when payouts are genuinely piling up unresolved.
+fn default_max_inflight_payouts() -> u32 {
+    100
+}
+
+/// Low enough that an abusive payee is caught long before the node-wide cap
+/// would notice, high enough to absorb the one benign way payouts pile up on
+/// a single pubkey: several buyers cashing out at once to the same custodial
+/// wallet, which shares one node. Those settle in seconds, so ten
+/// *simultaneously unresolved* payments to one destination already means that
+/// destination is not settling.
+fn default_max_inflight_payouts_per_destination() -> u32 {
+    10
+}
+
 /// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
 /// `holdexpirydelta` (12) plus slack for block-time variance and the
 /// guardian job's tick.
@@ -572,6 +607,8 @@ impl Default for LightningSettings {
             payment_retries_interval: 0,
             max_final_cltv_expiry_delta: default_max_final_cltv_expiry_delta(),
             escrow_deadline_margin_blocks: default_escrow_deadline_margin_blocks(),
+            max_inflight_payouts: default_max_inflight_payouts(),
+            max_inflight_payouts_per_destination: default_max_inflight_payouts_per_destination(),
             payment_cltv_limit: default_payment_cltv_limit(),
             allow_node_change: false,
         }

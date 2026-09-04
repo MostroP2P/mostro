@@ -35,6 +35,23 @@ max_final_cltv_expiry_delta = 144
 # dispute (FiatSent) while the escrow still exists. Must comfortably
 # exceed your node's holdexpirydelta.
 escrow_deadline_margin_blocks = 24
+# Ceiling on how many payments the node may have in flight before a new payout
+# waits its turn instead of adding another unresolved HTLC. A payee that never
+# settles pins the sats, the routing liquidity behind them and an HTLC slot
+# until the CLTV expires, and a locked-in HTLC cannot be canceled by the
+# sender — so without a ceiling, cheap repeat trades can exhaust the node's
+# slots. A gated payout is delayed, never dropped: it goes out on its own once
+# the node has room. 0 disables the gate.
+max_inflight_payouts = 100
+# The same ceiling per payout destination, and the sharper of the two:
+# holding an HTLC requires controlling the node that receives it, so the HTLCs
+# an abusive payee refuses to settle all share a destination pubkey. Capping
+# here prices the attack in funded channels — one more destination node per
+# this many held HTLCs — and catches it long before the node-wide cap would.
+# Ten simultaneously unresolved payments to one pubkey already means that
+# destination is not settling; the benign case it leaves room for is several
+# buyers cashing out at once to the same custodial wallet. 0 disables this arm.
+max_inflight_payouts_per_destination = 10
 # Upper bound (in blocks) on the TOTAL timelock of a payout route, handed to
 # LND as `cltv_limit`. max_final_cltv_expiry_delta bounds only the payee's own
 # hop; this bounds the whole path, which is what your channel is really locked

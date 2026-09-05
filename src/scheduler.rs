@@ -45,6 +45,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_reconcile_stranded_taker_bonds(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -1363,6 +1364,25 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
         let pool = ctx.pool();
         loop {
             bond::reconcile_stranded_range_maker_bonds(pool).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Belt-and-braces bound on the taker-bond window (issue #927 part 2).
+/// Normally LND's cancel of the expired bond hold invoice drops a
+/// `WaitingTakerBond` order back to `Pending`; if that signal is missed
+/// (daemon restart before resubscribe, dropped subscription, LND
+/// unreachable during the cancel), the order — and its published
+/// `pending` event — would otherwise linger until the 24 h expiry
+/// sweep. This job sweeps such orders within ~10 minutes instead.
+async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            bond::reconcile_stranded_taker_bonds(pool).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

@@ -341,7 +341,18 @@ El Toque's CUP/MLC need at least one direct USD source to be live.
 Each currency's stored `AggregatedPrice` carries `as_of` = the timestamp
 of the last tick that produced a fresh aggregate for it.
 
-- A tick that yields a fresh value overwrites the entry with `as_of = now`.
+- A tick that yields a fresh value overwrites the entry with `as_of` = when
+  the value was **observed**. For a directly-fetched rate that is the tick's
+  `now` (the HTTP request returns the rate as of now). For a rate relayed
+  over Nostr it is the source event's own `created_at`, so the provider's
+  acceptance window and this serving window do not stack: a relayed price is
+  bounded at one `max_price_staleness_seconds` from observation, whatever age
+  the event arrived with (issue #860). The same applies to a fiat-cross
+  currency resolved against a Nostr-sourced anchor
+  (`nostr_anchor_dependent`, §6.3), which is no fresher than that anchor.
+- `as_of` never moves backwards: a write carrying an observation older than
+  the one already stored is dropped, so a relayed rate predating a direct
+  fetch cannot shorten a currency's remaining serving window.
 - A tick with zero contributors for a currency leaves the prior entry
   untouched (old `as_of`).
 - `PriceManager::get_price(ccy)`:

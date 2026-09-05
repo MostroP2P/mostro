@@ -20,6 +20,7 @@
 //! (hermeme, PR #841).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -63,6 +64,14 @@ pub struct NostrProvider {
     /// the shared `[price].max_price_staleness_seconds` so upstream Nostr
     /// freshness uses the same TTL the store enforces on cached quotes.
     max_age: Duration,
+    /// `created_at` of the event that sourced the last successful
+    /// [`PriceProvider::fetch`], surfaced through
+    /// [`PriceProvider::last_observed_at`]. `0` ⇒ never set.
+    ///
+    /// Atomic rather than a lock because `fetch` takes `&self` and this is a
+    /// single `i64` written once per tick by one scheduler task; `Relaxed`
+    /// is sufficient as no other state is ordered against it.
+    last_observed_at: AtomicI64,
 }
 
 impl NostrProvider {
@@ -113,6 +122,7 @@ impl NostrProvider {
             // `PriceSettings::validate` already rejects non-positive values;
             // clamp here so a zero can never make every event look fresh.
             max_age: Duration::from_secs(max_price_staleness_seconds.max(1) as u64),
+            last_observed_at: AtomicI64::new(0),
         })
     }
 
@@ -204,12 +214,16 @@ impl NostrProvider {
     /// even though a usable redundant trusted node is right there. Split out
     /// from [`Self::fetch`] so the fallback behavior is unit-testable
     /// without a relay.
-    pub(crate) fn pick_first_usable(
-        candidates: &[&Event],
-    ) -> Result<ProviderQuotes, ProviderError> {
+    ///
+    /// Returns the winning event alongside its quotes: the caller needs its
+    /// `created_at` to stamp `as_of` from when the rate was observed rather
+    /// than when we ingested it (issue #860).
+    pub(crate) fn pick_first_usable<'a>(
+        candidates: &[&'a Event],
+    ) -> Result<(&'a Event, ProviderQuotes), ProviderError> {
         for event in candidates {
             match Self::parse_content(&event.content) {
-                Ok(quotes) if !quotes.is_empty() => return Ok(quotes),
+                Ok(quotes) if !quotes.is_empty() => return Ok((event, quotes)),
                 Ok(_) => debug!(
                     "price: nostr: candidate event {} parsed to zero usable rates, trying next",
                     event.id
@@ -309,7 +323,21 @@ impl PriceProvider for NostrProvider {
             ));
         }
 
-        Self::pick_first_usable(&candidates)
+        let (event, quotes) = Self::pick_first_usable(&candidates)?;
+        // Record when the rate was *observed* by the trusted node, not when
+        // we read it. `PriceManager::update_all` stamps `as_of` from this so
+        // the store's serving window is not stacked on top of the age the
+        // event already had (issue #860).
+        self.last_observed_at
+            .store(event.created_at.as_secs() as i64, Ordering::Relaxed);
+        Ok(quotes)
+    }
+
+    fn last_observed_at(&self) -> Option<i64> {
+        match self.last_observed_at.load(Ordering::Relaxed) {
+            0 => None,
+            ts => Some(ts),
+        }
     }
 }
 
@@ -565,8 +593,12 @@ mod tests {
         let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
         let candidates = vec![&malformed, &valid];
 
-        let quotes = NostrProvider::pick_first_usable(&candidates).unwrap();
+        let (event, quotes) = NostrProvider::pick_first_usable(&candidates).unwrap();
         assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(50_000.0)));
+        // The returned event must be the one that actually parsed — its
+        // `created_at` is what stamps `as_of` (issue #860), so returning the
+        // skipped newest candidate would backdate by the wrong amount.
+        assert_eq!(event.id, valid.id);
     }
 
     #[test]
@@ -576,8 +608,9 @@ mod tests {
         let valid = signed_event(&keys, SAMPLE_CONTENT, NOW - 2_000);
         let candidates = vec![&empty, &valid];
 
-        let quotes = NostrProvider::pick_first_usable(&candidates).unwrap();
+        let (event, quotes) = NostrProvider::pick_first_usable(&candidates).unwrap();
         assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(50_000.0)));
+        assert_eq!(event.id, valid.id);
     }
 
     #[test]

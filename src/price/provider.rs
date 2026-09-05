@@ -110,6 +110,19 @@ pub trait PriceProvider: Send + Sync {
     /// reports; any network/parse failure is an `Err` so the provider is
     /// skipped for this tick.
     async fn fetch(&self, http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError>;
+
+    /// Unix timestamp of the *observation* behind the last successful
+    /// [`Self::fetch`], for a provider that relays a figure it did not
+    /// observe itself.
+    ///
+    /// `None` — the default, and correct for every HTTP provider — means
+    /// ingestion time is observation time: the request returns the rate as
+    /// of now. Only the Nostr provider differs, since a trusted node's rate
+    /// event was created before we read it, and that gap must not be
+    /// discarded when the store stamps `as_of` (issue #860).
+    fn last_observed_at(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// Per-provider circuit-breaker state (spec §6.5).

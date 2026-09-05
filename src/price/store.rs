@@ -61,21 +61,36 @@ impl PriceStore {
         Self::default()
     }
 
-    /// Overwrite the currencies present in `aggregates` with `as_of = now`.
+    /// Overwrite the currencies present in `aggregates`, stamping each with
+    /// `as_of` — the time the value was **observed**, which is the tick's
+    /// `now` for a directly-fetched rate but the source event's own
+    /// timestamp for a relayed one (issue #860).
+    ///
     /// Currencies **absent** from `aggregates` are left untouched, so their
     /// last-known-good value (and its older `as_of`) is preserved (spec
     /// §6.4). Currency codes are upper-cased to match read lookups.
-    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, now: i64) {
+    ///
+    /// **`as_of` never moves backwards.** A write carrying an observation
+    /// older than the one already stored is dropped: a relayed rate whose
+    /// event predates a value this node fetched directly is not news, and
+    /// applying it would *shorten* the serving window below what writing
+    /// nothing at all would have left — refusing a currency that was
+    /// perfectly servable a moment earlier.
+    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) {
         if aggregates.is_empty() {
             return;
         }
         let mut w = self.inner.write().expect("price store lock poisoned");
         for (currency, agg) in aggregates {
+            let key = currency.to_uppercase();
+            if w.get(&key).is_some_and(|prior| prior.as_of > as_of) {
+                continue;
+            }
             w.insert(
-                currency.to_uppercase(),
+                key,
                 AggregatedPrice {
                     value: agg.value,
-                    as_of: now,
+                    as_of,
                     source_count: agg.sources,
                 },
             );

@@ -694,13 +694,19 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
+    // The sender half was Mostro's own key, which it publishes anyway. The
+    // receiver is not: `admin_take_dispute` calls this with `event.identity`,
+    // so on that path the line wrote an identity key. This is also the
+    // highest-frequency send path in the daemon, so it is the widest instance
+    // of the pattern. `request_id` gives the same correlation handle at no
+    // extra parsing cost, since `message` is already parsed.
+    info!(
+        "Sending DM, request_id: {:?}",
+        message.get_inner_message_kind().request_id
+    );
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
@@ -741,12 +747,11 @@ pub async fn send_dm(
     )
     .await?;
 
-    info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        payload
-    );
+    // `payload` can itself carry a key: `admin_take_dispute` sends
+    // `Payload::Peer { pubkey: event.identity }` to both counterparties, so
+    // this line paired a receiver's trade key with a solver's identity key.
+    // The event id is public on the relay and identifies the message.
+    info!("Sending message, Event ID: {}", event.id);
 
     if let Ok(client) = get_nostr_client() {
         client

@@ -3,6 +3,19 @@ use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+/// How long a restore-session request waits for results before the
+/// requester is told to retry instead of hanging forever.
+///
+/// Named so the timeout and the message reporting it cannot drift apart —
+/// they were two independent literals, and the log said "1 hour" whatever
+/// the duration actually was.
+///
+/// Written as a literal rather than `60 * 60`: the product is a computation
+/// with nothing to compute, and it only exists for a mutation operator to
+/// flip into `60 + 60`. No test can meaningfully catch that without
+/// restating the constant, so the operator is better removed than guarded.
+const RESTORE_SESSION_TIMEOUT_SECS: u64 = 3_600; // 1 hour
+
 /// Handle restore session action
 /// This function starts a background task to process the restore session
 /// and immediately returns, avoiding blocking the main application
@@ -41,7 +54,7 @@ pub async fn restore_session_action(
 /// Handle restore session results in the background
 async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
     // Wait for the result with a timeout
-    let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
+    let timeout = tokio::time::Duration::from_secs(RESTORE_SESSION_TIMEOUT_SECS);
 
     match tokio::time::timeout(timeout, manager.wait_for_result()).await {
         Ok(Some(result)) => {
@@ -60,7 +73,10 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
             tracing::error!("Restore session result channel closed unexpectedly");
         }
         Err(_) => {
-            tracing::error!("Restore session timed out after 1 hour");
+            tracing::error!(
+                "Restore session timed out after {} minutes",
+                RESTORE_SESSION_TIMEOUT_SECS / 60
+            );
             // Send timeout message to user
             if let Err(e) = send_restore_session_timeout(&trade_key).await {
                 tracing::error!("Failed to send timeout message: {}", e);

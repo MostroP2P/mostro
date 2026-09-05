@@ -66,3 +66,32 @@ docker-build-startos:
 	cd docker && \
 	docker compose build mostro-startos
 
+# cargo-mutants tests one mutant at a time by default (verified against
+# 27.1.0: a single scratch dir on a 16-CPU host with no -j). This target
+# sets it explicitly anyway, because the suite genuinely cannot tolerate
+# more: the LNURL tests bind a fixed host port, so parallel workers collide
+# on the listener, and a test that fails for its own reasons scores as a
+# killed mutant — silently inflating the number this target exists to
+# measure.
+#
+# MOSTRO_TEST_LN_PORT moves those tests off 8080 in case something on the
+# host already holds it. It does NOT make the suite hermetic: two workers
+# would still collide with each other on 18080. Serialising is what makes
+# the run trustworthy; the port override only dodges a pre-existing
+# listener.
+#
+# The 18080 here deliberately differs from the code's own 8080 default, so
+# `cargo test` and `make mutation-test` do bind different ports. That is the
+# point: plain `cargo test` keeps exercising the default path, and only this
+# target — which runs the suite hundreds of times over — steps aside from a
+# port a developer machine is likely to have in use.
+#
+# ARGS is spliced into the shell command as plain text — only pass
+# hand-typed, trusted values (e.g. `make mutation-test ARGS="--file
+# src/foo.rs"`). Never build ARGS from PR-diff filenames or other
+# attacker-controlled input; that class of data must be turned into a bash
+# array and passed to `cargo mutants` directly (see the PR job in
+# .github/workflows/mutation.yml).
+mutation-test:
+	@set -o pipefail; \
+	CARGO_MUTANTS_JOBS=1 MOSTRO_TEST_LN_PORT=$${MOSTRO_TEST_LN_PORT:-18080} cargo mutants $(ARGS)

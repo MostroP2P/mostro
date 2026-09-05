@@ -25,8 +25,10 @@ use crate::app::context::AppContext;
 use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
+use crate::config::constants::{DB_FILENAME, ENV_FILENAME, SETTINGS_FILENAME};
 use crate::config::{
-    get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
+    get_db_pool, permissions, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG,
+    NOSTR_CLIENT,
 };
 use crate::db::find_held_invoices;
 use crate::lightning::LnStatus;
@@ -60,7 +62,30 @@ async fn main() -> Result<()> {
         .init();
 
     // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    settings_init()?;
+    let settings_dir = settings_init()?;
+
+    // `settings.toml` carries `nsec_privkey` in plaintext unless it was moved
+    // to `<settings_dir>/.env`, which carries it instead — either way the key
+    // that signs every event this instance publishes sits in one of these two
+    // files. Both are what the deployment guides have operators create by hand
+    // with `cp`, `curl` or an editor, all of which apply the umask, so a `0644`
+    // settings file is the normal accident. `mostro.db` is the same directory
+    // and the same accident: SQLite creates it under the umask, and it holds
+    // the trade history, the disputes and the hold-invoice preimages. Checked
+    // in both Lightning and Cashu mode, unlike the macaroon further down,
+    // because none of the three is specific to either.
+    //
+    // The database is checked before it exists on a first boot, which is
+    // silent; a fresh install is not the case this catches. The one it does
+    // catch is the deployment that has been running on a `0755` settings
+    // directory since before any of this existed.
+    for (name, label) in [
+        (SETTINGS_FILENAME, "Mostro settings file"),
+        (ENV_FILENAME, "Mostro env file"),
+        (DB_FILENAME, "Mostro database"),
+    ] {
+        permissions::warn_if_other_accessible(&settings_dir.join(name), label);
+    }
 
     // Build and install the multi-source price manager (spec §9 Phase 1).
     // Done immediately after settings load so every later subsystem
@@ -226,6 +251,17 @@ async fn main() -> Result<()> {
         // Run the Mostro Cashu event loop and be happy!!
         return run_cashu(ctx).await;
     }
+
+    // The admin macaroon is spend-capable: whoever reads it controls the node,
+    // including the funds escrowed in the hold invoices mostrod manages. Say so
+    // once per boot when the file is left reachable by other local accounts —
+    // the documented deployment flows copy it around, and a bad mode is
+    // otherwise invisible until it is abused.
+    let macaroon_file = &Settings::get_ln().lnd_macaroon_file;
+    permissions::warn_if_other_accessible(
+        std::path::Path::new(macaroon_file),
+        "LND admin macaroon",
+    );
 
     let mut ln_client = LndConnector::new().await?;
     let ln_status = ln_client.get_node_info().await?;

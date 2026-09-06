@@ -151,7 +151,23 @@ identity mismatch, expired epoch).
 
 ## 6. Merging on the destination
 
-Seeds are added to the user's existing values; nothing is overwritten.
+Each dimension has its own merge rule, because they measure different things:
+
+- **Completed trades add up.** A trade on A and a trade on B are distinct
+  trades, so the seed is added to the local count.
+- **Rating is a weighted average**, weighted by review count per origin. It is
+  never summed and never maxed.
+- **Account age is a maximum, never a sum.** "Days operating" answers "since
+  when does this person trade?", and that is a single date, the oldest one that
+  can be proven. Time passes in parallel on every venue, so adding day counts
+  would count the same month twice. A user who opened orders on A and B on the
+  same 10 August has 30 days on both a month later; importing A into B leaves
+  B at `max(30, 30) = 30`, not 60. With the default bands the import does not
+  even move the date: 30 days falls in `<6m`, whose floor is 0. Only a user who
+  proves 6+ months elsewhere moves `created_at`, and only when the local date
+  is more recent than that floor.
+
+Seeds are applied to the user's existing values; nothing is overwritten.
 
 | `users` column | Effect |
 |---|---|

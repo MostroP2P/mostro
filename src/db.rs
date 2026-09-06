@@ -26,6 +26,20 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 /// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
 const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 
+/// Exception carved out of both terminal-status filters: a closed order can
+/// still owe a bond payout to the winning counterparty, so it stays visible
+/// until that obligation resolves.
+///
+/// `'failed'` belongs beside `'pending-payout'`: a `Failed` row still accepts
+/// a payout invoice while it is inside the `payout_claim_window_days` window
+/// (`app::bond::payout::apply_invoice`), so the claim is live even though the
+/// last `send_payment` gave up. Both states are left for good on payout,
+/// forfeit or slash, so the exception expires without any code to retract it.
+/// Pinned against `BondState`'s serialization by
+/// `claimable_bond_states_match_bond_state_display`.
+const HAS_CLAIMABLE_BOND_PAYOUT: &str = "EXISTS (SELECT 1 FROM bonds b \
+     WHERE b.order_id = orders.id AND b.state IN ('pending-payout','failed'))";
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -41,9 +55,13 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     let mut keys: HashSet<String> = HashSet::new();
 
     // Order participants of every still-active order (disputed orders
-    // included — `TERMINAL_ORDER_STATUSES` excludes `'dispute'`).
+    // included — `TERMINAL_ORDER_STATUSES` excludes `'dispute'`), plus those
+    // of terminal orders that still owe a bond payout: the winner has to
+    // answer Mostro's `AddInvoice` nudge, and a key outside this set is held
+    // to `pow_first_contact` and dropped before decryption.
     let order_query = format!(
-        "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders WHERE status NOT IN ({TERMINAL_ORDER_STATUSES})"
+        "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders \
+         WHERE status NOT IN ({TERMINAL_ORDER_STATUSES}) OR {HAS_CLAIMABLE_BOND_PAYOUT}"
     );
     let order_rows = sqlx::query(AssertSqlSafe(order_query))
         .fetch_all(pool)
@@ -1592,6 +1610,16 @@ pub async fn is_dispute_taken_by_admin(
 
 /// Find all orders for a user by their master key (for restore session).
 /// Uses constants for excluded statuses to maintain consistency across queries.
+///
+/// Terminal orders that still owe a bond payout are kept
+/// ([`HAS_CLAIMABLE_BOND_PAYOUT`]): the winner needs the order and its trade
+/// index to answer Mostro's `AddInvoice` nudge, and nothing else in the
+/// restore path carries bond state — `find_user_disputes_by_master_key`
+/// drops the resolved dispute too. The clause is order-scoped rather than
+/// recipient-scoped, so both parties see such an order; `bonds.pubkey` is a
+/// trade key, not a master key, and the Phase 6 maker-refund row pays
+/// `bond.pubkey` itself, so narrowing it in SQL would be wrong more often
+/// than it would be tidy.
 pub async fn find_user_orders_by_master_key(
     pool: &SqlitePool,
     master_key: &str,
@@ -1605,13 +1633,16 @@ pub async fn find_user_orders_by_master_key(
         r#"
         SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
         WHERE (master_buyer_pubkey = ?)
-        AND status NOT IN ({})
+        AND (status NOT IN ({}) OR {})
         UNION ALL
         SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
         WHERE (master_seller_pubkey = ?)
-        AND status NOT IN ({})
+        AND (status NOT IN ({}) OR {})
         "#,
-        EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT,
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT
     );
     let orders = sqlx::query_as::<_, RestoredOrdersInfo>(AssertSqlSafe(sql_query))
         .bind(master_key)
@@ -1757,6 +1788,7 @@ impl RestoreSessionManager {
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
+    use crate::app::bond::BondState;
     use mostro_core::error::CantDoReason;
     use mostro_core::prelude::MostroError;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -1850,7 +1882,52 @@ mod tests {
         .execute(&pool)
         .await?;
 
+        // `bonds` subset: the terminal-status filters join against it via
+        // `HAS_CLAIMABLE_BOND_PAYOUT`, so the table has to exist here even
+        // for the tests that never insert a row. Only the columns those
+        // queries and their fixtures touch, mirroring the real migration's
+        // NOT NULL / default shape.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS bonds (
+                id char(36) primary key not null,
+                order_id char(36) not null,
+                parent_bond_id char(36),
+                child_order_id char(36),
+                pubkey char(64) not null,
+                role varchar(8) not null,
+                amount_sats integer not null,
+                slashed_share_sats integer not null default 0,
+                state varchar(16) not null,
+                slashed_reason varchar(16),
+                slashed_at integer,
+                created_at integer not null
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(pool)
+    }
+
+    /// Attach a bond row in `state` to `order_id`, for the payout-exception
+    /// arms of the terminal-status filters.
+    async fn insert_bond(pool: &SqlitePool, order_id: uuid::Uuid, pubkey: &str, state: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO bonds (id, order_id, pubkey, role, amount_sats, state,
+                               slashed_reason, slashed_at, created_at)
+            VALUES (?1, ?2, ?3, 'taker', 10000, ?4, 'lost-dispute', 1700000000, 1700000000)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(order_id)
+        .bind(pubkey)
+        .bind(state)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// Insert a minimal test order with the fields relevant to order status and dev fee queries.
@@ -2233,6 +2310,141 @@ mod tests {
             vec!["waiting-payment"],
             "restore must return only the live order, got {statuses:?}"
         );
+    }
+
+    /// The two states [`HAS_CLAIMABLE_BOND_PAYOUT`] names are SQL literals,
+    /// so a rename on `BondState` would leave them silently matching nothing
+    /// — the same failure mode as the unhyphenated status constants this
+    /// change fixes. Pin them against the enum's own serialization.
+    #[test]
+    fn claimable_bond_states_match_bond_state_display() {
+        for state in [BondState::PendingPayout, BondState::Failed] {
+            let literal = format!("'{state}'");
+            assert!(
+                super::HAS_CLAIMABLE_BOND_PAYOUT.contains(&literal),
+                "{literal} missing from the claimable-payout clause"
+            );
+        }
+    }
+
+    /// A terminal order that still owes a bond payout must stay restorable.
+    ///
+    /// After `admin_cancel_action` the order is `canceled-by-admin` and its
+    /// dispute is resolved, yet the slashed bond can sit in `pending-payout`
+    /// waiting for the winner's invoice. Nothing else in the restore path
+    /// carries bond state, so dropping the order here costs the winner the
+    /// trade index they need to claim — and `process_one_bond` forfeits the
+    /// bond when the claim window elapses.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_keeps_terminal_orders_owing_a_payout() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        async fn insert_for_master(
+            pool: &SqlitePool,
+            status: &str,
+            master_key: &str,
+        ) -> uuid::Uuid {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                                    master_buyer_pubkey, trade_index_buyer)
+                VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400, ?3, 7)
+                "#,
+            )
+            .bind(id)
+            .bind(status)
+            .bind(master_key)
+            .execute(pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        // Terminal, no obligation left → still excluded.
+        insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        // Terminal, but a bond is awaiting the winner's invoice → kept.
+        let owed = insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        insert_bond(&pool, owed, &"b".repeat(64), "pending-payout").await;
+        // A payout that exhausted its retries is still claimable inside the
+        // window (`apply_invoice` accepts `Failed`), so it counts too.
+        let failed = insert_for_master(&pool, "cooperatively-canceled", &master_key).await;
+        insert_bond(&pool, failed, &"c".repeat(64), "failed").await;
+        // A settled bond on a terminal order owes nothing → excluded.
+        let done = insert_for_master(&pool, "settled-by-admin", &master_key).await;
+        insert_bond(&pool, done, &"d".repeat(64), "slashed").await;
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+
+        let mut ids: Vec<uuid::Uuid> = orders.iter().map(|o| o.order_id).collect();
+        ids.sort();
+        let mut expected = vec![owed, failed];
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "only the terminal orders with an open payout may be restored"
+        );
+        assert!(
+            orders.iter().all(|o| o.trade_index == 7),
+            "the trade index must come back with them — it is what the claim needs"
+        );
+    }
+
+    /// The winner of a bond payout has to answer Mostro's `AddInvoice` nudge.
+    /// If their trade key leaves the known-key set when the order closes, a
+    /// v2 node with `pow_first_contact > pow` drops that reply before
+    /// decrypting it, and the payout stalls even for a client that kept its
+    /// session intact. Independent of restore: this is the gate, not the
+    /// client's state.
+    #[tokio::test]
+    async fn find_active_trade_pubkeys_keeps_keys_of_terminal_orders_owing_a_payout() {
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        // Terminal with nothing outstanding → keys drop out, as before.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "canceled-by-admin",
+            Some("creator_done"),
+            Some("buyer_done"),
+            Some("seller_done"),
+        )
+        .await;
+
+        // Terminal but owing a payout → every participant key is retained.
+        let owed = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            owed,
+            "canceled-by-admin",
+            Some("creator_owed"),
+            Some("buyer_owed"),
+            Some("seller_owed"),
+        )
+        .await;
+        insert_bond(&pool, owed, "buyer_owed", "pending-payout").await;
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        for k in ["creator_owed", "buyer_owed", "seller_owed"] {
+            assert!(
+                keys.contains(k),
+                "{k} must stay known while a payout is due"
+            );
+        }
+        for k in ["creator_done", "buyer_done", "seller_done"] {
+            assert!(!keys.contains(k), "{k} must NOT be known (nothing owed)");
+        }
     }
 
     #[tokio::test]

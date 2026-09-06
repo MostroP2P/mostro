@@ -179,7 +179,7 @@ Seeds are applied to the user's existing values; nothing is overwritten.
 | `seeded_rating_sum` (new) | `+= trades_floor * rating_floor`, internal only |
 
 The public `rating` tag on order events is unchanged in shape:
-`{"total_reviews", "total_rating", "days"}`. No `legacy` marker is published.
+`{"total_reviews", "total_rating", "since"}` (see 6.1). No `legacy` marker is published.
 The seeded review count acts as an anchor, so new ratings move the average
 slowly, exactly as they would for a long-standing Mostro user.
 
@@ -190,9 +190,30 @@ lnp2pBot where they have 347 trades, 4.87 average, 3 years:
 |---|---|---|
 | `total_reviews` | 2 | 202 |
 | `total_rating` | 4.5 | 4.5 |
-| `days` | 10 | 730 |
+| `since` | 10 days ago | 730 days ago |
 
-Counterparties see "4.5 · 202 reviews · 2 years".
+Counterparties see "4.5 · 202 reviews · trading for 2 years".
+
+### 6.1 Publish `since` instead of `days`
+
+`days` is derived at publish time, so it is stale on any event that lives on
+relays for a while, and it is awkward to merge. The underlying datum is a
+date, so the public field should be one:
+
+```json
+{"total_reviews": 202, "total_rating": 4.5, "since": 1693526400}
+```
+
+`since` is a Unix timestamp **truncated to the start of its UTC day**
+(`created_at - created_at % 86400`). Second precision would be a unique
+fingerprint for the user, and the rating tag already travels on every order
+of the same user, so it would make trade pubkeys perfectly correlatable.
+Day precision carries exactly the information `days` carries today.
+
+Clients compute the age at display time. The merge rule in section 6 becomes
+`since = min(since_local, since_seed)`. The daemon publishes both `days` and
+`since` for one deprecation window, in the order rating tag and in the
+kind 38384 rating event, then drops `days`.
 
 ## 7. Mostro-to-Mostro specifics
 

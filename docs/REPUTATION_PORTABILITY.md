@@ -290,7 +290,15 @@ its own; nothing in a later phase starts until the release it depends on is
 published.
 
 Repositories: `protocol` (spec), `mostro-core` (shared types, crates.io),
-`mostro` (daemon), `mobile` (app), `lnp2pbot/bot`.
+`mostro` (daemon), `mobile` (app 1.x, pure Dart), `app` (app 2.x, Flutter UI
+over a Rust core through flutter_rust_bridge, already on mostro-core, nostr-sdk
+0.45 and cdk), `lnp2pbot/bot`.
+
+Both apps must support the migration. They differ in where the work lands:
+the 1.x app needs its own Dart implementation of everything (BDHKE, models,
+parsing), while the 2.x app gets the types from mostro-core and the BDHKE
+primitives from cdk inside its Rust core, and only adds bridge functions and
+UI on the Dart side.
 
 ### Phase 0: specification
 
@@ -311,6 +319,7 @@ Independent of the migration and worth shipping first.
 | 1.1 | mostro-core | `src/rating.rs`: `Rating` gains `since: Option<u64>` (serde default); `to_tags()` emits a `since` tag when set, `from_tags()` parses it; `Rating::new` keeps its signature and a `with_since(u64)` builder is added so no caller breaks. `src/user.rs`: `UserInfo` gains `since: Option<u64>` (serde default). Unit tests for both round trips. | Released as a **patch** (0.14.7): additive, no signature changes. |
 | 1.2 | mostro | Bump core. One helper `day_truncate(created_at) -> u64` in `util.rs`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
 | 1.3 | mobile | `data/models/rating.dart` parses `since` and falls back to `days`; `data/models/user_info.dart` parses `since` and falls back to `operating_days`; age is computed at display time. Tests for both shapes. | Old and new daemons render the same age. |
+| 1.3b | app | Rust core: `nostr/order_events.rs::parse_rating_tag` reads `since` and falls back to `days`; `mostro/status.rs` maps `UserInfo.since` with fallback to `operating_days`; bump mostro-core to 0.14.7. Bridge exposes `since` and the Dart side (`peer_reputation_card.dart`, trade detail) computes the age at display time. Tests for both shapes. | Old and new daemons render the same age. |
 | 1.4 | mostro | Remove `days` and `operating_days` emission after the deprecation window (open decision 6). `UserInfo.operating_days` removal in core is a **minor** bump and goes with PR 2.3. | Removed with a changelog entry. |
 
 ### Phase 2: shared types in mostro-core
@@ -343,7 +352,7 @@ Independent of the migration and worth shipping first.
 | 4.3 | mostro | Native trade count: `count_completed_orders_for_identity` in `db.rs` over `orders.master_buyer_pubkey` / `master_seller_pubkey` with status `success` (full-privacy orders carry no master pubkey and are simply not counted). Combined with `User::native_stats` from core into the export cell. Tested. | Seeded values are excluded. |
 | 4.4 | mostro | Handler `export_reputation_action`: eligibility, once-only flag, blind signature with `cdk`, DLEQ, reply; sets `reputation_exported_at`. Integration test: export from instance A, import on instance B, both in-process. | Round trip passes on two local daemons. |
 
-### Phase 5: mobile
+### Phase 5: mobile (app 1.x, `mobile`)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
@@ -354,6 +363,19 @@ Independent of the migration and worth shipping first.
 | 5.5 | mobile | Telegram transport: open `t.me/lnp2pbot?start=migrate_<B_>`, receive the response through the app's deep link scheme, verify DLEQ, store token. | Manual test with the bot from phase 6. |
 | 5.6 | mobile | Settings screen "Import reputation": issuer list from the selected node's trust list, status per issuer, localized strings in every `intl_*.arb`. | `flutter analyze` clean, gen-l10n reports no untranslated keys. |
 | 5.7 | mobile | Optional: "use a new identity on this instance" when importing. | Separate PR, can slip. |
+
+### Phase 5b: app 2.x (`app`)
+
+Runs in parallel with phase 5; shares the UI copy and the localized strings.
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 5b.1 | app | Rust core: bump mostro-core to 0.15.0 so `Cell`, `ReputationKeyset`, `ReputationToken`, the new `Action` / `Payload` / `CantDoReason` variants come from core. Add `rust/src/mostro/reputation.rs` with blind, unblind and DLEQ verify over `cdk`'s BDHKE (no new dependency). Tested against the 0.5 vectors. | No bridge, no UI. |
+| 5b.2 | app | Rust core: token and in-flight blinding state persisted in the existing SQLite (native) / IndexedDB (web) layer, so an interrupted flow resumes on every platform. | Survives restart in a test on native and WASM. |
+| 5b.3 | app | Rust core: `export_reputation(issuer)` and `import_reputation(token)` flows against a Mostro issuer through the existing message queue, with the random redemption delay; keyset fetch and cache per trusted issuer. Bridge functions exposed through flutter_rust_bridge (generated, never hand-written). | Integration test against the local daemon from 4.4. |
+| 5b.4 | app | Telegram transport: open `t.me/lnp2pbot?start=migrate_<B_>` from Dart, receive the response through the app's deep link scheme on mobile and through a paste field on desktop and web, hand it to the Rust core for DLEQ verification. | Manual test with the bot from phase 6. |
+| 5b.5 | app | Dart UI: settings screen "Import reputation" reusing the 1.x copy, localized in every ARB under `lib/l10n/`. | `flutter analyze` clean, no untranslated keys. |
+| 5b.6 | app | Optional: "use a new identity on this instance" when importing. | Separate PR, can slip. |
 
 ### Phase 6: lnp2pBot as issuer
 
@@ -369,7 +391,7 @@ Independent of the migration and worth shipping first.
 1. Deploy 1.2 and 1.3 first; wait one release before 1.4.
 2. Deploy phase 3 on the reference instance with an empty issuer list.
 3. Deploy phase 6 on the bot and phase 4 on the reference instance; add both keys to the trust list.
-4. Ship the app with phases 5.1-5.6.
+4. Ship the 1.x app with phases 5.1-5.6 and the 2.x app with phases 5b.1-5b.5.
 5. Document the operator side (`docs/REPUTATION_PORTABILITY.md`, settings template) and the user side (mobile in-app help).
 
 ## 10. Open decisions
@@ -380,4 +402,4 @@ Independent of the migration and worth shipping first.
 4. Keyset event kind number and epoch length (default yearly).
 5. Admin override for re-issuance: yes or no.
 6. Length of the `days` deprecation window before PR 1.4 (default one minor release).
-7. Whether the new actions bump `PROTOCOL_VER` (currently 2) or ride on the `Unknown` / ignore-unknown tolerance already in core.
+7. ~~Whether the new actions bump `PROTOCOL_VER`~~ Closed: they do not. New actions ride on the unknown-variant tolerance already in the protocol; `PROTOCOL_VER` stays at 2.

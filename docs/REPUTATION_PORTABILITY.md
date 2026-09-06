@@ -178,7 +178,7 @@ Seeds are applied to the user's existing values; nothing is overwritten.
 | `seeded_reviews` (new) | `+= trades_floor`, internal only |
 | `seeded_rating_sum` (new) | `+= trades_floor * rating_floor`, internal only |
 
-The public `rating` tag on order events is unchanged in shape:
+The public `rating` tag on order events keeps its three-field shape:
 `{"total_reviews", "total_rating", "since"}` (see 6.1). No `legacy` marker is published.
 The seeded review count acts as an anchor, so new ratings move the average
 slowly, exactly as they would for a long-standing Mostro user.

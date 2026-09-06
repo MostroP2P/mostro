@@ -145,9 +145,10 @@ identity key**, carrying the token. The destination daemon:
 5. Inserts the redemption and seeds the user row (section 6) in the same
    transaction.
 
-Replies: `reputation-imported` on success; existing error payload with a new
-reason on failure (untrusted issuer, bad signature, already redeemed,
-identity mismatch, expired epoch).
+Replies: `reputation-imported` on success; `cant-do` with one of the new
+`CantDoReason` variants on failure (section 9, PR 2.3). Older clients map
+unknown reasons to the `Unknown` catch-all that core 0.14.6 introduced, so
+the new variants do not break them.
 
 ## 6. Merging on the destination
 
@@ -168,6 +169,11 @@ Each dimension has its own merge rule, because they measure different things:
   is more recent than that floor.
 
 Seeds are applied to the user's existing values; nothing is overwritten.
+The math lives next to `User::update_rating` in mostro-core, which already
+owns the running-average formula (first vote weighted 1/2, then incremental
+mean). A seeded user has `total_reviews > 1` from the start, so the
+first-vote damping no longer applies to them; that is the intended anchor
+effect.
 
 | `users` column | Effect |
 |---|---|
@@ -211,9 +217,20 @@ of the same user, so it would make trade pubkeys perfectly correlatable.
 Day precision carries exactly the information `days` carries today.
 
 Clients compute the age at display time. The merge rule in section 6 becomes
-`since = min(since_local, since_seed)`. The daemon publishes both `days` and
-`since` for one deprecation window, in the order rating tag and in the
-kind 38384 rating event, then drops `days`.
+`since = min(since_local, since_seed)`.
+
+The day count is exposed in **three** places today, and all three change:
+
+| Site | Today | Owner |
+|---|---|---|
+| `rating` tag on order events | `days` inside the JSON built by `create_rating_tag` | mostro |
+| kind 38384 rating event | `days` tag pushed by `rate_user` next to `Rating::to_tags()` | mostro; `Rating` itself has no date field |
+| `Peer` payload sent to the counterparty | `UserInfo.operating_days`, filled in `util.rs` | mostro-core type, mostro fills it |
+
+The daemon publishes both `days` and `since` for one deprecation window at
+all three sites, then drops `days`. `Rating::from_tags` ignores unknown keys
+and `UserInfo` gains the field as `Option` with a serde default, so old and
+new peers interoperate during the window.
 
 ## 7. Mostro-to-Mostro specifics
 
@@ -291,10 +308,10 @@ Independent of the migration and worth shipping first.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 1.1 | mostro-core | `Rating` gains `since: Option<u64>`; `to_tags()` emits `since` when set. Pure type change with unit tests. | Released as a patch version. |
-| 1.2 | mostro | Bump core. `create_rating_tag` emits `days` **and** `since`; `rate_user` pushes a `since` tag next to `days`; one shared `day_truncate(created_at)` helper. Unit tests on both emitters. | Both events carry both fields on a local relay. |
-| 1.3 | mobile | `Rating` model parses `since`, falls back to `days` when absent; age is computed at display time from `since`. Tests for both shapes. | Old and new daemons render the same age. |
-| 1.4 | mostro | Remove `days` after the deprecation window (open decision: one minor release). | Removed with a changelog entry. |
+| 1.1 | mostro-core | `src/rating.rs`: `Rating` gains `since: Option<u64>` (serde default); `to_tags()` emits a `since` tag when set, `from_tags()` parses it; `Rating::new` keeps its signature and a `with_since(u64)` builder is added so no caller breaks. `src/user.rs`: `UserInfo` gains `since: Option<u64>` (serde default). Unit tests for both round trips. | Released as a **patch** (0.14.7): additive, no signature changes. |
+| 1.2 | mostro | Bump core. One helper `day_truncate(created_at) -> u64` in `util.rs`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
+| 1.3 | mobile | `data/models/rating.dart` parses `since` and falls back to `days`; `data/models/user_info.dart` parses `since` and falls back to `operating_days`; age is computed at display time. Tests for both shapes. | Old and new daemons render the same age. |
+| 1.4 | mostro | Remove `days` and `operating_days` emission after the deprecation window (open decision 6). `UserInfo.operating_days` removal in core is a **minor** bump and goes with PR 2.3. | Removed with a changelog entry. |
 
 ### Phase 2: shared types in mostro-core
 
@@ -302,19 +319,20 @@ Independent of the migration and worth shipping first.
 |---|---|---|---|
 | 2.1 | mostro-core | Module `reputation::bands`: `TradesBand`, `RatingBand`, `AgeBand` enums with cuts and floors, `Cell { trades, rating, age }`, `Cell::from_stats(trades, avg_rating, since, now)`, `Cell::id()` / `parse()`. Pure, exhaustively tested against 0.2. | Round-trips every cell id. |
 | 2.2 | mostro-core | `ReputationKeyset` (parse/build the event from 0.3, epoch handling) and `ReputationToken { issuer, epoch, cell, secret, c }` with serde and shape validation. No crypto. | Parses the 0.5 vectors. |
-| 2.3 | mostro-core | `Action` variants `ExportReputation`, `ExportReputationResponse`, `ImportReputation`, `ReputationImported`; `Payload` variants `BlindedReputationRequest { b }`, `BlindedReputationResponse { c, cell, dleq }`, `ReputationToken`; `CantDoReason` variants `UntrustedIssuer`, `InvalidReputationToken`, `ReputationAlreadyRedeemed`, `ReputationIdentityMismatch`, `ExpiredKeysetEpoch`, `NotEligibleForExport`, `ReputationAlreadyExported`. Serde round-trip tests. | Released as a minor version. |
+| 2.3 | mostro-core | `src/message.rs`: `Action` variants `ExportReputation`, `ReputationExported`, `ImportReputation`, `ReputationImported` (past participle for daemon replies, matching `Released` / `Canceled`); `Payload` variants `BlindedReputationRequest(BlindedReputationRequest)`, `BlindedReputationResponse(BlindedReputationResponse)`, `ReputationToken(ReputationToken)`. `src/error.rs`: `CantDoReason` variants `UntrustedReputationIssuer`, `InvalidReputationToken`, `ReputationAlreadyRedeemed`, `ReputationIdentityMismatch`, `ExpiredReputationKeyset`, `NotEligibleForReputationExport`, `ReputationAlreadyExported`, inserted before `Unknown`. `src/prelude.rs`: `NOSTR_REPUTATION_KEYSET_KIND`. Serde round-trip tests; decide whether `PROTOCOL_VER` bumps (open decision 7). | Part of the **minor** release. |
+| 2.4 | mostro-core | `src/user.rs`: `User` gains `seeded_reviews: i64`, `seeded_rating_sum: f64`, `reputation_exported_at: Option<i64>`, each with `#[sqlx(default)]` and `#[serde(default)]` so a daemon on an un-migrated database still deserialises `SELECT *`. `User::new` initialises them. | First use of `sqlx(default)` in core; test with a row that lacks the columns. |
+| 2.5 | mostro-core | `src/user.rs`: `User::apply_reputation_seed(&mut self, cell: &Cell, now: i64)` implementing section 6 next to `update_rating`, plus `User::native_stats(&self) -> (reviews, rating, since)` that subtracts the seeded part. Property tests: never decreases `total_reviews`, never moves `created_at` forward, idempotent per issuer. | No I/O; released as **0.15.0** together with 2.1-2.4. |
 
 ### Phase 3: mostrod as destination (import)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
 | 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `issuers`, `accepted_epochs`) with parsing, defaults and validation. No behaviour. | Bad config is rejected at startup with a clear error. |
-| 3.2 | mostro | Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `reputation_exported_at`; new table `redeemed_reputation_tokens(secret_hash PK, issuer, identity_pubkey, cell, redeemed_at)` with a unique index on `(issuer, identity_pubkey)`. `db.rs` accessors with tests. | Migration applies on an existing database. |
+| 3.2 | mostro | Bump core to 0.15.0. Migration `users` gains `seeded_reviews`, `seeded_rating_sum`, `reputation_exported_at` (matching PR 2.4 exactly, `SELECT *` + `FromRow` requires it); new table `redeemed_reputation_tokens(secret_hash PK, issuer, identity_pubkey, cell, redeemed_at)` with a unique index on `(issuer, identity_pubkey)`. `db.rs` accessors with tests. | Migration applies on an existing database; the `users` insert in `db.rs` binds the new columns. |
 | 3.3 | mostro | Crypto module `reputation::verify`: `hash_to_curve`, unblinded-signature verification and DLEQ verification on top of `cdk`. Tested against the 0.5 vectors, including every invalid case. | No daemon wiring yet. |
 | 3.4 | mostro | Keyset fetcher: fetch and cache the issuer keyset event per trusted issuer, refresh on epoch change, reject unknown epochs. Tested with the `local-relay` feature. | Cache survives a relay outage. |
-| 3.5 | mostro | Pure merge: `apply_seed(&mut User, &Cell, now)` implementing section 6 (trades add, weighted rating, `since` min, seeded counters). Property tests: never decreases `total_reviews`, never moves `created_at` forward, idempotent per issuer. | No I/O in the function. |
-| 3.6 | mostro | Handler `import_reputation_action`: routing in `app.rs`, checks 1-5 of section 5.3 in one transaction, reply `reputation-imported` or `cant-do`. Integration test end to end with a fixture issuer. | A second redemption of the same token is rejected. |
-| 3.7 | mostro | Publish the updated kind 38384 rating event after a successful import. | Event visible on the local relay. |
+| 3.5 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, checks 1-5 of section 5.3 in one transaction, calls `User::apply_reputation_seed` from core, persists through a new `update_user_reputation_seed` in `db.rs`, replies `reputation-imported` or `cant-do`. Integration test end to end with a fixture issuer. | A second redemption of the same token is rejected. |
+| 3.6 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
 
 ### Phase 4: mostrod as issuer (export)
 
@@ -322,7 +340,7 @@ Independent of the migration and worth shipping first.
 |---|---|---|---|
 | 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `epoch_length`); per-cell key derivation from the daemon key and epoch (HKDF, deterministic, never stored). Unit tests: same inputs, same keys. | No publication yet. |
 | 4.2 | mostro | Publish the keyset event at startup and on epoch rollover, with the K-anonymity merge from section 4 using cell populations from the database. | Event validates against 2.2. |
-| 4.3 | mostro | Native stats: `native_stats(identity)` = completed orders for the identity, native rating from `seeded_rating_sum`, `since` from `created_at`. Query plus pure function, tested. | Seeded values are excluded. |
+| 4.3 | mostro | Native trade count: `count_completed_orders_for_identity` in `db.rs` over `orders.master_buyer_pubkey` / `master_seller_pubkey` with status `success` (full-privacy orders carry no master pubkey and are simply not counted). Combined with `User::native_stats` from core into the export cell. Tested. | Seeded values are excluded. |
 | 4.4 | mostro | Handler `export_reputation_action`: eligibility, once-only flag, blind signature with `cdk`, DLEQ, reply; sets `reputation_exported_at`. Integration test: export from instance A, import on instance B, both in-process. | Round trip passes on two local daemons. |
 
 ### Phase 5: mobile
@@ -362,3 +380,4 @@ Independent of the migration and worth shipping first.
 4. Keyset event kind number and epoch length (default yearly).
 5. Admin override for re-issuance: yes or no.
 6. Length of the `days` deprecation window before PR 1.4 (default one minor release).
+7. Whether the new actions bump `PROTOCOL_VER` (currently 2) or ride on the `Unknown` / ignore-unknown tolerance already in core.

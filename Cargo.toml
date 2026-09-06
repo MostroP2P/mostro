@@ -2,7 +2,7 @@
 name = "mostro"
 version = "0.18.7"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
 description = "Lightning Network peer-to-peer nostr platform"
 homepage = "https://mostro.network"

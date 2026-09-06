@@ -263,29 +263,96 @@ issuers = [
   issuer signs a pubkey it does not see. It is bounded by eligibility, by the
   one-token rule, and by being equivalent to selling the account.
 
-## 9. Work breakdown
+## 9. Implementation plan
 
-**Protocol** (first, the others depend on it): actions `export-reputation`,
-`import-reputation`, `reputation-imported`; token payload; keyset event kind
-and schema; the band grid as a protocol constant; error reasons.
+Ordered by dependency. Each item is one pull request, small enough to be
+reviewed in full by a human and by the automated reviewers (CodeRabbit,
+Codex). A PR never mixes a protocol type change with behaviour, nor a
+migration with a handler. Every PR carries its own tests and lands green on
+its own; nothing in a later phase starts until the release it depends on is
+published.
 
-**lnp2pBot**: module `bot/modules/reputation` with the `/migrate` deep-link
-handler, issuer key from a new `REPUTATION_ISSUER_SK`, keyset publication via
-the existing `nostr` module, eligibility rules, `reputation_exported_at` on
-`User`, cell population check for `K`-anonymity before publishing.
+Repositories: `protocol` (spec), `mostro-core` (shared types, crates.io),
+`mostro` (daemon), `mobile` (app), `lnp2pbot/bot`.
 
-**Mostro**: `[reputation_import]` settings; keyset fetch and cache per
-issuer; BDHKE verify with `cdk`; migration adding `seeded_reviews`,
-`seeded_rating_sum`, `reputation_exported_at` to `users` and the table
-`redeemed_reputation_tokens(secret_hash, issuer, identity_pubkey, cell,
-redeemed_at)`; issuer side (`export-reputation`) with its own keyset and DLEQ.
+### Phase 0: specification
 
-**Mobile**: settings screen "Import reputation" listing available issuers;
-blinding, DLEQ verification and unblinding; Telegram deep-link round trip for
-the bot; random redemption delay; persisting the blinding state in Sembast so
-an interrupted flow can resume; optional "new identity on this instance"; the
-order-book rating filter already reads `total_rating`, so merged values pass
-through it unchanged.
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 0.1 | protocol | Add `since` to the `rating` tag and to the kind 38384 event, day-truncated Unix timestamp. Mark `days` deprecated with a removal version. | Spec merged, example events updated. |
+| 0.2 | protocol | Reputation band grid as a protocol constant: the three dimensions, cuts, floors, cell id string format (`trades:200+\|rating:4.5+\|age:24m+`), K-anonymity merge rule. | Open decisions 1-3 closed and written down. |
+| 0.3 | protocol | Issuer keyset event: kind number, `d` tag, `epoch` tag, content schema, accepted-epochs rule. | Kind number reserved. |
+| 0.4 | protocol | Actions `export-reputation`, `export-reputation-response`, `import-reputation`, `reputation-imported`; payload schemas; new `cant-do` reasons; the redemption checks in section 5.3 as normative text. | Spec merged. |
+| 0.5 | protocol | Test vectors: keyset, `B_`/`C_`/`C` for a fixed `r` and `k`, DLEQ, a valid token, and a table of invalid tokens (wrong cell, wrong identity, expired epoch). | Vectors file committed; every implementation below tests against it. |
+
+### Phase 1: `since` rollout
+
+Independent of the migration and worth shipping first.
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 1.1 | mostro-core | `Rating` gains `since: Option<u64>`; `to_tags()` emits `since` when set. Pure type change with unit tests. | Released as a patch version. |
+| 1.2 | mostro | Bump core. `create_rating_tag` emits `days` **and** `since`; `rate_user` pushes a `since` tag next to `days`; one shared `day_truncate(created_at)` helper. Unit tests on both emitters. | Both events carry both fields on a local relay. |
+| 1.3 | mobile | `Rating` model parses `since`, falls back to `days` when absent; age is computed at display time from `since`. Tests for both shapes. | Old and new daemons render the same age. |
+| 1.4 | mostro | Remove `days` after the deprecation window (open decision: one minor release). | Removed with a changelog entry. |
+
+### Phase 2: shared types in mostro-core
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 2.1 | mostro-core | Module `reputation::bands`: `TradesBand`, `RatingBand`, `AgeBand` enums with cuts and floors, `Cell { trades, rating, age }`, `Cell::from_stats(trades, avg_rating, since, now)`, `Cell::id()` / `parse()`. Pure, exhaustively tested against 0.2. | Round-trips every cell id. |
+| 2.2 | mostro-core | `ReputationKeyset` (parse/build the event from 0.3, epoch handling) and `ReputationToken { issuer, epoch, cell, secret, c }` with serde and shape validation. No crypto. | Parses the 0.5 vectors. |
+| 2.3 | mostro-core | `Action` variants `ExportReputation`, `ExportReputationResponse`, `ImportReputation`, `ReputationImported`; `Payload` variants `BlindedReputationRequest { b }`, `BlindedReputationResponse { c, cell, dleq }`, `ReputationToken`; `CantDoReason` variants `UntrustedIssuer`, `InvalidReputationToken`, `ReputationAlreadyRedeemed`, `ReputationIdentityMismatch`, `ExpiredKeysetEpoch`, `NotEligibleForExport`, `ReputationAlreadyExported`. Serde round-trip tests. | Released as a minor version. |
+
+### Phase 3: mostrod as destination (import)
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `issuers`, `accepted_epochs`) with parsing, defaults and validation. No behaviour. | Bad config is rejected at startup with a clear error. |
+| 3.2 | mostro | Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `reputation_exported_at`; new table `redeemed_reputation_tokens(secret_hash PK, issuer, identity_pubkey, cell, redeemed_at)` with a unique index on `(issuer, identity_pubkey)`. `db.rs` accessors with tests. | Migration applies on an existing database. |
+| 3.3 | mostro | Crypto module `reputation::verify`: `hash_to_curve`, unblinded-signature verification and DLEQ verification on top of `cdk`. Tested against the 0.5 vectors, including every invalid case. | No daemon wiring yet. |
+| 3.4 | mostro | Keyset fetcher: fetch and cache the issuer keyset event per trusted issuer, refresh on epoch change, reject unknown epochs. Tested with the `local-relay` feature. | Cache survives a relay outage. |
+| 3.5 | mostro | Pure merge: `apply_seed(&mut User, &Cell, now)` implementing section 6 (trades add, weighted rating, `since` min, seeded counters). Property tests: never decreases `total_reviews`, never moves `created_at` forward, idempotent per issuer. | No I/O in the function. |
+| 3.6 | mostro | Handler `import_reputation_action`: routing in `app.rs`, checks 1-5 of section 5.3 in one transaction, reply `reputation-imported` or `cant-do`. Integration test end to end with a fixture issuer. | A second redemption of the same token is rejected. |
+| 3.7 | mostro | Publish the updated kind 38384 rating event after a successful import. | Event visible on the local relay. |
+
+### Phase 4: mostrod as issuer (export)
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `epoch_length`); per-cell key derivation from the daemon key and epoch (HKDF, deterministic, never stored). Unit tests: same inputs, same keys. | No publication yet. |
+| 4.2 | mostro | Publish the keyset event at startup and on epoch rollover, with the K-anonymity merge from section 4 using cell populations from the database. | Event validates against 2.2. |
+| 4.3 | mostro | Native stats: `native_stats(identity)` = completed orders for the identity, native rating from `seeded_rating_sum`, `since` from `created_at`. Query plus pure function, tested. | Seeded values are excluded. |
+| 4.4 | mostro | Handler `export_reputation_action`: eligibility, once-only flag, blind signature with `cdk`, DLEQ, reply; sets `reputation_exported_at`. Integration test: export from instance A, import on instance B, both in-process. | Round trip passes on two local daemons. |
+
+### Phase 5: mobile
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 5.1 | mobile | BDHKE client primitives in Dart: `hashToCurve`, blind, unblind, DLEQ verify, over secp256k1. Tested against the 0.5 vectors. | No UI, no services. |
+| 5.2 | mobile | Models: keyset event parser, `ReputationToken`, band cell; `MostroMessage` support for the new actions and payloads. | Serde round-trip tests. |
+| 5.3 | mobile | Storage: Sembast repository for tokens and for in-flight blinding state (`r`, `secret`, issuer) so an interrupted flow resumes. | Survives app restart in a test. |
+| 5.4 | mobile | `MostroService` + notifier: `exportReputation(issuer)` and `importReputation(token)` flows against a Mostro issuer, with the random redemption delay. | Integration test against a local daemon from 4.4. |
+| 5.5 | mobile | Telegram transport: open `t.me/lnp2pbot?start=migrate_<B_>`, receive the response through the app's deep link scheme, verify DLEQ, store token. | Manual test with the bot from phase 6. |
+| 5.6 | mobile | Settings screen "Import reputation": issuer list from the selected node's trust list, status per issuer, localized strings in every `intl_*.arb`. | `flutter analyze` clean, gen-l10n reports no untranslated keys. |
+| 5.7 | mobile | Optional: "use a new identity on this instance" when importing. | Separate PR, can slip. |
+
+### Phase 6: lnp2pBot as issuer
+
+| PR | Repo | Scope | Done when |
+|---|---|---|---|
+| 6.1 | bot | `REPUTATION_ISSUER_SK` in `.env-sample` and config validation; per-cell key derivation (same HKDF scheme as 4.1); `@cashu/crypto` dependency. Unit tests on derivation. | No command yet. |
+| 6.2 | bot | Publish the keyset event through the existing `nostr` module at startup, with the K-anonymity merge computed from Mongo. | Event validates against 2.2. |
+| 6.3 | bot | `User.reputation_exported_at`; `computeCell(user)` and `isEligible(user)` in `util/` using `trades_completed`, `total_rating`, `disputes`, `banned`, `created_at`. Tests on band edges. | Pure functions only. |
+| 6.4 | bot | `/start migrate_<B_>` handler: parse, eligibility, once-only, blind sign, DLEQ, reply with the app deep link; error messages in every locale YAML. Tests with a mocked user. | Round trip with 5.5. |
+
+### Phase 7: rollout
+
+1. Deploy 1.2 and 1.3 first; wait one release before 1.4.
+2. Deploy phase 3 on the reference instance with an empty issuer list.
+3. Deploy phase 6 on the bot and phase 4 on the reference instance; add both keys to the trust list.
+4. Ship the app with phases 5.1-5.6.
+5. Document the operator side (`docs/REPUTATION_PORTABILITY.md`, settings template) and the user side (mobile in-app help).
 
 ## 10. Open decisions
 
@@ -294,3 +361,4 @@ through it unchanged.
 3. Eligibility minimums (default 10 trades, disputes lost < 10%).
 4. Keyset event kind number and epoch length (default yearly).
 5. Admin override for re-issuance: yes or no.
+6. Length of the `days` deprecation window before PR 1.4 (default one minor release).

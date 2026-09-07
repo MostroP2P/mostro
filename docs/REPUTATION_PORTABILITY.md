@@ -56,13 +56,13 @@ migrations per day, a colluding pair can match "issued at 14:02" with
 solved, and it is bounded rather than eliminated:
 
 - The client waits a random delay before redeeming, drawn from a window wide
-  enough that many issuances fall inside it (*open decision* 8, default 24h).
+  enough that many issuances fall inside it (*open decision* 7, default 24h).
   The effective anonymity set is the number of migrations from the same
   issuer within that window, which is small on day one and grows with
   adoption.
-- Issuers store no issuance timestamp finer than the per-user flag in
-  section 6, so the correlation must be done live; it cannot be reconstructed
-  later from the database alone.
+- Issuers store no issuance timestamp finer than the day-truncated per-user
+  flag in section 5.3, so the correlation must be done live; it cannot be
+  reconstructed later from the database alone.
 - Nothing here helps the very first migrant. Anyone for whom this matters
   should wait until the issuer has processed a meaningful number of exports.
 
@@ -75,17 +75,22 @@ band means.
 
 All intervals are **half-open**, `[low, high)`, so every value falls in
 exactly one band and two implementations cannot disagree on a boundary. A
-"month" is exactly 30 days of 86400 seconds; ages are computed from
-`day_truncate(created_at)` (section 6.1) so the band does not flip mid-day.
+"month" is exactly 30 days of 86400 seconds; ages are computed from the
+day-truncated creation date (section 6.1) so the band does not flip mid-day —
+on a Mostro issuer that date is `native_created_at`, never the backdated
+`created_at` (section 7).
 
-| Dimension | Bands (*open decision*) | Floor | Seeds on the destination |
-|---|---|---|---|
-| Ratings received | `[1,10)`, `[10,50)`, `[50,200)`, `[200,∞)` | 1 / 10 / 50 / 200 | `total_reviews` += floor |
-| Average rating | `[0,4.0)`, `[4.0,4.5)`, `[4.5,5.0]` | 0.0 / 4.0 / 4.5 | `total_rating` weighted with floor |
-| Account age | `[0,6m)`, `[6m,24m)`, `[24m,∞)` | 0d / 180d / 720d | `created_at` moved back by floor |
+| Dimension (cell-id key) | Bands (*open decision*) | Cell-id labels | Floor | Seeds on the destination |
+|---|---|---|---|---|
+| Ratings received (`reviews`) | `[1,10)`, `[10,50)`, `[50,200)`, `[200,∞)` | `1-10`, `10-50`, `50-200`, `200+` | 1 / 10 / 50 / 200 | `total_reviews` += floor |
+| Average rating (`rating`) | `[0,4.0)`, `[4.0,4.5)`, `[4.5,5.0]` | `0-4.0`, `4.0-4.5`, `4.5+` | 0.0 / 4.0 / 4.5 | `total_rating` weighted with floor |
+| Account age (`age`) | `[0,6m)`, `[6m,24m)`, `[24m,∞)` | `0-6m`, `6m-24m`, `24m+` | 0d / 180d / 720d | `created_at` moved back by floor |
 
 The top rating band is closed at 5.0 because that is the maximum a rating can
-take; every other band is half-open.
+take; every other band is half-open. The cell-id labels are the exact strings
+used in keyset events and token `cell` fields (section 5.1); a label always
+names the band's low bound and, except for the open-ended top band, its high
+bound.
 
 Rules:
 
@@ -101,7 +106,7 @@ Rules:
   any cell holding fewer than `K` users (*open decision*, default 50) into an
   adjacent lower cell before publishing, so every cell is a real crowd. The
   merge is **deterministic and published**: a sparse cell steps down one band,
-  trying dimensions in the fixed order ratings, age, rating, and repeats until
+  trying dimensions in the fixed order `reviews`, `age`, `rating`, and repeats until
   the absorbing cell holds at least `K` or no lower band exists in any
   dimension, in which case it merges into the nearest non-empty lower cell.
   The resulting raw→effective map ships in the keyset, so a client can apply
@@ -149,7 +154,7 @@ without extra framing.
 | Challenge | `c = int(H_"mostro/reputation/challenge/v1"(R ‖ m)) mod n`, `R` compressed |
 | `m` | `"repv1:"` (6 ASCII bytes) ‖ 32-byte x-only destination identity pubkey ‖ 32-byte random nonce — 70 bytes exactly |
 | Token id | `H_"mostro/reputation/token/v1"(m)`, the primary key in `redeemed_reputation_tokens` |
-| Cell id | UTF-8 `reviews:<band>\|rating:<band>\|age:<band>`, no spaces, bands spelled as in section 4 |
+| Cell id | UTF-8 `reviews:<label>\|rating:<label>\|age:<label>`, no spaces, labels from the section 4 table |
 
 Points are compressed rather than x-only, and the challenge is a plain tagged
 hash rather than BIP-340's: BIP-340 normalises `R` to even Y, and the client's
@@ -186,19 +191,26 @@ destination lists as a trusted issuer, and it is the `issuer` field of every
 token. For lnp2pBot that key is `REPUTATION_ISSUER_SK`, kept separate from the
 bot's existing `NOSTR_SK` so reputation issuance can be rotated or revoked
 without disturbing the bot's other Nostr activity. A Mostro uses its daemon
-key. Keysets are rotated by **epoch** (yearly); a destination accepts
-the current and previous epoch only, so stale reputation cannot be imported
-years later and an issuer can retire keys.
+key. How an issuer derives or stores its `x_cell` scalars is its own business
+and not part of the protocol; only the `P_cell` points are.
+
+Keysets are rotated by **epoch**. The epoch label is a protocol constant, not
+an issuer choice — the UTC calendar year by default (*open decision* 4) — so
+that "current and previous epoch" means the same thing to every destination
+regardless of which issuer minted the token. A destination accepts the current
+and previous epoch only, so stale reputation cannot be imported years later
+and an issuer can retire keys.
 
 ### 5.3 Issuance (export)
 
 The blinding runs on the user's device; the issuer never sees the message it
 signs. Writing `m` for that message and `H` for the challenge hash:
 
-1. Client builds `m = "repv1:" || destination_identity_pubkey || nonce`.
+1. Client builds `m = "repv1:" ‖ destination_identity_pubkey ‖ nonce` (section 5.1).
 2. Issuer looks up the user, checks eligibility and the once-only flag, picks
-   the cell, and opens the session by sending the cell id and two nonce
-   points `R'_0 = k_0·G`, `R'_1 = k_1·G`.
+   the effective cell (raw cell folded through its own published `merges`),
+   and opens the session by sending that cell id and two nonce points
+   `R'_0 = k_0·G`, `R'_1 = k_1·G`.
 3. **Client validates the cell against its own statistics.** The user knows
    their own review count, rating and account age, so the client computes the
    raw cell, applies the keyset's published `merges` map transitively, and
@@ -284,7 +296,7 @@ Each dimension has its own merge rule, because they measure different things:
   would count the same month twice. A user who opened orders on A and B on the
   same 10 August has 30 days on both a month later; importing A into B leaves
   B at `max(30, 30) = 30`, not 60. With the default bands the import does not
-  even move the date: 30 days falls in `<6m`, whose floor is 0. Only a user who
+  even move the date: 30 days falls in `[0,6m)`, whose floor is 0. Only a user who
   proves 6+ months elsewhere moves `created_at`, and only when the local date
   is more recent than that floor.
 
@@ -327,7 +339,7 @@ eligibility:
 |---|---|---|
 | `total_reviews` | 2 | 202 |
 | `total_rating` | 4.5 | 4.5 |
-| `since` | 10 days ago | 730 days ago |
+| `since` | 10 days ago | 720 days ago |
 
 Counterparties see "4.5 · 202 reviews · trading for 2 years".
 
@@ -475,7 +487,7 @@ Independent of the migration and worth shipping first.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 2.1 | mostro-core | Module `reputation::bands`: `ReviewsBand`, `RatingBand`, `AgeBand` enums with half-open cuts and floors, `Cell { reviews, rating, age }`, `Cell::from_stats(total_reviews, avg_rating, since, now)`, `Cell::id()` / `parse()`, and `apply_merges(&MergeMap)` implementing the transitive fold. Pure, exhaustively tested against 0.2 including every boundary value. | Round-trips every cell id; boundary values land in exactly one band; the fold terminates on a cyclic map instead of looping. |
+| 2.1 | mostro-core | Module `reputation::bands`: `ReviewsBand`, `RatingBand`, `AgeBand` enums with half-open cuts and floors, `Cell { reviews, rating, age }`, `Cell::from_stats(total_reviews, avg_rating, created_at, now)` (callers pass `native_created_at` on a Mostro issuer), `Cell::id()` / `parse()`, and `apply_merges(&MergeMap)` implementing the transitive fold. Pure, exhaustively tested against 0.2 including every boundary value. | Round-trips every cell id; boundary values land in exactly one band; the fold terminates on a cyclic map instead of looping. |
 | 2.2 | mostro-core | `ReputationKeyset` (parse/build the event from 0.3, epoch handling, `cells` **and** `merges`) and `ReputationToken { issuer, epoch, cell, m, r_point, s }` with serde and shape validation. Plus `reputation::encoding`: tagged hashes, point/scalar codecs, `m` builder and parser, token id — the section 5.1 contract, no signing. | Parses the 0.5 vectors byte for byte. |
 | 2.3 | mostro-core | `src/message.rs`: `Action` variants `ExportReputation`, `ReputationExported`, `ImportReputation`, `ReputationImported` (past participle for daemon replies, matching `Released` / `Canceled`); `Payload` variants `BlindedReputationRequest(BlindedReputationRequest)`, `BlindedReputationResponse(BlindedReputationResponse)`, `ReputationToken(ReputationToken)`. `src/error.rs`: `CantDoReason` variants `UntrustedReputationIssuer`, `InvalidReputationToken`, `ReputationAlreadyRedeemed`, `ReputationIdentityMismatch`, `ExpiredReputationKeyset`, `NotEligibleForReputationExport`, `ReputationAlreadyExported`, inserted before `Unknown`. `src/prelude.rs`: `NOSTR_REPUTATION_KEYSET_KIND`. Serde round-trip tests, plus a test asserting an old client never receives these variants (`PROTOCOL_VER` stays 2, see the compatibility note above). | Part of the **minor** release. |
 | 2.4 | mostro-core | `src/user.rs`: `User` gains `seeded_reviews: i64`, `seeded_rating_sum: f64`, `native_created_at: i64`, `reputation_exported_at: Option<i64>` (day-truncated), each with `#[sqlx(default)]` and `#[serde(default)]` so a daemon on an un-migrated database still deserialises `SELECT *`. `User::new` initialises `native_created_at` to `created_at`. | First use of `sqlx(default)` in core; test with a row that lacks the columns; existing rows backfill `native_created_at` from `created_at`. |
@@ -489,14 +501,14 @@ Independent of the migration and worth shipping first.
 | 3.2 | mostro | Bump core to 0.15.0. Migration `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_created_at` (backfilled from `created_at`) and `reputation_exported_at` (matching PR 2.4 exactly, `SELECT *` + `FromRow` requires it); new table `redeemed_reputation_tokens(token_id PK, issuer, identity_pubkey, cell, redeemed_at)` with a unique index on `(issuer, identity_pubkey)`. `db.rs` accessors with tests. | Migration applies on an existing database; the `users` insert in `db.rs` binds the new columns. |
 | 3.3 | mostro | Crypto module `reputation::verify` over `k256` (new dependency), using `reputation::encoding` from core so the byte contract is shared: challenge hash and the `s·G == R + H(R‖m)·P_cell` check. Tested against the 0.5 vectors, including every invalid case. | No daemon wiring yet. |
 | 3.4 | mostro | Keyset fetcher: fetch and cache the issuer keyset event per trusted issuer, refresh on epoch change, reject unknown epochs. Tested with the `local-relay` feature. | Cache survives a relay outage. |
-| 3.5 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, checks 1-5 of section 5.3 in one transaction, calls `User::apply_reputation_seed` from core, persists through a new `update_user_reputation_seed` in `db.rs`, replies `reputation-imported` or `cant-do`. Integration test end to end with a fixture issuer. | A second redemption of the same token is rejected. |
+| 3.5 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, checks 1-5 of section 5.4 in one transaction, calls `User::apply_reputation_seed` from core, persists through a new `update_user_reputation_seed` in `db.rs`, replies `reputation-imported` or `cant-do`. Integration test end to end with a fixture issuer. | A second redemption of the same token is rejected. |
 | 3.6 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
 
 ### Phase 4: mostrod as issuer (export)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `epoch_length`); per-cell key derivation from the daemon key and epoch (HKDF, deterministic, never stored). Unit tests: same inputs, same keys. | No publication yet. |
+| 4.1 | mostro | Settings `[reputation_export]` (`enabled`); per-cell key derivation from the daemon key and the protocol-constant epoch label (HKDF, deterministic, never stored). Unit tests: same inputs, same keys; a different epoch label yields different keys. | No publication yet. |
 | 4.2 | mostro | Publish the keyset event at startup and on epoch rollover: cell populations from the database, the deterministic merge from section 4, and both `cells` and the raw→effective `merges` map. | Event validates against 2.2; a client applying `merges` reproduces the issuer's assignment for every raw cell. |
 | 4.3 | mostro | Native stats for the export cell come from `User::native_stats` in core (reviews and rating minus the seeded part, `native_created_at` for age). `count_completed_orders_for_identity` in `db.rs` over `orders.master_buyer_pubkey` / `master_seller_pubkey` with status `success` feeds eligibility only (full-privacy orders carry no master pubkey and are simply not counted). Tested. | Seeded values are excluded from the cell. |
 | 4.4 | mostro | Handler `export_reputation_action`: the two-round-trip clause protocol (open session with `R'_0`/`R'_1`, then answer one clause), session store with expiry, eligibility, once-only flag, `reputation_exported_at`. Integration test: export from instance A, import on instance B, both in-process. | Round trip passes on two local daemons; an abandoned session expires without consuming the flag. |
@@ -535,7 +547,7 @@ Runs in parallel with phase 5; shares the UI copy and the localized strings.
 
 ### Phase 7: rollout
 
-1. Deploy 1.2 and 1.3 first; wait one release before 1.4.
+1. Deploy 1.2, then ship 1.3 and 1.3b; wait one release before 1.4.
 2. Deploy phase 3 on the reference instance with an empty issuer list.
 3. Deploy phase 6 on the bot and phase 4 on the reference instance; add both keys to the trust list.
 4. Ship the 1.x app with phases 5.1-5.6 and the 2.x app with phases 5b.1-5b.5.

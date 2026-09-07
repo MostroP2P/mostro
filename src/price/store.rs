@@ -137,30 +137,28 @@ impl PriceStore {
         applied
     }
 
-    /// How many of `currencies` currently hold an entry [`Self::get`] would
-    /// serve at `now` — the same `now - as_of <= max_staleness_secs`
-    /// predicate, evaluated under one read lock.
+    /// How many stored currencies [`Self::get`] would serve at `now` — the
+    /// same `now - as_of <= max_staleness_secs` predicate, over **every**
+    /// entry, under one read lock.
     ///
-    /// This is the honest count for the tick report. Sizing it from the
-    /// aggregate map instead would count a currency the tick has just
-    /// stamped **past** the TTL: `as_of` is no longer always the wall clock
-    /// (issue #860), so a relayed event admitted at the `max_age` boundary
-    /// can be unservable the instant it is written. Counting applied writes
-    /// would be wrong the other way — a write dropped by the monotonicity
-    /// guard leaves a *fresher* value in place, so that currency is still
-    /// servable. Only the stored entry knows.
-    pub fn servable_count<'a>(
-        &self,
-        currencies: impl Iterator<Item = &'a str>,
-        max_staleness_secs: i64,
-        now: i64,
-    ) -> usize {
+    /// This answers "what can this node serve right now", which is the only
+    /// question the operator-facing tick report is actually asking. Two
+    /// narrower counts were both wrong, in opposite directions:
+    ///
+    /// - the size of the tick's aggregate map counts a currency the tick has
+    ///   just stamped **past** the TTL, since `as_of` is no longer always the
+    ///   wall clock (issue #860) — it lies upward;
+    /// - restricting this count to the tick's own currencies omits every
+    ///   last-known-good value still inside its window, which is precisely
+    ///   what a partial outage leaves behind — it lies downward.
+    ///
+    /// Counting *applied writes* is wrong too: a write dropped by
+    /// [`Self::update_observed`]'s guard leaves a **fresher** value in place,
+    /// so that currency is still servable. Only the stored entry knows.
+    pub fn servable_count(&self, max_staleness_secs: i64, now: i64) -> usize {
         let r = self.inner.read().expect("price store lock poisoned");
-        currencies
-            .filter(|c| {
-                r.get(&c.to_uppercase())
-                    .is_some_and(|e| now.saturating_sub(e.as_of) <= max_staleness_secs)
-            })
+        r.values()
+            .filter(|e| now.saturating_sub(e.as_of) <= max_staleness_secs)
             .count()
     }
 
@@ -348,33 +346,33 @@ mod tests {
     }
 
     /// `servable_count` must agree with [`PriceStore::get`] entry by entry,
-    /// including the two cases the aggregate map cannot see: an entry
-    /// stamped past the TTL, and a currency that was never stored.
+    /// over the whole store — including the entry a tick's aggregate map
+    /// cannot see (a last-known-good value from an earlier tick) and the one
+    /// it would wrongly include (an entry stamped past the TTL).
     #[test]
     fn servable_count_agrees_with_get() {
         let store = PriceStore::new();
         store.update(results(&[("USD", 50_000.0, 2)]), 1_000);
         // Inside a 500s TTL at now = 2_000; USD, at 1_000, is not.
         store.update(results(&[("ARS", 105_000_000.0, 1)]), 1_600);
+        store.update(results(&[("EUR", 45_000.0, 1)]), 1_700);
 
-        let keys = ["USD", "ARS", "EUR"];
         assert_eq!(
-            store.servable_count(keys.iter().copied(), 500, 2_000),
-            1,
-            "only ARS is inside the window; USD aged out and EUR was never stored"
+            store.servable_count(500, 2_000),
+            2,
+            "ARS and EUR are inside the window; USD aged out"
         );
         // Entry by entry, the same predicate as `get`.
         assert!(store.get("ARS", 500, 2_000).is_ok());
+        assert!(store.get("EUR", 500, 2_000).is_ok());
         assert_eq!(
             store.get("USD", 500, 2_000).unwrap_err(),
             PriceError::TooStale
         );
-        assert_eq!(
-            store.get("EUR", 500, 2_000).unwrap_err(),
-            PriceError::NoCurrency
-        );
 
-        // Case-insensitive, like every other read path.
-        assert_eq!(store.servable_count(["ars"].into_iter(), 500, 2_000), 1);
+        // Widening the window brings the aged-out entry back into the count.
+        assert_eq!(store.servable_count(1_500, 2_000), 3);
+        // An empty store counts zero rather than panicking on the lock.
+        assert_eq!(PriceStore::new().servable_count(1_800, 2_000), 0);
     }
 }

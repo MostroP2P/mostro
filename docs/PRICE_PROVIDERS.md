@@ -170,7 +170,9 @@ parallel
  1. collect PerBtc quotes  → per-currency candidate lists (the "anchors")
  2. resolve PerBase quotes → currency/BTC = value × aggregate(base/BTC)   (§6.3)
  3. aggregate per currency → median + outlier guard / mean / single       (§6.2)
- 4. write store: { currency -> AggregatedPrice { value, as_of: now, sources } }
+ 4. write store: { currency -> AggregatedPrice { value, as_of: observed_at, sources } }
+    - `observed_at` is the tick's `now` for a directly-fetched rate, and the
+      source event's own `created_at` for one relayed over Nostr (§6.4).
     - currencies with zero fresh contributors this tick keep their prior
       AggregatedPrice (last-known-good, old `as_of`).
         │
@@ -351,17 +353,27 @@ that stored it (see the first bullet).
   the event arrived with (issue #860). The same applies to a fiat-cross
   currency resolved against a Nostr-sourced anchor
   (`nostr_anchor_dependent`, §6.3), which is no fresher than that anchor.
-- `as_of` never moves backwards: a write carrying an observation older than
-  the one already stored is dropped, so a relayed rate predating a direct
-  fetch cannot shorten a currency's remaining serving window.
+- A **backdated** write never moves `as_of` backwards: one carrying an
+  observation older than the one already stored is dropped, so a relayed rate
+  predating a direct fetch cannot shorten a currency's remaining serving
+  window. A **directly-fetched** write is not guarded this way on purpose —
+  it is this node's own authoritative observation and must land even when the
+  wall clock has stepped backwards behind a stamp already held, since
+  dropping it would freeze the price while still serving it as fresh.
 - A tick with zero contributors for a currency leaves the prior entry
   untouched (old `as_of`).
 - Because `as_of` can predate the tick, a fresh aggregate is **not** the same
   thing as a servable one: a relayed event admitted at the edge of the
   provider's acceptance window can already be past the TTL when it is
-  written. The tick report's `fresh_currencies` therefore counts entries the
-  store would actually serve, not entries the tick produced — it is the
-  number the partial-outage warning shows the operator.
+  written. The tick report therefore carries `servable_currencies` — every
+  stored entry inside the TTL, which is what `get_price` would serve right
+  now. It is deliberately not "fresh": an entry counted there may be old
+  enough to trigger the stale warning while still being served, and it may
+  come from an earlier tick. Both narrower counts mislead the operator, in
+  opposite directions — the size of the tick's aggregate map names
+  currencies the tick just stamped past the TTL, while restricting to the
+  tick's own currencies omits the last-known-good values a partial outage
+  leaves behind.
 - `PriceManager::get_price(ccy)`:
   - entry missing → `Err(NoCurrency)`.
   - `now - as_of <= max_price_staleness_seconds` → `Ok(value)` (a `warn!`

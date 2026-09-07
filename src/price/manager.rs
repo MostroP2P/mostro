@@ -303,6 +303,15 @@ impl PriceManager {
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         if aggregates.is_empty() {
             warn!("price: tick produced no fresh aggregates — keeping last-known-good");
+            // Last-known-good is exactly what this path preserves, so report
+            // it rather than zero. Reachable in a *partial* outage — every
+            // provider answered but every quote was scoped out or lost the
+            // outlier filter — where the operator warning would otherwise
+            // read "still 0" while the store serves everything it holds.
+            report.servable_currencies = self.store.servable_count(
+                self.settings.max_price_staleness_seconds,
+                Utc::now().timestamp(),
+            );
             return report;
         }
 
@@ -322,20 +331,18 @@ impl PriceManager {
         let now = Utc::now().timestamp();
         self.observe_warnings(&aggregates);
         self.store_with_observation_time(aggregates.clone(), now);
-        // Count what the store will actually **serve**, not what the tick
-        // produced. `as_of` is no longer always `now` (issue #860), so a
-        // relayed event admitted at the `max_age` boundary — the gate is the
-        // full TTL and inclusive (`nostr.rs`), and the tick's `now` is taken
-        // after every remaining provider's poll budget — can be past the TTL
-        // the instant it is written. This number reaches the operator in the
-        // partial-outage warning (`scheduler.rs`), which is precisely the
-        // tick a relayed rate lands in: `restrict_nostr_to_fallback` only
-        // lets Nostr through for a currency nobody else covered.
-        report.fresh_currencies = self.store.servable_count(
-            aggregates.keys().map(String::as_str),
-            self.settings.max_price_staleness_seconds,
-            now,
-        );
+        // What the store will actually **serve**, over the whole store —
+        // not the size of this tick's aggregate map, and not the tick's own
+        // currencies either. Both narrower counts lie, in opposite
+        // directions: the map counts a currency this tick just stamped past
+        // the TTL (`as_of` is no longer always `now`, issue #860), while
+        // restricting to the tick's currencies drops every last-known-good
+        // value still inside its window — which is precisely what a partial
+        // outage leaves behind, and a partial outage is exactly when
+        // `scheduler.rs` shows this number to the operator.
+        report.servable_currencies = self
+            .store
+            .servable_count(self.settings.max_price_staleness_seconds, now);
         report.contributors = contributors;
 
         if self.settings.publish_to_nostr {
@@ -882,14 +889,23 @@ pub struct TickReport {
     /// Distinct from `successes`: a scoped-out provider lands in
     /// `successes` (it did poll OK) but **not** in `contributors`.
     pub contributors: Vec<ProviderId>,
-    /// Number of currencies the store would actually **serve** after this
-    /// tick. Not the size of the aggregate map: `as_of` can predate the
-    /// tick (issue #860), so a relayed rate admitted at the edge of the
+    /// How many currencies [`PriceManager::get_price`] would serve right
+    /// now — every stored entry inside the TTL, not only the ones this tick
+    /// refreshed.
+    ///
+    /// Deliberately **not** named `fresh`: an entry counted here may be
+    /// stale in this codebase's own sense, old enough that
+    /// `observe_freshness` warns "is stale ({}s old)" while still serving
+    /// it. Servable and fresh are different things, and the operator asking
+    /// "what survived this outage" wants the first.
+    ///
+    /// It is not the size of the aggregate map either: `as_of` can predate
+    /// the tick (issue #860), so a relayed rate admitted at the edge of the
     /// provider's acceptance window can be past the TTL the instant it is
-    /// written. This is the number the partial-outage warning in
-    /// `scheduler.rs` shows the operator, so it must not name a currency
-    /// `get_price` refuses in the same second.
-    pub fresh_currencies: usize,
+    /// written. This number reaches the operator through the partial-outage
+    /// warning in `scheduler.rs`, so it must neither name a currency
+    /// `get_price` refuses in the same second nor omit one it would serve.
+    pub servable_currencies: usize,
 }
 
 /// Synthesise the legacy single-source config from the top-level
@@ -1196,7 +1212,7 @@ mod tests {
         );
     }
 
-    /// Review finding on PR #925: `report.fresh_currencies` was sized from
+    /// Review finding on PR #925: `report.servable_currencies` was sized from
     /// the aggregate map, so a tick could report a currency as fresh in the
     /// same second `get_price` refused it — and that number reaches the
     /// operator through the partial-outage warning in `scheduler.rs`.
@@ -1243,8 +1259,89 @@ mod tests {
             "a rate stamped past the TTL cannot be served"
         );
         assert_eq!(
-            report.fresh_currencies, 1,
+            report.servable_currencies, 1,
             "the count must exclude a currency this tick just made unservable"
+        );
+    }
+
+    /// CodeRabbit on PR #925, and it was right: restricting the count to the
+    /// tick's own currencies makes it lie *downward*. Every last-known-good
+    /// value still inside its window is servable and goes uncounted — and a
+    /// partial outage is exactly what leaves those behind, which is exactly
+    /// when `scheduler.rs` shows the number to the operator.
+    #[tokio::test]
+    async fn a_partial_outage_counts_last_known_good_not_just_this_tick() {
+        let mut t1 = ProviderQuotes::new();
+        t1.insert("USD".into(), Quote::PerBtc(50_000.0));
+        t1.insert("EUR".into(), Quote::PerBtc(45_000.0));
+        t1.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+        let mut t2 = ProviderQuotes::new();
+        t2.insert("USD".into(), Quote::PerBtc(50_100.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![Ok(t1), Err(ProviderError::Http("down".into()))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CoinGecko,
+                vec![Err(ProviderError::Http("cold".into())), Ok(t2)],
+            ),
+        ]);
+
+        assert_eq!(manager.update_all().await.servable_currencies, 3);
+
+        // Tick 2: Yadio is down, CoinGecko covers USD alone. EUR and ARS
+        // still hold tick 1's values, well inside the TTL.
+        let r = manager.update_all().await;
+        assert_eq!(r.failures.len(), 1, "this is the partial-outage tick");
+        for c in ["USD", "EUR", "ARS"] {
+            assert!(
+                manager.get_price(c).is_ok(),
+                "{c} is servable, so the operator's count must include it"
+            );
+        }
+        assert_eq!(
+            r.servable_currencies, 3,
+            "counting only the tick's own currencies would report 1 of 3"
+        );
+    }
+
+    /// The `aggregates.is_empty()` early return used to leave the count at
+    /// its default zero. That path is not only the all-providers-down case:
+    /// every provider can answer and still contribute nothing (scoped out,
+    /// or every quote lost the outlier filter), and then the operator's
+    /// partial-outage warning read "still 0" while the store served
+    /// everything it held.
+    #[tokio::test]
+    async fn a_tick_with_no_aggregates_still_reports_last_known_good() {
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted =
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes.clone()), Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+
+        assert_eq!(manager.update_all().await.servable_currencies, 1);
+
+        // Now scope Yadio to a currency it never quotes: it still polls OK,
+        // so this is not an all-failed tick, but the aggregate map is empty.
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::Yadio.to_string())
+            .unwrap()
+            .only = Some(vec!["MLC".into()]);
+
+        let r = manager.update_all().await;
+        assert_eq!(
+            r.successes,
+            vec![ProviderId::Yadio],
+            "the provider answered — this is the empty-aggregate path, not an outage"
+        );
+        assert!(manager.get_price("USD").is_ok(), "USD is still servable");
+        assert_eq!(
+            r.servable_currencies, 1,
+            "the early return must report last-known-good, not zero"
         );
     }
 
@@ -1269,7 +1366,7 @@ mod tests {
             "yadio's quotes all survived scoping, so it contributes"
         );
         assert!(report.failures.is_empty());
-        assert_eq!(report.fresh_currencies, 3);
+        assert_eq!(report.servable_currencies, 3);
 
         assert!(
             (manager.get_price("USD").unwrap() - 75_899.55).abs() < 1e-6,
@@ -1317,7 +1414,7 @@ mod tests {
             warned_single_source: RwLock::new(HashSet::new()),
         };
         let r = manager.update_all().await;
-        assert_eq!(r.fresh_currencies, 0);
+        assert_eq!(r.servable_currencies, 0);
         assert!(manager.get_price("USD").is_err());
     }
 
@@ -1825,7 +1922,7 @@ mod tests {
             report.contributors.is_empty(),
             "scoped-out provider must not appear in the Nostr source tag"
         );
-        assert_eq!(report.fresh_currencies, 0);
+        assert_eq!(report.servable_currencies, 0);
     }
 
     fn quotes_of(pairs: &[(&str, f64)]) -> ProviderQuotes {
@@ -1921,7 +2018,7 @@ mod tests {
         let manager = manager_with_many(providers);
         let report = manager.update_all().await;
         assert_eq!(
-            report.fresh_currencies, 1,
+            report.servable_currencies, 1,
             "only USD survives the allowlist"
         );
         assert!(manager.get_price("USD").is_ok());
@@ -2529,7 +2626,7 @@ mod coverage_tests {
             }],
         );
         let report = manager.update_all().await;
-        assert_eq!(report.fresh_currencies, 1);
+        assert_eq!(report.servable_currencies, 1);
         assert_eq!(report.contributors, vec![ProviderId::Yadio]);
     }
 }

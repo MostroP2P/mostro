@@ -183,9 +183,10 @@ Transport differs per issuer:
   (`t.me/lnp2pbot?start=migrate_...`), the bot answering into the app's deep
   link scheme. The bot sets `reputation_exported_at` on the user and stores
   nothing else.
-- **Mostro**: gift-wrapped `export-reputation` messages signed with the source
-  identity key, one per round trip. The daemon sets `reputation_exported_at`
-  in `users`.
+- **Mostro**: `export-reputation` messages over the daemon's ordinary
+  protocol transport (v2: NIP-44 `kind: 14`, authored by a trade key with the
+  identity proof inside the ciphertext), one per round trip. The daemon sets
+  `reputation_exported_at` in `users`.
 
 The session is stateful across the two round trips, so both the issuer and the
 client persist it; an abandoned session expires and does not consume the
@@ -193,16 +194,19 @@ once-only flag.
 
 ### 5.3 Redemption (import)
 
-A new gift-wrapped action `import-reputation`, signed with the **destination
-identity key**, carrying the token. The destination daemon:
+A new action `import-reputation` carrying the token, sent over the daemon's
+ordinary protocol transport. The destination daemon:
 
 1. Checks the issuer is in its trusted list and the epoch is accepted.
 2. Verifies `s·G == R + H(R ‖ m)·P_cell` with the `P_cell` published for the
    token's cell and epoch. This needs only public data, which is the whole
    reason for blind Schnorr; the cell whose key verifies is the band.
-3. Checks the pubkey embedded in `m` equals the identity that signed the
-   message. This binds the token to one identity; selling it means handing
-   over the key, which is the same risk as selling the account today.
+3. Checks the pubkey embedded in `m` equals `UnwrappedMessage.identity` —
+   the identity the transport *proved*, not one the sender claims. On
+   protocol v2 that proof is `identity_sig`, a domain-tagged signature bound
+   to the trade pubkey authoring the event, so it cannot be grafted from
+   another sender. This binds the token to one identity; selling it means
+   handing over the key, which is the same risk as selling the account today.
 4. Checks `hash(m)` is not in `redeemed_reputation_tokens`, and that this
    `(issuer, identity)` pair has not been redeemed before.
 5. Inserts the redemption and seeds the user row (section 6) in the same
@@ -378,7 +382,7 @@ functions and UI on the Dart side.
 not gate on it. In core 0.14.6 only `CantDoReason` carries `#[serde(other)]`;
 `Action` and `Payload` would fail to deserialise an unknown variant. That is
 safe here because these messages are strictly request/response over targeted
-gift wraps: `export-reputation` and `import-reputation` are only ever sent by
+encrypted direct messages: `export-reputation` and `import-reputation` are only ever sent by
 a client that implements them, and `reputation-exported` / `reputation-imported`
 only ever come back to the client that asked. No new variant is broadcast, so
 no old client is ever handed one. PR 2.3 carries a test that pins this

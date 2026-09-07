@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // Constants for status filtering used across restore session functions
-const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+const EXCLUDED_ORDER_STATUSES: &str = "'expired','success','canceled','dispute','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 
 /// Terminal order statuses for the Phase 2 active-trade-pubkey cache: an
@@ -24,7 +24,73 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 /// disputed order is still active (buyer, seller and the assigned solver keep
 /// messaging), so its trade keys must stay fast-pathed. See
 /// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
-const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceledbyadmin','completedbyadmin','settledbyadmin','cooperativelycanceled'";
+const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
+
+/// Exception carved out of both terminal-status filters: a closed order can
+/// still owe a bond payout to the winning counterparty, so it stays visible
+/// until that obligation resolves.
+///
+/// **The two arms are deliberately asymmetric, and the asymmetry is load
+/// bearing — do not "tidy" it into a single bound.**
+///
+/// `'pending-payout'` is **unbounded**. Such a row is not guaranteed to
+/// forfeit when the claim window elapses: `process_one_bond` only forfeits
+/// while `payout_invoice.is_none()` (`app::bond::payout`), and
+/// `on_send_payment_failure` deliberately *keeps* the invoice when the retry
+/// budget runs out on an `Indeterminate` LND failure. That payout is
+/// genuinely in flight and resolves whenever LND answers definitively, so
+/// bounding this arm on `slashed_at` would strand a live claim.
+///
+/// `'failed'` is **bounded** by `payout_claim_window_days` measured from
+/// `slashed_at`, because that is exactly what `apply_invoice` enforces: past
+/// the window it rejects any invoice on a `Failed` row, so the claim is dead
+/// while the row stays `Failed` forever (nothing transitions it afterwards).
+/// Without the bound the exception would be permanent — the trade keys stay
+/// fast-pathed and the dead order stays restorable indefinitely.
+///
+/// A `Failed` row with a `NULL` `slashed_at` is excluded, matching
+/// `apply_payout_invoice`'s conservative `Rejected` on the same invariant
+/// violation.
+///
+/// The cutoff is a **bound parameter**, not interpolated: it changes every
+/// second, and `sqlx`'s prepared-statement cache is keyed by SQL text
+/// (`LruCache<String, _>`, 100 entries by default). Interpolating it would
+/// mint a new cache entry on every `job_refresh_active_pubkeys` tick and
+/// evict everyone else's statements. Callers must bind it once per
+/// occurrence — see [`claim_window_cutoff`].
+///
+/// Pinned against `BondState`'s serialization by
+/// `claimable_bond_states_match_bond_state_display`.
+const HAS_CLAIMABLE_BOND_PAYOUT: &str = "EXISTS (SELECT 1 FROM bonds b \
+     WHERE b.order_id = orders.id AND (\
+       b.state = 'pending-payout' \
+       OR (b.state = 'failed' AND b.slashed_at IS NOT NULL AND b.slashed_at > ?)))";
+
+/// Claim window used when the global settings are not initialized, in
+/// seconds. Pinned against `AntiAbuseBondSettings::default()` by
+/// `claim_window_fallback_matches_settings_default`, so the literal cannot
+/// drift away from the config default the way the status constants did.
+const DEFAULT_CLAIM_WINDOW_SECONDS: i64 = 15 * 86_400;
+
+/// The value to bind for each `?` in [`HAS_CLAIMABLE_BOND_PAYOUT`]: a bond
+/// slashed at or before this instant can no longer be claimed.
+fn claim_window_cutoff() -> i64 {
+    let claim_window_seconds = Settings::get_bond()
+        .map(|c| c.payout_claim_window_days as i64 * 86_400)
+        .unwrap_or(DEFAULT_CLAIM_WINDOW_SECONDS);
+    claim_window_cutoff_at(chrono::Utc::now().timestamp(), claim_window_seconds)
+}
+
+/// [`claim_window_cutoff`] with `now` and the window injected, so the window
+/// boundary is testable without a wall clock or the global settings.
+///
+/// The clause compares with a strict `>`, so a row kept is one where
+/// `now - slashed_at < claim_window_seconds` — the exact complement of
+/// `apply_payout_invoice`'s `>=` rejection test. A bond slashed exactly one
+/// window ago is already unclaimable there, so it must not be kept here.
+fn claim_window_cutoff_at(now: i64, claim_window_seconds: i64) -> i64 {
+    now.saturating_sub(claim_window_seconds)
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -41,11 +107,17 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     let mut keys: HashSet<String> = HashSet::new();
 
     // Order participants of every still-active order (disputed orders
-    // included — `TERMINAL_ORDER_STATUSES` excludes `'dispute'`).
+    // included — `TERMINAL_ORDER_STATUSES` excludes `'dispute'`), plus those
+    // of terminal orders that still owe a bond payout: the winner has to
+    // answer Mostro's `AddInvoice` nudge, and a key outside this set is held
+    // to `pow_first_contact` and dropped before decryption.
     let order_query = format!(
-        "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders WHERE status NOT IN ({TERMINAL_ORDER_STATUSES})"
+        "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders \
+         WHERE status NOT IN ({TERMINAL_ORDER_STATUSES}) OR {HAS_CLAIMABLE_BOND_PAYOUT}"
     );
+    // One `?` in the clause above.
     let order_rows = sqlx::query(AssertSqlSafe(order_query))
+        .bind(claim_window_cutoff())
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1737,6 +1809,16 @@ pub async fn is_dispute_taken_by_admin(
 
 /// Find all orders for a user by their master key (for restore session).
 /// Uses constants for excluded statuses to maintain consistency across queries.
+///
+/// Terminal orders that still owe a bond payout are kept
+/// ([`HAS_CLAIMABLE_BOND_PAYOUT`]): the winner needs the order and its trade
+/// index to answer Mostro's `AddInvoice` nudge, and nothing else in the
+/// restore path carries bond state — `find_user_disputes_by_master_key`
+/// drops the resolved dispute too. The clause is order-scoped rather than
+/// recipient-scoped, so both parties see such an order; `bonds.pubkey` is a
+/// trade key, not a master key, and the Phase 6 maker-refund row pays
+/// `bond.pubkey` itself, so narrowing it in SQL would be wrong more often
+/// than it would be tidy.
 pub async fn find_user_orders_by_master_key(
     pool: &SqlitePool,
     master_key: &str,
@@ -1750,17 +1832,27 @@ pub async fn find_user_orders_by_master_key(
         r#"
         SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
         WHERE (master_buyer_pubkey = ?)
-        AND status NOT IN ({})
+        AND (status NOT IN ({}) OR {})
         UNION ALL
         SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
         WHERE (master_seller_pubkey = ?)
-        AND status NOT IN ({})
+        AND (status NOT IN ({}) OR {})
         "#,
-        EXCLUDED_ORDER_STATUSES, EXCLUDED_ORDER_STATUSES
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT,
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT
     );
+    // SQLite binds positional `?` in order of appearance, and each
+    // `UNION ALL` arm is `master_*_pubkey = ?` followed by the clause's
+    // cutoff — so the two pairs interleave. `claim_window_cutoff()` is read
+    // once so both arms filter on the same instant.
+    let cutoff = claim_window_cutoff();
     let orders = sqlx::query_as::<_, RestoredOrdersInfo>(AssertSqlSafe(sql_query))
         .bind(master_key)
+        .bind(cutoff)
         .bind(master_key)
+        .bind(cutoff)
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1902,6 +1994,7 @@ impl RestoreSessionManager {
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {
+    use crate::app::bond::BondState;
     use mostro_core::error::CantDoReason;
     use mostro_core::prelude::MostroError;
     use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -1997,7 +2090,77 @@ mod tests {
         .execute(&pool)
         .await?;
 
+        // `bonds` subset: the terminal-status filters join against it via
+        // `HAS_CLAIMABLE_BOND_PAYOUT`, so the table has to exist here even
+        // for the tests that never insert a row. Only the columns those
+        // queries and their fixtures touch, mirroring the real migration's
+        // NOT NULL / default shape.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS bonds (
+                id char(36) primary key not null,
+                order_id char(36) not null,
+                parent_bond_id char(36),
+                child_order_id char(36),
+                pubkey char(64) not null,
+                role varchar(8) not null,
+                amount_sats integer not null,
+                slashed_share_sats integer not null default 0,
+                state varchar(16) not null,
+                slashed_reason varchar(16),
+                slashed_at integer,
+                created_at integer not null
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(pool)
+    }
+
+    /// Default claim window, in seconds: `Settings::get_bond()` is unset in
+    /// unit tests, so `claim_window_cutoff` falls back to 15 days.
+    const TEST_CLAIM_WINDOW_SECS: i64 = super::DEFAULT_CLAIM_WINDOW_SECONDS;
+
+    /// A `slashed_at` comfortably inside the claim window.
+    fn slashed_at_within_window() -> i64 {
+        chrono::Utc::now().timestamp() - 3_600
+    }
+
+    /// A `slashed_at` comfortably outside it.
+    fn slashed_at_outside_window() -> i64 {
+        chrono::Utc::now().timestamp() - TEST_CLAIM_WINDOW_SECS - 3_600
+    }
+
+    /// Attach a bond row in `state` to `order_id`, for the payout-exception
+    /// arms of the terminal-status filters.
+    ///
+    /// `slashed_at` is a parameter because the `'failed'` arm is bounded by
+    /// it: a fixed timestamp would silently place every fixture outside the
+    /// claim window and make the bounded arm untestable.
+    async fn insert_bond(
+        pool: &SqlitePool,
+        order_id: uuid::Uuid,
+        pubkey: &str,
+        state: &str,
+        slashed_at: i64,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO bonds (id, order_id, pubkey, role, amount_sats, state,
+                               slashed_reason, slashed_at, created_at)
+            VALUES (?1, ?2, ?3, 'taker', 10000, ?4, 'lost-dispute', ?5, 1700000000)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(order_id)
+        .bind(pubkey)
+        .bind(state)
+        .bind(slashed_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// Insert a minimal test order with the fields relevant to order status and dev fee queries.
@@ -2170,6 +2333,45 @@ mod tests {
             None,
         )
         .await;
+        // Terminal statuses whose serialized form is hyphenated. These are the
+        // ones a mis-spelled TERMINAL_ORDER_STATUSES silently fails to match,
+        // so they must be covered explicitly.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "cooperatively-canceled",
+            Some("creator_coop"),
+            Some("buyer_coop"),
+            Some("seller_coop"),
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "canceled-by-admin",
+            Some("creator_cba"),
+            None,
+            None,
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "settled-by-admin",
+            Some("creator_sba"),
+            None,
+            None,
+        )
+        .await;
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "completed-by-admin",
+            Some("creator_cpa"),
+            None,
+            None,
+        )
+        .await;
 
         // Active dispute with an assigned solver → solver key included.
         sqlx::query(
@@ -2215,11 +2417,617 @@ mod tests {
             "seller_succ",
             "creator_canc",
             "solver_settled",
+            "creator_coop",
+            "buyer_coop",
+            "seller_coop",
+            "creator_cba",
+            "creator_sba",
+            "creator_cpa",
         ] {
             assert!(
                 !keys.contains(k),
                 "{k} must NOT be known (terminal/resolved)"
             );
+        }
+    }
+
+    /// Restore-session must not hand back orders that are already over.
+    ///
+    /// Four of the eight excluded statuses serialize with hyphens
+    /// (`canceled-by-admin`, `settled-by-admin`, `completed-by-admin`,
+    /// `cooperatively-canceled`). A status list written without them still
+    /// filters the single-word ones, so the query keeps *looking* correct
+    /// while quietly restoring dead orders — which is why every hyphenated
+    /// status is asserted here individually.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_excludes_all_terminal_statuses() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        async fn insert_for_master(pool: &SqlitePool, status: &str, master_key: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                                    master_buyer_pubkey, trade_index_buyer)
+                VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400, ?3, 1)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(master_key)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        // One live order — the only row the user should get back.
+        insert_for_master(&pool, "waiting-payment", &master_key).await;
+
+        for status in [
+            "expired",
+            "success",
+            "canceled",
+            "dispute",
+            "canceled-by-admin",
+            "completed-by-admin",
+            "settled-by-admin",
+            "cooperatively-canceled",
+        ] {
+            insert_for_master(&pool, status, &master_key).await;
+        }
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+
+        let statuses: Vec<&str> = orders.iter().map(|o| o.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec!["waiting-payment"],
+            "restore must return only the live order, got {statuses:?}"
+        );
+    }
+
+    /// The two states [`HAS_CLAIMABLE_BOND_PAYOUT`] names are SQL literals,
+    /// so a rename on `BondState` would leave them silently matching nothing
+    /// — the same failure mode as the unhyphenated status constants this
+    /// change fixes. Pin them against the enum's own serialization.
+    #[test]
+    fn claimable_bond_states_match_bond_state_display() {
+        for state in [BondState::PendingPayout, BondState::Failed] {
+            let literal = format!("'{state}'");
+            assert!(
+                super::HAS_CLAIMABLE_BOND_PAYOUT.contains(&literal),
+                "{literal} missing from the claimable-payout clause"
+            );
+        }
+    }
+
+    /// A terminal order that still owes a bond payout must stay restorable.
+    ///
+    /// After `admin_cancel_action` the order is `canceled-by-admin` and its
+    /// dispute is resolved, yet the slashed bond can sit in `pending-payout`
+    /// waiting for the winner's invoice. Nothing else in the restore path
+    /// carries bond state, so dropping the order here costs the winner the
+    /// trade index they need to claim — and `process_one_bond` forfeits the
+    /// bond when the claim window elapses.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_keeps_terminal_orders_owing_a_payout() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        async fn insert_for_master(
+            pool: &SqlitePool,
+            status: &str,
+            master_key: &str,
+        ) -> uuid::Uuid {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                                    master_buyer_pubkey, trade_index_buyer)
+                VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400, ?3, 7)
+                "#,
+            )
+            .bind(id)
+            .bind(status)
+            .bind(master_key)
+            .execute(pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        // Terminal, no obligation left → still excluded.
+        insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        // Terminal, but a bond is awaiting the winner's invoice → kept.
+        let owed = insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        insert_bond(
+            &pool,
+            owed,
+            &"b".repeat(64),
+            "pending-payout",
+            slashed_at_within_window(),
+        )
+        .await;
+        // A payout that exhausted its retries is still claimable inside the
+        // window (`apply_invoice` accepts `Failed`), so it counts too.
+        let failed = insert_for_master(&pool, "cooperatively-canceled", &master_key).await;
+        insert_bond(
+            &pool,
+            failed,
+            &"c".repeat(64),
+            "failed",
+            slashed_at_within_window(),
+        )
+        .await;
+        // A settled bond on a terminal order owes nothing → excluded.
+        let done = insert_for_master(&pool, "settled-by-admin", &master_key).await;
+        insert_bond(
+            &pool,
+            done,
+            &"d".repeat(64),
+            "slashed",
+            slashed_at_within_window(),
+        )
+        .await;
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+
+        let mut ids: Vec<uuid::Uuid> = orders.iter().map(|o| o.order_id).collect();
+        ids.sort();
+        let mut expected = vec![owed, failed];
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "only the terminal orders with an open payout may be restored"
+        );
+        assert!(
+            orders.iter().all(|o| o.trade_index == 7),
+            "the trade index must come back with them — it is what the claim needs"
+        );
+
+        // The contract is "a *closed* order with a claim attached stays
+        // restorable" — pin the status so a future change cannot satisfy the
+        // id assertion by quietly keeping these orders non-terminal.
+        let mut statuses: Vec<&str> = orders.iter().map(|o| o.status.as_str()).collect();
+        statuses.sort_unstable();
+        assert_eq!(
+            statuses,
+            vec!["canceled-by-admin", "cooperatively-canceled"],
+            "the restored rows must be the terminal ones, still carrying their terminal status"
+        );
+    }
+
+    /// The `'failed'` arm is bounded by the claim window, the `'pending-payout'`
+    /// arm is not. This test pins both halves of that asymmetry, because the
+    /// obvious "cleanup" is to give them the same bound and that breaks the
+    /// one that matters.
+    ///
+    /// - `failed` inside the window: `apply_invoice` still accepts an invoice
+    ///   on it, so the claim is live and the order stays restorable.
+    /// - `failed` outside the window: `apply_invoice` rejects, and nothing
+    ///   ever moves the row out of `Failed` again — keeping it would restore a
+    ///   dead order forever.
+    /// - `pending-payout` outside the window: still kept. A retry budget
+    ///   exhausted on an `Indeterminate` failure keeps the invoice, so
+    ///   `process_one_bond` never forfeits it; the payout is in flight and
+    ///   bounding this arm would strand a live claim.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_bounds_only_the_failed_payout_arm() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        async fn insert_for_master(
+            pool: &SqlitePool,
+            status: &str,
+            master_key: &str,
+        ) -> uuid::Uuid {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                                    master_buyer_pubkey, trade_index_buyer)
+                VALUES (?1, 'buy', 'event123', ?2, 0, 'lightning',
+                        100000, 'USD', 100, 1700000000, 1700086400, ?3, 7)
+                "#,
+            )
+            .bind(id)
+            .bind(status)
+            .bind(master_key)
+            .execute(pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        let failed_live = insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        insert_bond(
+            &pool,
+            failed_live,
+            &"b".repeat(64),
+            "failed",
+            slashed_at_within_window(),
+        )
+        .await;
+
+        let failed_expired = insert_for_master(&pool, "canceled-by-admin", &master_key).await;
+        insert_bond(
+            &pool,
+            failed_expired,
+            &"c".repeat(64),
+            "failed",
+            slashed_at_outside_window(),
+        )
+        .await;
+
+        let pending_old = insert_for_master(&pool, "cooperatively-canceled", &master_key).await;
+        insert_bond(
+            &pool,
+            pending_old,
+            &"d".repeat(64),
+            "pending-payout",
+            slashed_at_outside_window(),
+        )
+        .await;
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+        let mut ids: Vec<uuid::Uuid> = orders.iter().map(|o| o.order_id).collect();
+        ids.sort();
+        let mut expected = vec![failed_live, pending_old];
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "a `failed` bond past the claim window must stop keeping its order alive, \
+             while `pending-payout` stays kept regardless of age"
+        );
+    }
+
+    /// The same bound must hold for the known-key set: an expired `failed`
+    /// claim cannot keep trade keys on the anti-spam fast path forever.
+    #[tokio::test]
+    async fn find_active_trade_pubkeys_bounds_only_the_failed_payout_arm() {
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        let live = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            live,
+            "canceled-by-admin",
+            Some("creator_live"),
+            Some("buyer_live"),
+            Some("seller_live"),
+        )
+        .await;
+        insert_bond(
+            &pool,
+            live,
+            "buyer_live",
+            "failed",
+            slashed_at_within_window(),
+        )
+        .await;
+
+        let expired = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            expired,
+            "canceled-by-admin",
+            Some("creator_expired"),
+            Some("buyer_expired"),
+            Some("seller_expired"),
+        )
+        .await;
+        insert_bond(
+            &pool,
+            expired,
+            "buyer_expired",
+            "failed",
+            slashed_at_outside_window(),
+        )
+        .await;
+
+        let in_flight = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            in_flight,
+            "canceled-by-admin",
+            Some("creator_in_flight"),
+            Some("buyer_in_flight"),
+            Some("seller_in_flight"),
+        )
+        .await;
+        insert_bond(
+            &pool,
+            in_flight,
+            "buyer_in_flight",
+            "pending-payout",
+            slashed_at_outside_window(),
+        )
+        .await;
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        for k in [
+            "creator_live",
+            "buyer_live",
+            "seller_live",
+            "creator_in_flight",
+            "buyer_in_flight",
+            "seller_in_flight",
+        ] {
+            assert!(
+                keys.contains(k),
+                "{k} must stay known while a claim is live"
+            );
+        }
+        for k in ["creator_expired", "buyer_expired", "seller_expired"] {
+            assert!(
+                !keys.contains(k),
+                "{k} must drop out once the failed claim expired"
+            );
+        }
+    }
+
+    /// A `Failed` bond with no `slashed_at` is an invariant violation
+    /// (`apply_payout_invoice` answers `Rejected` rather than treating it as
+    /// infinitely recoverable). The filter has to be just as conservative, or
+    /// a NULL would read as "unbounded" through the `>` comparison.
+    #[tokio::test]
+    async fn failed_bond_without_slashed_at_does_not_keep_its_order() {
+        let pool = setup_orders_db().await.unwrap();
+        let master_key = "a".repeat(64);
+
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                master_buyer_pubkey, trade_index_buyer)
+            VALUES (?1, 'buy', 'event123', 'canceled-by-admin', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400, ?2, 7)
+            "#,
+        )
+        .bind(id)
+        .bind(&master_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO bonds (id, order_id, pubkey, role, amount_sats, state,
+                               slashed_reason, slashed_at, created_at)
+            VALUES (?1, ?2, ?3, 'taker', 10000, 'failed', 'lost-dispute', NULL, 1700000000)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(id)
+        .bind("e".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let orders = super::find_user_orders_by_master_key(&pool, &master_key)
+            .await
+            .unwrap();
+        assert!(
+            orders.is_empty(),
+            "a failed bond with no slash anchor must not keep a terminal order restorable"
+        );
+    }
+
+    /// Run the payout-exception clause on its own against `orders`, with
+    /// `now` and the window pinned. Lets the boundary and a non-default
+    /// window be exercised without a wall clock or the global settings,
+    /// neither of which a unit test can steer (`MOSTRO_CONFIG` is a
+    /// process-wide `OnceCell` shared with every other test).
+    async fn orders_kept_by_clause(
+        pool: &SqlitePool,
+        now: i64,
+        claim_window_seconds: i64,
+    ) -> Vec<uuid::Uuid> {
+        let sql = format!(
+            "SELECT id FROM orders WHERE {}",
+            super::HAS_CLAIMABLE_BOND_PAYOUT
+        );
+        sqlx::query_scalar::<_, uuid::Uuid>(AssertSqlSafe(sql))
+            .bind(super::claim_window_cutoff_at(now, claim_window_seconds))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Insert a terminal order carrying one bond, and return its id.
+    async fn order_with_bond(
+        pool: &SqlitePool,
+        state: &str,
+        slashed_at: i64,
+        pubkey: &str,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                                amount, fiat_code, fiat_amount, created_at, expires_at,
+                                master_buyer_pubkey, trade_index_buyer)
+            VALUES (?1, 'buy', 'event123', 'canceled-by-admin', 0, 'lightning',
+                    100000, 'USD', 100, 1700000000, 1700086400, ?2, 7)
+            "#,
+        )
+        .bind(id)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        insert_bond(pool, id, pubkey, state, slashed_at).await;
+        id
+    }
+
+    /// The cutoff must stay a bound parameter. `sqlx` keys its
+    /// prepared-statement cache by SQL text, so interpolating a value that
+    /// changes every second would mint a fresh entry on every
+    /// `job_refresh_active_pubkeys` tick and evict the rest of the daemon's
+    /// statements from a 100-entry LRU. Cheap to reintroduce by accident,
+    /// invisible at runtime, so pin it.
+    #[test]
+    fn claim_window_cutoff_is_a_bound_parameter() {
+        assert!(
+            super::HAS_CLAIMABLE_BOND_PAYOUT.ends_with("b.slashed_at > ?)))"),
+            "the cutoff must be bound, not interpolated: {}",
+            super::HAS_CLAIMABLE_BOND_PAYOUT
+        );
+        assert_eq!(
+            super::HAS_CLAIMABLE_BOND_PAYOUT.matches('?').count(),
+            1,
+            "one placeholder per occurrence of the clause; callers bind accordingly"
+        );
+    }
+
+    /// The window boundary is inclusive-of-expiry, matching
+    /// `apply_payout_invoice`: it rejects on `now - slashed_at >=
+    /// claim_window_seconds`, so a bond slashed *exactly* one window ago is
+    /// already unclaimable and must not keep its order alive. One second
+    /// later on the clock — i.e. one second younger — it still can.
+    ///
+    /// `now` is injected precisely because this is the one assertion a
+    /// wall-clock test cannot make: with `Utc::now()` inside the builder,
+    /// `>=` and `>` differ only when the two readings land on the same
+    /// second, so the mutation would escape most runs.
+    #[tokio::test]
+    async fn claim_window_boundary_excludes_a_bond_slashed_exactly_one_window_ago() {
+        let pool = setup_orders_db().await.unwrap();
+        let now = 1_800_000_000_i64;
+        let window = TEST_CLAIM_WINDOW_SECS;
+
+        let on_the_edge = order_with_bond(&pool, "failed", now - window, &"b".repeat(64)).await;
+        let one_second_inside =
+            order_with_bond(&pool, "failed", now - window + 1, &"c".repeat(64)).await;
+
+        let kept = orders_kept_by_clause(&pool, now, window).await;
+
+        assert!(
+            !kept.contains(&on_the_edge),
+            "a bond slashed exactly one window ago is already past apply_invoice's cutoff"
+        );
+        assert!(
+            kept.contains(&one_second_inside),
+            "one second inside the window the claim is still live"
+        );
+    }
+
+    /// The window is configuration, not a constant: an operator running
+    /// `payout_claim_window_days = 30` must get a 30-day exception. Unit
+    /// tests cannot set `MOSTRO_CONFIG` safely (process-wide `OnceCell`,
+    /// shared with every other test), so this pins the settings value → SQL
+    /// mapping directly, and
+    /// `claim_window_fallback_matches_settings_default` pins the fallback.
+    #[tokio::test]
+    async fn claim_window_bound_follows_the_configured_window() {
+        let pool = setup_orders_db().await.unwrap();
+        let now = 1_800_000_000_i64;
+        let twenty_days_ago = now - 20 * 86_400;
+
+        let bond = order_with_bond(&pool, "failed", twenty_days_ago, &"b".repeat(64)).await;
+
+        let kept_15 = orders_kept_by_clause(&pool, now, 15 * 86_400).await;
+        assert!(
+            !kept_15.contains(&bond),
+            "20 days > the 15-day window: the claim has expired"
+        );
+
+        let kept_30 = orders_kept_by_clause(&pool, now, 30 * 86_400).await;
+        assert!(
+            kept_30.contains(&bond),
+            "20 days < a configured 30-day window: the claim is still live"
+        );
+    }
+
+    /// The fallback used when the global settings are not initialized must
+    /// be the same window the config layer defaults to, or a node that never
+    /// writes an `[anti_abuse_bond]` section would filter on a different
+    /// deadline than the one its bonds actually run on.
+    #[test]
+    fn claim_window_fallback_matches_settings_default() {
+        let default_days =
+            crate::config::types::AntiAbuseBondSettings::default().payout_claim_window_days as i64;
+        assert_eq!(
+            super::DEFAULT_CLAIM_WINDOW_SECONDS,
+            default_days * 86_400,
+            "the SQL fallback drifted from the config default"
+        );
+    }
+
+    /// The winner of a bond payout has to answer Mostro's `AddInvoice` nudge.
+    /// If their trade key leaves the known-key set when the order closes, a
+    /// v2 node with `pow_first_contact > pow` drops that reply before
+    /// decrypting it, and the payout stalls even for a client that kept its
+    /// session intact. Independent of restore: this is the gate, not the
+    /// client's state.
+    #[tokio::test]
+    async fn find_active_trade_pubkeys_keeps_keys_of_terminal_orders_owing_a_payout() {
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        // Terminal with nothing outstanding → keys drop out, as before.
+        insert_order_with_pubkeys(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "canceled-by-admin",
+            Some("creator_done"),
+            Some("buyer_done"),
+            Some("seller_done"),
+        )
+        .await;
+
+        // Terminal but owing a payout → every participant key is retained.
+        let owed = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            owed,
+            "canceled-by-admin",
+            Some("creator_owed"),
+            Some("buyer_owed"),
+            Some("seller_owed"),
+        )
+        .await;
+        insert_bond(
+            &pool,
+            owed,
+            "buyer_owed",
+            "pending-payout",
+            slashed_at_within_window(),
+        )
+        .await;
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        for k in ["creator_owed", "buyer_owed", "seller_owed"] {
+            assert!(
+                keys.contains(k),
+                "{k} must stay known while a payout is due"
+            );
+        }
+        for k in ["creator_done", "buyer_done", "seller_done"] {
+            assert!(!keys.contains(k), "{k} must NOT be known (nothing owed)");
         }
     }
 

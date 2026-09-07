@@ -52,16 +52,19 @@ const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-
 /// `apply_payout_invoice`'s conservative `Rejected` on the same invariant
 /// violation.
 ///
-/// The interpolated cutoff is a computed `i64`, never user input, so the
-/// inline interpolation carries no injection risk — same pattern as the
-/// status constants above. Pinned against `BondState`'s serialization by
+/// The cutoff is a **bound parameter**, not interpolated: it changes every
+/// second, and `sqlx`'s prepared-statement cache is keyed by SQL text
+/// (`LruCache<String, _>`, 100 entries by default). Interpolating it would
+/// mint a new cache entry on every `job_refresh_active_pubkeys` tick and
+/// evict everyone else's statements. Callers must bind it once per
+/// occurrence — see [`claim_window_cutoff`].
+///
+/// Pinned against `BondState`'s serialization by
 /// `claimable_bond_states_match_bond_state_display`.
-fn has_claimable_bond_payout() -> String {
-    let claim_window_seconds = Settings::get_bond()
-        .map(|c| c.payout_claim_window_days as i64 * 86_400)
-        .unwrap_or(DEFAULT_CLAIM_WINDOW_SECONDS);
-    has_claimable_bond_payout_at(chrono::Utc::now().timestamp(), claim_window_seconds)
-}
+const HAS_CLAIMABLE_BOND_PAYOUT: &str = "EXISTS (SELECT 1 FROM bonds b \
+     WHERE b.order_id = orders.id AND (\
+       b.state = 'pending-payout' \
+       OR (b.state = 'failed' AND b.slashed_at IS NOT NULL AND b.slashed_at > ?)))";
 
 /// Claim window used when the global settings are not initialized, in
 /// seconds. Pinned against `AntiAbuseBondSettings::default()` by
@@ -69,19 +72,24 @@ fn has_claimable_bond_payout() -> String {
 /// drift away from the config default the way the status constants did.
 const DEFAULT_CLAIM_WINDOW_SECONDS: i64 = 15 * 86_400;
 
-/// [`has_claimable_bond_payout`] with `now` and the window injected, so the
-/// window boundary is testable without a wall clock or the global settings.
-fn has_claimable_bond_payout_at(now: i64, claim_window_seconds: i64) -> String {
-    // Kept while `now - slashed_at < claim_window_seconds`, the exact
-    // complement of `apply_payout_invoice`'s `>=` rejection test — a bond
-    // slashed exactly one window ago is already unclaimable there, so it
-    // must not be kept here either.
-    let cutoff = now.saturating_sub(claim_window_seconds);
-    format!(
-        "EXISTS (SELECT 1 FROM bonds b WHERE b.order_id = orders.id AND (\
-           b.state = 'pending-payout' \
-           OR (b.state = 'failed' AND b.slashed_at IS NOT NULL AND b.slashed_at > {cutoff})))"
-    )
+/// The value to bind for each `?` in [`HAS_CLAIMABLE_BOND_PAYOUT`]: a bond
+/// slashed at or before this instant can no longer be claimed.
+fn claim_window_cutoff() -> i64 {
+    let claim_window_seconds = Settings::get_bond()
+        .map(|c| c.payout_claim_window_days as i64 * 86_400)
+        .unwrap_or(DEFAULT_CLAIM_WINDOW_SECONDS);
+    claim_window_cutoff_at(chrono::Utc::now().timestamp(), claim_window_seconds)
+}
+
+/// [`claim_window_cutoff`] with `now` and the window injected, so the window
+/// boundary is testable without a wall clock or the global settings.
+///
+/// The clause compares with a strict `>`, so a row kept is one where
+/// `now - slashed_at < claim_window_seconds` — the exact complement of
+/// `apply_payout_invoice`'s `>=` rejection test. A bond slashed exactly one
+/// window ago is already unclaimable there, so it must not be kept here.
+fn claim_window_cutoff_at(now: i64, claim_window_seconds: i64) -> i64 {
+    now.saturating_sub(claim_window_seconds)
 }
 
 #[cfg(unix)]
@@ -103,12 +111,13 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     // of terminal orders that still owe a bond payout: the winner has to
     // answer Mostro's `AddInvoice` nudge, and a key outside this set is held
     // to `pow_first_contact` and dropped before decryption.
-    let claimable_payout = has_claimable_bond_payout();
     let order_query = format!(
         "SELECT buyer_pubkey, seller_pubkey, creator_pubkey FROM orders \
-         WHERE status NOT IN ({TERMINAL_ORDER_STATUSES}) OR {claimable_payout}"
+         WHERE status NOT IN ({TERMINAL_ORDER_STATUSES}) OR {HAS_CLAIMABLE_BOND_PAYOUT}"
     );
+    // One `?` in the clause above.
     let order_rows = sqlx::query(AssertSqlSafe(order_query))
+        .bind(claim_window_cutoff())
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1657,7 +1666,7 @@ pub async fn is_dispute_taken_by_admin(
 /// Uses constants for excluded statuses to maintain consistency across queries.
 ///
 /// Terminal orders that still owe a bond payout are kept
-/// ([`has_claimable_bond_payout`]): the winner needs the order and its trade
+/// ([`HAS_CLAIMABLE_BOND_PAYOUT`]): the winner needs the order and its trade
 /// index to answer Mostro's `AddInvoice` nudge, and nothing else in the
 /// restore path carries bond state — `find_user_disputes_by_master_key`
 /// drops the resolved dispute too. The clause is order-scoped rather than
@@ -1674,7 +1683,6 @@ pub async fn find_user_orders_by_master_key(
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
-    let claimable_payout = has_claimable_bond_payout();
     let sql_query = format!(
         r#"
         SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
@@ -1685,11 +1693,21 @@ pub async fn find_user_orders_by_master_key(
         WHERE (master_seller_pubkey = ?)
         AND (status NOT IN ({}) OR {})
         "#,
-        EXCLUDED_ORDER_STATUSES, claimable_payout, EXCLUDED_ORDER_STATUSES, claimable_payout
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT,
+        EXCLUDED_ORDER_STATUSES,
+        HAS_CLAIMABLE_BOND_PAYOUT
     );
+    // SQLite binds positional `?` in order of appearance, and each
+    // `UNION ALL` arm is `master_*_pubkey = ?` followed by the clause's
+    // cutoff — so the two pairs interleave. `claim_window_cutoff()` is read
+    // once so both arms filter on the same instant.
+    let cutoff = claim_window_cutoff();
     let orders = sqlx::query_as::<_, RestoredOrdersInfo>(AssertSqlSafe(sql_query))
         .bind(master_key)
+        .bind(cutoff)
         .bind(master_key)
+        .bind(cutoff)
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1926,7 +1944,7 @@ mod tests {
         .await?;
 
         // `bonds` subset: the terminal-status filters join against it via
-        // `has_claimable_bond_payout`, so the table has to exist here even
+        // `HAS_CLAIMABLE_BOND_PAYOUT`, so the table has to exist here even
         // for the tests that never insert a row. Only the columns those
         // queries and their fixtures touch, mirroring the real migration's
         // NOT NULL / default shape.
@@ -1955,7 +1973,7 @@ mod tests {
     }
 
     /// Default claim window, in seconds: `Settings::get_bond()` is unset in
-    /// unit tests, so `has_claimable_bond_payout` falls back to 15 days.
+    /// unit tests, so `claim_window_cutoff` falls back to 15 days.
     const TEST_CLAIM_WINDOW_SECS: i64 = super::DEFAULT_CLAIM_WINDOW_SECONDS;
 
     /// A `slashed_at` comfortably inside the claim window.
@@ -2380,7 +2398,7 @@ mod tests {
         );
     }
 
-    /// The two states [`has_claimable_bond_payout`] names are SQL literals,
+    /// The two states [`HAS_CLAIMABLE_BOND_PAYOUT`] names are SQL literals,
     /// so a rename on `BondState` would leave them silently matching nothing
     /// — the same failure mode as the unhyphenated status constants this
     /// change fixes. Pin them against the enum's own serialization.
@@ -2389,7 +2407,7 @@ mod tests {
         for state in [BondState::PendingPayout, BondState::Failed] {
             let literal = format!("'{state}'");
             assert!(
-                super::has_claimable_bond_payout().contains(&literal),
+                super::HAS_CLAIMABLE_BOND_PAYOUT.contains(&literal),
                 "{literal} missing from the claimable-payout clause"
             );
         }
@@ -2731,9 +2749,12 @@ mod tests {
         now: i64,
         claim_window_seconds: i64,
     ) -> Vec<uuid::Uuid> {
-        let clause = super::has_claimable_bond_payout_at(now, claim_window_seconds);
-        let sql = format!("SELECT id FROM orders WHERE {clause}");
+        let sql = format!(
+            "SELECT id FROM orders WHERE {}",
+            super::HAS_CLAIMABLE_BOND_PAYOUT
+        );
         sqlx::query_scalar::<_, uuid::Uuid>(AssertSqlSafe(sql))
+            .bind(super::claim_window_cutoff_at(now, claim_window_seconds))
             .fetch_all(pool)
             .await
             .unwrap()
@@ -2763,6 +2784,26 @@ mod tests {
         .unwrap();
         insert_bond(pool, id, pubkey, state, slashed_at).await;
         id
+    }
+
+    /// The cutoff must stay a bound parameter. `sqlx` keys its
+    /// prepared-statement cache by SQL text, so interpolating a value that
+    /// changes every second would mint a fresh entry on every
+    /// `job_refresh_active_pubkeys` tick and evict the rest of the daemon's
+    /// statements from a 100-entry LRU. Cheap to reintroduce by accident,
+    /// invisible at runtime, so pin it.
+    #[test]
+    fn claim_window_cutoff_is_a_bound_parameter() {
+        assert!(
+            super::HAS_CLAIMABLE_BOND_PAYOUT.ends_with("b.slashed_at > ?)))"),
+            "the cutoff must be bound, not interpolated: {}",
+            super::HAS_CLAIMABLE_BOND_PAYOUT
+        );
+        assert_eq!(
+            super::HAS_CLAIMABLE_BOND_PAYOUT.matches('?').count(),
+            1,
+            "one placeholder per occurrence of the clause; callers bind accordingly"
+        );
     }
 
     /// The window boundary is inclusive-of-expiry, matching

@@ -322,7 +322,20 @@ impl PriceManager {
         let now = Utc::now().timestamp();
         self.observe_warnings(&aggregates);
         self.store_with_observation_time(aggregates.clone(), now);
-        report.fresh_currencies = aggregates.len();
+        // Count what the store will actually **serve**, not what the tick
+        // produced. `as_of` is no longer always `now` (issue #860), so a
+        // relayed event admitted at the `max_age` boundary — the gate is the
+        // full TTL and inclusive (`nostr.rs`), and the tick's `now` is taken
+        // after every remaining provider's poll budget — can be past the TTL
+        // the instant it is written. This number reaches the operator in the
+        // partial-outage warning (`scheduler.rs`), which is precisely the
+        // tick a relayed rate lands in: `restrict_nostr_to_fallback` only
+        // lets Nostr through for a currency nobody else covered.
+        report.fresh_currencies = self.store.servable_count(
+            aggregates.keys().map(String::as_str),
+            self.settings.max_price_staleness_seconds,
+            now,
+        );
         report.contributors = contributors;
 
         if self.settings.publish_to_nostr {
@@ -356,6 +369,14 @@ impl PriceManager {
     ///   the cross provider (`aggregate.rs`) — the figure is no fresher
     ///   than the anchor it was built from.
     ///
+    /// Both halves rest on the same guarantee, which is why reading the
+    /// stamp from provider state *after* the tick is sound for both. The
+    /// flag is set from `anchor_uses_nostr`, i.e. `kept_contributors` over
+    /// **this tick's** direct quotes after `restrict_nostr_to_fallback`
+    /// (`aggregate.rs`), so it cannot be true unless Nostr's quote survived
+    /// this tick — exactly the condition `contributors.contains(&Nostr)`
+    /// states outright.
+    ///
     /// The second group is deliberately coarse: the flag is set when *any*
     /// surviving contributor resolved through a Nostr-touched anchor, so a
     /// currency that also has an independent, directly-observed contributor
@@ -370,6 +391,7 @@ impl PriceManager {
     /// is this really" are different questions, so the two must not be
     /// merged into one helper.
     fn store_with_observation_time(&self, aggregates: HashMap<String, AggregateResult>, now: i64) {
+        let requested = aggregates.len();
         let observed_at = self
             .providers
             .iter()
@@ -379,18 +401,29 @@ impl PriceManager {
         // A future-dated or absent stamp falls through to the existing
         // behaviour: never move `as_of` forward, that would *extend* the
         // serving window rather than bound it.
-        let Some(observed_at) = observed_at.filter(|ts| *ts < now) else {
-            self.store.update(aggregates, now);
-            return;
+        let applied = match observed_at.filter(|ts| *ts < now) {
+            None => self.store.update(aggregates, now),
+            Some(observed_at) => {
+                let (relayed, direct): (HashMap<_, _>, HashMap<_, _>) =
+                    aggregates.into_iter().partition(|(_, a)| {
+                        a.contributors.contains(&ProviderId::Nostr) || a.nostr_anchor_dependent
+                    });
+
+                self.store.update(direct, now) + self.store.update_observed(relayed, observed_at)
+            }
         };
 
-        let (relayed, direct): (HashMap<_, _>, HashMap<_, _>) =
-            aggregates.into_iter().partition(|(_, a)| {
-                a.contributors.contains(&ProviderId::Nostr) || a.nostr_anchor_dependent
-            });
-
-        self.store.update(direct, now);
-        self.store.update(relayed, observed_at);
+        // The monotonicity guard discards a backwards write by design, but
+        // discarding it in silence left a vanished rate with no trace
+        // anywhere (review on PR #925). Expected behaviour, not an
+        // anomaly — hence `debug`, and once per tick rather than per key.
+        if applied < requested {
+            debug!(
+                "price: {}/{} tick writes dropped — observation older than the stored one",
+                requested - applied,
+                requested
+            );
+        }
     }
 
     /// Wall-clock budget for one provider's poll: `provider_timeout_seconds`
@@ -849,7 +882,13 @@ pub struct TickReport {
     /// Distinct from `successes`: a scoped-out provider lands in
     /// `successes` (it did poll OK) but **not** in `contributors`.
     pub contributors: Vec<ProviderId>,
-    /// Number of currencies the tick produced a fresh aggregate for.
+    /// Number of currencies the store would actually **serve** after this
+    /// tick. Not the size of the aggregate map: `as_of` can predate the
+    /// tick (issue #860), so a relayed rate admitted at the edge of the
+    /// provider's acceptance window can be past the TTL the instant it is
+    /// written. This is the number the partial-outage warning in
+    /// `scheduler.rs` shows the operator, so it must not name a currency
+    /// `get_price` refuses in the same second.
     pub fresh_currencies: usize,
 }
 
@@ -1154,6 +1193,58 @@ mod tests {
                 .get("CUP", TTL, observed_at + TTL + 1)
                 .is_err(),
             "a cross currency built on a relayed anchor is no fresher than that anchor"
+        );
+    }
+
+    /// Review finding on PR #925: `report.fresh_currencies` was sized from
+    /// the aggregate map, so a tick could report a currency as fresh in the
+    /// same second `get_price` refused it — and that number reaches the
+    /// operator through the partial-outage warning in `scheduler.rs`.
+    ///
+    /// Reachable, not theoretical: the Nostr `max_age` gate is the full TTL
+    /// and its boundary is deliberately inclusive
+    /// (`rank_candidates_keeps_event_exactly_at_max_age_boundary`), it runs
+    /// at fetch time, and the tick's `now` is only taken once every
+    /// remaining provider's poll budget has burned down.
+    #[tokio::test]
+    async fn a_relayed_rate_stamped_past_the_ttl_is_not_reported_fresh() {
+        const TTL: i64 = 1_800;
+
+        // Admitted at the boundary, then the tick's clock moved on.
+        let observed_at = Utc::now().timestamp() - TTL - 5;
+
+        let mut yadio_quotes = ProviderQuotes::new();
+        yadio_quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr_quotes = ProviderQuotes::new();
+        // Uncovered by Yadio, so it survives `restrict_nostr_to_fallback`.
+        nostr_quotes.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio_quotes)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr_quotes)])
+                .observed_at(observed_at),
+        ]);
+        manager.settings.max_price_staleness_seconds = TTL;
+
+        let report = manager.update_all().await;
+
+        // The tick aggregated both currencies, and Nostr did contribute.
+        assert!(
+            report.contributors.contains(&ProviderId::Nostr),
+            "the relayed quote reached aggregation"
+        );
+        assert!(
+            manager.get_price("USD").is_ok(),
+            "the directly-fetched currency is servable"
+        );
+        // But ARS is unservable the instant it is written.
+        assert!(
+            manager.get_price("ARS").is_err(),
+            "a rate stamped past the TTL cannot be served"
+        );
+        assert_eq!(
+            report.fresh_currencies, 1,
+            "the count must exclude a currency this tick just made unservable"
         );
     }
 
@@ -2100,6 +2191,63 @@ mod tests {
             manager.warned_refused.read().unwrap().len(),
             1,
             "past-TTL refusal warning must not be suppressed by the within-TTL flag"
+        );
+    }
+
+    /// Review finding on PR #925: moving the `warned_refused` re-arm out of
+    /// `observe_freshness`'s `age <= one_interval` branch changed behaviour
+    /// for **every** currency, not only relayed ones, and no test covered
+    /// it — both existing warning tests stay green with the line in either
+    /// position.
+    ///
+    /// The change is needed because a backdated currency's age is measured
+    /// from observation, so it sits above one poll interval for its entire
+    /// servable life; gating the re-arm on "fully fresh" would let the
+    /// refusal warning fire exactly once per process. This pins the new
+    /// semantics — *once per staleness episode* — for the ordinary
+    /// directly-fetched case too.
+    #[tokio::test]
+    async fn a_served_but_stale_read_re_arms_the_refusal_warning() {
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+        manager.settings.update_interval_seconds = 1;
+        manager.settings.max_price_staleness_seconds = 30;
+
+        // 60s old: past a 30s TTL, so the read is refused and arms the flag.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        );
+        let now = Utc::now().timestamp();
+        manager.store.update(agg, now - 60);
+
+        assert!(manager.get_price("USD").is_err());
+        assert_eq!(
+            manager.warned_refused.read().unwrap().len(),
+            1,
+            "the refusal armed the flag"
+        );
+
+        // Widen the TTL: the same entry is served again, but it is still
+        // 60s old against a 1s interval — stale, never "fully fresh". The
+        // flag must re-arm anyway, or the next slide past the TTL is
+        // silent for the rest of the process.
+        manager.settings.max_price_staleness_seconds = 1_800;
+        assert!(
+            manager.get_price("USD").is_ok(),
+            "inside the widened TTL the stale value is served"
+        );
+        assert!(
+            manager.warned_refused.read().unwrap().is_empty(),
+            "a served read re-arms the refusal warning even when the value is stale"
         );
     }
 

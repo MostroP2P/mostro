@@ -338,8 +338,9 @@ El Toque's CUP/MLC need at least one direct USD source to be live.
 
 ### 6.4 Staleness (last-known-good + TTL)
 
-Each currency's stored `AggregatedPrice` carries `as_of` = the timestamp
-of the last tick that produced a fresh aggregate for it.
+Each currency's stored `AggregatedPrice` carries `as_of` = the time the
+served value was **observed**, which is not in general the time of the tick
+that stored it (see the first bullet).
 
 - A tick that yields a fresh value overwrites the entry with `as_of` = when
   the value was **observed**. For a directly-fetched rate that is the tick's
@@ -355,6 +356,12 @@ of the last tick that produced a fresh aggregate for it.
   fetch cannot shorten a currency's remaining serving window.
 - A tick with zero contributors for a currency leaves the prior entry
   untouched (old `as_of`).
+- Because `as_of` can predate the tick, a fresh aggregate is **not** the same
+  thing as a servable one: a relayed event admitted at the edge of the
+  provider's acceptance window can already be past the TTL when it is
+  written. The tick report's `fresh_currencies` therefore counts entries the
+  store would actually serve, not entries the tick produced — it is the
+  number the partial-outage warning shows the operator.
 - `PriceManager::get_price(ccy)`:
   - entry missing → `Err(NoCurrency)`.
   - `now - as_of <= max_price_staleness_seconds` → `Ok(value)` (a `warn!`

@@ -5,8 +5,10 @@
 //! Phase 1 on): the scheduler writes a fresh aggregate each tick, and
 //! consumers read a currency's price through the staleness check. A
 //! currency with no fresh contributors this tick simply keeps its prior
-//! entry (last-known-good) — [`PriceStore::update`] only overwrites the
-//! currencies present in the new aggregate.
+//! entry (last-known-good) — a write only touches the currencies present
+//! in the new aggregate, and [`PriceStore::update_observed`] may leave even
+//! one of those alone when the incoming observation is the older of the
+//! two.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,8 +22,10 @@ use super::aggregate::AggregateResult;
 pub struct AggregatedPrice {
     /// Fiat units per 1 BTC.
     pub value: f64,
-    /// Unix timestamp of the last tick that produced a fresh aggregate for
-    /// this currency. Anchors the staleness window.
+    /// Unix timestamp of when the value was **observed** — the storing
+    /// tick's own clock for a directly-fetched rate, the source event's
+    /// `created_at` for one relayed over Nostr (issue #860). Anchors the
+    /// staleness window.
     pub as_of: i64,
     /// How many sources contributed the value (observability / "down to one
     /// source" warnings).
@@ -70,20 +74,54 @@ impl PriceStore {
     /// last-known-good value (and its older `as_of`) is preserved (spec
     /// §6.4). Currency codes are upper-cased to match read lookups.
     ///
-    /// **`as_of` never moves backwards.** A write carrying an observation
-    /// older than the one already stored is dropped: a relayed rate whose
+    /// Returns **how many writes were applied** — always every entry here,
+    /// but the shape matches [`Self::update_observed`] so a caller can
+    /// account for both halves of a tick the same way.
+    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) -> usize {
+        self.write(aggregates, as_of, false)
+    }
+
+    /// Like [`Self::update`], but for a **backdated** write: `observed_at`
+    /// is a timestamp this node did not generate (a relayed event's own
+    /// `created_at`), so it may predate what is already stored.
+    ///
+    /// **Such a write never moves `as_of` backwards.** A relayed rate whose
     /// event predates a value this node fetched directly is not news, and
     /// applying it would *shorten* the serving window below what writing
     /// nothing at all would have left — refusing a currency that was
-    /// perfectly servable a moment earlier.
-    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) {
+    /// perfectly servable a moment earlier. Dropped entries are excluded
+    /// from the returned count, so a silently discarded rate leaves a trace
+    /// (review on PR #925).
+    ///
+    /// The guard is deliberately **not** on [`Self::update`]. A wall-clock
+    /// write is this node's own authoritative observation and must land even
+    /// when `now` sits behind a stamp we already hold — which a backwards
+    /// clock step (NTP step after a bad-RTC boot, a resumed VM snapshot)
+    /// makes possible. Guarding it there froze every currency at its
+    /// pre-jump price while `get` still reported it fresh, since
+    /// `now - as_of` goes negative and negative is inside any TTL.
+    pub fn update_observed(
+        &self,
+        aggregates: HashMap<String, AggregateResult>,
+        observed_at: i64,
+    ) -> usize {
+        self.write(aggregates, observed_at, true)
+    }
+
+    fn write(
+        &self,
+        aggregates: HashMap<String, AggregateResult>,
+        as_of: i64,
+        monotonic: bool,
+    ) -> usize {
         if aggregates.is_empty() {
-            return;
+            return 0;
         }
+        let mut applied = 0usize;
         let mut w = self.inner.write().expect("price store lock poisoned");
         for (currency, agg) in aggregates {
             let key = currency.to_uppercase();
-            if w.get(&key).is_some_and(|prior| prior.as_of > as_of) {
+            if monotonic && w.get(&key).is_some_and(|prior| prior.as_of > as_of) {
                 continue;
             }
             w.insert(
@@ -94,7 +132,36 @@ impl PriceStore {
                     source_count: agg.sources,
                 },
             );
+            applied += 1;
         }
+        applied
+    }
+
+    /// How many of `currencies` currently hold an entry [`Self::get`] would
+    /// serve at `now` — the same `now - as_of <= max_staleness_secs`
+    /// predicate, evaluated under one read lock.
+    ///
+    /// This is the honest count for the tick report. Sizing it from the
+    /// aggregate map instead would count a currency the tick has just
+    /// stamped **past** the TTL: `as_of` is no longer always the wall clock
+    /// (issue #860), so a relayed event admitted at the `max_age` boundary
+    /// can be unservable the instant it is written. Counting applied writes
+    /// would be wrong the other way — a write dropped by the monotonicity
+    /// guard leaves a *fresher* value in place, so that currency is still
+    /// servable. Only the stored entry knows.
+    pub fn servable_count<'a>(
+        &self,
+        currencies: impl Iterator<Item = &'a str>,
+        max_staleness_secs: i64,
+        now: i64,
+    ) -> usize {
+        let r = self.inner.read().expect("price store lock poisoned");
+        currencies
+            .filter(|c| {
+                r.get(&c.to_uppercase())
+                    .is_some_and(|e| now.saturating_sub(e.as_of) <= max_staleness_secs)
+            })
+            .count()
     }
 
     /// Read a currency's price, enforcing the staleness window.
@@ -214,8 +281,100 @@ mod tests {
     fn empty_update_is_noop() {
         let store = PriceStore::new();
         store.update(results(&[("USD", 50_000.0, 1)]), 1_000);
-        store.update(HashMap::new(), 9_999);
+        assert_eq!(store.update(HashMap::new(), 9_999), 0);
         // USD untouched.
         assert_eq!(store.snapshot("USD").unwrap().as_of, 1_000);
+    }
+
+    /// The monotonicity guard, at the layer that owns it. Review on PR #925:
+    /// the only coverage ran through the whole manager, and none of it
+    /// asserted that the **value** is dropped along with the stamp — a
+    /// backdated write must be discarded whole, not split into a new price
+    /// wearing an old timestamp.
+    #[test]
+    fn update_never_regresses_as_of_and_drops_the_value_with_it() {
+        let store = PriceStore::new();
+        assert_eq!(store.update(results(&[("USD", 50_000.0, 2)]), 2_000), 1);
+
+        // An older observation for the same currency is not news.
+        assert_eq!(
+            store.update_observed(results(&[("USD", 41_000.0, 1)]), 1_000),
+            0,
+            "a backwards write must report itself as dropped"
+        );
+
+        let entry = store.snapshot("USD").unwrap();
+        assert_eq!(entry.as_of, 2_000, "as_of must never move backwards");
+        assert_eq!(
+            entry.value, 50_000.0,
+            "the value is dropped along with the stamp"
+        );
+        assert_eq!(entry.source_count, 2, "and so is its source count");
+
+        // Equal stamps still apply: a re-observation at the same instant is
+        // not a regression, and the guard is `>`, not `>=`.
+        assert_eq!(
+            store.update_observed(results(&[("USD", 52_000.0, 3)]), 2_000),
+            1
+        );
+        assert_eq!(store.snapshot("USD").unwrap().value, 52_000.0);
+    }
+
+    /// The monotonicity guard must not reach a wall-clock write. Found by
+    /// `/code-review` on this PR: with the guard on `update` too, a
+    /// backwards clock step (NTP step after a bad-RTC boot, a resumed VM
+    /// snapshot) made `now` fall behind the stored `as_of`, so **every**
+    /// direct write for **every** currency was silently dropped — and
+    /// `get` kept serving the frozen pre-jump price as fresh, because
+    /// `now - as_of` goes negative and negative is inside any TTL. An hour
+    /// of a stale price presented as current, with only a `debug!` line
+    /// blaming a stale observation.
+    #[test]
+    fn a_backwards_clock_step_does_not_freeze_direct_writes() {
+        let store = PriceStore::new();
+        store.update(results(&[("USD", 50_000.0, 2)]), 10_000);
+
+        // The clock steps back an hour. This write is authoritative.
+        assert_eq!(
+            store.update(results(&[("USD", 60_000.0, 2)]), 6_400),
+            1,
+            "a wall-clock write must land even behind the stored stamp"
+        );
+
+        let entry = store.snapshot("USD").unwrap();
+        assert_eq!(entry.value, 60_000.0, "the new price must be served");
+        assert_eq!(entry.as_of, 6_400, "and stamped at the clock we now have");
+        assert_eq!(store.get("USD", 1_800, 6_400).unwrap(), 60_000.0);
+    }
+
+    /// `servable_count` must agree with [`PriceStore::get`] entry by entry,
+    /// including the two cases the aggregate map cannot see: an entry
+    /// stamped past the TTL, and a currency that was never stored.
+    #[test]
+    fn servable_count_agrees_with_get() {
+        let store = PriceStore::new();
+        store.update(results(&[("USD", 50_000.0, 2)]), 1_000);
+        // Inside a 500s TTL at now = 2_000; USD, at 1_000, is not.
+        store.update(results(&[("ARS", 105_000_000.0, 1)]), 1_600);
+
+        let keys = ["USD", "ARS", "EUR"];
+        assert_eq!(
+            store.servable_count(keys.iter().copied(), 500, 2_000),
+            1,
+            "only ARS is inside the window; USD aged out and EUR was never stored"
+        );
+        // Entry by entry, the same predicate as `get`.
+        assert!(store.get("ARS", 500, 2_000).is_ok());
+        assert_eq!(
+            store.get("USD", 500, 2_000).unwrap_err(),
+            PriceError::TooStale
+        );
+        assert_eq!(
+            store.get("EUR", 500, 2_000).unwrap_err(),
+            PriceError::NoCurrency
+        );
+
+        // Case-insensitive, like every other read path.
+        assert_eq!(store.servable_count(["ars"].into_iter(), 500, 2_000), 1);
     }
 }

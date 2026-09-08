@@ -329,8 +329,10 @@ impl PriceManager {
         let contributors: Vec<ProviderId> = contributor_set.into_iter().collect();
 
         let now = Utc::now().timestamp();
-        self.observe_warnings(&aggregates);
         self.store_with_observation_time(aggregates.clone(), now);
+        // Warn *after* the write, so the warnings describe what is being
+        // served rather than what the tick computed — see `observe_warnings`.
+        self.observe_warnings(&aggregates);
         // What the store will actually **serve**, over the whole store —
         // not the size of this tick's aggregate map, and not the tick's own
         // currencies either. Both narrower counts lie, in opposite
@@ -478,13 +480,40 @@ impl PriceManager {
             .collect()
     }
 
-    /// Emit one-shot warnings on the single-source transition: a currency
-    /// with one contributor warns once; gaining a second contributor
-    /// clears the flag so a later regression warns again (spec §10.4).
+    /// Emit one-shot warnings on the single-source transition (spec §10.4):
+    /// a currency drops to one source and warns once; regaining a second
+    /// clears the flag so a later regression warns again.
+    ///
+    /// The source count comes from the **store**, and this runs **after**
+    /// the tick's write, because the two can disagree:
+    /// [`PriceStore::update_observed`]'s monotonicity guard drops a write
+    /// whose observation predates what is already held, and then the
+    /// aggregate describes a value the node is not serving. A relayed
+    /// single-source quote older than a two-source direct fetch would
+    /// otherwise latch "now has a single source" while two sources are
+    /// being served — and because the flag is one-shot, that latch then
+    /// swallows the genuine transition when the currency really does drop
+    /// to one source. The warning is a claim about what is served, so it is
+    /// computed from what is served.
+    ///
+    /// (Found by `/code-review` on PR #925. The guard that made it
+    /// reachable is this PR's own, so it is fixed here rather than filed:
+    /// before it, every write landed and the aggregate could not disagree
+    /// with the store.)
+    ///
+    /// The iteration set is still the tick's currencies. One absent from
+    /// the tick keeps its last-known-good value untouched, so its flag must
+    /// not move either.
     fn observe_warnings(&self, aggregates: &HashMap<String, AggregateResult>) {
-        for (currency, agg) in aggregates {
+        for currency in aggregates.keys() {
             let key = currency.to_uppercase();
-            if agg.sources <= 1 {
+            // Unreachable in practice: the guard only drops a write when a
+            // prior entry exists, and every other write lands. Skip rather
+            // than guess a source count for a currency we cannot serve.
+            let Some(sources) = self.store.snapshot(currency).map(|e| e.source_count) else {
+                continue;
+            };
+            if sources <= 1 {
                 if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }
@@ -1342,6 +1371,81 @@ mod tests {
         assert_eq!(
             r.servable_currencies, 1,
             "the early return must report last-known-good, not zero"
+        );
+    }
+
+    /// Review finding on PR #925, and a regression from this PR's own
+    /// monotonicity guard: `observe_warnings` ran on the tick's aggregate
+    /// *before* the write, so a dropped write left it describing a value the
+    /// node was not serving. Both halves are pinned here — the false warning
+    /// and, because the flag is one-shot, the genuine warning it swallowed.
+    #[tokio::test]
+    async fn a_dropped_write_neither_warns_nor_swallows_the_real_single_source() {
+        let old = Utc::now().timestamp() - 600;
+
+        let mut y1 = ProviderQuotes::new();
+        y1.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+        let mut c1 = ProviderQuotes::new();
+        c1.insert("ARS".into(), Quote::PerBtc(105_100_000.0));
+        let mut n2 = ProviderQuotes::new();
+        n2.insert("ARS".into(), Quote::PerBtc(104_000_000.0));
+        let mut y3 = ProviderQuotes::new();
+        y3.insert("ARS".into(), Quote::PerBtc(106_000_000.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![Ok(y1), Err(ProviderError::Http("down".into())), Ok(y3)],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CoinGecko,
+                vec![
+                    Ok(c1),
+                    Err(ProviderError::Http("down".into())),
+                    Err(ProviderError::Http("down".into())),
+                ],
+            ),
+            ScriptedProvider::new(
+                ProviderId::Nostr,
+                vec![
+                    Err(ProviderError::Http("n/a".into())),
+                    Ok(n2),
+                    Err(ProviderError::Http("n/a".into())),
+                ],
+            )
+            .observed_at(old),
+        ]);
+
+        // Tick 1 — two HTTP sources agree. Nostr is dropped by
+        // `restrict_nostr_to_fallback` because ARS is already covered.
+        manager.update_all().await;
+        assert_eq!(manager.store.snapshot("ARS").unwrap().source_count, 2);
+        assert!(
+            !manager.warned_single_source.read().unwrap().contains("ARS"),
+            "two sources: nothing to warn about"
+        );
+
+        // Tick 2 — both HTTP providers fail, so Nostr survives as the sole
+        // contributor, but its event predates what we already hold. The
+        // guard drops the write: the served value still has two sources.
+        manager.update_all().await;
+        assert_eq!(
+            manager.store.snapshot("ARS").unwrap().source_count,
+            2,
+            "the backdated single-source write must not land"
+        );
+        assert!(
+            !manager.warned_single_source.read().unwrap().contains("ARS"),
+            "must not warn about a single source while serving two"
+        );
+
+        // Tick 3 — a genuine drop to one source, this time landing. The
+        // warning must fire, which it cannot if tick 2 latched the flag.
+        manager.update_all().await;
+        assert_eq!(manager.store.snapshot("ARS").unwrap().source_count, 1);
+        assert!(
+            manager.warned_single_source.read().unwrap().contains("ARS"),
+            "the real transition must still be reportable"
         );
     }
 

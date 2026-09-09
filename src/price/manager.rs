@@ -332,7 +332,7 @@ impl PriceManager {
         self.store_with_observation_time(aggregates.clone(), now);
         // Warn *after* the write, so the warnings describe what is being
         // served rather than what the tick computed — see `observe_warnings`.
-        self.observe_warnings(&aggregates);
+        self.observe_warnings(&aggregates, now);
         // What the store will actually **serve**, over the whole store —
         // not the size of this tick's aggregate map, and not the tick's own
         // currencies either. Both narrower counts lie, in opposite
@@ -504,16 +504,23 @@ impl PriceManager {
     /// The iteration set is still the tick's currencies. One absent from
     /// the tick keeps its last-known-good value untouched, so its flag must
     /// not move either.
-    fn observe_warnings(&self, aggregates: &HashMap<String, AggregateResult>) {
+    fn observe_warnings(&self, aggregates: &HashMap<String, AggregateResult>, now: i64) {
         for currency in aggregates.keys() {
             let key = currency.to_uppercase();
             // Unreachable in practice: the guard only drops a write when a
             // prior entry exists, and every other write lands. Skip rather
             // than guess a source count for a currency we cannot serve.
-            let Some(sources) = self.store.snapshot(currency).map(|e| e.source_count) else {
+            let Some(entry) = self.store.snapshot(currency) else {
                 continue;
             };
-            if sources <= 1 {
+            // A value past the TTL is stored but not served (issue #860 lets a
+            // relayed rate be stamped past it the instant it lands), so its
+            // source count must not warn — nor latch the one-shot flag and
+            // swallow a later genuine within-TTL single-source transition.
+            if now.saturating_sub(entry.as_of) > self.settings.max_price_staleness_seconds {
+                continue;
+            }
+            if entry.source_count <= 1 {
                 if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }
@@ -2732,5 +2739,35 @@ mod coverage_tests {
         let report = manager.update_all().await;
         assert_eq!(report.servable_currencies, 1);
         assert_eq!(report.contributors, vec![ProviderId::Yadio]);
+    }
+
+    #[tokio::test]
+    async fn a_past_ttl_relayed_single_source_does_not_latch_the_warning() {
+        // A relayed rate stamped past the TTL is stored but not served; its
+        // single source must not set warned_single_source, or the one-shot flag
+        // would swallow a later genuine within-TTL single-source transition.
+        const TTL: i64 = 1_800;
+        let observed_at = Utc::now().timestamp() - TTL - 5;
+
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]).observed_at(observed_at),
+        ]);
+        manager.settings.max_price_staleness_seconds = TTL;
+
+        manager.update_all().await;
+        assert!(
+            manager.get_price("ARS").is_err(),
+            "ARS is past the TTL — not served"
+        );
+        assert!(
+            !manager.warned_single_source.read().unwrap().contains("ARS"),
+            "a past-TTL, non-served relayed rate must not set the single-source flag"
+        );
     }
 }

@@ -400,7 +400,6 @@ impl PriceManager {
     /// is this really" are different questions, so the two must not be
     /// merged into one helper.
     fn store_with_observation_time(&self, aggregates: HashMap<String, AggregateResult>, now: i64) {
-        let requested = aggregates.len();
         let observed_at = self
             .providers
             .iter()
@@ -410,27 +409,30 @@ impl PriceManager {
         // A future-dated or absent stamp falls through to the existing
         // behaviour: never move `as_of` forward, that would *extend* the
         // serving window rather than bound it.
-        let applied = match observed_at.filter(|ts| *ts < now) {
-            None => self.store.update(aggregates, now),
-            Some(observed_at) => {
-                let (relayed, direct): (HashMap<_, _>, HashMap<_, _>) =
-                    aggregates.into_iter().partition(|(_, a)| {
-                        a.contributors.contains(&ProviderId::Nostr) || a.nostr_anchor_dependent
-                    });
-
-                self.store.update(direct, now) + self.store.update_observed(relayed, observed_at)
-            }
+        let Some(observed_at) = observed_at.filter(|ts| *ts < now) else {
+            self.store.update(aggregates, now);
+            return;
         };
+
+        let (relayed, direct): (HashMap<_, _>, HashMap<_, _>) =
+            aggregates.into_iter().partition(|(_, a)| {
+                a.contributors.contains(&ProviderId::Nostr) || a.nostr_anchor_dependent
+            });
+
+        self.store.update(direct, now);
+        let dropped = self.store.update_observed(relayed, observed_at);
 
         // The monotonicity guard discards a backwards write by design, but
         // discarding it in silence left a vanished rate with no trace
-        // anywhere (review on PR #925). Expected behaviour, not an
-        // anomaly — hence `debug`, and once per tick rather than per key.
-        if applied < requested {
+        // anywhere (review on PR #925). Name the currencies: a bare count
+        // records that *something* went missing without saying what, which
+        // cannot diagnose the rate that stopped moving. Expected behaviour,
+        // not an anomaly — hence `debug`.
+        if !dropped.is_empty() {
             debug!(
-                "price: {}/{} tick writes dropped — observation older than the stored one",
-                requested - applied,
-                requested
+                "price: dropped {} relayed write(s) older than the stored observation: {}",
+                dropped.len(),
+                dropped.join(", ")
             );
         }
     }
@@ -513,14 +515,20 @@ impl PriceManager {
             let Some(entry) = self.store.snapshot(currency) else {
                 continue;
             };
-            // A value past the TTL is stored but not served (issue #860 lets a
-            // relayed rate be stamped past it the instant it lands), so its
-            // source count must not warn — nor latch the one-shot flag and
-            // swallow a later genuine within-TTL single-source transition.
-            if now.saturating_sub(entry.as_of) > self.settings.max_price_staleness_seconds {
-                continue;
-            }
-            if entry.source_count <= 1 {
+            // A value past the TTL is stored but not served (issue #860 lets
+            // a relayed rate be stamped past it the instant it lands), so its
+            // source count must not raise the warning (@arkanoider).
+            //
+            // It must still **clear** the flag rather than skip the currency
+            // outright. `warned_single_source` means "we have already warned
+            // that this is down to one source"; a currency we cannot serve at
+            // all is not one we are warning about, and leaving the flag
+            // latched across an unservable stretch would swallow the genuine
+            // transition when it comes back inside the window — the same
+            // one-shot swallow this path exists to prevent.
+            let servable =
+                now.saturating_sub(entry.as_of) <= self.settings.max_price_staleness_seconds;
+            if servable && entry.source_count <= 1 {
                 if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }
@@ -1483,6 +1491,58 @@ mod tests {
         assert!(
             !manager.warned_single_source.read().unwrap().contains("ARS"),
             "a past-TTL, non-served relayed rate must not set the single-source flag"
+        );
+    }
+
+    /// `/code-review` on the round that added the past-TTL skip: skipping
+    /// the currency outright also skipped the `clear_warned` branch, so a
+    /// latched flag survived an unservable stretch and then swallowed the
+    /// genuine transition — the same one-shot swallow the skip was added to
+    /// prevent, one layer up.
+    #[tokio::test]
+    async fn an_unservable_currency_re_arms_the_single_source_warning() {
+        let mut quotes = ProviderQuotes::new();
+        quotes.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let scripted = ScriptedProvider::new(ProviderId::Yadio, vec![Ok(quotes)]);
+        let mut manager = manager_with(scripted);
+        manager.settings.max_price_staleness_seconds = 1_800;
+
+        let now = Utc::now().timestamp();
+        let agg = |sources: u8, contributors: Vec<ProviderId>| {
+            let mut m = HashMap::new();
+            m.insert(
+                "USD".to_string(),
+                AggregateResult {
+                    value: 50_000.0,
+                    sources,
+                    contributors,
+                    nostr_anchor_dependent: false,
+                },
+            );
+            m
+        };
+
+        // Latch the flag the ordinary way: one source, inside the TTL.
+        let single = agg(1, vec![ProviderId::Yadio]);
+        manager.store.update(single.clone(), now);
+        manager.observe_warnings(&single, now);
+        assert!(
+            manager.warned_single_source.read().unwrap().contains("USD"),
+            "a served single-source value warns once"
+        );
+
+        // The stored value is now past the TTL — unservable, so no warning.
+        // But the flag must not survive it.
+        let two = agg(2, vec![ProviderId::Yadio, ProviderId::CoinGecko]);
+        manager.store.update(two.clone(), now - 5_000);
+        assert!(
+            manager.get_price("USD").is_err(),
+            "past the TTL, so not served"
+        );
+        manager.observe_warnings(&two, now);
+        assert!(
+            manager.warned_single_source.read().unwrap().is_empty(),
+            "an unservable currency must re-arm, not stay latched"
         );
     }
 

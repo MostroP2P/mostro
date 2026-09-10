@@ -74,11 +74,10 @@ impl PriceStore {
     /// last-known-good value (and its older `as_of`) is preserved (spec
     /// §6.4). Currency codes are upper-cased to match read lookups.
     ///
-    /// Returns **how many writes were applied** — always every entry here,
-    /// but the shape matches [`Self::update_observed`] so a caller can
-    /// account for both halves of a tick the same way.
-    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) -> usize {
-        self.write(aggregates, as_of, false)
+    /// Every entry lands: a wall-clock write is unconditional (see
+    /// [`Self::update_observed`] for why the guard is not here).
+    pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) {
+        self.write(aggregates, as_of, false);
     }
 
     /// Like [`Self::update`], but for a **backdated** write: `observed_at`
@@ -89,9 +88,9 @@ impl PriceStore {
     /// event predates a value this node fetched directly is not news, and
     /// applying it would *shorten* the serving window below what writing
     /// nothing at all would have left — refusing a currency that was
-    /// perfectly servable a moment earlier. Dropped entries are excluded
-    /// from the returned count, so a silently discarded rate leaves a trace
-    /// (review on PR #925).
+    /// perfectly servable a moment earlier. **Returns the currency codes it
+    /// dropped**, so a discarded rate leaves a trace naming itself rather
+    /// than a bare count nothing can be diagnosed from (review on PR #925).
     ///
     /// The guard is deliberately **not** on [`Self::update`]. A wall-clock
     /// write is this node's own authoritative observation and must land even
@@ -104,7 +103,7 @@ impl PriceStore {
         &self,
         aggregates: HashMap<String, AggregateResult>,
         observed_at: i64,
-    ) -> usize {
+    ) -> Vec<String> {
         self.write(aggregates, observed_at, true)
     }
 
@@ -113,15 +112,16 @@ impl PriceStore {
         aggregates: HashMap<String, AggregateResult>,
         as_of: i64,
         monotonic: bool,
-    ) -> usize {
+    ) -> Vec<String> {
+        let mut dropped = Vec::new();
         if aggregates.is_empty() {
-            return 0;
+            return dropped;
         }
-        let mut applied = 0usize;
         let mut w = self.inner.write().expect("price store lock poisoned");
         for (currency, agg) in aggregates {
             let key = currency.to_uppercase();
             if monotonic && w.get(&key).is_some_and(|prior| prior.as_of > as_of) {
+                dropped.push(key);
                 continue;
             }
             w.insert(
@@ -132,9 +132,8 @@ impl PriceStore {
                     source_count: agg.sources,
                 },
             );
-            applied += 1;
         }
-        applied
+        dropped
     }
 
     /// How many stored currencies [`Self::get`] would serve at `now` — the
@@ -279,7 +278,7 @@ mod tests {
     fn empty_update_is_noop() {
         let store = PriceStore::new();
         store.update(results(&[("USD", 50_000.0, 1)]), 1_000);
-        assert_eq!(store.update(HashMap::new(), 9_999), 0);
+        store.update(HashMap::new(), 9_999);
         // USD untouched.
         assert_eq!(store.snapshot("USD").unwrap().as_of, 1_000);
     }
@@ -292,13 +291,14 @@ mod tests {
     #[test]
     fn update_never_regresses_as_of_and_drops_the_value_with_it() {
         let store = PriceStore::new();
-        assert_eq!(store.update(results(&[("USD", 50_000.0, 2)]), 2_000), 1);
+        store.update(results(&[("USD", 50_000.0, 2)]), 2_000);
 
-        // An older observation for the same currency is not news.
+        // An older observation for the same currency is not news, and the
+        // drop names itself so the trace can diagnose which rate stopped.
         assert_eq!(
             store.update_observed(results(&[("USD", 41_000.0, 1)]), 1_000),
-            0,
-            "a backwards write must report itself as dropped"
+            vec!["USD".to_string()],
+            "a backwards write must name itself as dropped"
         );
 
         let entry = store.snapshot("USD").unwrap();
@@ -311,10 +311,9 @@ mod tests {
 
         // Equal stamps still apply: a re-observation at the same instant is
         // not a regression, and the guard is `>`, not `>=`.
-        assert_eq!(
-            store.update_observed(results(&[("USD", 52_000.0, 3)]), 2_000),
-            1
-        );
+        assert!(store
+            .update_observed(results(&[("USD", 52_000.0, 3)]), 2_000)
+            .is_empty());
         assert_eq!(store.snapshot("USD").unwrap().value, 52_000.0);
     }
 
@@ -333,11 +332,7 @@ mod tests {
         store.update(results(&[("USD", 50_000.0, 2)]), 10_000);
 
         // The clock steps back an hour. This write is authoritative.
-        assert_eq!(
-            store.update(results(&[("USD", 60_000.0, 2)]), 6_400),
-            1,
-            "a wall-clock write must land even behind the stored stamp"
-        );
+        store.update(results(&[("USD", 60_000.0, 2)]), 6_400);
 
         let entry = store.snapshot("USD").unwrap();
         assert_eq!(entry.value, 60_000.0, "the new price must be served");

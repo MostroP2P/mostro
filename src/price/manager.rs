@@ -1457,6 +1457,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_past_ttl_relayed_single_source_does_not_latch_the_warning() {
+        // A relayed rate stamped past the TTL is stored but not served; its
+        // single source must not set warned_single_source, or the one-shot flag
+        // would swallow a later genuine within-TTL single-source transition.
+        const TTL: i64 = 1_800;
+        let observed_at = Utc::now().timestamp() - TTL - 5;
+
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]).observed_at(observed_at),
+        ]);
+        manager.settings.max_price_staleness_seconds = TTL;
+
+        manager.update_all().await;
+        assert!(
+            manager.get_price("ARS").is_err(),
+            "ARS is past the TTL — not served"
+        );
+        assert!(
+            !manager.warned_single_source.read().unwrap().contains("ARS"),
+            "a past-TTL, non-served relayed rate must not set the single-source flag"
+        );
+    }
+
+    #[tokio::test]
     async fn single_yadio_tick_matches_today() {
         // Spec §9 Phase 1 acceptance: with only Yadio enabled, the manager
         // produces the same values as the legacy single-source path for a
@@ -2739,35 +2769,5 @@ mod coverage_tests {
         let report = manager.update_all().await;
         assert_eq!(report.servable_currencies, 1);
         assert_eq!(report.contributors, vec![ProviderId::Yadio]);
-    }
-
-    #[tokio::test]
-    async fn a_past_ttl_relayed_single_source_does_not_latch_the_warning() {
-        // A relayed rate stamped past the TTL is stored but not served; its
-        // single source must not set warned_single_source, or the one-shot flag
-        // would swallow a later genuine within-TTL single-source transition.
-        const TTL: i64 = 1_800;
-        let observed_at = Utc::now().timestamp() - TTL - 5;
-
-        let mut yadio = ProviderQuotes::new();
-        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
-        let mut nostr = ProviderQuotes::new();
-        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
-
-        let mut manager = manager_with_many(vec![
-            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
-            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]).observed_at(observed_at),
-        ]);
-        manager.settings.max_price_staleness_seconds = TTL;
-
-        manager.update_all().await;
-        assert!(
-            manager.get_price("ARS").is_err(),
-            "ARS is past the TTL — not served"
-        );
-        assert!(
-            !manager.warned_single_source.read().unwrap().contains("ARS"),
-            "a past-TTL, non-served relayed rate must not set the single-source flag"
-        );
     }
 }

@@ -389,10 +389,21 @@ impl PriceManager {
     /// The second group is deliberately coarse: the flag is set when *any*
     /// surviving contributor resolved through a Nostr-touched anchor, so a
     /// currency that also has an independent, directly-observed contributor
-    /// is backdated as a whole. That over-refuses rather than over-serves,
-    /// which is the right way to be wrong on a price that quotes trades;
-    /// distinguishing the two would need per-contributor provenance that
-    /// `AggregateResult` does not carry.
+    /// is backdated as a whole. Distinguishing the two needs per-contributor
+    /// provenance that `AggregateResult` does not carry — tracked in #959.
+    ///
+    /// **The cost is larger than "stamped early", and worth stating plainly**
+    /// (`/code-review`, measured). Because the backdated write also meets the
+    /// monotonicity guard, a tainted aggregate whose observation predates the
+    /// stored stamp is dropped **whole** — the fresh, independently-observed
+    /// direct half with it. If a relay stays pinned on one old-but-accepted
+    /// event while the currency keeps being cross-quoted, every subsequent
+    /// tick is discarded the same way, and the currency ages out to a refusal
+    /// while a good direct quote arrived on every one of those ticks.
+    ///
+    /// It is still the right trade for a price that quotes trades — refusing
+    /// beats serving a figure staler than it claims — but it is a refusal
+    /// this node could have avoided, not merely a shorter window.
     ///
     /// Note this is **not** the same predicate as `republishable_rates`,
     /// which deliberately republishes a value Nostr merely helped

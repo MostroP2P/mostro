@@ -52,6 +52,7 @@ use crate::app::trade_pubkey::trade_pubkey_action;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
+use crate::inbox::{InboxKeeper, InboxSubscription};
 use crate::lightning::LndConnector;
 use crate::spam_gate::SpamGate;
 use crate::util::enqueue_cant_do_msg;
@@ -459,6 +460,11 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
+/// How long to wait before re-attaching to the notification stream after it
+/// ended without a shutdown. Long enough that a persistent failure cannot burn
+/// a core, short enough that a transient one costs no meaningful deaf time.
+const NOTIFICATION_STREAM_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Shared post-dispatch error handling (identical in both loops). A handler
 /// `Err` is downcast to a `MostroError` and turned into the right reply
 /// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
@@ -500,14 +506,26 @@ fn gate_for(is_v2: bool) -> Option<&'static SpamGate> {
     }
 }
 
-/// Main event loop that processes incoming Nostr events.
-/// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
+/// Which dispatcher a running [`event_loop`] hands a validated action to.
 ///
-/// # Arguments
-/// * `my_keys` - The node's keypair
-/// * `client` - Nostr client instance
-/// * `ln_client` - Lightning network connector
-pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
+/// The two modes share everything else — transport gate, POW and spam
+/// pre-validation, the inbox subscription lifecycle, the relay control plane —
+/// and differ in exactly one call, so they run the same loop rather than two
+/// copies of it that drift apart.
+enum Dispatcher<'a> {
+    /// Lightning mode: the full order lifecycle, against an LND connection.
+    Lightning(&'a mut LndConnector),
+    /// Cashu mode (CF-5): no LND, so escrow actions are rejected. See
+    /// [`dispatch_cashu`].
+    Cashu,
+}
+
+/// The daemon's event loop: read the Nostr notification stream, validate
+/// every incoming event, and route what survives to `dispatcher`.
+///
+/// Handles message verification, POW checking, the inbox's control plane, and
+/// re-attaching to the stream if it ends without a shutdown.
+async fn event_loop(ctx: AppContext, mut dispatcher: Dispatcher<'_>) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
@@ -525,82 +543,100 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
     let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+    // The inbox identity is derived here rather than passed around (see
+    // `crate::inbox`).
+    let subscription = InboxSubscription::new(my_keys.public_key(), accepted_kind);
+    let keeper = InboxKeeper::new(subscription.clone());
+    let mut subscribed = false;
 
     loop {
         let mut notifications = client.notifications();
 
+        // The REQ goes out only once this stream exists. A notification
+        // receiver never sees what was delivered before it was created, so
+        // subscribing any earlier throws away the relay's EOSE — and every
+        // event that lands while the rest of the daemon is still booting.
+        if !subscribed {
+            subscription.subscribe(client).await?;
+            subscribed = true;
+        }
+
         while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    gate,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result = handle_message_action(
-                    &action,
-                    message.clone(),
-                    &unwrapped,
-                    my_keys,
-                    ln_client,
-                    &ctx,
-                )
-                .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+            match notification {
+                ClientNotification::Event { event, .. } => {
+                    let Some((action, message, unwrapped)) = accept_event(
+                        &ctx,
+                        &event,
+                        my_keys,
+                        pow,
+                        pow_first_contact,
+                        accepted_kind,
+                        gate,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let result = match &mut dispatcher {
+                        Dispatcher::Lightning(ln_client) => {
+                            handle_message_action(
+                                &action,
+                                message.clone(),
+                                &unwrapped,
+                                my_keys,
+                                ln_client,
+                                &ctx,
+                            )
+                            .await
+                        }
+                        Dispatcher::Cashu => {
+                            dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx)
+                                .await
+                        }
+                    };
+                    finalize_dispatch(result, message, unwrapped, &action).await;
+                }
+                ClientNotification::Message { relay_url, message } => {
+                    keeper.on_relay_message(client, &relay_url, &message).await;
+                }
+                ClientNotification::Shutdown => return Ok(()),
             }
         }
+
+        // The stream ended without a `Shutdown` frame. That frame can be
+        // missed — the SDK's notification channel silently drops messages when
+        // the consumer falls behind — and after a shutdown `notifications()`
+        // hands back an empty stream, so re-taking it unconditionally spins
+        // this loop at full tilt. Leave when the client is done, and pace the
+        // retry otherwise.
+        if client.is_shutdown() {
+            return Ok(());
+        }
+        tracing::warn!("Nostr notification stream ended without a shutdown; re-attaching");
+        tokio::time::sleep(NOTIFICATION_STREAM_RETRY).await;
     }
 }
 
-/// Cashu-mode event loop (CF-5). Mirrors [`run`]'s transport/validation
-/// pipeline through the shared [`accept_event`]/[`finalize_dispatch`] helpers,
-/// but dispatches through [`dispatch_cashu`] instead of
-/// [`handle_message_action`] — there is no `ln_client` in Cashu mode. It
-/// differs from `run` in exactly one line: the dispatch call.
+/// Main event loop that processes incoming Nostr events.
+/// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
+///
+/// # Arguments
+/// * `ctx` - The application context (keys, settings, pool, Nostr client)
+/// * `ln_client` - Lightning network connector
+pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
+    event_loop(ctx, Dispatcher::Lightning(ln_client)).await
+}
+
+/// Cashu-mode event loop (CF-5). Mirrors [`run`] exactly — same transport and
+/// validation pipeline, same inbox handling — but dispatches through
+/// [`dispatch_cashu`] instead of [`handle_message_action`], because there is
+/// no `ln_client` in Cashu mode.
 ///
 /// During the foundation milestone every escrow/trade action is rejected with
 /// `CantDo(InvalidAction)`; the feature tracks replace those arms one at a time
 /// (see `docs/cashu/01-fundamentals.md` §6 action-ownership matrix).
 pub async fn run_cashu(ctx: AppContext) -> Result<()> {
-    let my_keys = ctx.keys();
-    let client = ctx.nostr_client();
-    let pow = ctx.settings().mostro.pow;
-    #[allow(deprecated)]
-    let accepted_kind = ctx.settings().mostro.transport.event_kind();
-    let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
-
-    loop {
-        let mut notifications = client.notifications();
-
-        while let Some(notification) = notifications.next().await {
-            if let ClientNotification::Event { event, .. } = notification {
-                let Some((action, message, unwrapped)) = accept_event(
-                    &ctx,
-                    &event,
-                    my_keys,
-                    pow,
-                    pow_first_contact,
-                    accepted_kind,
-                    gate,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let result =
-                    dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
-            }
-        }
-    }
+    event_loop(ctx, Dispatcher::Cashu).await
 }
 
 /// Route a validated action in Cashu mode (CF-5).

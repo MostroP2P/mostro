@@ -1423,10 +1423,10 @@ async fn job_update_bitcoin_prices() {
                 // covered. A summary at warn is enough; per-provider info
                 // is already in the manager's per-provider logs.
                 warn!(
-                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    "price: {}/{} providers failed this tick ({} currencies still servable)",
                     report.failures.len(),
                     report.failures.len() + report.successes.len(),
-                    report.fresh_currencies
+                    report.servable_currencies
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;

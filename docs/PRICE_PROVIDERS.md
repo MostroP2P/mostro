@@ -170,9 +170,12 @@ parallel
  1. collect PerBtc quotes  → per-currency candidate lists (the "anchors")
  2. resolve PerBase quotes → currency/BTC = value × aggregate(base/BTC)   (§6.3)
  3. aggregate per currency → median + outlier guard / mean / single       (§6.2)
- 4. write store: { currency -> AggregatedPrice { value, as_of: observed_at, sources } }
+ 4. write store: { currency -> AggregatedPrice { value, as_of: observed_at, written_at, sources } }
     - `observed_at` is the tick's `now` for a directly-fetched rate, and the
       source event's own `created_at` for one relayed over Nostr (§6.4).
+    - `written_at` is always the tick's `now`, even for a relayed rate — it
+      answers "did our tick refresh it?" (the freshness warning), while
+      `as_of` answers "how old is this price?" (the TTL).
     - currencies with zero fresh contributors this tick keep their prior
       AggregatedPrice (last-known-good, old `as_of`).
         │
@@ -377,7 +380,10 @@ that stored it (see the first bullet).
 - `PriceManager::get_price(ccy)`:
   - entry missing → `Err(NoCurrency)`.
   - `now - as_of <= max_price_staleness_seconds` → `Ok(value)` (a `warn!`
-    is logged once the value is older than one update interval).
+    is logged once the value is older than one update interval, measured
+    from `written_at` — when this node last wrote it — so a relayed rate
+    whose backdated `as_of` is already older than one interval does not warn
+    on a healthy node every tick).
   - else → `Err(PriceTooStale)` (§10.2). Market-priced create/take for
     that currency is refused with a clear message.
 
@@ -532,7 +538,7 @@ Phases 3 and 4 both depend on Phase 2 and can land in either order.
   `resolve_per_base(quotes, anchors) -> per_currency_candidates` (§6.3),
   `aggregate_tick(provider_results, cfg) -> HashMap<String, f64>` (steps
   1–3 of §5.3). No I/O, no globals.
-- `src/price/store.rs`: `AggregatedPrice { value, as_of, source_count }`,
+- `src/price/store.rs`: `AggregatedPrice { value, as_of, written_at, source_count }`,
   the `RwLock<HashMap<String, AggregatedPrice>>` store, and
   staleness-checked `get` (§6.4).
 - `src/price/config.rs`: `PriceSettings` + `ProviderConfig` serde types

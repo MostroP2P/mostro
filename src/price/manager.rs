@@ -431,7 +431,7 @@ impl PriceManager {
             });
 
         self.store.update(direct, now);
-        let dropped = self.store.update_observed(relayed, observed_at);
+        let dropped = self.store.update_observed(relayed, now, observed_at);
 
         // The monotonicity guard discards a backwards write by design, but
         // discarding it in silence left a vanished rate with no trace
@@ -611,23 +611,28 @@ impl PriceManager {
     /// to emit the "stale but within TTL" warning at most once, and to
     /// clear the past-TTL flag once a fresh enough value lands so the
     /// next slide past the TTL warns again.
+    ///
+    /// The within-TTL "is stale" warning asks "did our tick refresh it?", so
+    /// it measures age from `written_at` (when this node last wrote the
+    /// value), **not** from `as_of` (which the #860 fix backdates to a
+    /// relayed event's `created_at`). Measuring from `as_of` would fire this
+    /// warning on a healthy node for every relayed currency whose event
+    /// arrives older than one interval, even though our own tick just wrote
+    /// it (issue #860 review, PR #925).
     fn observe_freshness(&self, currency: &str, key: &str, now: i64) {
         let Some(entry) = self.store.snapshot(currency) else {
             return;
         };
-        let age = now.saturating_sub(entry.as_of);
+        let age = now.saturating_sub(entry.written_at);
         let one_interval = self.settings.update_interval_seconds as i64;
         // Reaching here means `get_price` served the value, so it is inside
         // the TTL by definition — re-arm the past-TTL refusal flag on any
-        // served read, not only on a fully fresh one. A relayed currency's
-        // age is measured from when the trusted node observed the rate
-        // (issue #860), so it can sit above one interval for its entire
-        // servable life; gating this on `age <= one_interval` would let the
-        // refusal warning fire exactly once per process.
+        // served read, not only on a fully fresh one, so the next slide past
+        // the TTL warns again.
         self.clear_warned(&self.warned_refused, key);
         if age <= one_interval {
-            // Fully fresh — also wipe the within-TTL stale flag so a future
-            // slide past one interval warns once more.
+            // Refreshed within an interval — also wipe the within-TTL stale
+            // flag so a future slide past one interval warns once more.
             self.clear_warned(&self.warned_stale, key);
             return;
         }
@@ -2557,6 +2562,42 @@ mod tests {
         assert!(
             manager.warned_refused.read().unwrap().is_empty(),
             "a served read re-arms the refusal warning even when the value is stale"
+        );
+    }
+
+    /// Review finding on PR #925 (@Catrya): the within-TTL "is stale"
+    /// warning must measure from `written_at`, not `as_of`. Post-#860 a
+    /// relayed currency's `as_of` is its source event's `created_at`, so an
+    /// event arriving older than one interval tripped this warning on a
+    /// healthy node every tick — even though our own tick had just written
+    /// it. It must stay quiet: `written_at` is this tick's clock.
+    #[tokio::test]
+    async fn a_healthy_relayed_tick_does_not_warn_is_stale() {
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        // Uncovered by Yadio, so it survives `restrict_nostr_to_fallback`.
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        // Event is 400s old; interval is 300s — older than one interval but
+        // well inside the TTL.
+        let observed_at = Utc::now().timestamp() - 400;
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]).observed_at(observed_at),
+        ]);
+        manager.settings.update_interval_seconds = 300;
+        manager.settings.max_price_staleness_seconds = 1_800;
+
+        manager.update_all().await;
+
+        assert!(
+            manager.get_price("ARS").is_ok(),
+            "the relayed rate is inside the TTL and served"
+        );
+        assert!(
+            manager.warned_stale.read().unwrap().is_empty(),
+            "a freshly-written relayed currency must not warn 'is stale' on a healthy node"
         );
     }
 

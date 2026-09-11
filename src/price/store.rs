@@ -27,6 +27,14 @@ pub struct AggregatedPrice {
     /// `created_at` for one relayed over Nostr (issue #860). Anchors the
     /// staleness window.
     pub as_of: i64,
+    /// Unix timestamp of when **this node** last wrote the value — always
+    /// the storing tick's clock, even for a relayed rate whose `as_of` is
+    /// backdated to the source event. Answers "did our tick refresh it?",
+    /// which is a different question from `as_of`'s "how old is this price?"
+    /// — the `observe_freshness` warning measures its interval from here so
+    /// a relayed event that arrives already older than one interval doesn't
+    /// trip it on a healthy node (issue #860 review, PR #925).
+    pub written_at: i64,
     /// How many sources contributed the value (observability / "down to one
     /// source" warnings).
     pub source_count: u8,
@@ -77,12 +85,15 @@ impl PriceStore {
     /// Every entry lands: a wall-clock write is unconditional (see
     /// [`Self::update_observed`] for why the guard is not here).
     pub fn update(&self, aggregates: HashMap<String, AggregateResult>, as_of: i64) {
-        self.write(aggregates, as_of, false);
+        // A direct write is observed and written at the same instant.
+        self.write(aggregates, as_of, as_of, false);
     }
 
     /// Like [`Self::update`], but for a **backdated** write: `observed_at`
     /// is a timestamp this node did not generate (a relayed event's own
-    /// `created_at`), so it may predate what is already stored.
+    /// `created_at`), so it may predate what is already stored. `now` is
+    /// this node's own clock, recorded as `written_at` so the freshness
+    /// warning still measures from when we wrote the value.
     ///
     /// **Such a write never moves `as_of` backwards.** A relayed rate whose
     /// event predates a value this node fetched directly is not news, and
@@ -102,14 +113,16 @@ impl PriceStore {
     pub fn update_observed(
         &self,
         aggregates: HashMap<String, AggregateResult>,
+        now: i64,
         observed_at: i64,
     ) -> Vec<String> {
-        self.write(aggregates, observed_at, true)
+        self.write(aggregates, now, observed_at, true)
     }
 
     fn write(
         &self,
         aggregates: HashMap<String, AggregateResult>,
+        written_at: i64,
         as_of: i64,
         monotonic: bool,
     ) -> Vec<String> {
@@ -129,6 +142,7 @@ impl PriceStore {
                 AggregatedPrice {
                     value: agg.value,
                     as_of,
+                    written_at,
                     source_count: agg.sources,
                 },
             );
@@ -296,7 +310,7 @@ mod tests {
         // An older observation for the same currency is not news, and the
         // drop names itself so the trace can diagnose which rate stopped.
         assert_eq!(
-            store.update_observed(results(&[("USD", 41_000.0, 1)]), 1_000),
+            store.update_observed(results(&[("USD", 41_000.0, 1)]), 2_000, 1_000),
             vec!["USD".to_string()],
             "a backwards write must name itself as dropped"
         );
@@ -312,9 +326,27 @@ mod tests {
         // Equal stamps still apply: a re-observation at the same instant is
         // not a regression, and the guard is `>`, not `>=`.
         assert!(store
-            .update_observed(results(&[("USD", 52_000.0, 3)]), 2_000)
+            .update_observed(results(&[("USD", 52_000.0, 3)]), 2_000, 2_000)
             .is_empty());
         assert_eq!(store.snapshot("USD").unwrap().value, 52_000.0);
+    }
+
+    /// A backdated write records `written_at` from the tick clock, not from
+    /// the backdated `as_of` — so the freshness warning measures from when
+    /// we wrote it, while the TTL keeps measuring from the observation
+    /// (issue #860 review, PR #925).
+    #[test]
+    fn update_observed_stamps_written_at_from_the_tick_clock() {
+        let store = PriceStore::new();
+        // Tick at now = 5_000 stores a rate observed 900s earlier.
+        store.update_observed(results(&[("ARS", 105_000_000.0, 1)]), 5_000, 4_100);
+
+        let entry = store.snapshot("ARS").unwrap();
+        assert_eq!(entry.as_of, 4_100, "the TTL clock is the observation time");
+        assert_eq!(
+            entry.written_at, 5_000,
+            "the freshness clock is when this node wrote it"
+        );
     }
 
     /// The monotonicity guard must not reach a wall-clock write. Found by

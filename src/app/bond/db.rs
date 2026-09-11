@@ -134,6 +134,45 @@ pub async fn find_active_bonds_for_order(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Orders parked at `Status::WaitingTakerBond` whose taker-bond window
+/// has demonstrably closed: every `Requested` taker bond on them was
+/// created before `stale_cutoff`, and none is `Locked`.
+///
+/// `Locked` taker bonds are excluded on purpose — a locked bond means a
+/// taker's sats are held and `on_bond_invoice_accepted` owns the next
+/// transition (promotion into the trade, not a drop back to `Pending`);
+/// sweeping such an order would strand the winner. Orders with no taker
+/// bond rows at all DO match: that is a pure stranded status and the
+/// drop is exactly the recovery needed.
+///
+/// Used by the scheduler sweep (`reconcile_stranded_taker_bonds`, issue
+/// #927 part 2) to bound the bond window when the LND cancel signal
+/// that normally drives `maybe_drop_waiting_taker_bond` was missed
+/// (daemon restart before resubscribe, dropped subscription, LND
+/// unreachable at cancel time).
+pub async fn find_stale_waiting_taker_bond_orders(
+    pool: &Pool<Sqlite>,
+    stale_cutoff: i64,
+) -> Result<Vec<Order>, mostro_core::error::MostroError> {
+    sqlx::query_as::<_, Order>(
+        "SELECT o.* FROM orders o \
+         WHERE o.status = ? \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM bonds b \
+             WHERE b.order_id = o.id AND b.role = ? \
+               AND (b.state = ? OR (b.state = ? AND b.created_at >= ?)) \
+           )",
+    )
+    .bind(Status::WaitingTakerBond.to_string())
+    .bind(BondRole::Taker.to_string())
+    .bind(BondState::Locked.to_string())
+    .bind(BondState::Requested.to_string())
+    .bind(stale_cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Look up the active (`Requested` or `Locked`) bond row for a given
 /// `(order_id, taker_pubkey)` pair. Used by the take handlers'
 /// idempotent-retry check (a taker re-emitting `take-buy` / `take-sell`

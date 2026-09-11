@@ -678,11 +678,6 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -703,6 +698,11 @@ pub async fn send_dm(
             .map(|secs| Timestamp::from_secs(secs as u64))
     });
 
+    // No party keys in the logs below: `receiver_pubkey` can be an identity
+    // key, and `payload` carries `Payload::Peer { pubkey }`. Routing fields
+    // only, on both outcomes of the wrap, so a failure is never silent.
+    let inner = message.get_inner_message_kind();
+
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
     // trade_index for the node.
@@ -718,20 +718,26 @@ pub async fn send_dm(
             ..WrapOptions::default()
         },
     )
-    .await?;
+    .await
+    .inspect_err(|e| {
+        tracing::warn!(
+            action = %inner.action,
+            order_id = ?inner.id,
+            request_id = ?inner.request_id,
+            error = %e,
+            "wrapping DM failed"
+        )
+    })?;
 
-    // Payer hashes and histories are identifiers that must stay inside the
-    // encrypted channel; log the action only.
-    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
-        "<payer-history payload redacted>"
-    } else {
-        payload
-    };
+    // `event_id` is the only join key to the relay copy. It links nothing the
+    // timestamp doesn't: the kind-14 is Mostro-signed, p-tagged to the
+    // receiver, with an untweaked `created_at`.
     info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        logged_payload
+        event_id = %event.id,
+        action = %inner.action,
+        order_id = ?inner.id,
+        request_id = ?inner.request_id,
+        "sending DM"
     );
 
     if let Ok(client) = get_nostr_client() {
@@ -2969,6 +2975,38 @@ mod tests {
                 && l.contains("FiatSentOk")),
             "routing fields not logged"
         );
+    }
+
+    /// The payload is not logged at all, so the payer hash stays out of this
+    /// line without a per-payload guard.
+    #[tokio::test]
+    async fn send_dm_logs_no_payer_hash() {
+        init_globals();
+        LogCapture::start();
+        let order_id = Uuid::new_v4();
+        let hash = Keys::generate().public_key().to_hex();
+        let message = Message::new_order(
+            Some(order_id),
+            None,
+            None,
+            Action::PayerDeclared,
+            Some(Payload::PayerDeclaration(PayerDeclaration::new(
+                hash.clone(),
+            ))),
+        );
+        let receiver = Keys::generate().public_key();
+
+        let _ = send_dm(
+            receiver,
+            &Keys::generate(),
+            &message.as_json().unwrap(),
+            None,
+        )
+        .await;
+
+        let logs = LogCapture::text();
+        assert!(logs.contains(&order_id.to_string()), "order id not logged");
+        assert!(!logs.contains(&hash), "payer hash logged");
     }
 
     #[tokio::test]

@@ -1,0 +1,9 @@
+# The Docker build context is the repository root (docker/compose.yml sets
+# `context: ..`) and both Dockerfiles pull it into the builder stage with
+# `COPY . .`. `make docker-build` stages the LND cert and admin macaroon in
+# docker/config/lnd/ right before `docker compose build`, so without this entry
+# a spend-capable credential would be shipped into the build context and left
+# in the builder layer and its cache. .gitignore already keeps it out of git,
+# but Docker does not read .gitignore.
+docker/config/
+docker/.env

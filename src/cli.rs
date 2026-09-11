@@ -4,6 +4,7 @@
 
 use crate::config::util::init_configuration_file;
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -33,20 +34,22 @@ pub struct Cli {
 /// Default folder is HOME but user can specify a custom folder with dirsettings (-d ) parameter from CLI
 /// Example: mostro p2p -d /user_folder/mostro
 ///
-pub fn settings_init() -> Result<(), Box<dyn std::error::Error>> {
+/// Returns the settings directory in use, which the caller needs to check the
+/// permissions of the secret-bearing files inside it.
+pub fn settings_init() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
     // Select config file from CLI or default to HOME/.mostro
     // create config file if it doesn't exist
-    if let Some(path) = cli.dirsettings.as_deref() {
+    let settings_dir = if let Some(path) = cli.dirsettings.as_deref() {
         init_configuration_file(Some(path.to_string()))?
     } else {
         init_configuration_file(None)?
     };
 
     // Mostro settings are initialized
-    Ok(())
+    Ok(settings_dir)
 }
 
 #[cfg(test)]
@@ -123,7 +126,7 @@ mod tests {
             // In a real implementation, we would need dependency injection for testing
 
             // Test that the function signature is correct
-            let _: fn() -> Result<(), Box<dyn std::error::Error>> = settings_init;
+            let _: fn() -> Result<PathBuf, Box<dyn std::error::Error>> = settings_init;
 
             // Verify function exists and has correct return type
             // No-op: type check above is sufficient

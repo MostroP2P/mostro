@@ -1,8 +1,8 @@
 use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
 use crate::db::{
-    ensure_dispute_finalize_permission, find_dispute_by_order_id, is_assigned_solver,
-    is_dispute_taken_by_admin,
+    claim_order_status, ensure_dispute_finalize_permission, find_dispute_by_order_id,
+    is_assigned_solver, is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
 use crate::nip33::{create_dispute_event_tags, new_dispute_event};
@@ -113,33 +113,51 @@ pub async fn admin_settle_action(
         }
     };
 
+    // #809: claim `Dispute → SettledHoldInvoice` before the settle, so a
+    // losing concurrent handler never reaches LND; a miss means another path
+    // owns the transition, so return `Ok`. The helper's `cashu_escrow_locked_at
+    // IS NULL` predicate never excludes an order here: `dispatch_cashu` refuses
+    // `AdminSettle`, and the admin RPC server and the escrow-deadline job (the
+    // other writer of `Dispute`) are Lightning-only.
+    if !claim_order_status(pool, order.id, Status::Dispute, Status::SettledHoldInvoice).await? {
+        tracing::warn!(
+            order_id = %order.id,
+            "admin_settle: order transitioned out of dispute concurrently; escrow untouched"
+        );
+        return Ok(());
+    }
+
     // Settle seller hold invoice
-    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
-    // Update order event
+    if let Err(e) =
+        settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order).await
+    {
+        // The claim is standing and the `Dispute` guard blocks a retry, so
+        // release it, only if the status is still ours. Best effort: the
+        // settle's error is what the caller needs.
+        if let Err(release) =
+            claim_order_status(pool, order.id, Status::SettledHoldInvoice, Status::Dispute).await
+        {
+            error!(
+                order_id = %order.id,
+                "admin_settle: could not release the settle claim after a failed settle; the order \
+                 stays settled-hold-invoice with its escrow unsettled: {release}"
+            );
+        }
+        return Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string())));
+    }
+
+    // The claim already persisted the status; patch only the republished
+    // `event_id` rather than writing back a pre-claim snapshot.
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
-    // Persist the status change to DB before calling do_payment (same reason as release_action)
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
-            .bind(&order_updated.status)
-            .bind(&order_updated.event_id)
-            .bind(order_updated.id)
-            .bind(Status::Dispute.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order_updated.id
-        );
-        return Ok(());
-    }
+    sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+        .bind(&order_updated.event_id)
+        .bind(order_updated.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
@@ -617,6 +635,107 @@ mod handler_tests {
             result,
             Err(MostroInternalErr(ServiceError::LnNodeError(_)))
         ));
+    }
+
+    /// The two transitions `admin_settle_action` drives through
+    /// `claim_order_status`: the claim, and its release on a failed settle.
+    async fn claim_settle(pool: &SqlitePool, order_id: uuid::Uuid) -> bool {
+        claim_order_status(pool, order_id, Status::Dispute, Status::SettledHoldInvoice)
+            .await
+            .unwrap()
+    }
+
+    async fn release_settle(pool: &SqlitePool, order_id: uuid::Uuid) -> bool {
+        claim_order_status(pool, order_id, Status::SettledHoldInvoice, Status::Dispute)
+            .await
+            .unwrap()
+    }
+
+    /// #809: exactly one caller can win `Dispute → SettledHoldInvoice`. The
+    /// race itself is not deterministically testable; this exclusivity is.
+    #[tokio::test]
+    async fn settle_claim_admits_exactly_one_winner() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+
+        assert!(
+            claim_settle(ctx.pool(), order.id).await,
+            "the first claim against a disputed order must win it"
+        );
+        assert!(
+            !claim_settle(ctx.pool(), order.id).await,
+            "the second claim must miss — the row has left dispute"
+        );
+
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::SettledHoldInvoice.to_string());
+    }
+
+    /// The release is conditional on the status this handler wrote, so a
+    /// release racing a later transition must not drag the order backwards.
+    #[tokio::test]
+    async fn releasing_a_settle_claim_leaves_other_statuses_alone() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.status = Status::CanceledByAdmin.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        assert!(
+            !release_settle(ctx.pool(), order.id).await,
+            "a release against a status this handler does not own must miss"
+        );
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
+    }
+
+    /// #809: a failed settle must surface and hand the order back to
+    /// `Dispute`; the `Dispute` guard would otherwise block any retry.
+    #[tokio::test]
+    async fn failed_settle_releases_the_claim() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.preimage = None; // settle short-circuits with InvalidInvoice
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::LnNodeError(_)))),
+            "the failed settle must surface, got {result:?}"
+        );
+
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            Status::Dispute.to_string(),
+            "a failed settle must release the claim so the solver can retry"
+        );
     }
 }
 

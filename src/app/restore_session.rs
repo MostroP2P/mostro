@@ -3,6 +3,14 @@ use crate::{db::RestoreSessionManager, util::enqueue_restore_session_msg};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+/// How long a restore-session request waits for results before the requester
+/// is told to retry instead of hanging forever.
+///
+/// Named so the timeout and the message reporting it cannot drift apart: they
+/// were two independent literals, and the log said "1 hour" whatever the
+/// duration actually was.
+const RESTORE_SESSION_TIMEOUT_SECS: u64 = 60 * 60;
+
 /// Handle restore session action
 /// This function starts a background task to process the restore session
 /// and immediately returns, avoiding blocking the main application
@@ -41,7 +49,7 @@ pub async fn restore_session_action(
 /// Handle restore session results in the background
 async fn handle_restore_session_results(mut manager: RestoreSessionManager, trade_key: String) {
     // Wait for the result with a timeout
-    let timeout = tokio::time::Duration::from_secs(60 * 60); // 1 hour timeout
+    let timeout = tokio::time::Duration::from_secs(RESTORE_SESSION_TIMEOUT_SECS);
 
     match tokio::time::timeout(timeout, manager.wait_for_result()).await {
         Ok(Some(result)) => {
@@ -60,7 +68,10 @@ async fn handle_restore_session_results(mut manager: RestoreSessionManager, trad
             tracing::error!("Restore session result channel closed unexpectedly");
         }
         Err(_) => {
-            tracing::error!("Restore session timed out after 1 hour");
+            // The `Duration` itself, not a hand-converted unit: it is the value
+            // actually passed to `tokio::time::timeout` above, so the message
+            // cannot disagree with the timeout for any value of the constant.
+            tracing::error!("Restore session timed out after {timeout:?}");
             // Send timeout message to user
             if let Err(e) = send_restore_session_timeout(&trade_key).await {
                 tracing::error!("Failed to send timeout message: {}", e);

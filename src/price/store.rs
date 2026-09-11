@@ -309,8 +309,10 @@ mod tests {
 
         // An older observation for the same currency is not news, and the
         // drop names itself so the trace can diagnose which rate stopped.
+        // The tick clock (3_000) differs from the stored `written_at` (2_000)
+        // on purpose, so a dropped write that still stamped it would show.
         assert_eq!(
-            store.update_observed(results(&[("USD", 41_000.0, 1)]), 2_000, 1_000),
+            store.update_observed(results(&[("USD", 41_000.0, 1)]), 3_000, 1_000),
             vec!["USD".to_string()],
             "a backwards write must name itself as dropped"
         );
@@ -322,13 +324,25 @@ mod tests {
             "the value is dropped along with the stamp"
         );
         assert_eq!(entry.source_count, 2, "and so is its source count");
+        assert_eq!(
+            entry.written_at, 2_000,
+            "a dropped write did not refresh the value, so the freshness clock stays"
+        );
 
         // Equal stamps still apply: a re-observation at the same instant is
         // not a regression, and the guard is `>`, not `>=`.
         assert!(store
-            .update_observed(results(&[("USD", 52_000.0, 3)]), 2_000, 2_000)
+            .update_observed(results(&[("USD", 52_000.0, 3)]), 3_000, 2_000)
             .is_empty());
-        assert_eq!(store.snapshot("USD").unwrap().value, 52_000.0);
+        // A re-observation of the same event lands too, so it stamps the tick
+        // clock: a relay stuck on one event reads as refreshed every tick, and
+        // is caught by the TTL rather than by the freshness warning.
+        let entry = store.snapshot("USD").unwrap();
+        assert_eq!(entry.value, 52_000.0);
+        assert_eq!(
+            entry.written_at, 3_000,
+            "a landed write stamps the tick clock, re-observations included"
+        );
     }
 
     /// A backdated write records `written_at` from the tick clock, not from

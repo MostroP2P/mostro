@@ -619,6 +619,10 @@ impl PriceManager {
     /// warning on a healthy node for every relayed currency whose event
     /// arrives older than one interval, even though our own tick just wrote
     /// it (issue #860 review, PR #925).
+    ///
+    /// Its blind spot: a relay stuck on one event is re-delivered and
+    /// re-written every tick, so this warning stays quiet for it, and the
+    /// first signal is the TTL refusal in `get_price`.
     fn observe_freshness(&self, currency: &str, key: &str, now: i64) {
         let Some(entry) = self.store.snapshot(currency) else {
             return;

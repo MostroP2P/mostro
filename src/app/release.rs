@@ -174,6 +174,25 @@ pub async fn check_failure_retries(
     // Count payment retries up to limit
     order.count_failed_payment(retries_number);
 
+    // Persist before anything that can fail. The flag is what keeps a settled
+    // order selectable by `find_failed_payment`, so it must not depend on the
+    // notification path below succeeding: resolving the buyer pubkey, and the
+    // three payload checks in the retries-exhausted branch, all return early.
+    // An order reaching here with an unusable buyer key would otherwise end up
+    // with neither the flag nor a payout marker — invisible to every recovery
+    // job, exactly the state this bookkeeping exists to prevent. Writing first
+    // also means the buyer is never told about a failure that was not stored.
+    //
+    // Only the payment-retry fields, to avoid overwriting fields modified by
+    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
+    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
+        .bind(order.failed_payment)
+        .bind(order.payment_attempts)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     let buyer_pubkey = order.get_buyer_pubkey().map_err(MostroInternalErr)?;
 
     // Only send notification on first failure
@@ -223,16 +242,6 @@ pub async fn check_failure_retries(
         )
         .await;
     }
-
-    // Only update payment-retry fields to avoid overwriting fields modified by
-    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, status, etc.)
-    sqlx::query("UPDATE orders SET failed_payment = ?, payment_attempts = ? WHERE id = ?")
-        .bind(order.failed_payment)
-        .bind(order.payment_attempts)
-        .bind(order.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(order)
 }
@@ -660,16 +669,58 @@ async fn handle_child_order(
 /// Lightning Addresses **and** bech32 LNURLs are resolved via
 /// [`resolv_ln_address`] under the LNURL host policy. A non-empty `pr` must
 /// decode as BOLT11 and pass [`validate_payout_invoice`] (chain match, final
-/// CLTV bound, not already expired) before LND submission; resolve, decode
-/// and validation failures — all pre-claim — go through
-/// [`check_failure_retries_or_log`] and return `Err`. `send_payment` RPC
-/// errors and streamed `PaymentStatus::Failed` updates bump the same retry
-/// bookkeeping from the background task. Callers such as `release_action`
-/// ignore the result after hold settlement — retries are driven by the
-/// failed-payment job.
+/// CLTV bound, not already expired) before LND submission. *Every* pre-claim
+/// failure — destination resolve, invoice decode, payout validation, LND
+/// client setup, the claim write itself — goes through
+/// [`check_failure_retries_or_log`] here before returning `Err`, so a settled
+/// order is never left invisible to both recovery jobs (see
+/// [`dispatch_payout`]). `send_payment` RPC errors and streamed
+/// `PaymentStatus::Failed` updates bump the same retry bookkeeping from the
+/// background task. Callers such as `release_action` ignore the result after
+/// hold settlement — retries are driven by the failed-payment job.
 pub async fn do_payment(
     ctx: &AppContext,
     order: Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Single bookkeeping point for the pre-claim paths. An `Err` out of
+    // `dispatch_payout` means the buyer was not paid *and* no payout marker
+    // was left behind, so the order has to be marked `failed_payment` here:
+    // otherwise it is selected by neither `find_failed_payment` (which needs
+    // the flag) nor `find_inflight_payouts` (which needs the marker), and it
+    // sits in settled-hold-invoice forever with the buyer never notified and
+    // no retry ever attempted.
+    match dispatch_payout(ctx, &order, request_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            check_failure_retries_or_log(ctx, &order, request_id).await;
+            Err(e)
+        }
+    }
+}
+
+/// Body of [`do_payment`]: the bounded inline work — resolve the payout
+/// destination, connect to LND, persist the idempotency claim — and the spawn
+/// of the background dispatch task. See [`do_payment`] for the contract this
+/// implements.
+///
+/// **Every `Err` returned from here is treated as a payment failure** by
+/// [`do_payment`], which runs [`check_failure_retries_or_log`] on it. That
+/// holds exactly today — this function is only reached once the order itself
+/// has been validated, so every error exit means "the buyer could not be
+/// paid" — and centralizing it is what keeps the bookkeeping off the
+/// individual `?` sites, where it was repeatedly forgotten. Keep it that way:
+/// an error that is *not* a payment failure would burn a retry and send the
+/// buyer a spurious `PaymentFailed`.
+///
+/// Two paths deliberately return `Ok(())` and so skip that bookkeeping: a
+/// lost claim CAS (another payout is already in flight for this order), and
+/// all post-claim work, which runs in the spawned task and does its own — the
+/// task keeps or releases the claim marker, and `reconcile_inflight_payout`
+/// owns whatever it leaves behind.
+async fn dispatch_payout(
+    ctx: &AppContext,
+    order: &Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let payment_request = match order.buyer_invoice.as_ref() {
@@ -698,9 +749,9 @@ pub async fn do_payment(
         // Resolving a payout destination is a network round-trip to a host the
         // buyer chose. When it yields no usable invoice — forbidden host (SSRF
         // policy), unreachable, LNURL-level ERROR, malformed or unpayable `pr`
-        // — that is a payment failure and must go through the same bookkeeping
-        // as a failed `send_payment`. Returning early would leave
-        // `failed_payment = false` and hide the order from the retry job.
+        // — that is a payment failure and gets the same bookkeeping as a failed
+        // `send_payment`: the `Err` returns to `do_payment`, which marks the
+        // order and notifies the buyer.
         Some(destination) => match resolv_ln_address(&destination, amount, None).await {
             Ok(pr) if !pr.is_empty() => match decode_invoice(&pr) {
                 // The LNURL server picked this invoice, not the buyer, so it
@@ -713,7 +764,6 @@ pub async fn do_payment(
                             "Order id {}: payout address returned unpayable invoice: {:?}",
                             order.id, e
                         );
-                        check_failure_retries_or_log(ctx, &order, request_id).await;
                         return Err(e);
                     }
                 },
@@ -722,7 +772,6 @@ pub async fn do_payment(
                         "Order id {}: payout address returned malformed invoice: {:?}",
                         order.id, e
                     );
-                    check_failure_retries_or_log(ctx, &order, request_id).await;
                     return Err(MostroInternalErr(ServiceError::LnAddressParseError));
                 }
             },
@@ -734,7 +783,6 @@ pub async fn do_payment(
                     ),
                     _ => warn!("Order id {}: payout address returned no invoice", order.id),
                 }
-                check_failure_retries_or_log(ctx, &order, request_id).await;
                 return Err(MostroInternalErr(ServiceError::LnAddressParseError));
             }
         },
@@ -786,8 +834,9 @@ pub async fn do_payment(
     // Get Mostro keys from context
     let my_keys = ctx.keys().clone();
 
-    // Clone ctx for the background task
+    // Clone ctx and the order for the background task
     let ctx = ctx.clone();
+    let order = order.clone();
 
     // From here on the payout runs OFF the event loop: `send_payment` waits
     // for LND's payment stream to reach a terminal state, which a locked-in
@@ -1611,6 +1660,38 @@ mod tests {
             .filter(|(msg, _)| msg.get_inner_message_kind().id == Some(order_id))
             .map(|(msg, _)| msg.get_inner_message_kind().action.clone())
             .collect()
+    }
+
+    /// Assert a pre-claim payout failure left the order recoverable: the
+    /// failure bookkeeping ran, so the row carries the retry flag and its
+    /// first attempt, the buyer was told, and no payout marker was left
+    /// behind for a payment that was never sent. Without the flag the order
+    /// is invisible to `find_failed_payment`, and without a marker it is
+    /// invisible to `find_inflight_payouts` — it would sit in
+    /// settled-hold-invoice forever.
+    async fn assert_payout_failure_recorded(pool: &SqlitePool, order_id: uuid::Uuid) {
+        let db_order = Order::by_id(pool, order_id).await.unwrap().unwrap();
+        assert!(
+            db_order.failed_payment,
+            "a pre-claim payout failure must set failed_payment"
+        );
+        assert_eq!(
+            db_order.payment_attempts, 1,
+            "the failure must count exactly once"
+        );
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT payout_payment_hash FROM orders WHERE id = ?")
+                .bind(order_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(
+            marker.is_none(),
+            "no payout marker may be left for a payment that was never sent"
+        );
+        assert!(queued_actions_for(order_id)
+            .await
+            .contains(&Action::PaymentFailed));
     }
 
     struct StubEscrow;
@@ -2440,7 +2521,10 @@ mod tests {
         let ctx = build_ctx(&pool);
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
-        let order = fiat_sent_sell_order(seller, buyer);
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2448,6 +2532,7 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
     #[tokio::test]
@@ -2460,6 +2545,9 @@ mod tests {
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
         order.amount = 100;
         order.fee = 100;
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2467,8 +2555,49 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError))
         ));
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
+    /// An unusable buyer pubkey fails inside `dispatch_payout` *and* inside
+    /// the bookkeeping's own `get_buyer_pubkey` call. The retry state is still
+    /// persisted, because it is written before the notification path — without
+    /// that ordering the settled order would again carry neither the flag nor
+    /// a payout marker. No message is enqueued: there is no key to send one to.
+    #[tokio::test]
+    async fn do_payment_records_the_failure_when_the_buyer_pubkey_is_unusable() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.buyer_pubkey = None;
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
+
+        let result = do_payment(&ctx, order, None).await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::InvalidPubkey))
+        ));
+        let db_order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert!(
+            db_order.failed_payment,
+            "the retry flag must survive a failed notification"
+        );
+        assert_eq!(db_order.payment_attempts, 1);
+        assert!(
+            queued_actions_for(order_id).await.is_empty(),
+            "no buyer key, so nothing can be notified"
+        );
+    }
+
+    /// Regression test for the stranded-order class: this exit is reached
+    /// through `?`, and before the bookkeeping moved into `do_payment` it
+    /// left a settled order with neither the retry flag nor a payout marker
+    /// — invisible to both recovery jobs, with the buyer never notified.
     #[tokio::test]
     async fn do_payment_fails_fast_when_lnd_is_unreachable() {
         // Arrange: with the global config set to test defaults, the LND cert
@@ -2481,12 +2610,16 @@ mod tests {
         let buyer = Keys::generate().public_key();
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_invoice = Some("lnbc1notchecked".to_string());
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         // Act
         let result = do_payment(&ctx, order, None).await;
 
         // Assert
         assert!(result.is_err());
+        assert_payout_failure_recorded(&pool, order_id).await;
     }
 
     /// An expired regtest invoice: rejected by `validate_payout_invoice` on
@@ -2558,6 +2691,9 @@ mod tests {
 
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_invoice = Some(lnurl);
+        order.status = Status::SettledHoldInvoice.to_string();
+        let order = order.create(&pool).await.unwrap();
+        let order_id = order.id;
 
         let result = do_payment(&ctx, order, None).await;
 
@@ -2568,6 +2704,10 @@ mod tests {
             ),
             "the resolved invoice must be rejected before LND is contacted: {result:?}"
         );
+        // This branch used to run the bookkeeping inline; `do_payment` now
+        // owns it. `payment_attempts == 1` pins that it runs exactly once —
+        // counting twice would silently halve the buyer's retry budget.
+        assert_payout_failure_recorded(&pool, order_id).await;
 
         server.abort();
     }

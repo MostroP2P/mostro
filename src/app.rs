@@ -416,10 +416,14 @@ async fn accept_event(
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
     if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+        // Identity beside trade key is the linkage the two-key design keeps to
+        // Mostro alone; `sender` alone is unpaired, and is what tells one
+        // misbehaving client from many. No `event.id`: on the v1 path this is
+        // the gift wrap, signed by a throwaway key with a tweaked timestamp
+        // precisely so it cannot be attributed to the rumor's author.
         tracing::warn!(
-            "Missing inner signature: identity {} differs from trade key {}",
-            unwrapped.identity,
-            unwrapped.sender
+            trade_key = %unwrapped.sender,
+            "missing inner signature: identity differs from trade key"
         );
         return None;
     }

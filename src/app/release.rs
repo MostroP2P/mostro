@@ -1142,7 +1142,7 @@ enum DispatchVerdict {
 ///   to its CLTV). Re-arming against it risks a double payout; kept, the
 ///   payout is delayed by at most the reconciler cadence, never lost.
 /// - An RPC-level send failure resolves the claim by what LND reports for
-///   the hash: in flight / settled / lookup error → KEEP (the payment may
+///   the hash: initiated / in flight / settled / lookup error → KEEP (the payment may
 ///   still settle); failed / unknown / no record / unusable hash → re-arm
 ///   retry now (and notify the buyer) instead of waiting for the
 ///   grace-delayed reconciliation job.
@@ -1157,9 +1157,13 @@ fn classify_dispatch(
             PAYOUT_SEND_PAYMENT_TIMEOUT.as_secs()
         )),
         Ok(Err(send_err)) => match lookup {
-            Some(Ok(Some(PaymentStatus::InFlight))) | Some(Ok(Some(PaymentStatus::Succeeded))) => {
+            // `Initiated` counts as pending: LND registered the payment and
+            // may still attempt HTLCs even though the send RPC errored.
+            Some(Ok(Some(PaymentStatus::InFlight)))
+            | Some(Ok(Some(PaymentStatus::Initiated)))
+            | Some(Ok(Some(PaymentStatus::Succeeded))) => {
                 DispatchVerdict::KeepMarker(format!(
-                    "send errored ({send_err}) but LND reports the payment in flight or settled"
+                    "send errored ({send_err}) but LND reports the payment pending or settled"
                 ))
             }
             Some(Err(lookup_err)) => DispatchVerdict::KeepMarker(format!(
@@ -2626,6 +2630,20 @@ mod tests {
             classify_dispatch(
                 Ok(Err(send_err())),
                 Some(Ok(Some(PaymentStatus::Succeeded)))
+            ),
+            DispatchVerdict::KeepMarker(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_error_with_initiated_payment_keeps_the_marker() {
+        // `Initiated`: LND registered the payment but attempted no HTLC
+        // yet. It may still go in flight and settle, so re-arming would
+        // risk a double payout.
+        assert!(matches!(
+            classify_dispatch(
+                Ok(Err(send_err())),
+                Some(Ok(Some(PaymentStatus::Initiated)))
             ),
             DispatchVerdict::KeepMarker(_)
         ));

@@ -60,7 +60,7 @@ sqlx = { version = "0.9.0", features = [
   "uuid",
 ] }
 tokio = { version = "1.47.1", features = ["full"] }
-fedimint-tonic-lnd = "0.3.0"
+fedimint-tonic-lnd = "0.4.0"
 uuid = { version = "1.17.0", features = [
   "v4",
   "fast-rng",

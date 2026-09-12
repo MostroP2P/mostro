@@ -856,7 +856,7 @@ async fn check_dev_fee_payment_status(
     {
         Ok(Ok(Some(status))) => match status {
             PaymentStatus::Succeeded => DevFeePaymentState::Succeeded,
-            PaymentStatus::InFlight => DevFeePaymentState::InFlight,
+            PaymentStatus::InFlight | PaymentStatus::Initiated => DevFeePaymentState::InFlight,
             PaymentStatus::Failed => DevFeePaymentState::Failed,
             _ => DevFeePaymentState::Unknown,
         },

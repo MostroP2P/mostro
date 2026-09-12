@@ -1375,8 +1375,9 @@ pub async fn reconcile_inflight_payout(
                 }
             }
         }
-        Ok(Some(PaymentStatus::InFlight)) => {
-            // Still pending — do not re-dispatch; a later tick will reconcile.
+        Ok(Some(PaymentStatus::InFlight)) | Ok(Some(PaymentStatus::Initiated)) => {
+            // Still pending (`Initiated` = registered by LND, no HTLC attempted
+            // yet) — do not re-dispatch; a later tick will reconcile.
         }
         Err(e) => {
             warn!("Order {order_id}: payout reconciliation lookup failed: {e}");

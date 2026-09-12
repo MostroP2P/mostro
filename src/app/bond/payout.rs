@@ -594,7 +594,10 @@ async fn pay_counterparty(
                     )
                     .await;
                 }
-                Ok(Some(PaymentStatus::InFlight)) => {
+                // `Initiated` (LND >= 0.17): the payment is registered but no
+                // HTLC has been attempted yet. Not terminal, so treat it like
+                // an in-flight payment and never re-send on top of it.
+                Ok(Some(PaymentStatus::InFlight)) | Ok(Some(PaymentStatus::Initiated)) => {
                     info!(
                         bond_id = %bond.id,
                         order_id = %bond.order_id,

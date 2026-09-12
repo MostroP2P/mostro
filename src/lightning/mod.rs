@@ -623,6 +623,7 @@ impl LndConnector {
         .await
         {
             Ok(Ok(Some(payment::PaymentStatus::InFlight)))
+            | Ok(Ok(Some(payment::PaymentStatus::Initiated)))
             | Ok(Ok(Some(payment::PaymentStatus::Succeeded))) => {
                 info!(
                     "Aborting payment for hash {}: already in flight or settled",
@@ -795,9 +796,13 @@ impl LndConnector {
         let mut total: u32 = 0;
         let mut to_destination: u32 = 0;
         for payment in response.into_inner().payments {
-            let in_flight =
-                fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
-                    == Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight);
+            // `Initiated` payments are about to dispatch HTLCs; count them
+            // toward the slot ceiling so the gate cannot be raced.
+            let in_flight = matches!(
+                fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status),
+                Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight)
+                    | Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::Initiated)
+            );
             if !in_flight {
                 continue;
             }
@@ -949,7 +954,9 @@ impl LnStatus {
             node_pubkey: info.identity_pubkey,
             commit_hash: info.commit_hash,
             node_alias: info.alias,
-            chains: info.chains.iter().map(|c| c.chain.to_string()).collect(),
+            // `Chain::chain` is deprecated since LND 0.17: the chain is
+            // always bitcoin, so report that for every entry.
+            chains: info.chains.iter().map(|_| "bitcoin".to_string()).collect(),
             networks: info.chains.iter().map(|c| c.network.to_string()).collect(),
             uris: info.uris.iter().map(|u| u.to_string()).collect(),
         }
@@ -1511,8 +1518,8 @@ mod offline_connector_tests {
             commit_hash: "deadbeef".to_string(),
             alias: "test-node".to_string(),
             chains: vec![fedimint_tonic_lnd::lnrpc::Chain {
-                chain: "bitcoin".to_string(),
                 network: "regtest".to_string(),
+                ..Default::default()
             }],
             uris: vec!["02abc@127.0.0.1:9735".to_string()],
             ..Default::default()

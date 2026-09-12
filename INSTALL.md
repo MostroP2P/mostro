@@ -237,7 +237,7 @@ In few minutes you should see a nostr event with Mostro settings:
       ["hold_invoice_expiration_window", "900"],
       ["hold_invoice_cltv_delta", "298"],
       ["invoice_expiration_window", "900"],
-      ["y", "mostrop2p"],
+      ["y", "mostro", "<instance name>"],
       ["z", "info"]
     ],
     "content": "",

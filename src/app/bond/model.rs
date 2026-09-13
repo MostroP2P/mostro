@@ -92,6 +92,11 @@ pub struct Bond {
     /// then; the counterparty share is always derived as
     /// `amount_sats - node_share_sats` so they cannot drift.
     pub node_share_sats: Option<i64>,
+    /// Who the counterparty share is paid to, fixed at slash time while
+    /// the order still names both sides (a timeout clears the slashed
+    /// taker's pubkeys right after). `None` on rows slashed before the
+    /// column existed.
+    pub payout_recipient: Option<String>,
     /// Number of `send_payment` retries against an invoice the counterparty
     /// has already submitted. Bumped only on Phase 3 step 6 (send_payment
     /// failure); `payout_max_retries` is checked against this counter
@@ -169,6 +174,8 @@ impl Bond {
             payout_routing_fee_sats: None,
             payout_payment_hash: None,
             node_share_sats: None,
+
+            payout_recipient: None,
             payout_attempts: 0,
             invoice_request_attempts: 0,
             last_invoice_request_at: None,

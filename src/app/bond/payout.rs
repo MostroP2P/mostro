@@ -1122,7 +1122,7 @@ async fn on_send_payment_failure(
 ///   one responsible for the elapsed waiting state, and the recipient
 ///   is the other side. The §9.2 table is encoded by *who got
 ///   slashed*, not consulted here.
-fn resolve_recipient(
+pub(super) fn resolve_recipient(
     order: &Order,
     bond: &Bond,
     _reason: BondSlashReason,
@@ -1151,13 +1151,21 @@ fn resolve_recipient(
 ///   child (whose `order_id` is the slice order and whose `pubkey` is the
 ///   maker's slice-side key) — resolves via [`resolve_recipient`] to the
 ///   non-`bond.pubkey` side of the order, i.e. the winning counterparty.
-fn resolve_payout_recipient(
+pub(super) fn resolve_payout_recipient(
     order: &Order,
     bond: &Bond,
     reason: BondSlashReason,
 ) -> Result<Option<PublicKey>, MostroError> {
     if bond.parent_bond_id.is_some() && bond.child_order_id.is_none() {
         let pk = PublicKey::from_str(&bond.pubkey)
+            .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+        return Ok(Some(pk));
+    }
+    // The recipient fixed at slash time outranks the order: a timeout
+    // clears the slashed taker's pubkeys from the order right after the
+    // slash, and the order alone then names nobody (MOSTRO-006).
+    if let Some(stored) = bond.payout_recipient.as_deref() {
+        let pk = PublicKey::from_str(stored)
             .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
         return Ok(Some(pk));
     }
@@ -1730,6 +1738,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260913120000_bond_payout_recipient.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient migration");
         // cashu escrow columns (mostro-core 0.12.1) — `Order::by_id` SELECTs
         // them. Apply each ALTER separately for the same reason as dev_fee.
         for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
@@ -1814,6 +1828,26 @@ mod tests {
         };
         let bond = pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, 0, None, None);
         let r = resolve_recipient(&order, &bond, BondSlashReason::LostDispute).unwrap();
+        assert_eq!(r.unwrap().to_string(), maker_pk());
+    }
+
+    /// MOSTRO-006: the timeout republish cleared the slashed taker's
+    /// pubkeys from the order, so the order alone named nobody and the
+    /// share forfeited to the node. The recipient fixed at slash time
+    /// still names the maker.
+    #[test]
+    fn resolve_payout_recipient_prefers_the_recipient_fixed_at_slash_time() {
+        let order = Order {
+            kind: Kind::Sell.to_string(),
+            seller_pubkey: Some(maker_pk().to_string()),
+            buyer_pubkey: None,
+            ..Order::default()
+        };
+        let mut bond =
+            pending_payout_bond(Uuid::new_v4(), taker_pk(), 10_000, 5_000, 0, None, None);
+        bond.slashed_reason = Some(BondSlashReason::Timeout.to_string());
+        bond.payout_recipient = Some(maker_pk().to_string());
+        let r = resolve_payout_recipient(&order, &bond, BondSlashReason::Timeout).unwrap();
         assert_eq!(r.unwrap().to_string(), maker_pk());
     }
 

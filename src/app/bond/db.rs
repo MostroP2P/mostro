@@ -354,6 +354,12 @@ mod tests {
         .await
         .expect("bond_payout_payment_hash migration");
         sqlx::query(include_str!(
+            "../../../migrations/20260913120000_bond_payout_recipient.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient migration");
+        sqlx::query(include_str!(
             "../../../migrations/20260611120000_bond_slice_slash_unique.sql"
         ))
         .execute(&pool)
@@ -447,6 +453,8 @@ mod tests {
             payout_routing_fee_sats: Some(15),
             payout_payment_hash: Some("q".repeat(64)),
             node_share_sats: Some(17),
+
+            payout_recipient: None,
             payout_attempts: 18,
             invoice_request_attempts: 19,
             last_invoice_request_at: Some(20),

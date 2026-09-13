@@ -347,7 +347,8 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
             // a transient settle failure leaves the bond `Locked` for an
             // admin retry, never released. Confirm the slash via the durable
             // `slashed_reason` witness before queueing a notice.
-            slash_one(pool, ln_client, &target, reason, node_share_pct).await;
+            let recipient = payout_recipient_of(order, &target, reason);
+            slash_one(pool, ln_client, &target, reason, node_share_pct, recipient).await;
             slashed_ids.insert(target.id);
             if slash_reason_recorded(pool, target.id, reason).await? {
                 notify_rows.push(target.clone());
@@ -585,12 +586,14 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
             None
         }
     } else {
+        let recipient = payout_recipient_of(order, &responsible, BondSlashReason::Timeout);
         slash_one(
             pool,
             ln_client,
             &responsible,
             BondSlashReason::Timeout,
             node_share_pct,
+            recipient,
         )
         .await;
         // Confirm the slash actually landed before claiming it: a transient
@@ -767,6 +770,31 @@ pub async fn notify_bond_slashed(order: &Order, slashed: &Bond) {
     .await;
 }
 
+/// The counterparty the share of `bond` goes to, read off `order` while
+/// it still names both sides. Logged and `None` when the order cannot
+/// say (the resolver then falls back to the order at payout time).
+fn payout_recipient_of(order: &Order, bond: &Bond, reason: BondSlashReason) -> Option<String> {
+    match super::payout::resolve_recipient(order, bond, reason) {
+        Ok(Some(pk)) => Some(pk.to_string()),
+        Ok(None) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %order.id,
+                "slash: the order names no counterparty for the payout; recipient left unset"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %order.id,
+                "slash: payout recipient unreadable ({e}); recipient left unset"
+            );
+            None
+        }
+    }
+}
+
 /// Single-bond slash: settle the hold invoice into Mostro's wallet,
 /// then CAS the row `Locked → PendingPayout` with snapshot fields.
 ///
@@ -776,16 +804,20 @@ pub async fn notify_bond_slashed(order: &Order, slashed: &Bond) {
 /// `WHERE id = ? AND state = 'locked'` so a duplicate admin call or a
 /// concurrent transition cannot overwrite a row that already moved on.
 ///
-/// The CAS write is the only place `slashed_reason`, `slashed_at`, and
-/// `node_share_sats` are populated for a `LostDispute` row, which is
-/// what makes the split snapshot deterministic across restarts and
-/// config changes.
+/// The CAS write is the only place `slashed_reason`, `slashed_at`,
+/// `node_share_sats` and `payout_recipient` are populated for a
+/// `LostDispute` row, which is what makes the split snapshot
+/// deterministic across restarts and config changes. The recipient is
+/// taken from the order as the caller still sees it: a timeout clears
+/// the slashed taker's pubkeys from the order right after the slash,
+/// and a resolver that read the order then could not name the winner.
 async fn slash_one<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
     bond: &Bond,
     reason: BondSlashReason,
     node_share_pct: f64,
+    payout_recipient: Option<String>,
 ) {
     let preimage = match bond.preimage.as_deref() {
         Some(p) => p,
@@ -820,13 +852,15 @@ async fn slash_one<L: SettleLightning + Send>(
     let now = Utc::now().timestamp();
     let result = sqlx::query(
         "UPDATE bonds \
-           SET state = ?, slashed_reason = ?, slashed_at = ?, node_share_sats = ? \
+           SET state = ?, slashed_reason = ?, slashed_at = ?, node_share_sats = ?, \
+               payout_recipient = ? \
          WHERE id = ? AND state = ?",
     )
     .bind(BondState::PendingPayout.to_string())
     .bind(reason.to_string())
     .bind(now)
     .bind(node_share_sats)
+    .bind(payout_recipient)
     .bind(bond.id)
     .bind(BondState::Locked.to_string())
     .execute(pool)
@@ -1517,6 +1551,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_payment_hash migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20260913120000_bond_payout_recipient.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient migration");
         // Phase 6 chain-walk tests load full `Order` rows via `Order::by_id`,
         // which selects every column the model declares — so the orders
         // table must carry the later Cashu columns too.
@@ -4294,7 +4334,15 @@ mod tests {
         bond.clone().create(&pool).await.unwrap();
         let mut ln = StubSettle::new();
 
-        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+        slash_one(
+            &pool,
+            &mut ln,
+            &bond,
+            BondSlashReason::LostDispute,
+            0.0,
+            None,
+        )
+        .await;
 
         assert!(
             ln.calls().is_empty(),
@@ -4304,6 +4352,56 @@ mod tests {
             read_bond_state(&pool, bond.id).await,
             BondState::Locked.to_string()
         );
+    }
+
+    /// MOSTRO-006: a waiting-state timeout slashes the taker and then
+    /// clears the taker's pubkeys from the order (`edit_pubkeys_order`),
+    /// after which the order alone names no counterparty and the share
+    /// forfeited whole to the node. The recipient fixed at slash time
+    /// keeps naming the maker.
+    #[tokio::test]
+    async fn slash_one_fixes_the_payout_recipient_before_the_timeout_clears_the_taker() {
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        let recipient = payout_recipient_of(&order, &bond, BondSlashReason::Timeout);
+        assert_eq!(recipient.as_deref(), Some(maker_pk()));
+
+        slash_one(
+            &pool,
+            &mut ln,
+            &bond,
+            BondSlashReason::Timeout,
+            0.5,
+            recipient,
+        )
+        .await;
+        crate::db::edit_pubkeys_order(&pool, &order).await.unwrap();
+
+        let cleared = Order::by_id(&pool, order.id)
+            .await
+            .unwrap()
+            .expect("order row");
+        assert!(
+            cleared.buyer_pubkey.is_none(),
+            "the timeout cleared the taker"
+        );
+        let slashed: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(slashed.payout_recipient.as_deref(), Some(maker_pk()));
+        let winner = super::super::payout::resolve_payout_recipient(
+            &cleared,
+            &slashed,
+            BondSlashReason::Timeout,
+        )
+        .unwrap()
+        .expect("the maker is still the recipient");
+        assert_eq!(winner.to_string(), maker_pk());
     }
 
     #[tokio::test]
@@ -4324,7 +4422,15 @@ mod tests {
             .unwrap();
         let mut ln = StubSettle::new();
 
-        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+        slash_one(
+            &pool,
+            &mut ln,
+            &bond,
+            BondSlashReason::LostDispute,
+            0.0,
+            None,
+        )
+        .await;
 
         assert_eq!(
             ln.calls(),
@@ -4360,7 +4466,15 @@ mod tests {
         let mut ln = StubSettle::new();
 
         // Must not panic despite the CAS query itself failing.
-        slash_one(&pool, &mut ln, &bond, BondSlashReason::LostDispute, 0.0).await;
+        slash_one(
+            &pool,
+            &mut ln,
+            &bond,
+            BondSlashReason::LostDispute,
+            0.0,
+            None,
+        )
+        .await;
 
         assert_eq!(
             ln.calls(),

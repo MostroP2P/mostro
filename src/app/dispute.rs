@@ -168,21 +168,44 @@ pub async fn dispute_action(
     // Create new dispute record
     let dispute = Dispute::new(order_id, order.status.clone());
 
-    // Setup dispute
+    // Setup dispute. In-memory only, so a rejection here writes nothing.
     order
         .setup_dispute(is_buyer_dispute)
         .map_err(MostroCantDo)?;
-    order
-        .clone()
-        .update(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
-    // Save dispute to database
-    let dispute = dispute
-        .create(pool)
+    // The dispute row and the order's flag + status land together or not at
+    // all: either half alone strands the order (#921).
+    //
+    // Raw sqlx because `Crud::create`/`update` take `&Pool<Sqlite>`, not an
+    // executor, so they cannot join a transaction. sqlx-crud, which
+    // mostro-core#154 replaced, was generic over the executor; this works
+    // around what that rewrite narrowed.
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
+         created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(dispute.id)
+    .bind(dispute.order_id)
+    .bind(&dispute.status)
+    .bind(&dispute.order_previous_status)
+    .bind(&dispute.solver_pubkey)
+    .bind(dispute.created_at)
+    .bind(dispute.taken_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Only what `setup_dispute` changed, not the whole row from a snapshot.
+    sqlx::query("UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? WHERE id = ?")
+        .bind(&order.status)
+        .bind(order.buyer_dispute)
+        .bind(order.seller_dispute)
+        .bind(order.id)
+        .execute(&mut *tx)
         .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
 
     // Get pubkeys of initiator and counterpart
     let (initiator_pubkey, counterpart_pubkey) = if is_buyer_dispute {
@@ -732,5 +755,89 @@ mod tests {
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
         assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+    }
+
+    /// The `disputes` insert is made to fail deterministically by dropping the
+    /// table: the order must not carry the dispute flag (nor the `Dispute`
+    /// status) when the row that makes the dispute visible was not written.
+    #[tokio::test]
+    async fn dispute_action_leaves_the_order_untouched_when_the_dispute_row_fails() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE disputes")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &create_event(buyer),
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
+
+        let stored_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(!stored_order.buyer_dispute);
+        assert!(!stored_order.seller_dispute);
+        assert_eq!(stored_order.status, Status::Active.to_string());
+    }
+
+    /// The inverse window: the insert succeeds and the order update fails.
+    /// Both writes are one transaction, so the row must roll back with it,
+    /// from either status a dispute can be filed in. A trigger aborting any
+    /// `orders` update injects the failure deterministically.
+    #[tokio::test]
+    async fn dispute_action_rolls_back_the_row_when_the_order_update_fails() {
+        for status in [Status::Active, Status::FiatSent] {
+            let pool = create_test_pool().await;
+            let ctx = build_ctx(&pool);
+            let buyer = Keys::generate().public_key();
+            let seller = Keys::generate().public_key();
+            let order = create_order(Some(buyer), Some(seller), status)
+                .create(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER fail_order_update BEFORE UPDATE ON orders \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let result = dispute_action(
+                &ctx,
+                dispute_msg_for(Some(order.id)),
+                &create_event(buyer),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+                ),
+                "{status}: got {result:?}"
+            );
+            assert!(
+                find_dispute_by_order_id(&pool, order.id).await.is_err(),
+                "{status}: the dispute row must roll back with the failed order update"
+            );
+        }
     }
 }

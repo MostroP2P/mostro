@@ -168,7 +168,8 @@ pub async fn dispute_action(
     // Create new dispute record
     let dispute = Dispute::new(order_id, order.status.clone());
 
-    // Setup dispute
+    // Setup dispute. `setup_dispute` leaves `order.status` dirty on `Err`;
+    // returning here keeps that out of the database.
     order
         .setup_dispute(is_buyer_dispute)
         .map_err(MostroCantDo)?;
@@ -435,6 +436,55 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::DisputeAlreadyExists))
         ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_with_dispute_flag_but_no_dispute_row() {
+        // #848 made a `setup_dispute` failure reach the client instead of
+        // being swallowed. That arm needs an order whose dispute flag is
+        // already set with no matching `disputes` row: the normal
+        // double-dispute path trips the `DisputeAlreadyExists` guard above
+        // and never reaches `setup_dispute`.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET buyer_dispute = 1 WHERE id = ?1")
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let err = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await
+        .expect_err("inconsistent dispute state must be rejected");
+
+        assert!(matches!(
+            err,
+            MostroCantDo(CantDoReason::DisputeCreationError)
+        ));
+
+        // The behaviour #848 changed: the old code created the row anyway.
+        // `find_dispute_by_order_id` uses `fetch_one`, so a missing row is
+        // `Err`, not `Ok(None)`.
+        assert!(find_dispute_by_order_id(&pool, order.id).await.is_err());
+
+        // Nothing was persisted before the early return.
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Active.to_string());
+        assert!(stored.buyer_dispute);
+        assert!(!stored.seller_dispute);
     }
 
     #[tokio::test]

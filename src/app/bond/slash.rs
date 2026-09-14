@@ -348,7 +348,7 @@ pub async fn apply_bond_resolution<L: SettleLightning + Send>(
             // admin retry, never released. Confirm the slash via the durable
             // `slashed_reason` witness before queueing a notice.
             let recipient = payout_recipient_of(order, &target, reason);
-            slash_one(pool, ln_client, &target, reason, node_share_pct, recipient).await;
+            slash_one(pool, ln_client, &target, reason, node_share_pct, recipient).await?;
             slashed_ids.insert(target.id);
             if slash_reason_recorded(pool, target.id, reason).await? {
                 notify_rows.push(target.clone());
@@ -595,7 +595,7 @@ pub async fn slash_or_release_on_timeout<L: SettleLightning + Send>(
             node_share_pct,
             recipient,
         )
-        .await;
+        .await?;
         // Confirm the slash actually landed before claiming it: a transient
         // settle failure leaves the bond `Locked` (`slash_one` is
         // best-effort), and we must never tell a user their bond was
@@ -811,6 +811,11 @@ fn payout_recipient_of(order: &Order, bond: &Bond, reason: BondSlashReason) -> O
 /// taken from the order as the caller still sees it: a timeout clears
 /// the slashed taker's pubkeys from the order right after the slash,
 /// and a resolver that read the order then could not name the winner.
+///
+/// Returns `Err` only when the CAS itself fails at the DB level: the HTLC
+/// is already settled but the row is still `Locked`, so callers must not
+/// treat the slash as handled (the timeout scheduler would otherwise move
+/// the order out of its retry window and strand the row).
 async fn slash_one<L: SettleLightning + Send>(
     pool: &Pool<Sqlite>,
     ln_client: &mut L,
@@ -818,7 +823,7 @@ async fn slash_one<L: SettleLightning + Send>(
     reason: BondSlashReason,
     node_share_pct: f64,
     payout_recipient: Option<String>,
-) {
+) -> Result<(), MostroError> {
     let preimage = match bond.preimage.as_deref() {
         Some(p) => p,
         None => {
@@ -827,7 +832,7 @@ async fn slash_one<L: SettleLightning + Send>(
                 order_id = %bond.order_id,
                 "slash: bond has no preimage — cannot settle HTLC; leaving Locked for operator review"
             );
-            return;
+            return Ok(());
         }
     };
 
@@ -844,7 +849,7 @@ async fn slash_one<L: SettleLightning + Send>(
                 order_id = %bond.order_id,
                 "slash: settle_hold_invoice failed: {e} — leaving bond Locked for admin retry"
             );
-            return;
+            return Ok(());
         }
     }
 
@@ -895,8 +900,12 @@ async fn slash_one<L: SettleLightning + Send>(
                 order_id = %bond.order_id,
                 "slash CAS DB error: {} (HTLC was settled)", e
             );
+            return Err(MostroInternalErr(ServiceError::DbAccessError(
+                e.to_string(),
+            )));
         }
     }
+    Ok(())
 }
 
 /// Phase 6 — record a proportional slash of a range maker bond against the
@@ -4352,7 +4361,8 @@ mod tests {
             0.0,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             ln.calls().is_empty(),
@@ -4387,7 +4397,8 @@ mod tests {
             0.5,
             recipient,
         )
-        .await;
+        .await
+        .unwrap();
         crate::db::edit_pubkeys_order(&pool, &order).await.unwrap();
 
         let cleared = Order::by_id(&pool, order.id)
@@ -4440,7 +4451,8 @@ mod tests {
             0.0,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(
             ln.calls(),
@@ -4461,10 +4473,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_one_cas_db_error_is_logged_not_propagated() {
+    async fn slash_one_cas_db_error_is_propagated() {
         // A DB-level failure on the CAS itself (after the HTLC is already
-        // settled) must be logged, not panic or propagate — `slash_one` is
-        // best-effort by design.
+        // settled) must surface as `Err`: the row is still `Locked`, so the
+        // timeout scheduler has to keep the order eligible and retry
+        // instead of treating the slash as handled.
         let pool = setup_pool().await;
         let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
         insert_order_row(&pool, &order).await;
@@ -4475,8 +4488,7 @@ mod tests {
             .unwrap();
         let mut ln = StubSettle::new();
 
-        // Must not panic despite the CAS query itself failing.
-        slash_one(
+        let result = slash_one(
             &pool,
             &mut ln,
             &bond,
@@ -4486,6 +4498,7 @@ mod tests {
         )
         .await;
 
+        assert!(result.is_err(), "a failed CAS must not report success");
         assert_eq!(
             ln.calls(),
             vec![stub_preimage()],

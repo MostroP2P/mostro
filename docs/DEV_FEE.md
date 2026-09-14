@@ -1145,7 +1145,7 @@ Why kind 8383 (Regular Event)?
     "status": "success"
   },
   "tags": [
-    ["y", "mostro"],
+    ["y", "mostro", "<instance name>"],
     ["z", "dev-fee-payment"],
     ["order", "550e8400-e29b-..."],
     ["amount", "100"],

@@ -3,8 +3,8 @@ use std::str::FromStr;
 use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
 use crate::db::{
-    ensure_dispute_finalize_permission, find_dispute_by_order_id, is_assigned_solver,
-    is_dispute_taken_by_admin,
+    claim_order_status, ensure_dispute_finalize_permission, find_dispute_by_order_id,
+    is_assigned_solver, is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
 use crate::nip33::{create_dispute_event_tags, new_dispute_event};
@@ -55,7 +55,12 @@ use tracing::{error, info, warn};
 ///
 /// Failures *after* the refund are logged and swallowed rather than
 /// returned (DM fan-out, bond resolution), so the handler always runs to
-/// the end once the escrow has moved. Making that tail atomic is #810.
+/// the end once the escrow has moved.
+///
+/// The `Dispute → CanceledByAdmin` transition is claimed atomically before
+/// the refund, so a second cancel cannot reach that escrow move (#810). The
+/// cancel/settle pair becomes exclusive once `admin_settle` claims before
+/// its own settle too (#809): on `main` it still settles first.
 pub async fn admin_cancel_action(
     ctx: &AppContext,
     msg: Message,
@@ -153,8 +158,8 @@ pub async fn admin_cancel_action(
     // in `Dispute`, so the LN side and the DB disagreed with no way back.
     // This initiator check now precedes the refund, as does the counterparty
     // resolution below. What remains after the refund either can't reject the
-    // call (the DM fan-out is best effort) or is a DB/event write whose
-    // atomicity is tracked separately in #810.
+    // call (the DM fan-out is best effort) or is a DB/event write serialized
+    // by the status claim below (#810).
     let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
         (true, false) => "seller",
         (false, true) => "buyer",
@@ -191,14 +196,47 @@ pub async fn admin_cancel_action(
         (None, _) | (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
 
+    // #810: claim `Dispute → CanceledByAdmin` before the escrow moves, so a
+    // concurrent transition cannot act on the same escrow. A miss means
+    // another path owns the transition. The helper's `cashu_escrow_locked_at
+    // IS NULL` predicate never excludes an order here, as nothing in Cashu
+    // mode reaches this handler.
+    if !claim_order_status(pool, order.id, Status::Dispute, Status::CanceledByAdmin).await? {
+        warn!(
+            order_id = %order.id,
+            "admin_cancel: order moved out of dispute concurrently; escrow untouched"
+        );
+        // Refused like the take flow's claim: a silent `Ok` would have the
+        // gRPC surface report a cancellation that never happened.
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
     if let Some(hash) = order.hash.as_ref() {
         // We return funds to seller. A hold invoice that LND already
         // canceled (CLTV expiry refunded the seller long ago) or does not
         // know at all (the daemon now runs against a different node) is
         // not an error: the HTLC is verifiably gone and the dispute can
         // still be closed. Only a transient LND failure aborts the cancel.
-        if tolerate_gone_hold_invoice(&order.id, ln_client.cancel_hold_invoice(hash).await)? {
-            info!("Order Id {}: Funds returned to seller", &order.id);
+        match tolerate_gone_hold_invoice(&order.id, ln_client.cancel_hold_invoice(hash).await) {
+            Ok(true) => info!("Order Id {}: Funds returned to seller", &order.id),
+            // Already gone: the claim stands and the dispute still closes.
+            Ok(false) => {}
+            Err(e) => {
+                // Only this arm releases: the guard above rejects a second
+                // admin cancel, so a claim standing on a refund that never
+                // happened would strand the escrow with no retry path.
+                if let Err(release) =
+                    claim_order_status(pool, order.id, Status::CanceledByAdmin, Status::Dispute)
+                        .await
+                {
+                    error!(
+                        order_id = %order.id,
+                        "admin_cancel: could not release the cancel claim after a failed refund; \
+                         the order stays canceled-by-admin with its escrow held: {release}"
+                    );
+                }
+                return Err(e);
+            }
         }
     }
 
@@ -210,9 +248,15 @@ pub async fn admin_cancel_action(
         let opened_at = d.created_at;
         // we update the dispute
         d.status = DisputeStatus::SellerRefunded.to_string();
-        d.update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        // Past the claim the order is committed — the `Dispute` guard rejects
+        // a retry — so a failure here must not skip the notifications and the
+        // bond resolution below. Same reasoning the DM fan-out carries.
+        if let Err(e) = d.update(pool).await {
+            error!(
+                order_id = %order.id,
+                "admin_cancel: could not move the dispute row to seller-refunded: {e}"
+            );
+        }
         // We create a tag to show status of the dispute
         let tags = create_dispute_event_tags(
             DisputeStatus::SellerRefunded.to_string(),
@@ -233,15 +277,28 @@ pub async fn admin_cancel_action(
         }
     }
 
-    // We publish a new replaceable kind nostr event with the status updated
-    // and update on local database the status and new event id
-    let order_updated = update_order_event(my_keys, Status::CanceledByAdmin, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    order_updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // The claim already persisted the status, so this only republishes the
+    // event and patches its id; both are best effort for the same reason as
+    // the dispute row above.
+    match update_order_event(my_keys, Status::CanceledByAdmin, &order).await {
+        Ok(order_updated) => {
+            if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+                .bind(&order_updated.event_id)
+                .bind(order.id)
+                .execute(pool)
+                .await
+            {
+                error!(
+                    order_id = %order.id,
+                    "admin_cancel: could not patch the republished event id: {e}"
+                );
+            }
+        }
+        Err(e) => error!(
+            order_id = %order.id,
+            "admin_cancel: could not republish the canceled order event: {e}"
+        ),
+    }
     // We create a Message for cancel
     let message = Message::new_order(
         Some(order.id),
@@ -896,6 +953,90 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::LnNodeError(_)))
         ));
+    }
+
+    /// #810: the claim is taken before the escrow moves, so a transient LND
+    /// failure has to hand it back — the `Dispute` guard rejects a second
+    /// admin cancel, so a claim left standing on a refund that never happened
+    /// would strand the escrow with no retry path at all. Only this arm
+    /// releases: an already-canceled or unknown invoice is tolerated and the
+    /// cancel completes (`gone_hold_invoice_is_not_an_error`).
+    #[tokio::test]
+    async fn a_transient_refund_failure_releases_the_claim() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::LnNodeError(_)))),
+            "the transient failure must surface, got {result:?}"
+        );
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            Status::Dispute.to_string(),
+            "a failed refund must release the claim so the solver can retry"
+        );
+    }
+
+    /// #810: past the claim the order is committed, so a failure in the tail
+    /// must not abort the handler — the `Dispute` guard rejects a retry, and
+    /// an early return here would skip the bond resolution and strand every
+    /// `Locked` bond. A trigger aborting any `disputes` update injects it.
+    #[tokio::test]
+    async fn a_post_claim_failure_does_not_abort_the_handler() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_dispute_update BEFORE UPDATE ON disputes \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(ctx.pool())
+        .await
+        .unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a failed dispute-row update must not abort past the claim: {result:?}"
+        );
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
     }
 
     /// Full no-LND cancel path: a seller-initiated dispute with no hold

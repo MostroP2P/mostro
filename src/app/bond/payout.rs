@@ -43,10 +43,16 @@
 //!
 //! ## Recipient resolution
 //!
-//! The non-slashed counterparty is recomputed from `order.{buyer,
-//! seller}_pubkey` + `bond.pubkey` + `slashed_reason` at scheduler time.
-//! No new schema column is needed; the same mapping the Phase 2
-//! validator uses on the way *in* applies here on the way *out*.
+//! The non-slashed counterparty is fixed at slash time in
+//! `bonds.payout_recipient` (by `slash_one` and the range slice-slash
+//! insert) while the order still names both sides, and the scheduler
+//! reads that column first. A waiting-state timeout clears the slashed
+//! taker's pubkeys from the order right after the slash, so a resolver
+//! that read only the order would name nobody and the share would
+//! forfeit whole to the node (MOSTRO-006). Rows slashed before the column
+//! existed fall back to recomputing it from `order.{buyer,seller}_pubkey`
+//! and `bond.pubkey`, the same mapping the Phase 2 validator uses on the
+//! way *in*.
 
 use std::str::FromStr;
 use std::time::Duration;

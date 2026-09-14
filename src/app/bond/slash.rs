@@ -969,6 +969,14 @@ async fn record_maker_slice_slash(
 
     let now = Utc::now().timestamp();
     let node_share = compute_node_share(slash_amount, node_share_pct);
+    // The winning counterparty, fixed now while the slice still names it: a
+    // waiting-state timeout clears the taker's pubkeys from the slice right
+    // after this insert (`edit_pubkeys_order`), and the payout resolver could
+    // then no longer name the winner (MOSTRO-006).
+    let payout_recipient = match kind {
+        Kind::Sell => slice.buyer_pubkey.as_deref(),
+        Kind::Buy => slice.seller_pubkey.as_deref(),
+    };
 
     // Insert the child slash row **atomically** with two guards, so a slice is
     // slashed at most once under a given parent *and* only while that parent is
@@ -999,8 +1007,9 @@ async fn record_maker_slice_slash(
     let insert = sqlx::query(
         "INSERT INTO bonds \
             (id, order_id, parent_bond_id, child_order_id, pubkey, role, \
-             amount_sats, state, slashed_reason, node_share_sats, slashed_at, created_at) \
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             amount_sats, state, slashed_reason, node_share_sats, payout_recipient, \
+             slashed_at, created_at) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM bonds WHERE parent_bond_id = ? AND child_order_id = ?) \
            AND EXISTS ( \
@@ -1016,6 +1025,7 @@ async fn record_maker_slice_slash(
     .bind(BondState::PendingPayout.to_string())
     .bind(reason.to_string())
     .bind(node_share)
+    .bind(payout_recipient)
     .bind(now)
     .bind(now)
     .bind(parent_bond.id)
@@ -4515,6 +4525,107 @@ mod tests {
             maker_pk(),
             "a buy-order slice's maker-side pubkey is the buyer's"
         );
+    }
+
+    /// MOSTRO-006 on the Phase 7 path: a waiting-state timeout slashes the
+    /// range maker's slice share and then clears the taker's pubkeys from
+    /// the slice order. The child row keeps naming the taker as winner.
+    #[tokio::test]
+    async fn record_maker_slice_slash_fixes_the_payout_recipient_before_the_timeout_clears_the_taker(
+    ) {
+        let pool = setup_pool().await;
+        let slice = range_slice(Kind::Sell, maker_pk(), taker_pk(), 40, 10, 100);
+        insert_range_order_row(&pool, &slice).await;
+        let parent = insert_parent_maker_bond(&pool, slice.id, maker_pk(), 1000).await;
+
+        let inserted = record_maker_slice_slash(
+            &pool,
+            &slice,
+            &slice,
+            &parent,
+            BondSlashReason::Timeout,
+            0.5,
+        )
+        .await
+        .unwrap();
+        assert!(inserted);
+        crate::db::edit_pubkeys_order(&pool, &slice).await.unwrap();
+
+        let cleared = Order::by_id(&pool, slice.id)
+            .await
+            .unwrap()
+            .expect("slice row");
+        assert!(
+            cleared.buyer_pubkey.is_none(),
+            "the timeout cleared the taker"
+        );
+        let children = find_child_slashes_for_parent(&pool, parent.id)
+            .await
+            .unwrap();
+        let child = &children[0];
+        assert_eq!(child.payout_recipient.as_deref(), Some(taker_pk()));
+        let winner = super::super::payout::resolve_payout_recipient(
+            &cleared,
+            child,
+            BondSlashReason::Timeout,
+        )
+        .unwrap()
+        .expect("the taker is still the recipient");
+        assert_eq!(winner.to_string(), taker_pk());
+    }
+
+    /// The repair migration fills `payout_recipient` only where the order
+    /// still names exactly one side and that side is not the slashed bond's.
+    #[tokio::test]
+    async fn payout_recipient_repair_migration_fills_only_unambiguous_rows() {
+        let pool = setup_pool().await;
+        // Taker slashed on timeout, taker cleared: the maker is the winner.
+        let mut repairable = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        repairable.buyer_pubkey = None;
+        insert_order_row(&pool, &repairable).await;
+        let taker_bond = insert_bond(&pool, repairable.id, taker_pk(), BondState::Locked).await;
+        // Maker slashed, taker (the winner) cleared: ambiguous, left manual.
+        let mut ambiguous = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        ambiguous.buyer_pubkey = None;
+        insert_order_row(&pool, &ambiguous).await;
+        let maker_bond = insert_bond(&pool, ambiguous.id, maker_pk(), BondState::Locked).await;
+        // Both sides still named: the order-derived resolver already works.
+        let intact = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &intact).await;
+        let intact_bond = insert_bond(&pool, intact.id, taker_pk(), BondState::Locked).await;
+        for id in [taker_bond.id, maker_bond.id, intact_bond.id] {
+            sqlx::query("UPDATE bonds SET state = ?, slashed_reason = ? WHERE id = ?")
+                .bind(BondState::PendingPayout.to_string())
+                .bind(BondSlashReason::Timeout.to_string())
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        sqlx::query(include_str!(
+            "../../../migrations/20260914120000_bond_payout_recipient_repair.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_recipient_repair migration");
+
+        let recipient_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                find_bond_by_id(&pool, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payout_recipient
+            }
+        };
+        assert_eq!(
+            recipient_of(taker_bond.id).await.as_deref(),
+            Some(maker_pk())
+        );
+        assert_eq!(recipient_of(maker_bond.id).await, None, "ambiguous");
+        assert_eq!(recipient_of(intact_bond.id).await, None, "not stranded");
     }
 
     #[tokio::test]

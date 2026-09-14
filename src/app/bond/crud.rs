@@ -29,6 +29,8 @@ pub(crate) const BOND_INSERT_COLUMNS: &[&str] = &[
     "payout_routing_fee_sats",
     "payout_payment_hash",
     "node_share_sats",
+    // `payout_recipient` is omitted on purpose: only the slash CAS and the
+    // slice-slash insert write it, so a `Bond` created here starts NULL.
     "payout_attempts",
     "invoice_request_attempts",
     "last_invoice_request_at",
@@ -82,6 +84,8 @@ fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
 fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bond) {
     // `created_at` is insert-only: omit from UPDATE so a mutated in-memory
     // `Bond` cannot rewrite the row's creation timestamp (schedulers order by it).
+    // `payout_recipient` is omitted for the same reason: it is fixed at slash
+    // time and a stale in-memory `Bond` must not NULL it out.
     set.push("order_id = ").push_bind_unseparated(bond.order_id);
     set.push("parent_bond_id = ")
         .push_bind_unseparated(bond.parent_bond_id);

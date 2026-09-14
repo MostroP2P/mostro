@@ -588,6 +588,46 @@ impl LndConnector {
             .min())
     }
 
+    /// Current state of a hold invoice at LND, or `None` when the node has no
+    /// record of it (already garbage-collected, or a hash we never created).
+    ///
+    /// Callers about to cancel an escrow need this: on an order still waiting
+    /// for the seller's payment, `Accepted` means their HTLC is locked in
+    /// *right now*, and canceling refunds it. See
+    /// `crate::app::cancel::classify_escrow_cancel`.
+    pub async fn lookup_invoice_state(
+        &mut self,
+        hash: &str,
+    ) -> Result<Option<InvoiceState>, MostroError> {
+        let r_hash = decode_hash32("payment hash", hash)?;
+
+        let invoice = match self
+            .client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(invoice) => invoice.into_inner(),
+            Err(status) => {
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
+                    return Ok(None);
+                }
+                return Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))));
+            }
+        };
+
+        InvoiceState::try_from(invoice.state)
+            .map(Some)
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))
+    }
+
     pub async fn send_payment(
         &mut self,
         payment_request: &str,

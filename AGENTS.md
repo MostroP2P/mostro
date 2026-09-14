@@ -43,6 +43,6 @@
 - Add a language specifier to every fenced code block. Static analysis (markdownlint MD040) flags blocks without a language identifier. Example: ` ```flutter test ` instead of bare ` ``` `.
 
 ## Security & Configuration Tips
-- Do not commit populated `settings.toml`. Copy from `settings.tpl.toml` to `~/.mostro/settings.toml` for local runs.
-- Protect LND credentials before `make docker-build`.
+- Do not commit populated `settings.toml`. Install it from `settings.tpl.toml` with `install -d -m 700 ~/.mostro && install -m 600 settings.tpl.toml ~/.mostro/settings.toml` for local runs: the file carries `nsec_privkey` and the directory also holds `mostro.db`.
+- Protect LND credentials before `make docker-build`. The admin macaroon is spend-capable: copy it with `install -m 600` (never plain `cp`, which inherits the source or destination mode) and keep its directory at `0700`.
 - Scrub logs that might leak invoices or Nostr keys; rotate secrets promptly if exposed.

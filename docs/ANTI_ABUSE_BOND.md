@@ -1203,7 +1203,21 @@ must land hand-in-hand with the client adoption. See §14.3.
 - **Recipient resolution.** Step 1 above sends `Action::AddBondInvoice`
   to the *non-slashed counterparty* of the trade — the party who is
   neither the bonded user (`bond.pubkey`) nor a co-slashed party.
-  Because `BondResolution` flags are dispute-only and `bond.pubkey`
+  **The recipient is fixed at slash time (MOSTRO-006).** Every slash
+  writes the winner's pubkey to `bonds.payout_recipient` while the
+  order still names both sides — `slash_one` in its
+  `Locked → PendingPayout` CAS, `record_maker_slice_slash` in the child
+  insert — and the scheduler uses that column when it is set. The
+  reason: a waiting-state timeout runs `edit_pubkeys_order` right after
+  the slash, clearing the responsible taker's pubkeys from the order
+  (or the slice order, for a range maker). A resolver reading only the
+  order then names nobody and the share forfeits whole to the node.
+  Maker-refund rows (Phase 6) still pay `bond.pubkey`. Rows slashed
+  before the column existed fall back to the order-derived rules
+  below; migration `20260914120000_bond_payout_recipient_repair.sql`
+  backfills the stranded ones where the order still names exactly one
+  side and it is not the slashed bond's, and leaves the rest for
+  operator review. For the order-derived fallback: because `BondResolution` flags are dispute-only and `bond.pubkey`
   is not enough on its own to recover the trade-flow side
   (buyer/seller), the rule is keyed on `slashed_reason`:
   - **`LostDispute` (Phase 2 / 5).** The solver's `BondResolution`
@@ -1595,8 +1609,9 @@ slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
   `state = PendingPayout, slashed_reason = Timeout` (Phase 3 then
   picks it up for the asynchronous counterparty payout). Continue
   the existing cancel-escrow + republish work. The payout recipient
-  is resolved by Phase 3 per the "Recipient resolution" rule in
-  §8.1: `slashed_reason = Timeout` plus the §9.2 responsibility entry
+  is fixed at slash time in `bonds.payout_recipient`, because the same
+  tick then clears the responsible taker's pubkeys from the order
+  (MOSTRO-006); it follows the "Recipient resolution" rule in §8.1: `slashed_reason = Timeout` plus the §9.2 responsibility entry
   uniquely names the non-slashed counterparty (`WaitingBuyerInvoice`
   → seller; `WaitingPayment` → buyer).
 - Localised forfeiture notice to the slashed user via the dedicated

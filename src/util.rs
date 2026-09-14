@@ -1455,16 +1455,36 @@ async fn update_order_event_stamped(
     Ok(Some(order_updated))
 }
 
+/// The identity Mostro authenticates with on NIP-42 relays, when it has one.
+///
+/// Keys are set by `settings_init()` long before any client is built, so in a
+/// running daemon this is always `Some`; it is `None` only in tests that skip
+/// the configuration bootstrap. Saying so out loud matters because the failure
+/// it causes is silent — an auth-gated relay simply stops delivering.
+fn nip42_identity() -> Option<&'static Keys> {
+    match get_keys() {
+        Ok(keys) => Some(keys),
+        Err(e) => {
+            tracing::warn!(
+                "Nostr keys unavailable ({e}); this client cannot answer NIP-42 challenges and \
+                 will be refused by relays that require authentication"
+            );
+            None
+        }
+    }
+}
+
 pub async fn connect_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
 
     // Daemon inbox client: shared size limits, but **no**
-    // `verify_subscriptions`. The long-lived `.limit(0)` subscription in
-    // `main.rs` must not count pre-EOSE frames against a zero limit — that
-    // would drop matching trade messages before dispatch (hermeme, PR #841).
+    // `verify_subscriptions`. The long-lived `.limit(0)` inbox subscription
+    // (`crate::inbox`) must not count pre-EOSE frames against a zero limit —
+    // that would drop matching trade messages before dispatch (hermeme, PR
+    // #841).
     // Price queries use [`connect_price_nostr`] / [`PRICE_NOSTR_CLIENT`] with
     // verification enabled instead.
-    let client = mostro_nostr_client_options().build();
+    let client = mostro_nostr_client_options(nip42_identity()).build();
 
     // Add relays
     for relay in nostr_settings.relays.iter() {
@@ -1484,7 +1504,7 @@ pub async fn connect_nostr() -> Result<Client, MostroError> {
 /// daemon client, with [`price_nostr_client_options`]).
 pub async fn connect_price_nostr() -> Result<Client, MostroError> {
     let nostr_settings = Settings::get_nostr();
-    let client = price_nostr_client_options().build();
+    let client = price_nostr_client_options(nip42_identity()).build();
 
     for relay in nostr_settings.relays.iter() {
         client
@@ -1531,23 +1551,45 @@ fn mostro_nostr_relay_limits() -> RelayLimits {
     limits
 }
 
-fn client_options_from_policy(policy: MostroNostrClientPolicy) -> ClientBuilder {
+fn client_options_from_policy(
+    policy: MostroNostrClientPolicy,
+    authenticate_as: Option<&Keys>,
+) -> ClientBuilder {
     let mut builder = ClientBuilder::new().relay_limits(mostro_nostr_relay_limits());
     if policy.verify_subscriptions {
         builder = builder.verify_subscriptions(true);
+    }
+    if let Some(keys) = authenticate_as {
+        // NIP-42. Without an authenticator the SDK cannot answer a relay's
+        // AUTH challenge, and a relay that gates reads behind it answers the
+        // REQ with `CLOSED "auth-required: …"` — which the SDK then treats as
+        // permanent, dropping the subscription for good. With one, the closure
+        // is provisional: the client authenticates and the REQ is re-sent.
+        //
+        // Authenticating costs no privacy Mostro has not already spent. The
+        // AUTH event is bound to that relay's challenge and URL, so it cannot
+        // be replayed elsewhere, and the node publishes orders signed with this
+        // very key to these very relays.
+        builder = builder.authenticator(SignerAuthenticator::new(keys.clone()));
     }
     builder
 }
 
 /// Process-wide daemon Nostr [`ClientBuilder`] (inbox / publishing).
-pub(crate) fn mostro_nostr_client_options() -> ClientBuilder {
-    client_options_from_policy(daemon_nostr_client_policy())
+///
+/// `authenticate_as` is the identity used for NIP-42; passing `None` builds a
+/// client that cannot read from auth-gated relays.
+pub(crate) fn mostro_nostr_client_options(authenticate_as: Option<&Keys>) -> ClientBuilder {
+    client_options_from_policy(daemon_nostr_client_policy(), authenticate_as)
 }
 
 /// Price-provider Nostr [`ClientBuilder`]: size limits plus subscription
 /// filter verification, scoped away from the daemon inbox client.
-pub(crate) fn price_nostr_client_options() -> ClientBuilder {
-    client_options_from_policy(price_nostr_client_policy())
+///
+/// Shares the daemon's relay list, so it needs the same NIP-42 identity: an
+/// auth-gated relay blinds the price feed exactly like it blinds the inbox.
+pub(crate) fn price_nostr_client_options(authenticate_as: Option<&Keys>) -> ClientBuilder {
+    client_options_from_policy(price_nostr_client_policy(), authenticate_as)
 }
 
 /// Which caller drove `show_hold_invoice`, and therefore which order
@@ -3721,7 +3763,7 @@ mod tests {
 
     #[test]
     fn nostr_client_policies_scope_verify_to_price_only() {
-        // Daemon inbox must not enable verify_subscriptions (main.rs limit(0)).
+        // Daemon inbox must not enable verify_subscriptions (inbox limit(0)).
         assert!(
             !daemon_nostr_client_policy().verify_subscriptions,
             "daemon client must leave verify_subscriptions off"
@@ -3731,8 +3773,79 @@ mod tests {
             "price client must enable verify_subscriptions"
         );
         // Helpers remain constructible (SDK copies the flag into RelayOptions).
-        let _daemon = mostro_nostr_client_options().build();
-        let _price = price_nostr_client_options().build();
+        let _daemon = mostro_nostr_client_options(None).build();
+        let _price = price_nostr_client_options(None).build();
+        // Both accept a NIP-42 identity: they share a relay list, so an
+        // auth-gated relay blinds the price feed exactly like the inbox.
+        let keys = Keys::generate();
+        let _daemon_auth = mostro_nostr_client_options(Some(&keys)).build();
+        let _price_auth = price_nostr_client_options(Some(&keys)).build();
+    }
+
+    /// A local relay that requires NIP-42 authentication before it will serve
+    /// reads — the shape that silently blinded the daemon.
+    async fn nip42_read_gated_relay() -> nostr_sdk::local_relay::LocalRelay {
+        let relay = nostr_sdk::local_relay::LocalRelay::builder()
+            .nip42(nostr_sdk::local_relay::LocalRelayBuilderNip42::read())
+            .build();
+        relay.run().await.expect("run nip42 relay");
+        relay
+    }
+
+    #[tokio::test]
+    async fn auth_gated_relay_keeps_the_subscription_only_when_authenticating() {
+        use std::time::Duration;
+
+        let relay = nip42_read_gated_relay().await;
+        let url = relay.url().await;
+
+        let keys = Keys::generate();
+        let seeded = EventBuilder::new(nostr::event::Kind::TextNote, "gated")
+            .finalize(&keys)
+            .expect("sign");
+        relay.add_event(seeded).await.expect("seed event");
+
+        let filter = Filter::new().kind(nostr::event::Kind::TextNote).limit(0);
+        let id = SubscriptionId::new("nip42-probe");
+
+        // Without an identity the relay answers `auth-required`, and the SDK
+        // drops the subscription for good: the daemon is deaf on this relay
+        // with no way back.
+        let anonymous = mostro_nostr_client_options(None).build();
+        anonymous.add_relay(url.clone()).await.expect("add_relay");
+        anonymous.connect().await;
+        anonymous
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .expect("subscribe");
+
+        // With one, the closure is provisional: the client answers the
+        // challenge and the REQ is re-sent, so the subscription survives.
+        let authenticated = mostro_nostr_client_options(Some(&keys)).build();
+        authenticated
+            .add_relay(url.clone())
+            .await
+            .expect("add_relay");
+        authenticated.connect().await;
+        authenticated
+            .subscribe(filter)
+            .with_id(id.clone())
+            .await
+            .expect("subscribe");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert!(
+            !anonymous.subscriptions().await.contains_key(&id),
+            "SDK behaviour changed: an auth-required CLOSED no longer drops the subscription"
+        );
+        assert!(
+            authenticated.subscriptions().await.contains_key(&id),
+            "a client with a NIP-42 identity must keep its subscription on an auth-gated relay"
+        );
+
+        relay.shutdown();
     }
 
     #[tokio::test]
@@ -3750,7 +3863,7 @@ mod tests {
         .expect("mock relay");
         let url = mock.url().await;
 
-        let price_client = price_nostr_client_options().build();
+        let price_client = price_nostr_client_options(None).build();
         price_client
             .add_relay(url.clone())
             .await
@@ -3779,14 +3892,14 @@ mod tests {
         use nostr_sdk::local_relay::MockRelay;
         use std::time::Duration;
 
-        // Clean mock (no random flood): mirrors main.rs `.limit(0)` inbox —
+        // Clean mock (no random flood): mirrors the `.limit(0)` inbox —
         // history is skipped, but live matching events after EOSE must arrive.
         // Daemon options intentionally omit verify_subscriptions so pre-EOSE
         // frames are not counted against limit 0 (hermeme, PR #841).
         let mock = MockRelay::run().await.expect("mock relay");
         let url = mock.url().await;
 
-        let daemon = mostro_nostr_client_options().build();
+        let daemon = mostro_nostr_client_options(None).build();
         daemon.add_relay(url.clone()).await.expect("add_relay");
         daemon.connect().await;
 
@@ -3853,7 +3966,7 @@ mod tests {
             seeder.send_event(&event).await.expect("seed");
         }
 
-        let price_client = price_nostr_client_options().build();
+        let price_client = price_nostr_client_options(None).build();
         price_client.add_relay(url).await.expect("add_relay");
         price_client.connect().await;
 

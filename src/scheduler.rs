@@ -257,7 +257,7 @@ async fn job_retry_failed_payments(ctx: AppContext) {
     tokio::spawn(async move {
         loop {
             info!(
-                "I run async every {} minutes - checking for failed lighting payment",
+                "I run async every {} seconds - checking for failed lightning payment",
                 interval
             );
 

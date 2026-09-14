@@ -694,11 +694,6 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -727,6 +722,10 @@ pub async fn send_dm(
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
     // trade_index for the node.
+    // No party keys on this path: `receiver_pubkey` can be an identity key, and
+    // `payload` carries `Payload::Peer { pubkey }`. Routing fields only, on both
+    // outcomes of the wrap, so a failure is never silent.
+    let inner = message.get_inner_message_kind();
     let event = wrap_message_with(
         transport,
         &message,
@@ -739,13 +738,27 @@ pub async fn send_dm(
             ..WrapOptions::default()
         },
     )
-    .await?;
+    .await
+    .inspect_err(|e| {
+        tracing::warn!(
+            action = %inner.action,
+            order_id = ?inner.id,
+            request_id = ?inner.request_id,
+            error = %e,
+            "wrapping DM failed"
+        )
+    })?;
 
+    // `event_id` is the only join key to the relay copy. On v2 it links nothing
+    // the timestamp doesn't: the kind-14 is Mostro-signed, p-tagged to the
+    // receiver, with an untweaked `created_at`. On v1 it resolves the receiver
+    // through the wrap's `p` tag — a residual that goes with that transport.
     info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        payload
+        event_id = %event.id,
+        action = %inner.action,
+        order_id = ?inner.id,
+        request_id = ?inner.request_id,
+        "sending DM"
     );
 
     if let Ok(client) = get_nostr_client() {

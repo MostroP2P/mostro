@@ -997,6 +997,62 @@ mod tests {
         );
     }
 
+    /// #810: losing the claim has to stop the handler *before* the refund, and
+    /// say so — a silent `Ok` would have the gRPC surface report a cancellation
+    /// that never happened. The interleaving itself is not deterministically
+    /// testable, so the miss is injected the way `a_post_claim_failure_…` below
+    /// injects its write failure: a `BEFORE UPDATE` trigger that `RAISE`s
+    /// `IGNORE` on the claim's own write, which is what a lost race leaves
+    /// behind — `rows_affected() == 0` — without borrowing an unrelated
+    /// predicate to get there. The `hash` is what makes a reached refund
+    /// observable: it fails against the dead node
+    /// (`dispute_with_hash_reaches_ln_cancel_seam`), so `CantDo` here means
+    /// the escrow was never touched.
+    #[tokio::test]
+    async fn a_lost_claim_refuses_before_the_refund() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+        // Exactly the claim's write: whoever else owned the transition got
+        // there first, so this one matches no row.
+        sqlx::query(
+            "CREATE TRIGGER lose_the_claim BEFORE UPDATE ON orders \
+             WHEN new.status = 'canceled-by-admin' BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .execute(ctx.pool())
+        .await
+        .unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a lost claim must refuse before the refund, got {result:?}"
+        );
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            Status::Dispute.to_string(),
+            "the order must be left to whichever path owns the transition"
+        );
+    }
+
     /// #810: past the claim the order is committed, so a failure in the tail
     /// must not abort the handler — the `Dispute` guard rejects a retry, and
     /// an early return here would skip the bond resolution and strand every

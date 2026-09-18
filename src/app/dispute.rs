@@ -202,9 +202,14 @@ pub async fn dispute_action(
     .map_err(db_err)?;
     // Only what `setup_dispute` changed, not the whole row from a snapshot,
     // and only if the order is still in the status `get_valid_order` admitted
-    // — `dispute.order_previous_status` is that status. Matching on `id`
-    // alone would let a release or a `fiat_sent` that committed in between be
-    // dragged back to `Dispute`; a miss rolls the inserted row back with it.
+    // — `dispute.order_previous_status` is that status. Another user message
+    // cannot commit in between: the event loop awaits each handler before it
+    // reads the next event. Two tasks of our own can, and both move an
+    // `Active` order to `Canceled` — the scheduler's
+    // `enforce_escrow_deadline_pass`, and `hold_invoice_canceled` on the LND
+    // invoice subscription once the escrow deadline has passed. Matching on
+    // `id` alone would drag such an order back to `Dispute`; a miss rolls the
+    // inserted row back with it.
     let updated = sqlx::query(
         "UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? \
          WHERE id = ? AND status = ?",

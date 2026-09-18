@@ -198,13 +198,22 @@ pub async fn admin_cancel_action(
 
     // #810: claim `Dispute → CanceledByAdmin` before the escrow moves, so a
     // concurrent transition cannot act on the same escrow. A miss means
-    // another path owns the transition. The helper's `cashu_escrow_locked_at
-    // IS NULL` predicate never excludes an order here, as nothing in Cashu
-    // mode reaches this handler.
+    // another path owns the transition.
+    //
+    // The helper's `cashu_escrow_locked_at IS NULL` predicate excludes nothing
+    // here *while* `dispatch_cashu` refuses `AdminCancel` (`app.rs`, the
+    // `InvalidAction` arm) and no locked order can reach `Dispute` in the same
+    // run. Two things end that, and both need a CAS of their own rather than
+    // this helper: TD-3, which replaces that arm and whose Track D §5C makes a
+    // locked escrow the seller-wins path rather than something to refuse; and
+    // a daemon restarted in Lightning mode against a database that was in
+    // Cashu mode — nothing ever clears the lock (`find_locked_cashu_orders`
+    // pins that as deliberate), so such an order can be disputed here and then
+    // never admin-cancelled.
     if !claim_order_status(pool, order.id, Status::Dispute, Status::CanceledByAdmin).await? {
         warn!(
             order_id = %order.id,
-            "admin_cancel: order moved out of dispute concurrently; escrow untouched"
+            "admin_cancel: the dispute → canceled-by-admin claim matched no row; escrow untouched"
         );
         // Refused like the take flow's claim: a silent `Ok` would have the
         // gRPC surface report a cancellation that never happened.
@@ -225,14 +234,19 @@ pub async fn admin_cancel_action(
                 // Only this arm releases: the guard above rejects a second
                 // admin cancel, so a claim standing on a refund that never
                 // happened would strand the escrow with no retry path.
-                if let Err(release) =
+                // `Ok(false)` is the same operator problem as `Err`: the
+                // release matched no row because something else moved the
+                // status, so the claim is not ours to hand back and the escrow
+                // is held either way. Reporting only `Err` would stay silent
+                // in half the cases this log exists for.
+                let released =
                     claim_order_status(pool, order.id, Status::CanceledByAdmin, Status::Dispute)
-                        .await
-                {
+                        .await;
+                if released != Ok(true) {
                     error!(
                         order_id = %order.id,
-                        "admin_cancel: could not release the cancel claim after a failed refund; \
-                         the order stays canceled-by-admin with its escrow held: {release}"
+                        "admin_cancel: the cancel claim was not handed back after a failed refund; \
+                         the escrow stays held with no retry path: {released:?}"
                     );
                 }
                 return Err(e);

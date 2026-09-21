@@ -368,8 +368,12 @@ pub async fn release_action(
     }
 
     // If there was an active dispute on this order, close it since the seller
-    // released the funds, resolving the situation.
-    close_dispute_after_user_resolution(ctx, &order, DisputeStatus::Settled, my_keys, "release")
+    // released the funds, resolving the situation. `Released`, not `Settled`:
+    // the outcome is the same for the buyer, but `Settled` is what a solver's
+    // `admin-settle` writes, and keeping the two apart is what lets anyone
+    // reading the dispute tell a trade the users resolved themselves from
+    // one a solver decided.
+    close_dispute_after_user_resolution(ctx, &order, DisputeStatus::Released, my_keys, "release")
         .await;
 
     enqueue_order_msg(
@@ -2009,14 +2013,15 @@ mod tests {
         // Act
         let result = release_action(&ctx, msg, &event, &my_keys, &mut escrow).await;
 
-        // Assert: order settled and dispute auto-closed as Settled.
+        // Assert: order settled and dispute auto-closed as Released — not
+        // Settled, which is reserved for a solver's admin-settle.
         assert!(result.is_ok());
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
         let dispute = crate::db::find_dispute_by_order_id(&pool, order.id)
             .await
             .unwrap();
-        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+        assert_eq!(dispute.status, DisputeStatus::Released.to_string());
     }
 
     #[tokio::test]

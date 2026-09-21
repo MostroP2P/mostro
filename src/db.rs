@@ -6351,6 +6351,39 @@ mod migration_and_query_tests {
         assert_eq!(disputes[0].order_id, order_id);
     }
 
+    /// A dispute the users closed themselves is as final as one a solver
+    /// closed: restore must not hand it back as open. `released` is the
+    /// status a release during a dispute writes, and every final status is
+    /// kept out by the same allow-list.
+    #[tokio::test]
+    async fn find_user_disputes_by_master_key_skips_every_final_status() {
+        let pool = migrated_pool().await;
+        for status in ["settled", "seller-refunded", "released"] {
+            let order_id = Uuid::new_v4();
+            insert_order(
+                &pool,
+                order_id,
+                "buy",
+                "settled-hold-invoice",
+                Some(HEX_KEY_A),
+                Some(HEX_KEY_B),
+                HEX_KEY_A,
+                0,
+            )
+            .await;
+            insert_dispute(&pool, order_id, status, None).await;
+        }
+
+        let disputes = find_user_disputes_by_master_key(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        assert!(
+            disputes.is_empty(),
+            "final disputes restored as open: {:?}",
+            disputes.iter().map(|d| &d.status).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn restore_session_manager_delivers_background_results() {
         let pool = migrated_pool().await;

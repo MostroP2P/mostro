@@ -231,7 +231,9 @@ pub async fn dispute_action(
 /// # Arguments
 /// * `pool` - Database connection pool
 /// * `order` - The order associated with the dispute
-/// * `new_status` - The new dispute status (e.g., SellerRefunded or Settled)
+/// * `new_status` - The new dispute status: `Released` after a release,
+///   `SellerRefunded` after a cooperative cancel. Never `Settled`, which marks
+///   a solver's `admin-settle`.
 /// * `my_keys` - Mostro's keys for signing the dispute event
 /// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
 pub async fn close_dispute_after_user_resolution(
@@ -662,7 +664,7 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::Settled,
+            DisputeStatus::Released,
             &Keys::generate(),
             "release",
         )
@@ -724,13 +726,13 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::Settled,
+            DisputeStatus::Released,
             &Keys::generate(),
             "release",
         )
         .await;
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+        assert_eq!(dispute.status, DisputeStatus::Released.to_string());
     }
 }

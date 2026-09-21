@@ -692,14 +692,14 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::SellerRefunded,
+            DisputeStatus::CooperativelyCanceled,
             &Keys::generate(),
             "cooperative cancel",
         )
         .await;
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        assert_eq!(dispute.status, DisputeStatus::SellerRefunded.to_string());
+        assert_eq!(dispute.status, DisputeStatus::CooperativelyCanceled.to_string());
     }
 
     /// Inconsistent flags (both unset) fall into the "unknown" initiator

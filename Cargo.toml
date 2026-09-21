@@ -71,7 +71,10 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.15.0", features = ["sqlx"] }
+# TEMPORARY: mostro-core main after MostroP2P/mostro-core#173, which is merged
+# but not released yet. Pinned to the merge commit, not a branch. Flip back
+# to the crates.io version once the release carrying it is out.
+mostro-core = { git = "https://github.com/MostroP2P/mostro-core", rev = "878d89c", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

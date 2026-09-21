@@ -511,6 +511,11 @@ pub fn order_to_tags(
             Tag::custom("premium", vec![order.premium.to_string()]),
             Tag::custom("network", vec![ln_network]),
             Tag::custom("layer", vec!["lightning".to_string()]),
+            // When the order was created (NIP-69). The event's own
+            // `created_at` moves on every revision of this addressable event;
+            // this one does not, so clients can show the order's real age.
+            // Kept after the positional `rating` / `source` inserts below.
+            Tag::custom("created_at", vec![order.created_at.to_string()]),
             Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
                 "expiration",
@@ -950,6 +955,66 @@ mod tests {
             y_values, expected,
             "order_to_tags must wire create_platform_tag_values correctly into the y tag"
         );
+    }
+
+    // ── order_to_tags: created_at tag (NIP-69) ───────────────────────────────────
+
+    /// The tag carries the order's own creation time, not the revision's,
+    /// and is the same on a later revision with another status.
+    #[test]
+    fn order_to_tags_created_at_is_the_orders_and_stable_across_revisions() {
+        init_test_settings();
+        let pending = Order {
+            created_at: 1_702_548_701,
+            ..make_pending_order()
+        };
+        // Taken: a sell order waiting for the buyer's invoice publishes as
+        // `in-progress`, a new revision of the same addressable event.
+        let in_progress = Order {
+            status: Status::WaitingBuyerInvoice.to_string(),
+            ..pending.clone()
+        };
+
+        for order in [&pending, &in_progress] {
+            let tags = order_to_tags(order, None, Some(TEST_MOSTRO_PUBKEY))
+                .expect("order_to_tags must not error")
+                .expect("order must produce Some(tags)");
+            assert_eq!(
+                get_tag_value(&tags, "created_at").as_deref(),
+                Some("1702548701"),
+                "status {}",
+                order.status
+            );
+        }
+    }
+
+    /// `rating` and `source` are inserted by position; the new tag must sit
+    /// after them so their indices, and so the tags other clients read by
+    /// position, are unchanged.
+    #[test]
+    fn order_to_tags_created_at_precedes_expires_at_and_leaves_the_positional_tags_alone() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(
+            &order,
+            Some((4.5, 7, 1_700_000_000)),
+            Some(TEST_MOSTRO_PUBKEY),
+        )
+        .expect("order_to_tags must not error")
+        .expect("pending order must produce Some(tags)");
+        let names: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.clone().to_vec()[0].clone())
+            .collect();
+
+        assert_eq!(names[7], "rating");
+        assert_eq!(names[8], "source");
+        let created = names
+            .iter()
+            .position(|n| n == "created_at")
+            .expect("created_at");
+        assert_eq!(names[created + 1], "expires_at");
     }
 
     // ── order_to_tags: source tag with Mostro pubkey (kind 38383) ───────────────

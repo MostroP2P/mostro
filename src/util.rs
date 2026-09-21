@@ -2294,12 +2294,15 @@ pub async fn notify_taker_reputation(
                 rating: user.total_rating,
                 reviews: user.total_reviews,
                 operating_days: (now - user.created_at as u64) / 86400,
+                // Filled by the `since` rollout (REPUTATION_PORTABILITY.md, PR 1.2).
+                since: None,
             }
         }
         Err(_) => UserInfo {
             rating: 0.0,
             reviews: 0,
             operating_days: 0,
+            since: None,
         },
     };
 

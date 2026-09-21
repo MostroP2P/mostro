@@ -71,11 +71,7 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-# TEMPORARY: points at MostroP2P/mostro-core#172 until it is released as
-# 0.14.7. Flip back to a crates.io version before merging.
-# Pinned to the exact commit, not the branch: a branch is mutable, and a
-# force-push to it would change what CI validated without touching this file.
-mostro-core = { git = "https://github.com/MostroP2P/mostro-core", rev = "a078fe4f4d6c86c7700024b1d21363f3332f2877", features = ["sqlx"] }
+mostro-core = { version = "0.15.0", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

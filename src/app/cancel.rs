@@ -137,10 +137,14 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
 
     // If there was an active dispute on this order, close it since the users
     // resolved the situation themselves via cooperative cancellation.
+    // `CooperativelyCanceled`, not `SellerRefunded`: the seller is refunded
+    // either way, but `SellerRefunded` is what a solver's `admin-cancel`
+    // writes, and keeping the two apart is what tells a dispute the users
+    // closed themselves from one a solver decided.
     close_dispute_after_user_resolution(
         ctx,
         &order,
-        DisputeStatus::SellerRefunded,
+        DisputeStatus::CooperativelyCanceled,
         my_keys,
         "cooperative cancel",
     )
@@ -1582,8 +1586,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             dispute.status,
-            DisputeStatus::SellerRefunded.to_string(),
-            "the open dispute must be closed as seller-refunded"
+            DisputeStatus::CooperativelyCanceled.to_string(),
+            "the open dispute must be closed as cooperatively-canceled, \
+             not the seller-refunded of a solver's admin-cancel"
         );
         assert!(queued_actions_for(maker)
             .await

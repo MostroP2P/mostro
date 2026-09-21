@@ -1819,6 +1819,13 @@ pub async fn is_dispute_taken_by_admin(
 /// trade key, not a master key, and the Phase 6 maker-refund row pays
 /// `bond.pubkey` itself, so narrowing it in SQL would be wrong more often
 /// than it would be tidy.
+///
+/// Each arm also returns the **other** party's trade pubkey
+/// (`counterparty_trade_pubkey`): peer chat is end-to-end between the two
+/// trade keys and never reaches this daemon, so a client restoring onto a
+/// clean database can only re-derive the conversation keys — and re-fetch
+/// its chat history from the relays — if it learns that pubkey again. It is
+/// `NULL` while nobody has taken the order.
 pub async fn find_user_orders_by_master_key(
     pool: &SqlitePool,
     master_key: &str,
@@ -1830,11 +1837,13 @@ pub async fn find_user_orders_by_master_key(
 
     let sql_query = format!(
         r#"
-        SELECT id as order_id, trade_index_buyer as trade_index, status FROM orders 
+        SELECT id as order_id, trade_index_buyer as trade_index, status,
+               seller_pubkey as counterparty_trade_pubkey FROM orders 
         WHERE (master_buyer_pubkey = ?)
         AND (status NOT IN ({}) OR {})
         UNION ALL
-        SELECT id as order_id, trade_index_seller as trade_index, status FROM orders 
+        SELECT id as order_id, trade_index_seller as trade_index, status,
+               buyer_pubkey as counterparty_trade_pubkey FROM orders 
         WHERE (master_seller_pubkey = ?)
         AND (status NOT IN ({}) OR {})
         "#,
@@ -6242,6 +6251,76 @@ mod migration_and_query_tests {
             .await
             .unwrap();
         assert_eq!(orders.len(), 2, "terminal orders are excluded");
+    }
+
+    /// Each side gets the *other* party's trade pubkey — the half a restoring
+    /// client cannot derive on its own, and without which its peer chat stays
+    /// unreadable on the relays.
+    #[tokio::test]
+    async fn find_user_orders_by_master_key_returns_the_counterparty_trade_pubkey() {
+        let pool = migrated_pool().await;
+        let taken = Uuid::new_v4();
+        let untaken = Uuid::new_v4();
+
+        insert_order(
+            &pool,
+            taken,
+            "buy",
+            "active",
+            Some(HEX_KEY_A),
+            Some(HEX_KEY_B),
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+        // Nobody on the other side yet: the column is NULL, not an error.
+        insert_order(
+            &pool,
+            untaken,
+            "buy",
+            "pending",
+            Some(HEX_KEY_A),
+            None,
+            HEX_KEY_A,
+            0,
+        )
+        .await;
+
+        let as_buyer = find_user_orders_by_master_key(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        let taken_row = as_buyer
+            .iter()
+            .find(|o| o.order_id == taken)
+            .expect("taken order restored");
+        assert_eq!(
+            taken_row.counterparty_trade_pubkey.as_deref(),
+            Some(HEX_KEY_B),
+            "the buyer must get the seller's trade pubkey"
+        );
+        assert!(
+            as_buyer
+                .iter()
+                .find(|o| o.order_id == untaken)
+                .expect("untaken order restored")
+                .counterparty_trade_pubkey
+                .is_none(),
+            "an order nobody has taken has no counterparty"
+        );
+
+        let as_seller = find_user_orders_by_master_key(&pool, HEX_KEY_B)
+            .await
+            .unwrap();
+        assert_eq!(
+            as_seller
+                .iter()
+                .find(|o| o.order_id == taken)
+                .expect("taken order restored")
+                .counterparty_trade_pubkey
+                .as_deref(),
+            Some(HEX_KEY_A),
+            "the seller must get the buyer's trade pubkey"
+        );
     }
 
     #[tokio::test]

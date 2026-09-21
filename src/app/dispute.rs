@@ -699,7 +699,10 @@ mod tests {
         .await;
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        assert_eq!(dispute.status, DisputeStatus::CooperativelyCanceled.to_string());
+        assert_eq!(
+            dispute.status,
+            DisputeStatus::CooperativelyCanceled.to_string()
+        );
     }
 
     /// Inconsistent flags (both unset) fall into the "unknown" initiator

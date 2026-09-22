@@ -1,6 +1,6 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
-use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::app::dispute::close_dispute_after_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
@@ -141,7 +141,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     // either way, but `SellerRefunded` is what a solver's `admin-cancel`
     // writes, and keeping the two apart is what tells a dispute the users
     // closed themselves from one a solver decided.
-    close_dispute_after_user_resolution(
+    close_dispute_after_resolution(
         ctx,
         &order,
         DisputeStatus::CooperativelyCanceled,

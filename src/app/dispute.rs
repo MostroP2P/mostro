@@ -275,7 +275,7 @@ pub async fn dispute_action(
 /// * `pool` - Database connection pool
 /// * `order` - The order associated with the dispute
 /// * `new_status` - The new dispute status: `Released` after a release,
-///   `SellerRefunded` after a cooperative cancel. Never `Settled`, which marks
+///   `CooperativelyCanceled` after a cooperative cancel. Never `Settled`, which marks
 ///   a solver's `admin-settle`.
 /// * `my_keys` - Mostro's keys for signing the dispute event
 /// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")

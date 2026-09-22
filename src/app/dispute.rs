@@ -10,6 +10,7 @@ use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use mostro_core::db::Crud;
+use sqlx::{Pool, Sqlite};
 use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
@@ -125,14 +126,76 @@ async fn notify_dispute_to_users(
     Ok(())
 }
 
+/// Persists a new dispute and the order's dispute state in one transaction.
+///
+/// The dispute row and the order's flag + status land together or not at
+/// all: either half alone strands the order (#921).
+///
+/// Raw sqlx because `Crud::create`/`update` take `&Pool<Sqlite>`, not an
+/// executor, so they cannot join a transaction. sqlx-crud, which
+/// mostro-core#154 replaced, was generic over the executor; this works
+/// around what that rewrite narrowed. The column list mirrors
+/// `Crud::create`'s, so a new `disputes` column upstream has to be added
+/// here too — until an executor-generic `Crud` makes this call site
+/// unnecessary.
+async fn persist_dispute(
+    pool: &Pool<Sqlite>,
+    dispute: &Dispute,
+    order: &Order,
+) -> Result<(), MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
+         created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(dispute.id)
+    .bind(dispute.order_id)
+    .bind(&dispute.status)
+    .bind(&dispute.order_previous_status)
+    .bind(&dispute.solver_pubkey)
+    .bind(dispute.created_at)
+    .bind(dispute.taken_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Only what `setup_dispute` changed, not the whole row from a snapshot,
+    // and only if the order is still in the status `get_valid_order` admitted
+    // — `dispute.order_previous_status` is that status. Another user message
+    // cannot commit in between: the event loop awaits each handler before it
+    // reads the next event. Two tasks of our own can, and both move an
+    // `Active` order to `Canceled` — the scheduler's
+    // `enforce_escrow_deadline_pass`, and `hold_invoice_canceled` on the LND
+    // invoice subscription once the escrow deadline has passed. Matching on
+    // `id` alone would drag such an order back to `Dispute`; a miss rolls the
+    // inserted row back with it.
+    let updated = sqlx::query(
+        "UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? \
+         WHERE id = ? AND status = ?",
+    )
+    .bind(&order.status)
+    .bind(order.buyer_dispute)
+    .bind(order.seller_dispute)
+    .bind(order.id)
+    .bind(&dispute.order_previous_status)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(())
+}
+
 /// Main handler for dispute actions.
 ///
 /// This function:
 /// 1. Validates the order and dispute status
-/// 2. Updates the order status
-/// 3. Creates a new dispute record
-/// 4. Notifies both parties
-/// 5. Publishes the dispute event to the network
+/// 2. Atomically persists the new dispute record and the order's dispute
+///    state (see `persist_dispute`)
+/// 3. Notifies both parties
+/// 4. Publishes the dispute event to the network
 pub async fn dispute_action(
     ctx: &AppContext,
     msg: Message,
@@ -176,56 +239,7 @@ pub async fn dispute_action(
 
     // The dispute row and the order's flag + status land together or not at
     // all: either half alone strands the order (#921).
-    //
-    // Raw sqlx because `Crud::create`/`update` take `&Pool<Sqlite>`, not an
-    // executor, so they cannot join a transaction. sqlx-crud, which
-    // mostro-core#154 replaced, was generic over the executor; this works
-    // around what that rewrite narrowed. The column list mirrors
-    // `Crud::create`'s, so a new `disputes` column upstream has to be added
-    // here too — until an executor-generic `Crud` makes this call site
-    // unnecessary.
-    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
-    sqlx::query(
-        "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
-         created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(dispute.id)
-    .bind(dispute.order_id)
-    .bind(&dispute.status)
-    .bind(&dispute.order_previous_status)
-    .bind(&dispute.solver_pubkey)
-    .bind(dispute.created_at)
-    .bind(dispute.taken_at)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    // Only what `setup_dispute` changed, not the whole row from a snapshot,
-    // and only if the order is still in the status `get_valid_order` admitted
-    // — `dispute.order_previous_status` is that status. Another user message
-    // cannot commit in between: the event loop awaits each handler before it
-    // reads the next event. Two tasks of our own can, and both move an
-    // `Active` order to `Canceled` — the scheduler's
-    // `enforce_escrow_deadline_pass`, and `hold_invoice_canceled` on the LND
-    // invoice subscription once the escrow deadline has passed. Matching on
-    // `id` alone would drag such an order back to `Dispute`; a miss rolls the
-    // inserted row back with it.
-    let updated = sqlx::query(
-        "UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? \
-         WHERE id = ? AND status = ?",
-    )
-    .bind(&order.status)
-    .bind(order.buyer_dispute)
-    .bind(order.seller_dispute)
-    .bind(order.id)
-    .bind(&dispute.order_previous_status)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    if updated.rows_affected() != 1 {
-        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
-    }
-    tx.commit().await.map_err(db_err)?;
+    persist_dispute(pool, &dispute, &order).await?;
 
     // Get pubkeys of initiator and counterpart
     let (initiator_pubkey, counterpart_pubkey) = if is_buyer_dispute {

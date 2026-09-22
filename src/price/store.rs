@@ -95,13 +95,25 @@ impl PriceStore {
     /// this node's own clock, recorded as `written_at` so the freshness
     /// warning still measures from when we wrote the value.
     ///
-    /// **Such a write never moves `as_of` backwards.** A relayed rate whose
-    /// event predates a value this node fetched directly is not news, and
-    /// applying it would *shorten* the serving window below what writing
-    /// nothing at all would have left — refusing a currency that was
-    /// perfectly servable a moment earlier. **Returns the currency codes it
-    /// dropped**, so a discarded rate leaves a trace naming itself rather
-    /// than a bare count nothing can be diagnosed from (review on PR #925).
+    /// **Such a write never moves `as_of` backwards** — with one exception,
+    /// below. A relayed rate whose event predates a value this node fetched
+    /// directly is not news, and applying it would *shorten* the serving
+    /// window below what writing nothing at all would have left — refusing
+    /// a currency that was perfectly servable a moment earlier. **Returns
+    /// the currency codes it dropped**, so a discarded rate leaves a trace
+    /// naming itself rather than a bare count nothing can be diagnosed from
+    /// (review on PR #925).
+    ///
+    /// The exception: the guard defers only to a stamp **reachable from the
+    /// clock we are writing with** (`prior.as_of <= now`). After a
+    /// backwards clock step the stored stamp sits in our future, while
+    /// every event the provider can still accept is older than `now`
+    /// (`rank_candidates` filters `created_at <= now`) — so an
+    /// unconditional guard would drop every relayed write until the wall
+    /// clock climbed back past the frozen stamp, serving the pre-step price
+    /// as fresh the whole time (a negative age is inside any TTL). A stamp
+    /// our own clock could not have produced is not the "newer observation"
+    /// the guard exists to protect (round-6 review, PR #925).
     ///
     /// The guard is deliberately **not** on [`Self::update`]. A wall-clock
     /// write is this node's own authoritative observation and must land even
@@ -133,7 +145,16 @@ impl PriceStore {
         let mut w = self.inner.write().expect("price store lock poisoned");
         for (currency, agg) in aggregates {
             let key = currency.to_uppercase();
-            if monotonic && w.get(&key).is_some_and(|prior| prior.as_of > as_of) {
+            // Defer to the stored stamp only when our own clock could still
+            // have produced it (`prior.as_of <= written_at`): after a
+            // backwards clock step the held stamp is in our future and
+            // every acceptable observation predates it, so an unconditional
+            // guard would freeze the pre-step price in place while `get`
+            // keeps serving it as fresh (round-6 review, PR #925).
+            if monotonic
+                && w.get(&key)
+                    .is_some_and(|prior| prior.as_of > as_of && prior.as_of <= written_at)
+            {
                 dropped.push(key);
                 continue;
             }
@@ -384,6 +405,41 @@ mod tests {
         assert_eq!(entry.value, 60_000.0, "the new price must be served");
         assert_eq!(entry.as_of, 6_400, "and stamped at the clock we now have");
         assert_eq!(store.get("USD", 1_800, 6_400).unwrap(), 60_000.0);
+    }
+
+    /// The relayed half of the same freeze (round-6 review, PR #925). The
+    /// guard defers to the stored stamp only when that stamp is reachable
+    /// from the clock we are writing with. After a backwards step it is
+    /// not: `rank_candidates` filters `created_at <= now`, so every event
+    /// we can still accept is older than the stored pre-step stamp, and an
+    /// unconditional guard would drop every relayed write until the wall
+    /// clock climbed back — serving the frozen pre-step price as fresh the
+    /// whole time, with `written_at` also in the future, so the freshness
+    /// warning stays quiet too.
+    #[test]
+    fn a_backwards_clock_step_does_not_freeze_relayed_writes() {
+        let store = PriceStore::new();
+        store.update_observed(results(&[("ARS", 100.0, 1)]), 10_100, 10_000);
+
+        // The clock steps back; the freshest event we can still accept is
+        // older than the stamp we hold, but that stamp is no longer
+        // reachable — the write must land, not name itself dropped.
+        assert!(store
+            .update_observed(results(&[("ARS", 200.0, 1)]), 9_800, 9_700)
+            .is_empty());
+        let entry = store.snapshot("ARS").unwrap();
+        assert_eq!(entry.value, 200.0, "the new price must be served");
+        assert_eq!(entry.as_of, 9_700, "stamped at the reachable observation");
+        assert_eq!(store.get("ARS", 1_800, 9_800).unwrap(), 200.0);
+
+        // A stamp the clock *can* still produce keeps the guard intact:
+        // this is the ordinary regression case, unchanged.
+        assert_eq!(
+            store.update_observed(results(&[("ARS", 150.0, 1)]), 9_801, 9_600),
+            vec!["ARS".to_string()],
+            "an older-but-reachable observation is still dropped"
+        );
+        assert_eq!(store.snapshot("ARS").unwrap().value, 200.0);
     }
 
     /// `servable_count` must agree with [`PriceStore::get`] entry by entry,

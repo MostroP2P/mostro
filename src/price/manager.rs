@@ -182,6 +182,16 @@ impl PriceManager {
         let mut report = TickReport::default();
         if self.providers.is_empty() {
             warn!("price: no providers enabled — skipping tick");
+            // Same contract as the empty-aggregate path below: the field
+            // reports what this node can serve, not what this tick produced
+            // (round-6 review, PR #925). Unreachable for the scheduler's
+            // partial-outage branch today (`failures` is empty here), but
+            // it is the only return path where the count would otherwise
+            // silently mean something else.
+            report.servable_currencies = self.store.servable_count(
+                self.settings.max_price_staleness_seconds,
+                Utc::now().timestamp(),
+            );
             return report;
         }
 
@@ -583,7 +593,7 @@ impl PriceManager {
                         .map(|e| now.saturating_sub(e.as_of));
                     match age {
                         Some(age) => warn!(
-                            "price: {} is past the staleness window ({}s old) — refusing",
+                            "price: {} is past the staleness window (observed {}s ago) — refusing",
                             currency, age
                         ),
                         None => warn!(
@@ -642,7 +652,7 @@ impl PriceManager {
         }
         if self.mark_warned(&self.warned_stale, key) {
             warn!(
-                "price: {} is stale ({}s old, > {}s interval)",
+                "price: {} is stale (not refreshed for {}s, > {}s interval)",
                 currency, age, one_interval
             );
         }
@@ -959,9 +969,9 @@ pub struct TickReport {
     ///
     /// Deliberately **not** named `fresh`: an entry counted here may be
     /// stale in this codebase's own sense, old enough that
-    /// `observe_freshness` warns "is stale ({}s old)" while still serving
-    /// it. Servable and fresh are different things, and the operator asking
-    /// "what survived this outage" wants the first.
+    /// `observe_freshness` warns "is stale (not refreshed for {}s, …)"
+    /// while still serving it. Servable and fresh are different things, and
+    /// the operator asking "what survived this outage" wants the first.
     ///
     /// It is not the size of the aggregate map either: `as_of` can predate
     /// the tick (issue #860), so a relayed rate admitted at the edge of the
@@ -1518,7 +1528,11 @@ mod tests {
     /// the currency outright also skipped the `clear_warned` branch, so a
     /// latched flag survived an unservable stretch and then swallowed the
     /// genuine transition — the same one-shot swallow the skip was added to
-    /// prevent, one layer up.
+    /// prevent, one layer up. The unservable stretch below stays
+    /// **single-source** on purpose: with two sources the source-count
+    /// branch alone would clear the flag, and the test would pass against
+    /// an implementation that skips unservable currencies outright — the
+    /// bare `continue` this regression came from (round-6 review, PR #925).
     #[tokio::test]
     async fn an_unservable_currency_re_arms_the_single_source_warning() {
         let mut quotes = ProviderQuotes::new();
@@ -1552,14 +1566,15 @@ mod tests {
         );
 
         // The stored value is now past the TTL — unservable, so no warning.
-        // But the flag must not survive it.
-        let two = agg(2, vec![ProviderId::Yadio, ProviderId::CoinGecko]);
-        manager.store.update(two.clone(), now - 5_000);
+        // Still single-source, so only the servability check can clear the
+        // flag. But the flag must not survive it.
+        let stale_single = agg(1, vec![ProviderId::Yadio]);
+        manager.store.update(stale_single.clone(), now - 5_000);
         assert!(
             manager.get_price("USD").is_err(),
             "past the TTL, so not served"
         );
-        manager.observe_warnings(&two, now);
+        manager.observe_warnings(&stale_single, now);
         assert!(
             manager.warned_single_source.read().unwrap().is_empty(),
             "an unservable currency must re-arm, not stay latched"

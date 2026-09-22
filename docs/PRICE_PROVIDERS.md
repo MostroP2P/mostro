@@ -359,10 +359,16 @@ that stored it (see the first bullet).
 - A **backdated** write never moves `as_of` backwards: one carrying an
   observation older than the one already stored is dropped, so a relayed rate
   predating a direct fetch cannot shorten a currency's remaining serving
-  window. A **directly-fetched** write is not guarded this way on purpose —
-  it is this node's own authoritative observation and must land even when the
-  wall clock has stepped backwards behind a stamp already held, since
-  dropping it would freeze the price while still serving it as fresh.
+  window. The guard defers only to a stamp the writing clock could still
+  have produced (`prior.as_of <= now`): after a backwards clock step the
+  held stamp sits in the future while every event the provider can still
+  accept (`created_at <= now`) predates it, so an unconditional guard would
+  drop every relayed write until the clock climbed back — the same freeze,
+  one layer down. A **directly-fetched** write is not guarded at all, on
+  purpose — it is this node's own authoritative observation and must land
+  even when the wall clock has stepped backwards behind a stamp already
+  held, since dropping it would freeze the price while still serving it as
+  fresh.
 - A tick with zero contributors for a currency leaves the prior entry
   untouched (old `as_of`).
 - Because `as_of` can predate the tick, a fresh aggregate is **not** the same
@@ -386,6 +392,12 @@ that stored it (see the first bullet).
     on a healthy node every tick).
   - else → `Err(PriceTooStale)` (§10.2). Market-priced create/take for
     that currency is refused with a clear message.
+
+  The two warnings measure different clocks and say so in the log line:
+  "not refreshed for Ns" (`written_at`) asks whether our tick is keeping
+  up, "observed Ns ago" (`as_of`) how old the price itself is. For a
+  relayed currency the two ages differ, so adjacent lines about one value
+  are not the same measurement repeated.
 
 `max_price_staleness_seconds` defaults to **1800** (30 min) — long enough
 to ride out short API outages, short enough that nobody trades on an
@@ -919,6 +931,15 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
   with no in-provider outlier guard; operators mitigate by choosing
   `trusted_nodes` they actually trust, same as any other single-sourced
   provider.
+- **Publish cadence bounds the serving window.** A relayed rate is stamped
+  with the source event's `created_at`, not with when it arrived (§6.4), so
+  its serving window on this node is `max_price_staleness_seconds` **minus
+  the event's age on arrival** — not a full TTL from ingestion. A trusted
+  node publishing anywhere near the TTL cadence produces currencies that go
+  unservable rather than merely stale, where `main` before the #860 fix
+  served them. Choose `trusted_nodes` whose publish cadence
+  (`update_interval_seconds`, with `publish_to_nostr` enabled) is well under
+  this node's `max_price_staleness_seconds`.
 - **Client-side pubkey verification.** Even though the relay-side `authors`
   filter already restricts the query, the adapter re-checks each returned
   event's `pubkey` against `trusted_nodes` before trusting its content —

@@ -1,0 +1,196 @@
+name: Ortsom baseline
+
+# The full Ortsom e2e suite against `main`, on the self-contained regtest
+# stack. Pull requests are not run twice (once with their change, once
+# without): they compare against these periodic measurements of `main`
+# instead. See docs/ORTSOM_PR_E2E_SPEC.md § 5.
+#
+# The run's conclusion is informational. A scenario failing on `main` is
+# exactly what a baseline records; it only turns red when the pipeline
+# itself breaks before it can record anything.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Reruns on an unchanged `main` are intentional: they build the
+    # per-scenario history the verdict uses to set flaky scenarios aside.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# One baseline at a time. A push during a run waits instead of cancelling
+# it; GitHub keeps one pending run per group, so a burst of pushes
+# collapses into one baseline of the latest.
+concurrency:
+  group: ortsom-baseline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: ortsom=info
+  ORTSOM: ./target/release/ortsom --config ortsom.regtest.toml
+
+jobs:
+  baseline:
+    name: Full suite on main
+    runs-on: ubuntu-latest
+    # Above the suite step's cap, with room for the build, the stack and
+    # the always-steps: the job timeout must never be what stops a run, or
+    # it takes the artifact and the teardown with it.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: mostro
+
+      - name: Read the pinned Ortsom
+        id: pin
+        run: |
+          ref="$(python3 -c 'import tomllib; print(tomllib.load(open("mostro/.github/ortsom/map.toml", "rb"))["settings"]["ortsom_ref"])')"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          mkdir -p baseline
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          repository: MostroP2P/ortsom
+          ref: ${{ steps.pin.outputs.ref }}
+          path: ortsom
+
+      - uses: dtolnay/rust-toolchain@stable
+      # Ortsom's LND backend compiles gRPC stubs; runners ship no protoc.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ortsom
+
+      # Ortsom publishes no release binaries; build the pinned tag.
+      - name: Build Ortsom
+        working-directory: ortsom
+        run: cargo build --release --bin ortsom
+
+      - name: Bring up the stack
+        id: stack
+        working-directory: ortsom
+        # Exit codes (Ortsom docs/ci-regtest.md): 3 the daemon image could
+        # not be built, 4 the daemon never came up, anything else the
+        # runner or the rest of the world. A 3 is retried once, because a
+        # download failing inside `docker build` looks the same as mostro
+        # not compiling.
+        run: |
+          set +e
+          $ORTSOM stack up --ref "$GITHUB_SHA"
+          code=$?
+          if [ "$code" -eq 3 ]; then
+            echo "::warning::stack up exited 3; retrying once"
+            $ORTSOM stack up --ref "$GITHUB_SHA"
+            code=$?
+          fi
+          case "$code" in
+            0) stack=ok ;;
+            3) stack=build_failed ;;
+            4) stack=daemon_failed ;;
+            *) stack=infra_failed ;;
+          esac
+          if [ "$stack" = ok ] && ! $ORTSOM doctor; then
+            stack=doctor_failed
+          fi
+          echo "stack=$stack" >> "$GITHUB_OUTPUT"
+
+      - name: Run the full suite
+        if: steps.stack.outputs.stack == 'ok'
+        working-directory: ortsom
+        timeout-minutes: 300
+        # The exit code goes to a file rather than a step output so that a
+        # step timeout leaves no file, which meta.json records as null.
+        run: |
+          set +e -o pipefail
+          mkdir -p artifacts
+          $ORTSOM run --jobs 1 2>&1 | tee ../baseline/suite.log
+          echo "$?" > ../baseline/suite_exit
+
+      - name: Write meta.json
+        if: always()
+        env:
+          ORTSOM_REF: ${{ steps.pin.outputs.ref }}
+          STACK: ${{ steps.stack.outputs.stack || 'infra_failed' }}
+          STARTED_AT: ${{ steps.pin.outputs.started_at }}
+        run: |
+          mkdir -p baseline
+          summary="$(find ortsom/artifacts -name summary.json -print -quit 2>/dev/null || true)"
+          if [ -n "$summary" ]; then
+            cp "$summary" baseline/summary.json
+          fi
+          python3 - <<'EOF'
+          import json, os
+          exit_file = "baseline/suite_exit"
+          suite_exit = int(open(exit_file).read()) if os.path.exists(exit_file) else None
+          meta = {
+              "sha": os.environ["GITHUB_SHA"],
+              "ortsom_ref": os.environ["ORTSOM_REF"],
+              "stack": os.environ["STACK"],
+              "suite_exit": suite_exit,
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "started_at": os.environ["STARTED_AT"],
+          }
+          with open("baseline/meta.json", "w") as f:
+              json.dump(meta, f, indent=2)
+              f.write("\n")
+          EOF
+          cat baseline/meta.json
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Ortsom baseline of \`${GITHUB_SHA::12}\`"
+            echo
+            echo "Ortsom \`$(jq -r .ortsom_ref baseline/meta.json)\`, stack \`$(jq -r .stack baseline/meta.json)\`"
+            echo
+            if [ -f baseline/summary.json ]; then
+              jq -r '
+                "| scenario | outcome | duration | attempts | detail |",
+                "|---|---|--:|--:|---|",
+                (.results[] | "| \(.name) | \(.outcome)\(if .flaky then " (flaky)" else "" end) | \(.duration_secs | .*10 | round / 10)s | \(.attempts) | \(.detail // "") |"),
+                "",
+                "**\(.metrics.passed) passed, \(.metrics.failed) failed, \(.metrics.skipped) skipped, \(.metrics.flaky) flaky**"
+              ' baseline/summary.json
+            else
+              echo "No summary.json: the suite did not run to the end."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel orphaned orders
+        # Without the daemon identity `stack up` writes, the config cannot
+        # even load; skip rather than report a second failure.
+        if: always() && hashFiles('ortsom/ortsom.regtest.local.toml') != ''
+        working-directory: ortsom
+        run: $ORTSOM cleanup
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f ortsom/ci/regtest/compose.yml --profile daemon logs \
+            --no-color --timestamps > baseline/stack.log 2>&1 || true
+          if [ -d ortsom/artifacts ]; then
+            cp -r ortsom/artifacts baseline/ortsom-artifacts
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ortsom-baseline
+          path: baseline/
+          retention-days: 90
+
+      - name: Tear down
+        if: always()
+        working-directory: ortsom
+        run: |
+          $ORTSOM stack down \
+            || docker compose -f ci/regtest/compose.yml --profile daemon down -v

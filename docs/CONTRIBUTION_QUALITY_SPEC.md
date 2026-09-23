@@ -177,11 +177,15 @@ The **Manual testing** section is a step-by-step procedure that tests
 **this specific pull request** end to end, against a running mostrod. It
 serves three purposes:
 
-1. **It proves the author ran the change.** Concrete steps with concrete
-   expected results cannot be written without running them; vague ones
-   are visible at a glance.
-2. **It lets a reviewer reproduce the change** without reverse-engineering
+1. **It lets a reviewer reproduce the change** without reverse-engineering
    the diff.
+2. **It turns the description into checkable claims.** Each step has an
+   expected result a reviewer can confirm or refute by following it, and
+   vague steps are visible at a glance. The steps are evidence, not
+   proof that the author ran them: a plausible procedure can be written
+   without running anything (§14). The author's statement that they ran
+   it is the checklist item of §5, and a procedure that does not work is
+   a close reason (§3.3).
 3. **It is the source of a per-PR Ortsom scenario** (§9). Once written in
    the structured form, the same steps run automatically on every push.
 
@@ -323,9 +327,12 @@ commit instead:
 - A fix pull request **starts with a commit whose subject begins with
   `test:`** and that only adds the regression test. The fix follows in
   one or more later commits.
-- This is the one exception to "squash before review" in
-  `CONTRIBUTING.md`: the test commit stays separate until merge, and the
-  maintainer may squash when merging.
+- The test commit is a meaningful commit in the sense of
+  `CONTRIBUTING.md` ("Keep the git history clean"), not a fixup: it is
+  not squashed into the fix before review. It stays separate until
+  merge, and the maintainer may squash when merging.
+- The test commit does not need to be on the latest `main`: the job
+  applies it to the current base itself (§8.2).
 
 ### 8.2 Algorithm
 
@@ -341,16 +348,35 @@ type `fix`:
    `#[cfg(test)]` module or under `tests/`. Otherwise the result is
    `test-commit-changes-code`: a test commit that also changes
    production code is not evidence.
-4. At the test commit, run `cargo test` filtered to those names. If it
-   **does not compile**, the result is `test-does-not-compile-on-base`;
-   if every test **passes**, `bug-not-reproduced`. If any fails,
-   continue.
-5. At the pull request head, run the same tests. If they pass, the
-   result is `bug-reproduced`; otherwise `test-fails-on-head`.
+4. Check out the **current base** (`pull_request.base.sha`) and
+   cherry-pick the test commit onto it. The test commit's own parent may
+   be an older `main` on which the bug still existed; running there could
+   report a bug as reproduced after `main` has already fixed it. If the
+   cherry-pick conflicts, the result is `test-commit-does-not-apply` (the
+   author rebases).
+5. On that tree, run `cargo test` filtered to those names. If it **does
+   not compile**, the result is `test-does-not-compile-on-base`; if every
+   test **passes**, `bug-not-reproduced`. If any fails, continue.
+6. On the pull request's merge commit (the `pull_request` default
+   checkout, i.e. the same current base plus the whole pull request), run
+   the same tests. If they pass, the result is `bug-reproduced`;
+   otherwise `test-fails-on-head`.
 
-The job uploads `red-test.json` (`pr`, `head_sha`, the result, the test
-names and the tail of each `cargo test` output) as an artifact. It has a
-45-minute timeout and reuses the cargo cache of `ci.yml`.
+After the tests, a workflow step (not the tests) writes `red-test.json`
+from the exit codes it recorded: `pr`, `head_sha`, `base_sha`, the
+result, the test names and the tail of each `cargo test` output. The job
+uploads it as an artifact. It has a 45-minute timeout and reuses the
+cargo cache of `ci.yml`.
+
+Writing the file from a workflow step keeps honest pull requests honest,
+but it is not a guarantee: `cargo test` runs pull request code (tests,
+`build.rs`) in the same job, which can tamper with anything that runs
+after it, and on `pull_request` the pull request can also edit this
+workflow (§10). A forged result is not worth much, though. The author
+already controls the test, so forging `bug-reproduced` gains nothing a
+contrived test would not, and the reviewer still reads the test (§8.4).
+The only result that counts toward closing is `bug-not-reproduced`, and
+forging that one only hurts the forger.
 
 ### 8.3 Verdict — `quality-verdict.yml`
 
@@ -358,7 +384,10 @@ A `workflow_run` workflow built like `ortsom-verdict.yml`
 ([ORTSOM_PR_E2E_SPEC.md §9.1](./ORTSOM_PR_E2E_SPEC.md#91-why-two-workflows)):
 it never executes pull request code, treats the artifact as untrusted
 data, and verifies that the pull request belongs to the triggering run
-before touching it. It maps the result to a label:
+before touching it. The artifact must match an exact schema: missing or
+unknown fields, a SHA that is not 40 hex characters, a `head_sha` that
+is not the pull request's current head, or a result outside the table
+below reject it, and nothing is labelled. It maps the result to a label:
 
 | Result | Label | Meaning for the reviewer |
 |---|---|---|
@@ -367,6 +396,7 @@ before touching it. It maps the result to a label:
 | `test-fails-on-head` | `quality:test-fails` | The fix does not make its own test pass |
 | `no-test-commit` | `quality:needs-info`, reason added to the triage comment | The §8.1 convention is not followed |
 | `test-commit-changes-code` | `quality:needs-info`, reason added to the triage comment | Same |
+| `test-commit-does-not-apply` | `quality:needs-info`, reason added to the triage comment | The test commit conflicts with the current `main`; rebase |
 | `test-does-not-compile-on-base` | `quality:red-test-inconclusive` | Usually the test uses an API the fix introduces; a reviewer decides |
 
 `bug-not-reproduced` is only a label until Phase 4. Even then it never

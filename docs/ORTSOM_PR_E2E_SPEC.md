@@ -283,8 +283,9 @@ or a selecting rule). A new module that nobody mapped then fails a unit
 test in the pull request that adds it, instead of silently running
 smoke only. It only reads the tree and the map, so it runs in seconds
 as its own job in `ortsom-pr.yml`, before and independently of the
-suite, on every pull request that is not skipped; a failure shows as a
-red check on that job.
+suite, on every pull request, the skip path (§6) included, so neither
+`ortsom:skip` nor a draft or Dependabot pull request lets an unmapped
+file through; a failure shows as a red check on that job.
 
 ## 5. Baseline of `main` — `ortsom-baseline.yml`
 
@@ -323,10 +324,11 @@ flaky scenarios.
 - **Skipped when:** the pull request is a draft, or carries
   `ortsom:skip`, or is authored by `dependabot[bot]`. A `labeled` event
   only proceeds when the label is `ortsom:run`, which forces a re-run.
-  A skip still runs one cheap job that uploads the `ortsom-pr` artifact
-  with only `meta.json`, carrying `skipped` and its reason, so the
-  verdict workflow always has something to act on (removing stale
-  verdict labels, removing `ortsom:run`).
+  A skip still runs the map coverage job (§4.4) and one cheap job that
+  uploads the `ortsom-pr` artifact with only `meta.json`, carrying
+  `skipped` and its reason, so the verdict workflow always has
+  something to act on (removing stale verdict labels, removing
+  `ortsom:run`).
 - **Concurrency:** group `ortsom-pr-<number>`, `cancel-in-progress: true`.
 - **Permissions:** `contents: read` only. No secrets. This workflow never
   adds or removes a label or writes a comment; every change to the pull
@@ -492,7 +494,7 @@ One sticky comment per pull request, found by the marker
 
 | Label | Effect |
 |---|---|
-| `ortsom:skip` | No run. The verdict workflow removes any verdict label. |
+| `ortsom:skip` | No suite run; the map coverage job (§4.4) still runs. The verdict workflow removes any verdict label. |
 | `ortsom:run` | Forces a re-run. The verdict workflow removes it once that run reports, so adding it again re-runs again. |
 | `ortsom:expected-break` | Regressions are reported, but the verdict is capped at `regression`. For intentional behaviour changes the harness has not caught up with yet. |
 | `ortsom:false-positive` | Set by a maintainer who disagrees with a verdict. Changes nothing in the workflow; it is the data source for the shadow-phase review (§11). |

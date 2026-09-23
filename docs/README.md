@@ -11,6 +11,7 @@ Quick links to architecture and feature guides.
 - Anti-Abuse Bond: ANTI_ABUSE_BOND.md (opt-in maker/taker Lightning bond; off by default)
 - Payment-Account History / Anti-Triangulation: PAYER_HISTORY_ANTI_TRIANGULATION.md (opt-in buyer payer declaration + private success history; off by default)
 - Maintenance Mode & LN Node Migration: MAINTENANCE_MODE_LN_MIGRATION.md (design spec; operator procedure lives in LIGHTNING_OPS.md)
+- Contribution Quality Bar: [CONTRIBUTION_QUALITY_SPEC.md](./CONTRIBUTION_QUALITY_SPEC.md) (design spec: PR template, Manual testing, triage bot, red test on `main`; label-only at first)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 - Ortsom on Pull Requests: [ORTSOM_PR_E2E_SPEC.md](./ORTSOM_PR_E2E_SPEC.md) (design spec for the automated e2e gate; label-only at first)

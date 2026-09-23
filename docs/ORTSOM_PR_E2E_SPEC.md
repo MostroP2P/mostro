@@ -24,8 +24,13 @@ before anything is closed.
 ### Non-goals
 
 - Replacing `cargo test`, clippy or the existing CI. A pull request that
-  does not compile is reported by the Rust workflow; this gate reports it
-  as inconclusive and adds nothing.
+  does not compile is reported as `inconclusive` (reason `build-failed`),
+  not as a regression: whether it compiles is the Rust CI's question.
+  Note that today no Rust workflow runs on `pull_request` — `ci.yml`
+  runs on `push`, which covers branches of this repository but not
+  forks ([#929](https://github.com/MostroP2P/mostro/issues/929)). Until
+  that is fixed, a fork pull request that does not compile is reported by
+  nothing but this gate's comment; see §14.
 - Running on mainnet or with real sats. Only the regtest stack is used.
 - Testing Ortsom itself. Ortsom has its own CI.
 
@@ -115,8 +120,19 @@ name = "trade flow"
 paths = [
   "src/app/take_sell.rs", "src/app/take_buy.rs", "src/app/add_invoice.rs",
   "src/app/fiat_sent.rs", "src/app/release.rs", "src/app/order.rs",
+  "src/app/orders.rs", "src/app/dev_fee.rs",
 ]
 tags = ["happy-path"]
+
+[[rule]]
+name = "pricing"
+paths = ["src/price/**", "src/bitcoin_price.rs"]
+scenarios = ["market_price_order", "range_order"]
+
+[[rule]]
+name = "maintenance mode"
+paths = ["src/app/maintenance.rs", "src/app/daemon_state.rs"]
+tags = ["happy-path", "cancellation"]
 
 [[rule]]
 name = "cancellation"
@@ -157,10 +173,39 @@ tags = ["bond"]
 name = "core plumbing"
 paths = [
   "src/flow.rs", "src/db.rs", "src/app.rs", "src/main.rs", "src/config/**",
+  "src/escrow.rs", "src/app/context.rs",
   "migrations/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
 ]
 full = true
+
+[[rule]]
+name = "admin RPC"
+paths = ["src/rpc/**", "proto/**"]
+uncovered = "ortsom has no gRPC client; admin actions it exercises go over Nostr (see the dispute rule)"
+
+[[rule]]
+name = "cashu"
+paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
+uncovered = "covered by cashu.yml, not by ortsom"
+
+[[rule]]
+name = "session restore and key bookkeeping"
+paths = ["src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs"]
+uncovered = "no ortsom scenario yet"
+
+[[rule]]
+name = "misc daemon entry points"
+paths = ["src/cli.rs", "src/lnurl.rs"]
+uncovered = "no ortsom scenario yet (the stack pays bolt11 invoices, never LNURL)"
 ```
+
+Every `src/**/*.rs` file and every file under `proto/` matches at least
+one rule on the `main` of this spec's date. Code that Ortsom cannot
+exercise is not left out of the map: it is matched by a rule carrying
+`uncovered = "<reason>"`. Such a rule selects nothing beyond
+`always_tags`, and the comment names the files and the reason. That
+separates **known uncovered** code, a decision written down with its
+reason, from **unmapped** code, which is a gap in the map.
 
 The map above is the initial content; it is expected to be tuned during
 the shadow phase.
@@ -190,8 +235,10 @@ removed or renamed — both old and new name for renames).
    - `always_tags`,
    - the `tags` and `scenarios` of every rule matched by a remaining file.
 
-   A remaining file matched by no rule is recorded as **unmapped**; it
-   contributes nothing beyond `always_tags`.
+   A remaining file matched only by `uncovered` rules is recorded as
+   **uncovered**, with the rule's reason. A remaining file matched by no
+   rule at all is recorded as **unmapped**. Neither contributes anything
+   beyond `always_tags`.
 5. Tags are resolved to scenario names with `.github/ortsom/scenarios.json`,
    the committed output of `ortsom list --json` for the pinned
    `ortsom_ref`. A tag no scenario carries, or a scenario name that does
@@ -216,14 +263,28 @@ override's own `list --json`.
   "mode": "subset",
   "scenarios": ["cancel_before_taken", "happy_buy", "happy_sell", "range_order"],
   "matched_rules": ["trade flow"],
-  "unmapped_files": ["src/app/restore_session.rs"],
+  "uncovered_files": {"src/rpc/service.rs": "ortsom has no gRPC client; …"},
+  "unmapped_files": ["src/new_module.rs"],
   "ignored_files": ["docs/ARCHITECTURE.md"]
 }
 ```
 
 `mode` is one of `none`, `subset` or `full`. The comment lists
-`unmapped_files` explicitly: they are code paths Ortsom does not cover,
-and the comment must not imply they were tested.
+`uncovered_files` and `unmapped_files` explicitly: they are code paths
+Ortsom did not exercise, and the comment must not imply they were
+tested.
+
+### 4.4 Keeping the map complete
+
+`.github/ortsom/tests/` holds a **coverage test** for the map: it walks
+`git ls-files` and asserts that every `src/**/*.rs` file and every file
+under `proto/` matches at least one rule (`ignore`, `uncovered`, `full`
+or a selecting rule). A new module that nobody mapped then fails a unit
+test in the pull request that adds it, instead of silently running
+smoke only. It only reads the tree and the map, so it runs in seconds
+as its own job in `ortsom-pr.yml`, before and independently of the
+suite, on every pull request that is not skipped; a failure shows as a
+red check on that job.
 
 ## 5. Baseline of `main` — `ortsom-baseline.yml`
 
@@ -417,7 +478,8 @@ One sticky comment per pull request, found by the marker
 - a table of regressions: scenario, PR detail, baseline outcome;
 - collapsed sections for passes, skipped, `unstable-on-main` and
   `no-baseline` scenarios;
-- `unmapped_files`, the code this run did not exercise;
+- `uncovered_files` with their reasons and `unmapped_files`, the code
+  this run did not exercise;
 - links to the PR run, its artifacts, and the baseline run;
 - how to re-run (push, or add `ortsom:run`), and the escape hatches of
   §8;
@@ -514,7 +576,26 @@ or withholds is worth nothing to an attacker.
 
 The PR run compiles and executes the pull request's mostrod inside
 Docker on an ephemeral GitHub-hosted runner, with no secrets and a
-read-only token — the same exposure as the existing `cargo test` job.
+read-only token.
+
+There is only a partial precedent for this in the repository.
+`mutation.yml` and `cashu.yml` already build and run pull-request code on
+`pull_request`, but only when a maintainer applies a label (`run-mutation`,
+`cashu`). This gate is the first workflow to do it for **every** pull
+request. The case for it rests on its own terms:
+
+- the runner is ephemeral and discarded after the job;
+- the job has no secrets and a `contents: read` token, so there is
+  nothing to exfiltrate and nothing it can write back to the repository;
+- the repository requires maintainer approval before workflows run for
+  first-time contributors (fork approval policy
+  `first_time_contributors`), so a drive-by pull request does not get
+  compute without a human looking at it first.
+
+What an attacker gets is runner minutes. That is the same exposure the
+Rust CI will have once
+[#929](https://github.com/MostroP2P/mostro/issues/929) adds
+`pull_request` to it.
 
 ## 10. Changes needed in Ortsom (Phase 1)
 
@@ -566,6 +647,16 @@ Documented in the README and `docs/ci-regtest.md`.
 - `inconclusive` below 20% of runs; otherwise the baseline or the stack
   is too unreliable to enforce anything.
 
+The review also tracks, per run, the number of **smoke-only** selections
+(files remained after ignores, but only `uncovered` or unmapped ones) and
+the unmapped-file count. They say whether the map is converging, which
+the verdict counts alone do not. For reference, replaying the initial
+map of an earlier draft over the 29 pull requests merged in September
+2026 gave 14 `full`, 7 `subset`, 5 smoke-only and 3 `none`; the five
+smoke-only ones included the maintenance-mode work (#938, #940, #943,
+#944), which the current map now selects `happy-path` and
+`cancellation` for.
+
 ## 12. Phase 5: enforcement (not enabled by this spec)
 
 A repository variable `ORTSOM_MODE` switches the verdict workflow:
@@ -604,9 +695,18 @@ Baseline: about four scheduled runs a day plus one per merge.
   `bond` scenarios are always skipped: a pull request touching
   `src/app/bond/**` gets no signal. A bonds-enabled stack variant is
   follow-up work in Ortsom.
-- **Uncovered code.** `restore_session`, `last_trade_index`,
-  `trade_pubkey`, `cashu`, `price` and `rpc` have no scenarios. They are
-  reported as unmapped rather than claimed as tested.
+- **Uncovered code.** The admin gRPC surface (`src/rpc/**`,
+  `proto/**`), Cashu, session restore, trade-key bookkeeping, the daemon
+  CLI and LNURL have no Ortsom scenarios. The map lists them as
+  `uncovered` with the reason, and the comment reports them rather than
+  claiming they were tested. The admin RPC is the largest of these: it
+  carries the maintenance drain counters, and exercising it needs a gRPC
+  client in Ortsom.
+- **No compile check on fork pull requests.** Until
+  [#929](https://github.com/MostroP2P/mostro/issues/929) adds
+  `pull_request` to the Rust CI, `build_failed` is reported only as this
+  gate's `inconclusive` verdict, and the comment says plainly that the
+  pull request does not compile.
 - **Serial runs.** One identity slot means `--jobs 1`. More slots would
   shorten `full` runs considerably.
 - **Fork commits.** Building `--ref <head_sha>` for a pull request from a

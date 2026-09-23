@@ -1,0 +1,111 @@
+# Ortsom e2e gate: which scenarios a pull request runs, chosen by the files
+# it touches. Design and semantics: docs/ORTSOM_PR_E2E_SPEC.md § 4.
+#
+# Every src/**/*.rs and proto/** file must match at least one rule; the
+# coverage test in tests/test_map.py fails otherwise. Code Ortsom cannot
+# exercise gets a rule with `uncovered = "<reason>"` rather than no rule.
+#
+# Tags and scenario names are checked against scenarios.json, the
+# `ortsom list --json` output of `ortsom_ref`. Bump both in one pull request.
+
+[settings]
+# Ortsom revision the gate runs. Bumped by PR, like any dependency.
+ortsom_ref = "v0.3.0"
+# Tags every non-ignored selection includes.
+always_tags = ["smoke"]
+# Minimum eligible scenarios for the close verdict to be possible.
+min_scenarios = 4
+# Regression ratio (regressions / eligible) that triggers the close verdict.
+close_ratio = 0.5
+# How many first-parent commits back from the merge-base a baseline may be.
+baseline_max_distance = 10
+# How many recent baselines a scenario must have passed to be "stable".
+stability_window = 3
+
+[[rule]]
+name = "docs and metadata"
+paths = ["**/*.md", "docs/**", "LICENSE"]
+ignore = true
+
+[[rule]]
+name = "trade flow"
+paths = [
+  "src/app/take_sell.rs", "src/app/take_buy.rs", "src/app/add_invoice.rs",
+  "src/app/fiat_sent.rs", "src/app/release.rs", "src/app/order.rs",
+  "src/app/orders.rs", "src/app/dev_fee.rs",
+]
+tags = ["happy-path"]
+
+[[rule]]
+name = "pricing"
+paths = ["src/price/**", "src/bitcoin_price.rs"]
+scenarios = ["market_price_order", "range_order"]
+
+[[rule]]
+name = "maintenance mode"
+paths = ["src/app/maintenance.rs", "src/app/daemon_state.rs"]
+tags = ["happy-path", "cancellation"]
+
+[[rule]]
+name = "cancellation"
+paths = ["src/app/cancel.rs"]
+tags = ["cancellation"]
+
+[[rule]]
+name = "disputes and admin"
+paths = ["src/app/dispute.rs", "src/app/admin_*.rs"]
+tags = ["dispute"]
+
+[[rule]]
+name = "rating"
+paths = ["src/app/rate_user.rs"]
+scenarios = ["full_trade_with_rating"]
+
+[[rule]]
+name = "scheduler"
+paths = ["src/scheduler.rs"]
+tags = ["expiration"]
+
+[[rule]]
+name = "lightning"
+paths = ["src/lightning/**"]
+tags = ["payment-failure", "happy-path"]
+
+[[rule]]
+name = "message intake"
+paths = ["src/messages.rs", "src/spam_gate.rs", "src/nip33.rs", "src/util.rs"]
+tags = ["adversarial"]
+
+[[rule]]
+name = "bonds"
+paths = ["src/app/bond/**"]
+tags = ["bond"]
+
+[[rule]]
+name = "core plumbing"
+paths = [
+  "src/flow.rs", "src/db.rs", "src/app.rs", "src/main.rs", "src/config/**",
+  "src/escrow.rs", "src/app/context.rs",
+  "migrations/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+]
+full = true
+
+[[rule]]
+name = "admin RPC"
+paths = ["src/rpc/**", "proto/**"]
+uncovered = "ortsom has no gRPC client; admin actions it exercises go over Nostr (see the dispute rule)"
+
+[[rule]]
+name = "cashu"
+paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
+uncovered = "covered by cashu.yml, not by ortsom"
+
+[[rule]]
+name = "session restore and key bookkeeping"
+paths = ["src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs"]
+uncovered = "no ortsom scenario yet"
+
+[[rule]]
+name = "misc daemon entry points"
+paths = ["src/cli.rs", "src/lnurl.rs"]
+uncovered = "no ortsom scenario yet (the stack pays bolt11 invoices, never LNURL)"

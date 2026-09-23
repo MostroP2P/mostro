@@ -1,6 +1,6 @@
 # Ortsom on Pull Requests — Automated E2E Gate
 
-**Status:** Spec · Phase 0 (this document)
+**Status:** Phase 2 (selection, map and `main` baseline). Phase 3 pending
 **Harness:** [MostroP2P/ortsom](https://github.com/MostroP2P/ortsom)
 **Initial mode:** label-only (shadow). Pull requests are never closed until
 Phase 5 is explicitly enabled.
@@ -78,15 +78,18 @@ All selection and verdict logic lives in version-controlled scripts under
 
 ```text
 .github/ortsom/
-├── map.toml          # path → scenario rules and gate settings
-├── scenarios.json    # `ortsom list --json` of the pinned Ortsom, committed
-├── select.py         # changed files → selection.json
-├── verdict.py        # PR summary + baselines → verdict.json + comment.md
-└── tests/            # unittest suites for both scripts
+├── map.toml             # path → scenario rules and gate settings
+├── scenarios.json       # `ortsom list --json` of the pinned Ortsom, committed
+├── select_scenarios.py  # changed files → selection.json
+├── verdict.py           # PR summary + baselines → verdict.json + comment.md
+└── tests/               # unittest suites for both scripts
 ```
 
 Python is used because it is on every GitHub runner and `tomllib` is in
-the standard library (3.11+). No third-party packages.
+the standard library (3.11+). No third-party packages. The selection
+script is not called `select.py`: a module of that name next to the
+script shadows the standard library's `select`, which `subprocess`
+imports.
 
 ## 4. Scenario selection
 
@@ -256,7 +259,7 @@ verdict is `inconclusive`, reason `stale-registry`. A pull request that
 overrides the Ortsom ref (§8.2) skips this check and selects against the
 override's own `list --json`.
 
-`select.py` writes `selection.json`:
+`select_scenarios.py` writes `selection.json`:
 
 ```json
 {
@@ -282,11 +285,11 @@ under `proto/` matches at least one rule (`ignore`, `uncovered`, `full`
 or a selecting rule). A new module that nobody mapped then fails a unit
 test in the pull request that adds it, instead of silently running
 smoke only. It only reads the tree and the map, so it runs in seconds
-as its own job in `ortsom-pr.yml`, before and independently of the
-suite, on every run of that workflow except an irrelevant label event
-(§6), the skip path included, so neither `ortsom:skip` nor a draft or
-Dependabot pull request lets an unmapped file through; a failure shows
-as a red check on that job.
+in its own workflow, `ortsom-map.yml`, on every pull request and every
+push to `main`, together with the scripts' unit tests. It is independent
+of `ortsom-pr.yml` and its skip path, so neither `ortsom:skip` nor a
+draft or Dependabot pull request lets an unmapped file through; a
+failure shows as a red check on that workflow.
 
 ## 5. Baseline of `main` — `ortsom-baseline.yml`
 
@@ -362,7 +365,7 @@ Steps:
    `map.toml`, `scenarios.json` and `ortsom_ref` of the run come from that
    checkout, i.e. from the current `main` plus the pull request's own
    changes. List changed files with
-   `git diff --name-status <base_sha>...<head_sha>`, run `select.py`. If
+   `git diff --name-status <base_sha>...<head_sha>`, run `select_scenarios.py`. If
    `mode` is `none`, upload the artifact and stop.
 2. **Harness.** Check out `MostroP2P/ortsom` at `ortsom_ref` — or at the
    override of §8.2 — and `cargo build --release` it (Swatinem cache).
@@ -566,7 +569,7 @@ runs the workflow definition from `main` with a write token, and
 therefore:
 
 - **never checks out or executes pull request code**; it checks out
-  `main` only, for `verdict.py`, `select.py`, `map.toml` and
+  `main` only, for `verdict.py`, `select_scenarios.py`, `map.toml` and
   `scenarios.json`;
 - ignores a triggering run whose conclusion is `skipped`: it was an
   irrelevant label event (§6);
@@ -613,11 +616,11 @@ therefore:
 
 For `pull_request` events GitHub runs the workflow files of the pull
 request's merge commit, so a pull request can change `ortsom-pr.yml`,
-`map.toml` or `select.py` to select nothing or to forge a passing
+`map.toml` or `select_scenarios.py` to select nothing or to forge a passing
 `summary.json`. The verdict workflow limits the damage:
 
 - It **recomputes the selection** with `main`'s `map.toml`,
-  `scenarios.json` and `select.py` from the changed-file list fetched through the API. A
+  `scenarios.json` and `select_scenarios.py` from the changed-file list fetched through the API. A
   scenario in the trusted selection that is absent from the PR summary
   counts as `missing`, i.e. a regression.
 - A pull request that touches `.github/ortsom/**` or any `ortsom-*.yml`
@@ -690,7 +693,7 @@ Documented in the README and `docs/ci-regtest.md`.
 |---|---|---|
 | 0 | mostro | This spec. |
 | 1 | ortsom | §10 A–C, docs, changelog; release `v0.3.0`. |
-| 2 | mostro | `.github/ortsom/` (`map.toml`, `scenarios.json`, `select.py`, tests) and `ortsom-baseline.yml`. Let baselines accumulate. |
+| 2 | mostro | `.github/ortsom/` (`map.toml`, `scenarios.json`, `select_scenarios.py`, tests) and `ortsom-baseline.yml`. Let baselines accumulate. |
 | 3 | mostro | `ortsom-pr.yml`, `verdict.py` with tests, `ortsom-verdict.yml`; labels created. **Shadow mode.** |
 | 4 | — | Manual review period, at least two weeks or 20 verdicts. Every `would-close` and `regression` is checked by a maintainer; disagreements get `ortsom:false-positive`. Tune `map.toml` and thresholds. |
 | 5 | mostro | Enforcement, only by explicit maintainer decision (§12). |

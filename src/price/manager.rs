@@ -1170,6 +1170,54 @@ mod tests {
         );
     }
 
+    /// The observation stamp may only ever move `as_of` **backwards**. A
+    /// stamp ahead of the tick's own clock — a backwards clock step between
+    /// the poll and the post-aggregation `Utc::now()`, or a trusted node
+    /// publishing from a fast clock — must fall through to the ordinary
+    /// wall-clock write instead of becoming `as_of`.
+    ///
+    /// Using it would hand the currency a *negative* age, and a negative age
+    /// is inside every TTL: `get` would serve the rate as fresh for as long
+    /// as the skew lasted, and for a full window on top of that — the
+    /// stacked serving window issue #860 exists to close, re-opened from the
+    /// other side. Nothing else in the suite pins this branch; deleting the
+    /// `filter` leaves every other test green.
+    #[tokio::test]
+    async fn a_future_dated_observation_never_extends_the_serving_window() {
+        const TTL: i64 = 1_800;
+        const SKEW: i64 = 3_600;
+
+        let tick_start = Utc::now().timestamp();
+
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        // Uncovered by Yadio, so it survives `restrict_nostr_to_fallback`.
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)])
+                .observed_at(tick_start + SKEW),
+        ]);
+        manager.update_all().await;
+
+        let entry = manager.store.snapshot("ARS").expect("ARS was written");
+        assert!(
+            entry.as_of <= Utc::now().timestamp(),
+            "a stamp this node's clock could not have produced must not become as_of"
+        );
+        // The same thing said as a serving window: the skew must not buy the
+        // rate an extra SKEW seconds of life on top of its TTL.
+        assert!(
+            manager
+                .store
+                .get("ARS", TTL, tick_start + SKEW + TTL)
+                .is_err(),
+            "a future-dated observation must not extend the serving window"
+        );
+    }
+
     /// Backdating must never *shorten* a currency's serving window. A
     /// relayed event older than a value this node already fetched directly
     /// is not news, and applying it would refuse a currency that was

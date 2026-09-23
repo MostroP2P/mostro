@@ -112,7 +112,7 @@ stability_window = 3
 
 [[rule]]
 name = "docs and metadata"
-paths = ["**/*.md", "docs/**", "LICENSE", ".github/ISSUE_TEMPLATE/**"]
+paths = ["**/*.md", "docs/**", "LICENSE"]
 ignore = true
 
 [[rule]]
@@ -283,9 +283,10 @@ or a selecting rule). A new module that nobody mapped then fails a unit
 test in the pull request that adds it, instead of silently running
 smoke only. It only reads the tree and the map, so it runs in seconds
 as its own job in `ortsom-pr.yml`, before and independently of the
-suite, on every pull request, the skip path (§6) included, so neither
-`ortsom:skip` nor a draft or Dependabot pull request lets an unmapped
-file through; a failure shows as a red check on that job.
+suite, on every run of that workflow except an irrelevant label event
+(§6), the skip path included, so neither `ortsom:skip` nor a draft or
+Dependabot pull request lets an unmapped file through; a failure shows
+as a red check on that job.
 
 ## 5. Baseline of `main` — `ortsom-baseline.yml`
 
@@ -300,7 +301,10 @@ compares against those measurements.
   because pull requests select different subsets and each one needs a
   baseline result for every scenario it runs.
 - **Concurrency:** group `ortsom-baseline`, `cancel-in-progress: false`.
-  A push while a scheduled run is in flight queues behind it.
+  A push while a run is in flight waits behind it. GitHub keeps at most
+  one pending run per group, so several pushes during one run collapse
+  into a single baseline of the latest one; the commits in between get
+  none, which `baseline_max_distance` (§7.1) absorbs.
 - **Output:** artifact `ortsom-baseline`, retention 90 days, containing:
   - `summary.json` as written by Ortsom,
   - `meta.json` with `sha`, `ortsom_ref`, `stack`
@@ -320,25 +324,41 @@ flaky scenarios.
 ## 6. Pull request run — `ortsom-pr.yml`
 
 - **Trigger:** `pull_request` on `opened`, `synchronize`, `reopened`,
-  `ready_for_review` and `labeled`, targeting `main`.
+  `ready_for_review`, `labeled` and `unlabeled`, targeting `main`.
+- **Label events.** Only three labels are relevant: `ortsom:run`
+  (added), `ortsom:skip` (added or removed) and `ortsom:expected-break`
+  (added or removed). Each of those proceeds as an ordinary run, so the
+  label takes effect at once: adding `ortsom:skip` takes the skip path
+  below, removing it runs the suite, and adding or removing
+  `ortsom:expected-break` re-runs so the verdict reflects the cap. Any
+  other label event is **irrelevant**: every job's `if` is false, no
+  artifact is uploaded, and the verdict workflow, finding no artifact,
+  leaves the pull request untouched.
 - **Skipped when:** the pull request is a draft, or carries
-  `ortsom:skip`, or is authored by `dependabot[bot]`. A `labeled` event
-  only proceeds when the label is `ortsom:run`, which forces a re-run.
-  A skip still runs the map coverage job (§4.4) and one cheap job that
-  uploads the `ortsom-pr` artifact with only `meta.json`, carrying
-  `skipped` and its reason, so the verdict workflow always has
-  something to act on (removing stale verdict labels, removing
-  `ortsom:run`).
-- **Concurrency:** group `ortsom-pr-<number>`, `cancel-in-progress: true`.
+  `ortsom:skip`, or is authored by `dependabot[bot]`. A skip still runs
+  the map coverage job (§4.4) and one cheap job that uploads the
+  `ortsom-pr` artifact with only `meta.json`, carrying `skipped` and its
+  reason, so the verdict workflow always has something to act on
+  (removing stale verdict labels, removing `ortsom:run`).
+- **Concurrency:** on the suite job, not on the workflow: group
+  `ortsom-pr-<number>`, `cancel-in-progress: true`. GitHub applies a
+  workflow-level group before any job's `if` is evaluated, so there an
+  irrelevant label event would cancel a suite already in flight — up to
+  a `full` run of more than two hours. A job whose `if` is false never
+  enters its group.
+- **Timeout:** suite job 330 min, suite step 300 min, as in §5.
 - **Permissions:** `contents: read` only. No secrets. This workflow never
   adds or removes a label or writes a comment; every change to the pull
   request is made by `ortsom-verdict.yml` (§9.1).
 
 Steps:
 
-1. **Select.** Check out the pull request with full history
-   (`fetch-depth: 0`, so the base SHA, the head SHA and their merge-base
-   are all present), list changed files with
+1. **Select.** Check out the pull request's merge commit (the
+   `pull_request` default) with full history (`fetch-depth: 0`, so the
+   base SHA, the head SHA and their merge-base are all present). The
+   `map.toml`, `scenarios.json` and `ortsom_ref` of the run come from that
+   checkout, i.e. from the current `main` plus the pull request's own
+   changes. List changed files with
    `git diff --name-status <base_sha>...<head_sha>`, run `select.py`. If
    `mode` is `none`, upload the artifact and stop.
 2. **Harness.** Check out `MostroP2P/ortsom` at `ortsom_ref` — or at the
@@ -347,7 +367,9 @@ Steps:
    runs.
 3. **Stack.** `ortsom stack up --ref <head_sha>`. Its exit code (§10,
    item C) classifies the outcome: 0 is `ok`, 3 is `build_failed`, 4 is
-   `daemon_failed`, anything else is `infra_failed`.
+   `daemon_failed`, anything else is `infra_failed`. An exit code 3 is
+   retried once before it is recorded, because a download failing inside
+   the image build looks the same as mostro not compiling.
 4. **Readiness.** If the stack is `ok`, `ortsom doctor`. A non-zero exit
    turns the outcome into `doctor_failed`. By then `stack up` has already
    seen the daemon publish its info event, so what `doctor` still catches
@@ -394,17 +416,25 @@ comment. Making the gate a required check is a Phase 5 decision.
 2. Walk `main`'s first-parent history from the merge-base back
    `baseline_max_distance` commits. Only baselines measured with the
    **same harness** as the PR run are candidates: `meta.ortsom_ref` equal
-   to the pinned `ortsom_ref` the PR run used. Comparing across harness
-   revisions would blame the pull request for a harness change.
+   to the `ortsom_ref` pinned in `main`'s `map.toml`, which is also the one
+   the PR run used unless it was overridden (§8.2). Comparing across
+   harness revisions would blame the pull request for a harness change.
+   Only candidates whose `stack` is `ok` carry results; the others are
+   passed over.
 3. The **reference baseline** is the most recent candidate whose
-   `meta.sha` is on that walk and whose `stack` is `ok`.
+   `meta.sha` is on that walk.
 4. The **history** is the `stability_window` most recent candidates on
    the same walk, the reference included. Fewer than `stability_window`
    candidates is fine; the rule then uses the ones there are.
 5. No reference baseline → verdict `inconclusive`, reason
-   `no-baseline`. This is expected for a few hours after `ortsom_ref` is
-   bumped on `main`, until the baseline workflow the bump itself
-   triggers has finished.
+   `no-baseline`. After `ortsom_ref` is bumped on `main`, this is the
+   verdict of every pull request whose merge-base predates the bump:
+   the PR run uses the new harness (step 1 of §6 reads the pin from the
+   merge commit), while every baseline on its walk used the old one. It
+   stays so until the pull request merges or rebases onto a `main` whose
+   new-harness baseline has finished, and the comment says so in those
+   words. A pull request branched after the bump waits only for that
+   first baseline.
 
 Artifacts are listed through the Actions API for `ortsom-baseline.yml`
 runs on `main`; each run carries its `head_sha`.
@@ -443,7 +473,7 @@ Evaluated in order; the first that applies wins.
 |---|---|---|
 | `not-applicable` | selection `mode` is `none` | none; a previous `ortsom:*` verdict label is removed |
 | `inconclusive` | selection error, stale registry (§4.3), gate modified (§9.2), `stack` is `build_failed`, `infra_failed` or `doctor_failed`, incomplete run (§7.2), or no reference baseline | `ortsom:inconclusive` |
-| `would-close` | `stack` is `daemon_failed`, the reference baseline's stack was `ok`, and no cap applies | `ortsom:would-close` |
+| `would-close` | `stack` is `daemon_failed` and no cap applies | `ortsom:would-close` |
 | `would-close` | `eligible ≥ min_scenarios` and `ratio ≥ close_ratio`, and no cap applies | `ortsom:would-close` |
 | `regression` | a `would-close` condition held but a cap applies, or at least one `regression` | `ortsom:regression` |
 | `pass` | otherwise | `ortsom:pass` |
@@ -458,8 +488,10 @@ exists for.
 and `close_ratio`.** Those guards protect against drawing a conclusion
 from a small or noisy sample of scenarios. A daemon that builds but does
 not start is not a sample: every scenario the pull request could select
-would fail the same way, and the same stack starts on `main`. So it
-needs no minimum — but it is still subject to the caps.
+would fail the same way, and the same stack starts on `main` (the
+reference baseline, which exists by now, has `stack` `ok` by
+definition). So it needs no minimum — but it is still subject to the
+caps.
 
 Verdict labels are mutually exclusive: applying one removes the others.
 They are re-evaluated on every run, so a fixed pull request goes from
@@ -494,9 +526,9 @@ One sticky comment per pull request, found by the marker
 
 | Label | Effect |
 |---|---|
-| `ortsom:skip` | No suite run; the map coverage job (§4.4) still runs. The verdict workflow removes any verdict label. |
+| `ortsom:skip` | No suite run; the map coverage job (§4.4) still runs. The verdict workflow removes any verdict label. Takes effect when added; removing it runs the suite. |
 | `ortsom:run` | Forces a re-run. The verdict workflow removes it once that run reports, so adding it again re-runs again. |
-| `ortsom:expected-break` | Regressions are reported, but the verdict is capped at `regression`. For intentional behaviour changes the harness has not caught up with yet. |
+| `ortsom:expected-break` | Regressions are reported, but the verdict is capped at `regression`. For intentional behaviour changes the harness has not caught up with yet. Adding or removing it re-runs. |
 | `ortsom:false-positive` | Set by a maintainer who disagrees with a verdict. Changes nothing in the workflow; it is the data source for the shadow-phase review (§11). |
 
 ### 8.2 Running against an Ortsom branch
@@ -533,6 +565,9 @@ therefore:
 - **never checks out or executes pull request code**; it checks out
   `main` only, for `verdict.py`, `select.py`, `map.toml` and
   `scenarios.json`;
+- ignores a triggering run whose conclusion is `cancelled` or
+  `skipped`: a cancelled run was superseded by a newer one that will
+  report, and a skipped one was an irrelevant label event (§6);
 - treats the `ortsom-pr` artifact as **untrusted data**: parsed as JSON
   with size limits, validated field by field (SHA format, known enum
   values, integer PR number), never interpolated into shell commands;
@@ -625,9 +660,9 @@ tell whose fault a failed stack is without parsing text:
 | Exit code | Meaning |
 |---|---|
 | 0 | stack up |
-| 3 | the daemon image could not be produced: ref not found, or mostro did not compile |
-| 4 | the daemon image exists but mostrod did not start (exited, restart loop, timeout waiting for it) |
-| 1 | anything else (Docker, bitcoind, LND, relay, config) |
+| 3 | the daemon image could not be produced: the ref does not exist, or `docker build` failed — usually mostro not compiling, but a download failing inside the build looks the same, hence the retry in §6 |
+| 4 | the daemon image exists, but waiting for mostrod ran out: it exited, restart-looped, or never published its info event on a relay that was up |
+| 1 | anything else: git or github.com unreachable, Docker (also mid-wait), bitcoind, LND, a relay that never answered, the config |
 
 Documented in the README and `docs/ci-regtest.md`.
 

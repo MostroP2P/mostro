@@ -1,6 +1,6 @@
 # Contribution Quality Bar — Spec
 
-**Status:** Spec · Phase 0 (this document)
+**Status:** Phase 1 (policy in `CONTRIBUTING.md`, pull request template, close message)
 **Related:** [Ortsom on Pull Requests](./ORTSOM_PR_E2E_SPEC.md), the e2e
 gate proposed in [#975](https://github.com/MostroP2P/mostro/pull/975)
 **Initial mode:** label-only (shadow). Nothing is closed automatically

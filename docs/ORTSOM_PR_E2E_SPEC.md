@@ -345,7 +345,10 @@ flaky scenarios.
   workflow-level group before any job's `if` is evaluated, so there an
   irrelevant label event would cancel a suite already in flight — up to
   a `full` run of more than two hours. A job whose `if` is false never
-  enters its group.
+  enters its group. The skip job joins the same group, so adding
+  `ortsom:skip` cancels a suite already in flight instead of letting it
+  finish and report after the skip. The map coverage job stays out of
+  it.
 - **Timeout:** suite job 330 min, suite step 300 min, as in §5.
 - **Permissions:** `contents: read` only. No secrets. This workflow never
   adds or removes a label or writes a comment; every change to the pull
@@ -526,7 +529,7 @@ One sticky comment per pull request, found by the marker
 
 | Label | Effect |
 |---|---|
-| `ortsom:skip` | No suite run; the map coverage job (§4.4) still runs. The verdict workflow removes any verdict label. Takes effect when added; removing it runs the suite. |
+| `ortsom:skip` | No suite run; the map coverage job (§4.4) still runs. The verdict workflow removes any verdict label. Takes effect when added, cancelling a suite in flight; removing it runs the suite. |
 | `ortsom:run` | Forces a re-run. The verdict workflow removes it once that run reports, so adding it again re-runs again. |
 | `ortsom:expected-break` | Regressions are reported, but the verdict is capped at `regression`. For intentional behaviour changes the harness has not caught up with yet. Adding or removing it re-runs. |
 | `ortsom:false-positive` | Set by a maintainer who disagrees with a verdict. Changes nothing in the workflow; it is the data source for the shadow-phase review (§11). |
@@ -565,9 +568,24 @@ therefore:
 - **never checks out or executes pull request code**; it checks out
   `main` only, for `verdict.py`, `select.py`, `map.toml` and
   `scenarios.json`;
-- ignores a triggering run whose conclusion is `cancelled` or
-  `skipped`: a cancelled run was superseded by a newer one that will
-  report, and a skipped one was an irrelevant label event (§6);
+- ignores a triggering run whose conclusion is `skipped`: it was an
+  irrelevant label event (§6);
+- on a triggering run whose conclusion is `cancelled`, looks for a
+  **successor**: a run of `ortsom-pr.yml` with the same
+  `head_repository.full_name` and `head_branch`, created after the
+  cancelled one. If there is one, it does nothing, because the successor
+  will report. If there is none, the run was cancelled by hand. A
+  cancelled run may not have uploaded an artifact, so the pull request is
+  resolved from the run's head repository and branch, and checked as
+  below without the `meta` fields. The workflow then removes any verdict
+  label and `ortsom:run`, and rewrites the comment to say that the last
+  run was cancelled, that no verdict is current, and how to re-run;
+- before applying a suite result, re-reads the pull request. If it now
+  carries `ortsom:skip` or is a draft, the result is discarded and
+  handled as a skip: verdict labels are removed and no scenario results
+  are posted. The skip job cancels a suite in flight (§6), but a suite
+  that finished moments before can still report after the skip, and
+  this check makes both orders end in the same state;
 - treats the `ortsom-pr` artifact as **untrusted data**: parsed as JSON
   with size limits, validated field by field (SHA format, known enum
   values, integer PR number), never interpolated into shell commands;

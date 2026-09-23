@@ -83,6 +83,40 @@ technical review because it does not meet the contribution quality bar
 You are welcome to reopen it, or open a new one, once it does.
 ```
 
+### 3.1 Instructions for AI agents
+
+`CONTRIBUTING.md` is the single source of the rules; it is also the file
+GitHub links from the new pull request page. Coding agents read
+`AGENTS.md`, so that file gets a short section pointing to it, with the
+rules an agent most often breaks stated inline:
+
+```markdown
+## Before opening a pull request
+
+If you are an AI agent preparing a pull request, follow
+`CONTRIBUTING.md § Contribution quality bar`. In short:
+
+- Link an issue labelled `status: accepted` (`Closes #N`). If there is no
+  accepted issue, do not open the pull request; comment on the issue instead.
+- Fill in every section of `.github/pull_request_template.md`, including
+  Manual testing with steps you actually ran against a mostrod.
+- For a fix, the first commit is `test:` and adds a regression test that
+  fails on `main`.
+- If you could not build or run mostrod, say so in the pull request instead
+  of claiming results.
+```
+
+`AGENTS.md` points to `CONTRIBUTING.md`, never to this spec: the spec
+describes how the checks work, which an agent does not need in order to
+meet them. No per-tool instruction files are added; `AGENTS.md` stays
+the only one.
+
+This helps an agent that reads its instructions get the pull request
+right the first time. Nothing depends on it: many of these pull requests
+come from agents that ignore instructions or from code pasted out of a
+chat that never saw the repository, and the template, the triage bot
+and the red test check the result either way.
+
 ## 4. Issue before pull request
 
 Every pull request that is not exempt links an issue that a maintainer
@@ -614,7 +648,7 @@ nothing in this spec depends on it.
 | Phase | Repository | Content |
 |---|---|---|
 | 0 | mostro | This spec |
-| 1 | mostro | `CONTRIBUTING.md` sections (quality bar, Manual testing, red test commit convention), `.github/pull_request_template.md`, `.github/quality/close-message.md`, labels. Maintainers apply the policy by hand |
+| 1 | mostro | `CONTRIBUTING.md` sections (quality bar, Manual testing, red test commit convention), the `AGENTS.md` section of §3.1, `.github/pull_request_template.md`, `.github/quality/close-message.md`, labels. Maintainers apply the policy by hand |
 | 2 | mostro | `quality-triage.yml`, `triage.py` with tests, `config.toml`. **Shadow**: labels and comment only, `neutral` check run |
 | 3 | mostro | `quality-red-test.yml` and `quality-verdict.yml`. **Shadow** |
 | 4 | mostro | Enforcement: `quality-stale.yml` closes after 7 days of `quality:needs-info`. Needs a separate, explicit decision after reviewing the shadow labels |

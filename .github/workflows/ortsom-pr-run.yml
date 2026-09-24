@@ -145,17 +145,22 @@ jobs:
           shared-key: ortsom
           save-if: false
 
-      # Build, then keep only what the stack runs from: no sources, no
-      # intermediate build output, before any pull request image loads.
+      # Build, then keep only what the stack runs from — an allowlist, so a
+      # directory Ortsom adds later is dropped too: the binary, its two
+      # configs and ci/regtest/ (the compose file, the daemon's settings
+      # template). No sources, no build output, before any pull request
+      # image loads.
       - name: Build Ortsom
         if: steps.select.outputs.state == 'go'
-        working-directory: ortsom
         run: |
-          cargo build --release --bin ortsom
-          cp target/release/ortsom "$RUNNER_TEMP/ortsom"
-          rm -rf target crates .git
-          mkdir -p target/release
-          mv "$RUNNER_TEMP/ortsom" target/release/ortsom
+          (cd ortsom && cargo build --release --bin ortsom)
+          keep="$RUNNER_TEMP/ortsom-runtime"
+          mkdir -p "$keep/target/release"
+          cp ortsom/target/release/ortsom "$keep/target/release/"
+          cp -r ortsom/ci ortsom/ortsom.toml ortsom/ortsom.regtest.toml "$keep/"
+          rm -rf ortsom
+          mv "$keep" ortsom
+          find ortsom -maxdepth 2 | sort
 
       - name: Check the registry
         id: registry

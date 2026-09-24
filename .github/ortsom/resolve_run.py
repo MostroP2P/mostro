@@ -35,6 +35,8 @@ REF_LINE = re.compile(r"^ortsom-ref:[ \t]*(.*?)[ \t]*\r?$", re.M)
 STATUS = {"added": "A", "removed": "D", "modified": "M", "changed": "M", "unchanged": "M"}
 MAX_META_BYTES = 4096
 PER_PAGE = 100
+# GitHub lists at most 3000 files for a pull request.
+MAX_PAGES = 30
 
 
 class ResolveError(Exception):
@@ -133,13 +135,13 @@ def api(path, token, params=""):
 
 
 def paginate(path, token):
-    items, page = [], 1
-    while True:
+    items = []
+    for page in range(1, MAX_PAGES + 1):
         batch = api(path, token, f"?per_page={PER_PAGE}&page={page}")
         items += batch
         if len(batch) < PER_PAGE:
-            return items
-        page += 1
+            break
+    return items
 
 
 def write_outputs(values):

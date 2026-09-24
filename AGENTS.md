@@ -52,6 +52,9 @@ If you are an AI agent preparing a pull request, follow
 - If you could not build or run mostrod, say so in the pull request instead
   of claiming results.
 
+A pull request that only changes Markdown files is exempt from the first
+three points (see the exemptions in that section); commits are still signed.
+
 ## Documentation Guidelines
 - Do not hardcode source code line numbers in documentation (e.g., `src/app/take_buy.rs:11`). Line numbers drift as the codebase evolves, misleading developers. Reference file paths (`src/app/take_buy.rs`) or function names (`fn take_buy_action`) instead, which are far more stable and easily searchable.
 - Add a language specifier to every fenced code block. Static analysis (markdownlint MD040) flags blocks without a language identifier. Example: ` ```flutter test ` instead of bare ` ``` `.

@@ -50,6 +50,8 @@ A pull request has to prove two things before a reviewer reads the diff: that th
 3. A pull request whose description does not match its diff, or whose Manual testing steps do not work when a reviewer follows them, is closed the same way.
 4. An account that repeatedly opens pull requests closed under this policy may be blocked from the organisation.
 
+**Exempt** from the accepted issue, the template, Manual testing and the Red test: pull requests that only change Markdown files, pull requests from maintainers and bots, and pull requests a maintainer labels `quality:exempt`. Signed commits and, for first-time contributors, the size limits apply to everyone but bots.
+
 For now maintainers apply these rules by hand. Automated checks will first only add labels and comments; nothing is closed automatically without a separate, announced decision. The design is in [docs/CONTRIBUTION_QUALITY_SPEC.md](docs/CONTRIBUTION_QUALITY_SPEC.md).
 
 ### Issue before pull request
@@ -59,8 +61,6 @@ Every pull request links an issue that a maintainer has labelled `status: accept
 - Link it with a closing keyword in the description (`Closes #123`, `Fixes #123`). A plain mention does not count.
 - Only maintainers apply `status: accepted`, when they agree the problem is real and in scope. An issue opened minutes before the pull request is not accepted until a maintainer says so.
 - If there is no accepted issue yet, comment on the issue instead of opening the pull request.
-
-Exempt: pull requests that only change Markdown files, pull requests from maintainers and bots, and pull requests a maintainer labels `quality:exempt`.
 
 ### Pull request template
 

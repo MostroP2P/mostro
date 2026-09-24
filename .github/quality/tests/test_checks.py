@@ -332,8 +332,11 @@ class StepsSyntaxTest(unittest.TestCase):
         self.assertIn("unknown action `sleep`", reasons["steps-syntax"][0])
 
     def test_attacker_text_cannot_break_out_of_the_code_span(self):
-        block = '[[step]]\nactor = "a"\ndo = "x` @maintainer `y"\n\n[[step]]\nexpect = "s"\n"k`@m\\nz" = 1'
+        block = '[[step]]\nactor = "a"\ndo = "x` @maintainer `y"\n\n[[step]]\nexpect = "s"\n"k`@m\\nz" = [1]'
         reasons = failing(evaluate(pr(body=self.body_with(block))))["steps-syntax"]
+        # Both attacker strings reach a reason, so the sanitizing is exercised.
+        self.assertTrue(any("`x' @maintainer 'y`" in r for r in reasons), reasons)
+        self.assertTrue(any("`k'@m'z`" in r for r in reasons), reasons)
         for reason in reasons:
             body = reason.split("`", 1)[1]
             self.assertEqual(reason.count("`") % 2, 0, reason)

@@ -1,6 +1,6 @@
 # Contribution Quality Bar — Spec
 
-**Status:** Spec · Phase 0 (this document)
+**Status:** Phase 1 (policy in `CONTRIBUTING.md`, pull request template, close message)
 **Related:** [Ortsom on Pull Requests](./ORTSOM_PR_E2E_SPEC.md), the e2e
 gate proposed in [#975](https://github.com/MostroP2P/mostro/pull/975)
 **Initial mode:** label-only (shadow). Nothing is closed automatically
@@ -225,11 +225,16 @@ serves three purposes:
 
 ### 6.1 Rules
 
-- **Setup** says which environment and which configuration: the Ortsom
-  regtest stack (`ortsom stack up --ref <branch>`) or a local mostrod
-  with its own LND; which `settings.toml` keys differ from
-  `settings.tpl.toml`; and which client each actor uses (mostro-cli,
-  Mostro Mobile, Ortsom).
+- **A person runs the steps by hand.** Ortsom is an internal tool of
+  the Mostro developers (a private repository); external contributors
+  have no access to it and are never asked to use it. It runs only in
+  CI ([ORTSOM_PR_E2E_SPEC.md](./ORTSOM_PR_E2E_SPEC.md) and §9 here), on the
+  maintainers' side.
+- **Setup** says which environment and which configuration: a mostrod
+  built from the branch, with its own LND (regtest, signet or testnet)
+  and a relay (`make docker-relay-up` starts a local one); which
+  `settings.toml` keys differ from `settings.tpl.toml`; and which client
+  each actor uses (mostro-cli or Mostro Mobile).
 - **Steps** are numbered. Each step names **one actor** (seller, buyer,
   solver, operator), **one action**, and **the expected observable
   result**: an order status on the public event (kind 38383), a dispute
@@ -255,9 +260,10 @@ manual test:
 ```markdown
 ### Setup
 
-Ortsom regtest stack: `ortsom stack up --ref <branch of #967>`.
-Default settings. Seller and buyer on mostro-cli; solver on mostro-cli
-with the admin key.
+mostrod built from the branch of #967, on regtest with its own LND and
+a local relay (`make docker-relay-up`). Default settings. Seller and buyer on
+mostro-cli with two funded LND nodes; solver on mostro-cli with the
+admin key.
 
 ### Steps
 
@@ -287,7 +293,9 @@ out of scope for this pull request.
 Next to the prose, the author may add a fenced block with the language
 `ortsom-steps` that expresses the same steps in the fixed vocabulary of
 §9.2. It is optional until the per-PR runner exists; the bot validates
-its syntax when it is present.
+its syntax when it is present. The vocabulary is documented here, so an
+external contributor can write the block without access to Ortsom;
+if they do not, a maintainer may add it.
 
 ## 7. Triage bot — `quality-triage.yml`
 

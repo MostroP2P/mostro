@@ -1,0 +1,33 @@
+name: Quality scripts
+
+# Unit tests of the triage bot. quality-triage.yml runs the version on `main`,
+# so a change to the bot is only exercised here before it merges.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/quality/**"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/quality-scripts.yml"
+  pull_request:
+    paths:
+      - ".github/quality/**"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/quality-scripts.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Triage bot tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -m unittest discover -s .github/quality/tests -v

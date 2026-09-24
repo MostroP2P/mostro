@@ -54,11 +54,17 @@ jobs:
           mkdir -p baseline
           echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      # Ortsom is a private repository: GITHUB_TOKEN cannot read it, so it is
+      # fetched with a read-only deploy key (secret ORTSOM_DEPLOY_KEY, deploy
+      # key `mostro-ci` on MostroP2P/ortsom). The key is only handed to this
+      # step and not left in the git config for the steps that follow.
       - uses: actions/checkout@v6
         with:
           repository: MostroP2P/ortsom
           ref: ${{ steps.pin.outputs.ref }}
           path: ortsom
+          ssh-key: ${{ secrets.ORTSOM_DEPLOY_KEY }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
       # Ortsom's LND backend compiles gRPC stubs; runners ship no protoc.

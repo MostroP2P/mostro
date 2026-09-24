@@ -301,6 +301,10 @@ compares against those measurements.
 
 - **Triggers:** `push` to `main`, `schedule` every 6 hours, and
   `workflow_dispatch`.
+- **Harness access:** Ortsom is a private repository, internal to the
+  Mostro developers. `GITHUB_TOKEN` cannot read it, so the workflow checks
+  it out with a read-only deploy key (secret `ORTSOM_DEPLOY_KEY`, deploy
+  key `mostro-ci` on `MostroP2P/ortsom`), handed to that step only.
 - **What runs:** the **full** suite (`ortsom run` with no filter) against
   `ortsom stack up --ref <github.sha>`, with the pinned Ortsom. Full,
   because pull requests select different subsets and each one needs a
@@ -751,6 +755,13 @@ Baseline: about four scheduled runs a day plus one per merge.
 
 ## 14. Known gaps
 
+- **Pull requests from forks cannot fetch Ortsom.** A `pull_request` run
+  from a fork gets no secrets, so the deploy key of §5 is unavailable to
+  `ortsom-pr.yml` as designed in §6. Phase 3 has to split it: the
+  untrusted job only builds the mostrod image from the pull request and
+  uploads it; a trusted `workflow_run` job fetches Ortsom with the key
+  and runs the suite with `ortsom stack up --mostro-image`. That changes
+  §6 and §9 and is specified before Phase 3 starts.
 - **Bonds.** The regtest stack runs with `[anti_abuse_bond]` off, so the
   `bond` scenarios are always skipped: a pull request touching
   `src/app/bond/**` gets no signal. A bonds-enabled stack variant is

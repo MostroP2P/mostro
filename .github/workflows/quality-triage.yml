@@ -23,16 +23,17 @@ permissions:
   # The neutral "Contribution quality bar" check run on the head commit.
   checks: write
 
-concurrency:
-  group: quality-triage-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   triage:
     name: Triage
     if: >-
       (github.event.action != 'labeled' && github.event.action != 'unlabeled')
       || github.event.label.name == 'quality:exempt'
+    # On the job, not the workflow: a run whose job is skipped (any other
+    # label event) must not join the group and cancel a real triage.
+    concurrency:
+      group: quality-triage-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

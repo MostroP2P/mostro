@@ -195,6 +195,9 @@ def steps_blocks(body):
                 current = None
             else:
                 current[1].append(line)
+    # CommonMark closes an unterminated fence at the end of the document.
+    if current is not None:
+        blocks.append("\n".join(current[1]))
     return blocks
 
 
@@ -264,7 +267,8 @@ def steps_errors(block):
     except RecursionError:
         return ["nested too deeply"]
     steps = doc.get("step")
-    if set(doc) != {"step"} or not isinstance(steps, list) or not steps:
+    if (set(doc) != {"step"} or not isinstance(steps, list) or not steps
+            or not all(isinstance(s, dict) for s in steps)):
         return ["expected one or more `[[step]]` tables and nothing else"]
     errors = [e for i, step in enumerate(steps, 1) for e in validate_step(i, step)]
     if sum(1 for s in steps if s.get("fails_on_main") is True) > 1:
@@ -287,7 +291,7 @@ def check_fix_has_test(files, is_fix):
         return Check("fix-has-test", True)
     adds_test = any(
         TEST_ATTRIBUTE.match(line)
-        for f in files if f.patch
+        for f in files if f.patch and f.filename.endswith(".rs")
         for line in f.patch.split("\n")
     )
     # GitHub omits the patch of a large file; a test there cannot be ruled out.

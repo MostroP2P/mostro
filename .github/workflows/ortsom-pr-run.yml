@@ -1,0 +1,290 @@
+name: Ortsom PR run
+
+# Trusted half of the Ortsom e2e gate (docs/ORTSOM_PR_E2E_SPEC.md § 6.2,
+# § 9). Triggered when `Ortsom PR` finishes; GitHub runs this file as it is
+# on main, with secrets. `resolve` ties the run to its pull request; `suite`
+# fetches the private harness with the deploy key, loads the image the pull
+# request built and runs the scenarios main's map selects. Pull request code
+# only ever runs inside the daemon's container. For a pull request from a
+# fork the suite waits for a maintainer in the `ortsom-fork` environment.
+#
+# Phase 3b: the result is an artifact only. Labels and the comment come
+# with the verdict job (Phase 3c).
+
+on:
+  workflow_run:
+    workflows: [Ortsom PR]
+    types: [completed]
+  # For maintainers: re-run the trusted side for one `Ortsom PR` run.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the `Ortsom PR` run to resolve and test
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: ortsom=info
+  ORTSOM: ./target/release/ortsom --config ortsom.regtest.toml
+  TRIGGER_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+
+jobs:
+  resolve:
+    name: Resolve
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: read
+      contents: read
+    outputs:
+      proceed: ${{ steps.resolve.outputs.proceed }}
+      reason: ${{ steps.resolve.outputs.reason }}
+      pr: ${{ steps.resolve.outputs.pr }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      fork: ${{ steps.resolve.outputs.fork }}
+      image: ${{ steps.resolve.outputs.image }}
+      ortsom_ref: ${{ steps.resolve.outputs.ortsom_ref }}
+      ortsom_ref_overridden: ${{ steps.resolve.outputs.ortsom_ref_overridden }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # An irrelevant label event uploads nothing; resolve then rejects.
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: ortsom-pr
+          path: ortsom-pr
+          run-id: ${{ env.TRIGGER_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Resolve
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          python3 .github/ortsom/resolve_run.py resolve --meta ortsom-pr/meta.json \
+            ${RUN_ID:+--run-id "$RUN_ID"}
+
+  suite:
+    name: Suite
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    # A fork's code waits here for grunch, Catrya or arkanoider (§ 9.3).
+    environment: ${{ needs.resolve.outputs.fork == 'true' && 'ortsom-fork' || '' }}
+    timeout-minutes: 330
+    permissions:
+      actions: read
+      pull-requests: read
+      contents: read
+    concurrency:
+      group: ortsom-pr-run-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: true
+    env:
+      PR: ${{ needs.resolve.outputs.pr }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+      BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+      IMAGE_STATE: ${{ needs.resolve.outputs.image }}
+      ORTSOM_REF: ${{ needs.resolve.outputs.ortsom_ref }}
+      OVERRIDDEN: ${{ needs.resolve.outputs.ortsom_ref_overridden }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: mostro
+          persist-credentials: false
+
+      - name: Trusted selection
+        id: select
+        working-directory: mostro
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ../result
+          python3 .github/ortsom/resolve_run.py changes --pr "$PR" --out "$RUNNER_TEMP/changes.txt"
+          if ! python3 .github/ortsom/select_scenarios.py \
+              --changes "$RUNNER_TEMP/changes.txt" --out ../result/selection.json; then
+            echo "state=selection_error" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mode="$(jq -r .mode ../result/selection.json)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = none ]; then state=not_run
+          elif [ "$IMAGE_STATE" = build_failed ]; then state=build_failed
+          elif [ "$IMAGE_STATE" != built ]; then state=no_image
+          else state=go; fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      # The only step that sees the deploy key (§ 5, § 9.3).
+      - uses: actions/checkout@v6
+        if: steps.select.outputs.state == 'go'
+        with:
+          repository: MostroP2P/ortsom
+          ref: ${{ env.ORTSOM_REF }}
+          path: ortsom
+          ssh-key: ${{ secrets.ORTSOM_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.select.outputs.state == 'go'
+      - uses: taiki-e/install-action@v2
+        if: steps.select.outputs.state == 'go'
+        with:
+          tool: protoc
+      # Restores the baseline's cache and never saves: this job runs pull
+      # request code later on, so nothing it leaves behind is cached.
+      - uses: Swatinem/rust-cache@v2
+        if: steps.select.outputs.state == 'go'
+        with:
+          workspaces: ortsom
+          shared-key: ortsom
+          save-if: false
+
+      # Build, then keep only what the stack runs from: no sources, no
+      # intermediate build output, before any pull request image loads.
+      - name: Build Ortsom
+        if: steps.select.outputs.state == 'go'
+        working-directory: ortsom
+        run: |
+          cargo build --release --bin ortsom
+          cp target/release/ortsom "$RUNNER_TEMP/ortsom"
+          rm -rf target crates .git
+          mkdir -p target/release
+          mv "$RUNNER_TEMP/ortsom" target/release/ortsom
+
+      - name: Check the registry
+        id: registry
+        if: steps.select.outputs.state == 'go'
+        working-directory: ortsom
+        run: |
+          stale=false
+          if [ "$OVERRIDDEN" != true ] && ! diff -q \
+              <(./target/release/ortsom list --json 2>/dev/null | jq -S .) \
+              <(jq -S . ../mostro/.github/ortsom/scenarios.json) >/dev/null; then
+            stale=true
+          fi
+          echo "stale=$stale" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        if: steps.select.outputs.state == 'go'
+        with:
+          name: ortsom-pr-image
+          path: image
+          run-id: ${{ env.TRIGGER_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      # The tar is untrusted: it must hold exactly the one image the pull
+      # request claims, or it could replace an image the stack trusts
+      # (LND, bitcoind, the relay) that compose would then use unpulled.
+      - name: Load the image
+        id: load
+        if: steps.select.outputs.state == 'go'
+        run: |
+          set +e
+          loaded="$(zstd -dc image/mostro.tar.zst | docker load 2>&1)"
+          echo "$loaded"
+          expected="Loaded image: ortsom-pr/mostro:$HEAD_SHA"
+          label="$(docker image inspect "ortsom-pr/mostro:$HEAD_SHA" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null)"
+          if [ "$loaded" = "$expected" ] && [ "$label" = "$HEAD_SHA" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::image rejected: expected only $expected with that revision label"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bring up the stack
+        id: stack
+        if: steps.load.outputs.ok == 'true'
+        working-directory: ortsom
+        run: |
+          set +e
+          $ORTSOM stack up --mostro-image "ortsom-pr/mostro:$HEAD_SHA"
+          case "$?" in
+            0) stack=ok ;;
+            4) stack=daemon_failed ;;
+            *) stack=infra_failed ;;
+          esac
+          if [ "$stack" = ok ] && ! $ORTSOM doctor; then
+            stack=doctor_failed
+          fi
+          echo "stack=$stack" >> "$GITHUB_OUTPUT"
+
+      - name: Run the selected scenarios
+        if: steps.stack.outputs.stack == 'ok'
+        working-directory: ortsom
+        timeout-minutes: 300
+        run: |
+          set +e -o pipefail
+          mkdir -p artifacts
+          args=(--jobs 1)
+          if [ "$(jq -r .mode ../result/selection.json)" != full ]; then
+            mapfile -t names < <(jq -r '.scenarios[]' ../result/selection.json)
+            args+=("${names[@]}")
+          fi
+          $ORTSOM run "${args[@]}" 2>&1 | tee ../result/suite.log
+          echo "$?" > ../result/suite_exit
+
+      - name: Write meta.json
+        if: always()
+        env:
+          SELECT_STATE: ${{ steps.select.outputs.state }}
+          LOAD_OK: ${{ steps.load.outputs.ok }}
+          STACK: ${{ steps.stack.outputs.stack }}
+          STALE: ${{ steps.registry.outputs.stale || 'false' }}
+        run: |
+          mkdir -p result
+          summary="$(find ortsom/artifacts -name summary.json -print -quit 2>/dev/null || true)"
+          [ -n "$summary" ] && cp "$summary" result/summary.json
+          if [ "$SELECT_STATE" != go ]; then stack="${SELECT_STATE:-infra_failed}"
+          elif [ "$LOAD_OK" != true ]; then stack=bad_image
+          else stack="${STACK:-infra_failed}"; fi
+          exit_code=null
+          [ -f result/suite_exit ] && exit_code="$(cat result/suite_exit)"
+          jq -n --argjson pr "$PR" --arg head "$HEAD_SHA" --arg base "$BASE_SHA" \
+            --arg ref "$ORTSOM_REF" --argjson overridden "$OVERRIDDEN" --argjson stale "$STALE" \
+            --arg stack "$stack" --argjson suite_exit "$exit_code" \
+            '{pr: $pr, head_sha: $head, base_sha: $base, ortsom_ref: $ref,
+              ortsom_ref_overridden: $overridden, registry_stale: $stale,
+              skipped: null, stack: $stack, suite_exit: $suite_exit}' > result/meta.json
+          cat result/meta.json
+          {
+            echo "## Ortsom on #$PR at \`${HEAD_SHA::12}\`"
+            echo
+            echo "Ortsom \`$ORTSOM_REF\`, selection \`$(jq -r '.mode // "?"' result/selection.json 2>/dev/null)\`, stack \`$stack\`"
+            if [ -f result/summary.json ]; then
+              echo
+              jq -r '"| scenario | outcome |", "|---|---|", (.results[] | "| \(.name) | \(.outcome) |")' result/summary.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel orphaned orders
+        if: always() && hashFiles('ortsom/ortsom.regtest.local.toml') != ''
+        working-directory: ortsom
+        run: $ORTSOM cleanup
+
+      - name: Collect logs
+        if: always() && steps.load.outputs.ok == 'true'
+        run: |
+          docker compose -f ortsom/ci/regtest/compose.yml --profile daemon logs \
+            --no-color --timestamps > result/stack.log 2>&1 || true
+          [ -d ortsom/artifacts ] && cp -r ortsom/artifacts result/ortsom-artifacts || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ortsom-pr-result
+          path: result/
+          retention-days: 30
+
+      - name: Tear down
+        if: always() && steps.load.outputs.ok == 'true'
+        working-directory: ortsom
+        run: |
+          $ORTSOM stack down \
+            || docker compose -f ci/regtest/compose.yml --profile daemon down -v

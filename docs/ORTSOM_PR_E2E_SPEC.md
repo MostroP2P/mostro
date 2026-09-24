@@ -442,6 +442,11 @@ request that bumps `ortsom_ref`.
   `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 330 min, suite
   step 300 min, as in §5.
 - **Job `verdict`**: see §7 and §9.1.
+- **`workflow_dispatch`** with the ID of an `ortsom-pr.yml` run re-runs
+  `resolve` and `suite` for it, for maintainers.
+- **Rust cache:** `suite` restores the baseline's Ortsom build cache
+  (`shared-key: ortsom`) and never saves one, since it runs pull request
+  code afterwards.
 
 Steps of `suite`:
 
@@ -465,7 +470,10 @@ Steps of `suite`:
    `github-token: ${{ github.token }}`, which `actions: read` allows; by
    default it only sees the current run) and `docker load` it. Exactly
    one image, tagged `ortsom-pr/mostro:<head_sha>`, with that revision
-   label, or the outcome is `inconclusive`, reason `bad-image`.
+   label, or the outcome is `inconclusive`, reason `bad-image`. `docker load`
+   must report exactly that one image: a tar that also carries another
+   tag could replace an image the stack trusts (LND, bitcoind, the
+   relay), which compose would then start without pulling.
 4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`.
    Compose starts a local image without pulling it. Exit 0 is `ok`, 4 is
    `daemon_failed`, anything else `infra_failed` (3 cannot happen: there
@@ -495,6 +503,12 @@ Artifact `ortsom-pr-result` contains `meta.json`:
   "suite_exit": 1
 }
 ```
+
+`stack` is one of `ok`, `daemon_failed`, `infra_failed`,
+`doctor_failed` (as for the baseline), `build_failed` (the image build
+failed in `ortsom-pr.yml`), `bad_image` (step 3), `no_image` (the PR run
+skipped the build but the trusted selection is not `none`),
+`selection_error` or `not_run` (trusted selection `none`).
 
 plus `selection.json`, `summary.json` (if the run happened), `suite.log`,
 `stack.log` and Ortsom's per-scenario artifacts. This artifact is

@@ -71,9 +71,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: protoc
+      # Shared with ortsom-pr-run.yml's suite job, which restores this
+      # cache and never saves one of its own.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ortsom
+          shared-key: ortsom
 
       # Ortsom publishes no release binaries; build the pinned tag.
       - name: Build Ortsom

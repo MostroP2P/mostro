@@ -291,27 +291,27 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     }
 }
 
-fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    // `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
-    // state (Phase 1.5). On the wire it publishes as `pending` (per
-    // `create_status_tags`), so range-order min/max advertising must
-    // mirror the `Pending` branch — otherwise the bond window would
-    // expose a single `fiat_amount` and clients would think the order
-    // had moved out of the range-takeable state.
-    if order.status == Status::Pending.to_string()
+/// `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
+/// state (Phase 1.5). On the wire it publishes as `pending` (per
+/// `create_status_tags`), so `fa` must treat it exactly like `Pending`.
+/// Otherwise the bond window would expose a single `fiat_amount` and
+/// clients would think a range order had left the takeable state.
+fn publishes_as_pending(order: &Order) -> bool {
+    order.status == Status::Pending.to_string()
         || order.status == Status::WaitingTakerBond.to_string()
-    {
-        match (order.min_amount, order.max_amount) {
-            (Some(min), Some(max)) => {
-                vec![min.to_string(), max.to_string()]
-            }
-            _ => {
-                vec![order.fiat_amount.to_string()]
-            }
+}
+
+fn create_fiat_amt_array(order: &Order) -> Vec<String> {
+    // While the order publishes as `pending`, a range order advertises
+    // its [min, max] — otherwise the bond window would expose a single
+    // `fiat_amount` and clients would think the order had moved out of
+    // the range-takeable state.
+    if publishes_as_pending(order) {
+        if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
+            return vec![min.to_string(), max.to_string()];
         }
-    } else {
-        vec![order.fiat_amount.to_string()]
     }
+    vec![order.fiat_amount.to_string()]
 }
 
 pub(crate) fn create_platform_tag_values(instance_name: Option<&str>) -> Vec<String> {
@@ -1732,10 +1732,45 @@ mod tests {
             vec!["42".to_string()]
         );
 
+        // Bond window still publishes as pending, so the range stays.
+        order.status = Status::WaitingTakerBond.to_string();
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["10".to_string(), "100".to_string()]
+        );
+
         // Taken (active) order → exact amount even if min/max present.
         order.status = Status::Active.to_string();
         order.fiat_amount = 55;
         assert_eq!(super::create_fiat_amt_array(&order), vec!["55".to_string()]);
+    }
+
+    /// Issue #927: any publish of a range order in `WaitingTakerBond`
+    /// (e.g. the orderbook reconciler, from the DB row) must match the
+    /// `Pending` event: `s: pending`, `amt: 0`, `fa: [min, max]`.
+    #[test]
+    fn waiting_taker_bond_range_order_publishes_unpriced_range() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::WaitingTakerBond.to_string();
+        order.amount = 0;
+        order.fiat_amount = 0;
+        order.min_amount = Some(500_000);
+        order.max_amount = Some(2_000_000);
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("WaitingTakerBond must produce a publishable event");
+
+        let fa: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .find(|v| v[0] == "fa")
+            .expect("fa tag present")[1..]
+            .to_vec();
+        assert_eq!(get_tag_value(&tags, "s").as_deref(), Some("pending"));
+        assert_eq!(get_tag_value(&tags, "amt").as_deref(), Some("0"));
+        assert_eq!(fa, vec!["500000".to_string(), "2000000".to_string()]);
     }
 
     // ── create_status_tags remaining arms ────────────────────────────────

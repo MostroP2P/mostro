@@ -430,7 +430,9 @@ request that bumps `ortsom_ref`.
 - **Trigger:** `workflow_run` of `ortsom-pr.yml`, `completed`. The
   workflow definition, the scripts, `map.toml` and `scenarios.json`
   always come from `main`.
-- **Job `resolve`** (`actions: read`, `pull-requests: read`): applies
+- **Job `resolve`** (`actions: read`, `pull-requests: read`): downloads
+  the `ortsom-pr` artifact from the triggering run the same way as the
+  image (step 3 below), applies
   every check of §9.1 to tie the run to its pull request, handles the
   skip and cancel cases, and outputs the pull request number, `head_sha`,
   `base_sha` and whether the head is a fork. Nothing else runs if it
@@ -459,7 +461,11 @@ Steps of `suite`:
    `ortsom list --json` with the snapshot; a mismatch is recorded as
    `registry_stale: true`, and the verdict is `inconclusive`, reason
    `stale-registry`.
-3. **Image.** Download `ortsom-pr-image` and `docker load` it. Exactly
+3. **Image.** Download `ortsom-pr-image` from the **triggering**
+   `ortsom-pr.yml` run (`actions/download-artifact` with
+   `run-id: ${{ github.event.workflow_run.id }}` and
+   `github-token: ${{ github.token }}`, which `actions: read` allows; by
+   default it only sees the current run) and `docker load` it. Exactly
    one image, tagged `ortsom-pr/mostro:<head_sha>`, with that revision
    label, or the outcome is `inconclusive`, reason `bad-image`.
 4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`.

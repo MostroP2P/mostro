@@ -142,6 +142,16 @@ class TemplateTest(unittest.TestCase):
         body = GOOD_BODY.replace("## Blast radius\n", "```text\n## Blast radius\n```\n")
         self.assertIn("Section `Blast radius` is missing or empty", failing(evaluate(pr(body=body)))["template"])
 
+    def test_fence_with_a_rich_info_string_closes(self):
+        for info in ("rust,ignore", "text title=x", "console $"):
+            with self.subTest(info=info):
+                body = GOOD_BODY.replace("## Blast radius\n", f"```{info}\nlet x = 1;\n```\n\n## Blast radius\n")
+                self.assertEqual(failing(evaluate(pr(body=body))), {})
+
+    def test_backtick_in_a_backtick_fence_info_string_is_not_a_fence(self):
+        body = GOOD_BODY.replace("## Blast radius\n", "```a`b\n\n## Blast radius\n")
+        self.assertEqual(failing(evaluate(pr(body=body))), {})
+
     def test_body_beyond_the_limit_is_not_read(self):
         padding = "x" * CONFIG["limits"]["max_body_bytes"]
         self.assertIn("template", failing(evaluate(pr(body=padding + GOOD_BODY))))
@@ -344,6 +354,11 @@ class StepsSyntaxTest(unittest.TestCase):
             with self.subTest(block=block):
                 reasons = failing(evaluate(pr(body=self.body_with(block))))["steps-syntax"]
                 self.assertTrue(reasons[0].startswith("`ortsom-steps`: "))
+
+    def test_block_with_extra_info_words_is_checked(self):
+        body = GOOD_BODY + '\n```ortsom-steps v1\n[[step]]\nactor = "alice"\ndo = "sleep"\n```\n'
+        reasons = failing(evaluate(pr(body=body)))["steps-syntax"]
+        self.assertIn("unknown action `sleep`", reasons[0])
 
     def test_unterminated_block_is_still_checked(self):
         body = GOOD_BODY + '\n```ortsom-steps\n[[step]]\nactor = "alice"\ndo = "sleep"\n'

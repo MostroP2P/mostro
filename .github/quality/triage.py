@@ -143,6 +143,15 @@ def normalize(text):
     return "\n".join(line for line in lines if line)
 
 
+def code(value, limit=40):
+    """Attacker text as a Markdown code span it cannot break out of: no
+    backticks or line breaks (which would turn `@name` into a live mention
+    in the bot's comment), and no more than `limit` characters."""
+    text = re.sub(r"[`\r\n]", "'", str(value))
+    text = text if len(text) <= limit else text[: limit - 1] + "…"
+    return f"`{text or ' '}`"
+
+
 def plain(text):
     """Lowercase text without Markdown emphasis or code marks."""
     return re.sub(r"[*_`]", "", text).lower()
@@ -234,13 +243,13 @@ def validate_step(i, step):
         if not isinstance(step.get("actor"), str) or not isinstance(step.get("do"), str):
             errors.append(f"step {i}: `actor` and `do` must both be strings")
         elif step["do"] not in STEP_ACTIONS:
-            errors.append(f"step {i}: unknown action `{step['do']}`")
-    elif step["expect"] not in STEP_EXPECTATIONS:
-        errors.append(f"step {i}: unknown expectation `{step['expect']}`")
+            errors.append(f"step {i}: unknown action {code(step['do'])}")
+    elif not isinstance(step["expect"], str) or step["expect"] not in STEP_EXPECTATIONS:
+        errors.append(f"step {i}: unknown expectation {code(step['expect'])}")
     if not isinstance(step.get("fails_on_main", False), bool):
         errors.append(f"step {i}: `fails_on_main` must be true or false")
     errors += [
-        f"step {i}: `{key}` must be a string, number or boolean"
+        f"step {i}: {code(key)} must be a string, number or boolean"
         for key, value in step.items()
         if not isinstance(value, (str, int, float, bool))
     ]
@@ -252,6 +261,8 @@ def steps_errors(block):
         doc = tomllib.loads(block)
     except tomllib.TOMLDecodeError as e:
         return [f"not valid TOML ({e})"]
+    except RecursionError:
+        return ["nested too deeply"]
     steps = doc.get("step")
     if set(doc) != {"step"} or not isinstance(steps, list) or not steps:
         return ["expected one or more `[[step]]` tables and nothing else"]

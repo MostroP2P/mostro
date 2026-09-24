@@ -314,6 +314,24 @@ class StepsSyntaxTest(unittest.TestCase):
         reasons = failing(evaluate(pr(body=self.body_with('[[step]]\nactor = "alice"\ndo = "sleep"'))))
         self.assertIn("unknown action `sleep`", reasons["steps-syntax"][0])
 
+    def test_attacker_text_cannot_break_out_of_the_code_span(self):
+        block = '[[step]]\nactor = "a"\ndo = "x` @maintainer `y"\n\n[[step]]\nexpect = "s"\n"k`@m\\nz" = 1'
+        reasons = failing(evaluate(pr(body=self.body_with(block))))["steps-syntax"]
+        for reason in reasons:
+            body = reason.split("`", 1)[1]
+            self.assertEqual(reason.count("`") % 2, 0, reason)
+            self.assertNotIn("\n", reason)
+            self.assertNotIn("` @", body)
+
+    def test_deeply_nested_toml_is_rejected_not_crashing(self):
+        block = "[[step]]\nexpect = \"status\"\nx = " + "[" * 5000 + "]" * 5000
+        reasons = failing(evaluate(pr(body=self.body_with(block))))["steps-syntax"]
+        self.assertTrue(reasons[0].startswith("`ortsom-steps`: "))
+
+    def test_non_string_expectation_is_rejected_not_crashing(self):
+        reasons = failing(evaluate(pr(body=self.body_with('[[step]]\nexpect = [1]'))))["steps-syntax"]
+        self.assertTrue(reasons)
+
     def test_step_must_be_action_or_expectation(self):
         block = '[[step]]\nactor = "alice"\ndo = "release"\nexpect = "status"'
         self.assertIn("steps-syntax", failing(evaluate(pr(body=self.body_with(block)))))

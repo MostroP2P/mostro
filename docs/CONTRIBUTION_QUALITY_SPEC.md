@@ -679,6 +679,13 @@ close them with a clear, written reason.
 
 ## 14. Known gaps
 
+- **`fix-has-test` fails open on large diffs.** GitHub omits the patch
+  of a very large file, and the bot then cannot rule out a test in it,
+  so it passes. Failing closed would flag legitimate large pull
+  requests; the red test (§8) reads the commits themselves.
+- **The type is self-declared.** A fix described as `feat` skips the
+  `(fails on main)` step and `fix-has-test`. The reviewer still sees the
+  diff, and a wrong type is a close reason under §3.3.
 - **A description can be fabricated.** A plausible Manual testing
   section can be written without running anything. Until Phase 5 makes
   the steps executable, the defence is a reviewer following them, and

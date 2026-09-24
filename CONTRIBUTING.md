@@ -70,9 +70,11 @@ Fill in every section of [`.github/pull_request_template.md`](.github/pull_reque
 
 ### Manual testing
 
-The **Manual testing** section is a step-by-step procedure that tests this specific pull request end to end, against a running mostrod. A reviewer must be able to follow it and see the same results.
+The **Manual testing** section is a step-by-step procedure that tests this specific pull request end to end, against a running mostrod. **A person runs it by hand** and writes down what they saw; a reviewer must be able to follow the same steps and see the same results.
 
-- **Setup** says which environment and configuration you used: the [Ortsom](https://github.com/MostroP2P/ortsom) regtest stack (`ortsom stack up --ref <branch>`) or a local mostrod with its own LND; which `settings.toml` keys differ from `settings.tpl.toml`; and which client each actor uses (mostro-cli, Mostro Mobile, Ortsom).
+Mostro's developers also run end-to-end suites in CI with an internal tool (Ortsom). It is not available to external contributors and nothing here requires it: you test with the same software an operator and a user run.
+
+- **Setup** says which environment and configuration you used: a mostrod built from your branch, with its own LND (regtest, signet or testnet) and a relay (`make docker-relay-up` starts a local one); which `settings.toml` keys differ from `settings.tpl.toml`; and which client each actor uses (mostro-cli or Mostro Mobile).
 - **Steps** are numbered. Each step names one actor (seller, buyer, solver, operator), one action, and an `Expected:` line with an observable result: an order status on the public event (kind 38383), a dispute status (kind 38386), a message action received by an actor, a payment settled or refunded, a log line, or a database row.
 - **For a fix**, one step is marked **(fails on `main`)** and also says what `main` does instead. If no step fails on `main`, the pull request has not shown that the bug exists.
 - **Regression**: at least one step exercises a neighbouring flow named in **Blast radius** and shows it behaves as before.
@@ -84,9 +86,10 @@ Example, for a fix where a release during a dispute must close the dispute as `r
 ```markdown
 ### Setup
 
-Ortsom regtest stack: `ortsom stack up --ref <branch>`.
-Default settings. Seller and buyer on mostro-cli; solver on mostro-cli
-with the admin key.
+mostrod built from this branch, on regtest with its own LND and a local
+relay (`make docker-relay-up`). Default settings. Seller and buyer on
+mostro-cli with two funded LND nodes; solver on mostro-cli with the
+admin key.
 
 ### Steps
 

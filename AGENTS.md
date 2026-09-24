@@ -46,7 +46,9 @@ If you are an AI agent preparing a pull request, follow
 - Link an issue labelled `status: accepted` (`Closes #N`). If there is no
   accepted issue, do not open the pull request; comment on the issue instead.
 - Fill in every section of `.github/pull_request_template.md`, including
-  Manual testing with steps you actually ran against a mostrod.
+  Manual testing: steps a person ran by hand against a mostrod, with
+  mostro-cli or Mostro Mobile. Do not present steps nobody ran as results.
+  Ortsom is an internal tool of the Mostro developers; do not use or cite it.
 - For a fix, the first commit is `test:` and adds a regression test that
   fails on `main`.
 - If you could not build or run mostrod, say so in the pull request instead

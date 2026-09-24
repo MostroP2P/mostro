@@ -1,6 +1,6 @@
 # Ortsom on Pull Requests — Automated E2E Gate
 
-**Status:** Phase 2 (selection, map and `main` baseline). Phase 3 pending
+**Status:** Phase 2 (selection, map and `main` baseline). Phase 3 pending; §6 and §9 redesigned for a private Ortsom
 **Harness:** [MostroP2P/ortsom](https://github.com/MostroP2P/ortsom)
 **Initial mode:** label-only (shadow). Pull requests are never closed until
 Phase 5 is explicitly enabled.
@@ -54,24 +54,34 @@ wallet without fault injection) is **skipped**, never failed.
 
 ## 3. Architecture
 
-Three workflows in this repository, plus one small release of Ortsom.
+Four workflows in this repository, plus one small release of Ortsom.
+
+Ortsom is a private repository (§5): only a workflow with secrets can
+fetch it, and a pull request from a fork runs without secrets. So the
+pull request's code is **compiled** in a workflow that has no secrets,
+and the **suite runs** in a workflow that has the key but only ever
+executes the pull request's code inside the daemon's container.
 
 ```text
 push to main ─┐
-cron (6 h) ───┴─► ortsom-baseline.yml ──► artifact ortsom-baseline (per main SHA)
-                                                     │
-pull_request ───► ortsom-pr.yml ──► artifact ortsom-pr (selection + summary)
-                                                     │
-                  workflow_run(completed) ──► ortsom-verdict.yml
-                                               - trusted code from main only
-                                               - recompute selection
-                                               - fetch baseline for merge-base
-                                               - compute verdict
-                                               - sticky comment + labels
+cron (6 h) ───┴─► ortsom-baseline.yml ─► artifact ortsom-baseline (per main SHA)
+                                                         │
+pull_request ──► ortsom-pr.yml         untrusted: no secrets, read-only token
+                  - build the mostrod image from the PR
+                  - artifacts ortsom-pr (meta.json), ortsom-pr-image
+                        │
+workflow_run ──► ortsom-pr-run.yml     definition from main
+                  job resolve   verify the PR owns the run; skip, cancel
+                  job suite     deploy key for the Ortsom checkout only
+                                - trusted selection, build Ortsom
+                                - docker load, stack up --mostro-image
+                                - artifact ortsom-pr-result
+                  job verdict   pull-requests: write; never runs PR code
+                                - baseline for the merge-base ◄──┘
+                                - verdict, sticky comment, labels
 ```
 
-The split between `ortsom-pr.yml` and `ortsom-verdict.yml` is a security
-boundary, see §9.
+The boundaries between these jobs are security boundaries, see §9.
 
 All selection and verdict logic lives in version-controlled scripts under
 `.github/ortsom/`, with unit tests, so the workflows stay thin.
@@ -81,7 +91,8 @@ All selection and verdict logic lives in version-controlled scripts under
 ├── map.toml             # path → scenario rules and gate settings
 ├── scenarios.json       # `ortsom list --json` of the pinned Ortsom, committed
 ├── select_scenarios.py  # changed files → selection.json
-├── verdict.py           # PR summary + baselines → verdict.json + comment.md
+├── verdict.py           # PR result + baselines → verdict.json + comment.md
+├── mostro.Dockerfile    # the daemon image recipe, mirrored from Ortsom (§6.1)
 └── tests/               # unittest suites for both scripts
 ```
 
@@ -330,7 +341,13 @@ Scheduled reruns on an unchanged `main` are intentional: they build the
 per-scenario history that the stability rule (§7.2) uses to exclude
 flaky scenarios.
 
-## 6. Pull request run — `ortsom-pr.yml`
+## 6. Pull request run
+
+Two workflows: `ortsom-pr.yml` compiles the pull request without
+secrets, and `ortsom-pr-run.yml` runs the suite against the result with
+the Ortsom deploy key (§3, §9.3).
+
+### 6.1 Image build — `ortsom-pr.yml`
 
 - **Trigger:** `pull_request` on `opened`, `synchronize`, `reopened`,
   `ready_for_review`, `labeled` and `unlabeled`, targeting `main`.
@@ -341,60 +358,116 @@ flaky scenarios.
   below, removing it runs the suite, and adding or removing
   `ortsom:expected-break` re-runs so the verdict reflects the cap. Any
   other label event is **irrelevant**: every job's `if` is false, no
-  artifact is uploaded, and the verdict workflow, finding no artifact,
+  artifact is uploaded, and `ortsom-pr-run.yml`, finding no artifact,
   leaves the pull request untouched.
 - **Skipped when:** the pull request is a draft, or carries
-  `ortsom:skip`, or is authored by `dependabot[bot]`. A skip still runs
-  the map coverage job (§4.4) and one cheap job that uploads the
-  `ortsom-pr` artifact with only `meta.json`, carrying `skipped` and its
-  reason, so the verdict workflow always has something to act on
-  (removing stale verdict labels, removing `ortsom:run`).
-- **Concurrency:** on the suite job, not on the workflow: group
+  `ortsom:skip`, or is authored by `dependabot[bot]`. A skip runs one
+  cheap job that uploads the `ortsom-pr` artifact with only `meta.json`,
+  carrying `skipped` and its reason, so the trusted side always has
+  something to act on (removing stale verdict labels, removing
+  `ortsom:run`). The map coverage test (§4.4) runs in `ortsom-map.yml`
+  whatever this workflow does.
+- **Concurrency:** on the build job, not on the workflow: group
   `ortsom-pr-<number>`, `cancel-in-progress: true`. GitHub applies a
   workflow-level group before any job's `if` is evaluated, so there an
-  irrelevant label event would cancel a suite already in flight — up to
-  a `full` run of more than two hours. A job whose `if` is false never
-  enters its group. The skip job joins the same group, so adding
-  `ortsom:skip` cancels a suite already in flight instead of letting it
-  finish and report after the skip. The map coverage job stays out of
-  it.
-- **Timeout:** suite job 330 min, suite step 300 min, as in §5.
-- **Permissions:** `contents: read` only. No secrets. This workflow never
-  adds or removes a label or writes a comment; every change to the pull
-  request is made by `ortsom-verdict.yml` (§9.1).
+  irrelevant label event would cancel a build already in flight. The skip
+  job joins the same group.
+- **Timeout:** 60 min.
+- **Permissions:** `contents: read` only. No secrets. It never touches
+  the pull request and never sees Ortsom.
 
 Steps:
 
-1. **Select.** Check out the pull request's merge commit (the
-   `pull_request` default) with full history (`fetch-depth: 0`, so the
-   base SHA, the head SHA and their merge-base are all present). The
-   `map.toml`, `scenarios.json` and `ortsom_ref` of the run come from that
-   checkout, i.e. from the current `main` plus the pull request's own
-   changes. List changed files with
-   `git diff --name-status <base_sha>...<head_sha>`, run `select_scenarios.py`. If
-   `mode` is `none`, upload the artifact and stop.
-2. **Harness.** Check out `MostroP2P/ortsom` at `ortsom_ref` — or at the
-   override of §8.2 — and `cargo build --release` it (Swatinem cache).
-   Ortsom publishes no release binaries today; the build is cached across
-   runs.
-3. **Stack.** `ortsom stack up --ref <head_sha>`. Its exit code (§10,
-   item C) classifies the outcome: 0 is `ok`, 3 is `build_failed`, 4 is
-   `daemon_failed`, anything else is `infra_failed`. An exit code 3 is
-   retried once before it is recorded, because a download failing inside
-   the image build looks the same as mostro not compiling.
-4. **Readiness.** If the stack is `ok`, `ortsom doctor`. A non-zero exit
-   turns the outcome into `doctor_failed`. By then `stack up` has already
-   seen the daemon publish its info event, so what `doctor` still catches
-   is mostly the rest of the world (relay reachability, wallet
-   funding, the limits in the settings template) — not something to
-   blame on the pull request. The outcome is recorded in `meta.json`.
-5. **Run.** Only if the outcome is `ok`: `ortsom run <scenarios…>` (or no
-   filter for `full`), `--jobs 1`. Its exit code is recorded in
-   `meta.json` as `suite_exit`; a step timeout records `null`.
-6. **Always:** `ortsom cleanup`, collect `stack.log`, upload artifact
-   `ortsom-pr`, `ortsom stack down`.
+1. **Select, to save work.** Check out the merge commit with full
+   history, list changed files with
+   `git diff --name-status <base_sha>...<head_sha>` and run
+   `select_scenarios.py`. If `mode` is `none`, upload `meta.json` with
+   `image: "not-needed"` and stop. This selection only avoids a useless
+   build; the one that counts is recomputed on the trusted side (§6.2).
+2. **Build.** Check out `head_sha` (`persist-credentials: false`) and
+   build `.github/ortsom/mostro.Dockerfile` with that checkout as the
+   build context, tagged `ortsom-pr/mostro:<head_sha>`. A failed build is
+   retried once, because a download failing inside it looks the same as
+   mostro not compiling.
+3. **Hand over.** `docker save` the image, compressed, as artifact
+   `ortsom-pr-image` (retention 3 days), and `meta.json` as artifact
+   `ortsom-pr`:
 
-Artifact `ortsom-pr` contains `meta.json`:
+   ```json
+   {
+     "pr": 980,
+     "head_sha": "0123456789abcdef0123456789abcdef01234567",
+     "base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+     "skipped": null,
+     "image": "built"
+   }
+   ```
+
+   `image` is `built`, `build_failed` or `not-needed`.
+
+`.github/ortsom/mostro.Dockerfile` mirrors Ortsom's
+`ci/regtest/mostro.Dockerfile`, the recipe `ortsom stack up --ref` uses,
+with one difference: it compiles the build context instead of fetching
+the commit from GitHub, which also removes any question of whether a
+fork's commit can be fetched from this repository. The runtime stage,
+user and labels (`org.opencontainers.image.revision` = `head_sha`) are
+the same, so the stack runs it exactly as it runs an image it built
+itself. From Phase 3 the baseline (§5) builds `main` with this same file
+and runs it with `--mostro-image` too, so both sides of every comparison
+come from one recipe. The copy follows Ortsom's recipe in the pull
+request that bumps `ortsom_ref`.
+
+### 6.2 Suite — `ortsom-pr-run.yml`
+
+- **Trigger:** `workflow_run` of `ortsom-pr.yml`, `completed`. The
+  workflow definition, the scripts, `map.toml` and `scenarios.json`
+  always come from `main`.
+- **Job `resolve`** (`actions: read`, `pull-requests: read`): applies
+  every check of §9.1 to tie the run to its pull request, handles the
+  skip and cancel cases, and outputs the pull request number, `head_sha`,
+  `base_sha` and whether the head is a fork. Nothing else runs if it
+  rejects the run.
+- **Job `suite`** (`contents: read`, `actions: read`): for a pull
+  request from a fork it runs in the environment `ortsom-fork`, whose
+  required reviewers are the maintainers (§9.3). Concurrency group
+  `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 330 min, suite
+  step 300 min, as in §5.
+- **Job `verdict`**: see §7 and §9.1.
+
+Steps of `suite`:
+
+1. **Trusted selection.** Check out `main`. Fetch the changed files of
+   the pull request through the API and run `select_scenarios.py` with
+   `main`'s map. If `mode` is `none`, record it and stop. If the
+   `ortsom-pr` meta says `build_failed`, the outcome is `build_failed`
+   and nothing runs; `not-needed` while the trusted selection is not
+   `none` is `inconclusive`, reason `no-image`.
+2. **Harness.** Check out `MostroP2P/ortsom` at `ortsom_ref`, or at the
+   override of §8.2, with the deploy key of §5, in that step only
+   (`persist-credentials: false`). `cargo build --release` it, then
+   delete everything the stack does not need at run time (keeping the
+   binary, `ci/regtest/` and the `ortsom.*.toml` configs). Compare
+   `ortsom list --json` with the snapshot; a mismatch is recorded as
+   `registry_stale: true`, and the verdict is `inconclusive`, reason
+   `stale-registry`.
+3. **Image.** Download `ortsom-pr-image` and `docker load` it. Exactly
+   one image, tagged `ortsom-pr/mostro:<head_sha>`, with that revision
+   label, or the outcome is `inconclusive`, reason `bad-image`.
+4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`.
+   Compose starts a local image without pulling it. Exit 0 is `ok`, 4 is
+   `daemon_failed`, anything else `infra_failed` (3 cannot happen: there
+   is nothing to build).
+5. **Readiness.** If the stack is `ok`, `ortsom doctor`; a non-zero exit
+   is `doctor_failed`. By then `stack up` has already seen the daemon
+   publish its info event, so what `doctor` still catches is mostly the
+   rest of the world, not something to blame on the pull request.
+6. **Run.** Only if the outcome is `ok`: `ortsom run <scenarios…>` (or no
+   filter for `full`), `--jobs 1`. Its exit code is recorded as
+   `suite_exit`; a step timeout records `null`.
+7. **Always:** `ortsom cleanup`, collect `stack.log`, upload artifact
+   `ortsom-pr-result`, `ortsom stack down`.
+
+Artifact `ortsom-pr-result` contains `meta.json`:
 
 ```json
 {
@@ -411,12 +484,15 @@ Artifact `ortsom-pr` contains `meta.json`:
 ```
 
 plus `selection.json`, `summary.json` (if the run happened), `suite.log`,
-`stack.log` and Ortsom's per-scenario artifacts.
+`stack.log` and Ortsom's per-scenario artifacts. This artifact is
+written by a job running `main`'s definition, so the
+pull request cannot forge it (§9.2).
 
-The job's own conclusion is **success** whenever the pipeline worked,
-whatever the scenarios did: a red check would duplicate the verdict and
-mislead during the shadow phase. The verdict lives in the label and the
-comment. Making the gate a required check is a Phase 5 decision.
+The workflows' own conclusions are **success** whenever the pipeline
+worked, whatever the scenarios did: a red check would duplicate the
+verdict and mislead during the shadow phase. The verdict lives in the
+label and the comment. Making the gate a required check is a Phase 5
+decision.
 
 ## 7. Verdict
 
@@ -441,8 +517,9 @@ comment. Making the gate a required check is a Phase 5 decision.
 5. No reference baseline → verdict `inconclusive`, reason
    `no-baseline`. After `ortsom_ref` is bumped on `main`, this is the
    verdict of every pull request whose merge-base predates the bump:
-   the PR run uses the new harness (step 1 of §6 reads the pin from the
-   merge commit), while every baseline on its walk used the old one. It
+   the suite runs with the pin of the current `main` (§6.2 reads it from
+   `main`, not from the pull request), while every baseline on its walk
+   used the old one. It
    stays so until the pull request merges or rebases onto a `main` whose
    new-harness baseline has finished, and the comment says so in those
    words. A pull request branched after the bump waits only for that
@@ -484,7 +561,7 @@ Evaluated in order; the first that applies wins.
 | Verdict | When | Label |
 |---|---|---|
 | `not-applicable` | selection `mode` is `none` | none; a previous `ortsom:*` verdict label is removed |
-| `inconclusive` | selection error, stale registry (§4.3), gate modified (§9.2), `stack` is `build_failed`, `infra_failed` or `doctor_failed`, incomplete run (§7.2), or no reference baseline | `ortsom:inconclusive` |
+| `inconclusive` | selection error, stale registry (§4.3), gate modified (§9.2), no or bad image (§6.2), `stack` is `build_failed`, `infra_failed` or `doctor_failed`, incomplete run (§7.2), or no reference baseline | `ortsom:inconclusive` |
 | `would-close` | `stack` is `daemon_failed` and no cap applies | `ortsom:would-close` |
 | `would-close` | `eligible ≥ min_scenarios` and `ratio ≥ close_ratio`, and no cap applies | `ortsom:would-close` |
 | `regression` | a `would-close` condition held but a cap applies, or at least one `regression` | `ortsom:regression` |
@@ -555,7 +632,11 @@ ortsom-ref: feat/new-action
 ```
 
 The PR run then uses that Ortsom ref: a branch, tag, commit or Ortsom
-pull request number, resolved on `MostroP2P/ortsom` only. Because the
+pull request number, resolved on `MostroP2P/ortsom` only. The `suite`
+job reads the line from the pull request body through the API, never
+from an artifact, and accepts only
+`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`; it fetches that ref with the same
+deploy key. Because the
 baseline was measured with the pinned Ortsom, the comparison mixes
 harness versions: the verdict is capped at `regression` and the comment
 says so.
@@ -566,42 +647,36 @@ adds a mandatory setting needs this path too.
 
 ## 9. Security
 
-### 9.1 Why two workflows
+### 9.1 Why the gate is split
 
 A `pull_request` run from a fork gets a read-only token and no secrets,
-which is what running untrusted code requires — but that token cannot
-label or comment. `ortsom-verdict.yml` is triggered by `workflow_run`,
-runs the workflow definition from `main` with a write token, and
-therefore:
+which is what compiling untrusted code requires, but it can neither
+fetch the private harness nor label or comment. `ortsom-pr-run.yml` is
+triggered by `workflow_run` and always runs `main`'s definition, with
+secrets and, per job, only the permissions that job needs. Its `resolve`
+job ties the run to a pull request before anything else happens:
 
-- **never checks out or executes pull request code**; it checks out
-  `main` only, for `verdict.py`, `select_scenarios.py`, `map.toml` and
-  `scenarios.json`;
-- ignores a triggering run whose conclusion is `skipped`: it was an
-  irrelevant label event (§6);
-- on a triggering run whose conclusion is `cancelled`, looks for a
+- it ignores a triggering run whose conclusion is `skipped`: it was an
+  irrelevant label event (§6.1);
+- on a triggering run whose conclusion is `cancelled`, it looks for a
   **successor**: a run of `ortsom-pr.yml` with the same
   `head_repository.full_name` and `head_branch`, created after the
   cancelled one. If there is one, it does nothing, because the successor
   will report. If there is none, the run was cancelled by hand. A
   cancelled run may not have uploaded an artifact, so the pull request is
   resolved from the run's head repository and branch, and checked as
-  below without the `meta` fields. The workflow then removes any verdict
-  label and `ortsom:run`, and rewrites the comment to say that the last
-  run was cancelled, that no verdict is current, and how to re-run;
-- before applying a suite result, re-reads the pull request. If it now
-  carries `ortsom:skip` or is a draft, the result is discarded and
-  handled as a skip: verdict labels are removed and no scenario results
-  are posted. The skip job cancels a suite in flight (§6), but a suite
-  that finished moments before can still report after the skip, and
-  this check makes both orders end in the same state;
-- treats the `ortsom-pr` artifact as **untrusted data**: parsed as JSON
-  with size limits, validated field by field (SHA format, known enum
-  values, integer PR number), never interpolated into shell commands;
-- resolves the pull request from `meta.pr` and, before touching it,
-  **verifies** that the pull request belongs to the triggering run. For a
-  pull request from a fork `workflow_run.pull_requests` is empty, so the
-  association is checked field by field through the API:
+  below without the `meta` fields. The `verdict` job then removes any
+  verdict label and `ortsom:run`, and rewrites the comment to say that
+  the last run was cancelled, that no verdict is current, and how to
+  re-run;
+- it treats the `ortsom-pr` artifact as **untrusted data**: parsed as
+  JSON with size limits, validated field by field (SHA format, known
+  enum values, integer PR number), never interpolated into shell
+  commands;
+- it resolves the pull request from `meta.pr` and **verifies** that the
+  pull request belongs to the triggering run. For a pull request from a
+  fork `workflow_run.pull_requests` is empty, so the association is
+  checked field by field through the API:
   - the triggering run's `event` is `pull_request` and its workflow is
     `ortsom-pr.yml`;
   - the pull request's base is `main` of this repository;
@@ -611,55 +686,89 @@ therefore:
   - its current head SHA equals both `meta.head_sha` and the run's
     `head_sha`.
 
-  If any check fails it labels, comments and closes nothing. A head SHA
+  If any check fails nothing runs and nothing is labelled. A head SHA
   mismatch is the ordinary case of a newer push superseding this run —
   the newer run will report; any other mismatch is logged as a rejected
-  artifact;
-- has permissions `pull-requests: write`, `issues: write`,
-  `actions: read` and `contents: read`, and nothing else.
+  artifact.
+
+The `verdict` job, before applying a result, re-reads the pull request.
+If it now carries `ortsom:skip` or is a draft, the result is discarded
+and handled as a skip: verdict labels are removed and no scenario
+results are posted. A skip cancels a build in flight (§6.1), but a suite
+that finished moments before can still report after the skip, and this
+check makes both orders end in the same state.
+
+Permissions per job: `resolve` has `actions: read` and
+`pull-requests: read`; `suite` has `contents: read` and `actions: read`,
+plus the deploy key in its one checkout step; `verdict` has
+`pull-requests: write`, `issues: write`, `actions: read` and
+`contents: read`, never checks out anything but `main`, and never runs
+pull request code.
 
 ### 9.2 A pull request can edit its own workflow
 
 For `pull_request` events GitHub runs the workflow files of the pull
 request's merge commit, so a pull request can change `ortsom-pr.yml`,
-`map.toml` or `select_scenarios.py` to select nothing or to forge a passing
-`summary.json`. The verdict workflow limits the damage:
+`mostro.Dockerfile`, `map.toml` or `select_scenarios.py`. What that buys
+it is limited to the image it hands over:
 
-- It **recomputes the selection** with `main`'s `map.toml`,
-  `scenarios.json` and `select_scenarios.py` from the changed-file list fetched through the API. A
-  scenario in the trusted selection that is absent from the PR summary
-  counts as `missing`, i.e. a regression.
+- The selection that counts is **recomputed** in `ortsom-pr-run.yml`
+  from `main`'s map and the changed-file list fetched through the API.
+  A scenario in that selection absent from the summary counts as
+  `missing`, i.e. a regression.
+- The summary is produced by the `suite` job, which runs `main`'s
+  definition: the pull request cannot forge a passing result. It can
+  only change what its own daemon does, which is exactly what the gate
+  measures.
 - A pull request that touches `.github/ortsom/**` or any `ortsom-*.yml`
-  workflow gets the verdict `inconclusive`, reason `gate-modified`.
+  workflow gets the verdict `inconclusive`, reason `gate-modified`: its
+  image may not have been built the way the baseline's was.
 
-A forged passing summary cannot be ruled out from inside the PR run; the
-gate is a review aid, not a security control, and the label it applies
-or withholds is worth nothing to an attacker.
+### 9.3 Running untrusted code
 
-### 9.3 Building untrusted code
+Pull request code runs in two places:
 
-The PR run compiles and executes the pull request's mostrod inside
-Docker on an ephemeral GitHub-hosted runner, with no secrets and a
-read-only token.
+1. **Compiling it** (`cargo build`, including build scripts and
+   procedural macros) happens only in `ortsom-pr.yml`, on an ephemeral
+   runner with no secrets and a `contents: read` token. What an attacker
+   gets there is runner minutes. The repository's approval requirement
+   for first-time contributors (fork approval policy
+   `first_time_contributors`) applies to it.
+2. **Running the daemon** happens in the `suite` job of
+   `ortsom-pr-run.yml`, as the `mostro` container of the stack. That job
+   has had the deploy key and holds the compiled harness, so it is
+   hardened:
+   - the deploy key is read-only, scoped to `MostroP2P/ortsom`, and given
+     to the checkout step only (`persist-credentials: false`); no later
+     step, and no container, can read it;
+   - Ortsom's sources are deleted after the build, before any image of
+     the pull request is loaded;
+   - the container gets no Docker socket and no host path except the
+     stack's own `config/` directory (the compose file of Ortsom);
+   - the job's token is `contents: read` and `actions: read`; labelling
+     happens in another job, on another runner;
+   - for a pull request from a fork, the job waits for a maintainer's
+     approval in the `ortsom-fork` environment. Environments with
+     required reviewers are free for public repositories. A maintainer
+     approves once the pull request has been read, typically once the
+     triage bot has labelled it `quality:ok`.
 
-There is only a partial precedent for this in the repository.
-`mutation.yml` and `cashu.yml` already build and run pull-request code on
-`pull_request`, but only when a maintainer applies a label (`run-mutation`,
-`cashu`). This gate is the first workflow to do it for **every** pull
-request. The case for it rests on its own terms:
+   What remains is a container escape on an ephemeral runner, after a
+   maintainer approved the run, which would expose the compiled Ortsom
+   binary. That is the accepted risk.
 
-- the runner is ephemeral and discarded after the job;
-- the job has no secrets and a `contents: read` token, so there is
-  nothing to exfiltrate and nothing it can write back to the repository;
-- the repository requires maintainer approval before workflows run for
-  first-time contributors (fork approval policy
-  `first_time_contributors`), so a drive-by pull request does not get
-  compute without a human looking at it first.
+Rejected alternatives:
 
-What an attacker gets is runner minutes. That is the same exposure the
-Rust CI will have once
-[#929](https://github.com/MostroP2P/mostro/issues/929) adds
-`pull_request` to it.
+- **One `pull_request_target` workflow** that builds and runs the pull
+  request with the key. It compiles untrusted code inside the job that
+  holds the key, and the first-time contributor approval does not apply
+  to `pull_request_target`.
+- **Shipping the Ortsom binary to the untrusted job** as an artifact:
+  artifacts of a public repository can be downloaded by anyone, which
+  would publish the private harness.
+- **A self-hosted runner** with Ortsom installed: GitHub advises against
+  self-hosted runners for pull requests from forks of public
+  repositories, since the runner persists between jobs.
 
 ## 10. Changes needed in Ortsom (Phase 1)
 
@@ -700,7 +809,7 @@ Documented in the README and `docs/ci-regtest.md`.
 | 0 | mostro | This spec. |
 | 1 | ortsom | §10 A–C, docs, changelog; release `v0.3.0`. |
 | 2 | mostro | `.github/ortsom/` (`map.toml`, `scenarios.json`, `select_scenarios.py`, tests) and `ortsom-baseline.yml`. Let baselines accumulate. |
-| 3 | mostro | `ortsom-pr.yml`, `verdict.py` with tests, `ortsom-verdict.yml`; labels created. **Shadow mode.** |
+| 3 | mostro | `mostro.Dockerfile` (the baseline switches to it), `ortsom-pr.yml` (image build), `ortsom-pr-run.yml` (`resolve`, `suite`, `verdict`), `verdict.py` with tests; environment `ortsom-fork` with the maintainers as required reviewers; labels created. **Shadow mode.** |
 | 4 | — | Manual review period, at least two weeks or 20 verdicts. Every `would-close` and `regression` is checked by a maintainer; disagreements get `ortsom:false-positive`. Tune `map.toml` and thresholds. |
 | 5 | mostro | Enforcement, only by explicit maintainer decision (§12). |
 
@@ -746,6 +855,8 @@ time and queue contention.
 | Run | Approx. duration |
 |---|---|
 | Cold mostrod build (per commit, no cross-run BuildKit cache) | 5–8 min |
+| Image hand-over (`docker save`, upload, download, `docker load`) | 1–2 min |
+| Waiting for a maintainer's approval (fork pull requests) | human time |
 | Stack up and doctor | 2–3 min |
 | Smoke plus one family (typical PR) | 5–15 min |
 | `expiration` family (serial, one identity slot) | up to ~60 min |
@@ -755,13 +866,6 @@ Baseline: about four scheduled runs a day plus one per merge.
 
 ## 14. Known gaps
 
-- **Pull requests from forks cannot fetch Ortsom.** A `pull_request` run
-  from a fork gets no secrets, so the deploy key of §5 is unavailable to
-  `ortsom-pr.yml` as designed in §6. Phase 3 has to split it: the
-  untrusted job only builds the mostrod image from the pull request and
-  uploads it; a trusted `workflow_run` job fetches Ortsom with the key
-  and runs the suite with `ortsom stack up --mostro-image`. That changes
-  §6 and §9 and is specified before Phase 3 starts.
 - **Bonds.** The regtest stack runs with `[anti_abuse_bond]` off, so the
   `bond` scenarios are always skipped: a pull request touching
   `src/app/bond/**` gets no signal. A bonds-enabled stack variant is
@@ -780,8 +884,8 @@ Baseline: about four scheduled runs a day plus one per merge.
   pull request does not compile.
 - **Serial runs.** One identity slot means `--jobs 1`. More slots would
   shorten `full` runs considerably.
-- **Fork commits.** Building `--ref <head_sha>` for a pull request from a
-  fork relies on GitHub serving that commit from the base repository
-  through `refs/pull/<n>/head`. To be verified in Phase 3; the fallback
-  is `--ref <number>` plus a check that the built commit equals
-  `head_sha`.
+- **Recipe drift from Ortsom.** `.github/ortsom/mostro.Dockerfile`
+  mirrors Ortsom's recipe by hand (§6.1). Baselines and pull requests
+  both use the copy, so a drift never skews a verdict; it only makes the
+  gate's daemon differ from the one a developer gets locally with
+  `ortsom stack up --ref`.

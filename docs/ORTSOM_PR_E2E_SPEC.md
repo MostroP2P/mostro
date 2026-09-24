@@ -316,10 +316,18 @@ compares against those measurements.
   Mostro developers. `GITHUB_TOKEN` cannot read it, so the workflow checks
   it out with a read-only deploy key (secret `ORTSOM_DEPLOY_KEY`, deploy
   key `mostro-ci` on `MostroP2P/ortsom`), handed to that step only.
-- **What runs:** the **full** suite (`ortsom run` with no filter) against
-  `ortsom stack up --ref <github.sha>`, with the pinned Ortsom. Full,
-  because pull requests select different subsets and each one needs a
-  baseline result for every scenario it runs.
+- **What runs:** the **full** suite (`ortsom run` with no filter) with
+  the pinned Ortsom, against `main` at `github.sha`. Full, because pull
+  requests select different subsets and each one needs a baseline result
+  for every scenario it runs.
+- **Daemon image:** built with `.github/ortsom/mostro.Dockerfile` from
+  the checkout, tagged `ortsom-baseline/mostro:<sha>`, and started with
+  `ortsom stack up --mostro-image`, the same recipe and invocation as a
+  pull request (§6). Until Phase 3 ships that file the baseline uses
+  `ortsom stack up --ref <github.sha>`; the switch lands in the same pull
+  request as `ortsom-pr.yml`, so no verdict ever compares images built by
+  two recipes. With `--mostro-image` there is no build inside `stack up`,
+  so a failed `docker build` is recorded as `build_failed` directly.
 - **Concurrency:** group `ortsom-baseline`, `cancel-in-progress: false`.
   A push while a run is in flight waits behind it. GitHub keeps at most
   one pending run per group, so several pushes during one run collapse
@@ -427,7 +435,8 @@ request that bumps `ortsom_ref`.
   skip and cancel cases, and outputs the pull request number, `head_sha`,
   `base_sha` and whether the head is a fork. Nothing else runs if it
   rejects the run.
-- **Job `suite`** (`contents: read`, `actions: read`): for a pull
+- **Job `suite`** (`contents: read`, `actions: read`,
+  `pull-requests: read`): for a pull
   request from a fork it runs in the environment `ortsom-fork`, whose
   required reviewers are the maintainers (§9.3). Concurrency group
   `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 330 min, suite
@@ -592,13 +601,18 @@ the counts, the verdict and its reason) and `comment.md`.
 ### 7.4 The comment
 
 One sticky comment per pull request, found by the marker
-`<!-- ortsom-verdict -->` and edited in place. It contains:
+`<!-- ortsom-verdict -->` on a comment authored by `github-actions[bot]`
+(a marker in anyone else's comment is ignored) and edited in place. It contains:
 
 - the verdict, in one sentence, with the numbers, e.g. *3 of 5 eligible
   scenarios regressed (60%, threshold 50%, minimum 4)*;
 - the daemon commit tested, the Ortsom revision, and the baseline commit
   compared against with its distance from the merge-base;
-- a table of regressions: scenario, PR detail, baseline outcome;
+- a table of regressions: scenario, PR detail, baseline outcome. The
+  PR `detail` comes from a run of the pull request's daemon and is
+  untrusted: it is cut to 200 characters, reduced to one line, and shown
+  inside a code span with backticks removed, so it cannot create links,
+  mentions, HTML or a comment marker;
 - collapsed sections for passes, skipped, `unstable-on-main` and
   `no-baseline` scenarios;
 - `uncovered_files` with their reasons and `unmapped_files`, the code
@@ -692,15 +706,19 @@ job ties the run to a pull request before anything else happens:
   artifact.
 
 The `verdict` job, before applying a result, re-reads the pull request.
-If it now carries `ortsom:skip` or is a draft, the result is discarded
-and handled as a skip: verdict labels are removed and no scenario
-results are posted. A skip cancels a build in flight (§6.1), but a suite
+If its current head SHA differs from the result's `head_sha` and the
+triggering run's, a newer push has superseded the run while the suite
+was running: the result is discarded without touching labels or the
+comment, and the newer run reports. If it now carries `ortsom:skip` or
+is a draft, the result is discarded and handled as a skip: verdict
+labels are removed and no scenario results are posted. A skip cancels a build in flight (§6.1), but a suite
 that finished moments before can still report after the skip, and this
 check makes both orders end in the same state.
 
 Permissions per job: `resolve` has `actions: read` and
-`pull-requests: read`; `suite` has `contents: read` and `actions: read`,
-plus the deploy key in its one checkout step; `verdict` has
+`pull-requests: read`; `suite` has `contents: read`, `actions: read` and
+`pull-requests: read` (changed files and the §8.2 line come from the
+pull request API), plus the deploy key in its one checkout step; `verdict` has
 `pull-requests: write`, `issues: write`, `actions: read` and
 `contents: read`, never checks out anything but `main`, and never runs
 pull request code.
@@ -745,7 +763,8 @@ Pull request code runs in two places:
      the pull request is loaded;
    - the container gets no Docker socket and no host path except the
      stack's own `config/` directory (the compose file of Ortsom);
-   - the job's token is `contents: read` and `actions: read`; labelling
+   - the job's token is read-only (`contents`, `actions`,
+     `pull-requests`); labelling
      happens in another job, on another runner;
    - for a pull request from a fork, the job waits for a maintainer's
      approval in the `ortsom-fork` environment. Environments with

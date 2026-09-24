@@ -187,6 +187,18 @@ class ValidateMapTest(unittest.TestCase):
         with self.assertRaisesRegex(sel.SelectionError, "duplicate"):
             sel.validate_map(make_map(TRADE, dict(TRADE)))
 
+    def test_non_table_settings_is_rejected(self):
+        with self.assertRaisesRegex(sel.SelectionError, "settings"):
+            sel.validate_map({"settings": "bad", "rule": [TRADE]})
+
+    def test_non_list_rules_are_rejected(self):
+        with self.assertRaisesRegex(sel.SelectionError, "rule"):
+            sel.validate_map({"settings": {"ortsom_ref": "v0.3.0"}, "rule": "bad"})
+
+    def test_non_table_rule_is_rejected(self):
+        with self.assertRaisesRegex(sel.SelectionError, "rule"):
+            sel.validate_map(make_map("bad"))
+
     def test_missing_ortsom_ref_is_rejected(self):
         with self.assertRaisesRegex(sel.SelectionError, "ortsom_ref"):
             sel.validate_map({"settings": {"always_tags": []}, "rule": [TRADE]})
@@ -212,6 +224,20 @@ class MainTest(unittest.TestCase):
             result = json.loads((tmp / "selection.json").read_text())
             self.assertEqual(result["mode"], "subset")
             self.assertEqual(result["matched_rules"], ["trade flow"])
+
+    def test_malformed_settings_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "map.toml").write_text('settings = "bad"\n')
+            (tmp / "scenarios.json").write_text(json.dumps(REGISTRY))
+            (tmp / "changes.txt").write_text("M\ta.rs\n")
+            code = sel.main([
+                "--map", str(tmp / "map.toml"),
+                "--scenarios", str(tmp / "scenarios.json"),
+                "--changes", str(tmp / "changes.txt"),
+                "--out", str(tmp / "selection.json"),
+            ])
+            self.assertEqual(code, 2)
 
     def test_stale_map_exits_2_without_writing(self):
         with tempfile.TemporaryDirectory() as tmp:

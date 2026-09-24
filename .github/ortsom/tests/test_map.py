@@ -52,6 +52,13 @@ class MapTest(unittest.TestCase):
             "(use `uncovered = \"<reason>\"` if Ortsom cannot exercise them)",
         )
 
+    def test_scheduler_changes_run_the_full_suite(self):
+        # src/scheduler.rs flushes every outgoing message and runs payment
+        # retries, payout reconciliation, dev fee and bond payouts.
+        registry = load_registry()
+        result = sel.select(["src/scheduler.rs"], load_map(), registry)
+        self.assertEqual(result["mode"], "full")
+
     def test_every_tag_and_scenario_exists_in_the_registry(self):
         sel.check_references(load_map(), load_registry())
 

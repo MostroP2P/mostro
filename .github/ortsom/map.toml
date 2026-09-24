@@ -62,9 +62,11 @@ paths = ["src/app/rate_user.rs"]
 scenarios = ["full_trade_with_rating"]
 
 [[rule]]
+# Not only expirations: it flushes every outgoing message and runs payment
+# retries, payout reconciliation, price updates, dev fee and bond payouts.
 name = "scheduler"
 paths = ["src/scheduler.rs"]
-tags = ["expiration"]
+full = true
 
 [[rule]]
 name = "lightning"

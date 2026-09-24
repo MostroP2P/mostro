@@ -92,13 +92,20 @@ def rule_kind(rule):
 
 
 def validate_map(gate_map):
+    if not isinstance(gate_map, dict):
+        raise SelectionError("map.toml must be a table")
     settings = gate_map.get("settings", {})
+    if not isinstance(settings, dict):
+        raise SelectionError("[settings] must be a table")
+    rules = gate_map.get("rule", [])
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise SelectionError("rule must be an array of [[rule]] tables")
     if not isinstance(settings.get("ortsom_ref"), str) or not settings["ortsom_ref"]:
         raise SelectionError("[settings] needs a non-empty ortsom_ref")
     if not isinstance(settings.get("always_tags", []), list):
         raise SelectionError("[settings] always_tags must be a list")
     seen = set()
-    for rule in gate_map.get("rule", []):
+    for rule in rules:
         name = rule.get("name")
         if not isinstance(name, str) or not name:
             raise SelectionError(f"rule without a name: {rule!r}")

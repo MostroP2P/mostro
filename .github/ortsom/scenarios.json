@@ -1,0 +1,287 @@
+[
+  {
+    "name": "action_out_of_state",
+    "tags": [
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "bad_encryption",
+    "tags": [
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "bond_race_loser_is_told",
+    "tags": [
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 300
+  },
+  {
+    "name": "bond_released_on_success",
+    "tags": [
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 300
+  },
+  {
+    "name": "bond_slash_payout",
+    "tags": [
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 900
+  },
+  {
+    "name": "buyer_invoice_deadline",
+    "tags": [
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
+    "name": "buyer_invoice_expires_mid_flight",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 600
+  },
+  {
+    "name": "cancel_after_take_unpaid",
+    "tags": [
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 600
+  },
+  {
+    "name": "cancel_before_taken",
+    "tags": [
+      "smoke",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 120
+  },
+  {
+    "name": "cooperative_cancel",
+    "tags": [
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "dispute_by_buyer",
+    "tags": [
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "dispute_by_seller",
+    "tags": [
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "dispute_resolved_for_buyer",
+    "tags": [
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 420
+  },
+  {
+    "name": "dispute_resolved_for_seller",
+    "tags": [
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 420
+  },
+  {
+    "name": "dispute_taken_then_cooperative_cancel",
+    "tags": [
+      "dispute",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 420
+  },
+  {
+    "name": "dispute_then_cooperative_cancel",
+    "tags": [
+      "dispute",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "fiat_window_expires",
+    "tags": [
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 1200
+  },
+  {
+    "name": "full_trade_with_rating",
+    "tags": [
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 240
+  },
+  {
+    "name": "gated_payouts_do_not_starve_other_destinations",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 1800
+  },
+  {
+    "name": "happy_buy",
+    "tags": [
+      "smoke",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "happy_sell",
+    "tags": [
+      "smoke",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "hold_invoice_expires",
+    "tags": [
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
+    "name": "invalid_buyer_invoice",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "malformed_message",
+    "tags": [
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "market_price_order",
+    "tags": [
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 240
+  },
+  {
+    "name": "message_replay",
+    "tags": [
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "payment_fails_on_release",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 600
+  },
+  {
+    "name": "payout_invoice_below_the_expiry_floor",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 300
+  },
+  {
+    "name": "payout_slots_capped_per_destination",
+    "tags": [
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 900
+  },
+  {
+    "name": "pending_order_expires",
+    "tags": [
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
+    "name": "range_order",
+    "tags": [
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 240
+  },
+  {
+    "name": "unauthorized_actor",
+    "tags": [
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 180
+  },
+  {
+    "name": "unilateral_cancel_rejected",
+    "tags": [
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  }
+]

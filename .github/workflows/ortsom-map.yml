@@ -1,0 +1,28 @@
+name: Ortsom map
+
+# Unit tests of the Ortsom gate's scripts, plus the map coverage test: every
+# src/**/*.rs and proto/** file must match a rule in .github/ortsom/map.toml
+# (docs/ORTSOM_PR_E2E_SPEC.md § 4.4). Seconds, no build, so it runs on every
+# pull request: a new module nobody mapped fails here instead of silently
+# running smoke only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    name: Map and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -m unittest discover -s .github/ortsom/tests -v

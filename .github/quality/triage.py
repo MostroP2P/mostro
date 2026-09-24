@@ -28,7 +28,7 @@ CONTENT_CHECKS = ("issue", "template", "manual-testing", "fix-has-test")
 
 TEST_ATTRIBUTE = re.compile(r"^\+\s*#\[(tokio::)?test\b")
 STEP_LINE = re.compile(r"^\s{0,3}(\d+)[.)](?:\s+|$)")
-FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([\w-]*)\s*$")
+FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 COMMENT = re.compile(r"<!--.*?-->", re.S)
 TITLE_TYPE = re.compile(r"^\s*([a-z]+)(?:\([^)]*\))?!?:")
 
@@ -105,13 +105,25 @@ def load_config(path):
 # --- Markdown -----------------------------------------------------------------
 
 
+def open_fence(line):
+    """(fence, first info word) if `line` opens a code fence, else None.
+
+    CommonMark: any info string, but a backtick fence's cannot hold a backtick.
+    """
+    m = FENCE.match(line)
+    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
+        return None
+    words = m.group(2).split()
+    return m.group(1), words[0] if words else ""
+
+
 def outside_fences(lines):
     """Yield (line, inside_fence) so headings in code blocks are not sections."""
     fence = None
     for line in lines:
-        m = FENCE.match(line)
-        if fence is None and m:
-            fence = m.group(1)
+        opened = open_fence(line)
+        if fence is None and opened:
+            fence = opened[0]
             yield line, True
         elif fence is not None:
             if line.strip().startswith(fence) and set(line.strip()) == {fence[0]}:
@@ -186,9 +198,9 @@ def pr_type(sections, title):
 def steps_blocks(body):
     blocks, current = [], None
     for line in body.replace("\r\n", "\n").split("\n"):
-        m = FENCE.match(line)
-        if current is None and m and m.group(2) == "ortsom-steps":
-            current = (m.group(1), [])
+        opened = open_fence(line)
+        if current is None and opened and opened[1] == "ortsom-steps":
+            current = (opened[0], [])
         elif current is not None:
             if line.strip().startswith(current[0]) and set(line.strip()) == {current[0][0]}:
                 blocks.append("\n".join(current[1]))

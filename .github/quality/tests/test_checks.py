@@ -201,6 +201,13 @@ class FixHasTestTest(unittest.TestCase):
         files = [triage.ChangedFile("src/util.rs", 0, 2, "@@ -1 +1 @@\n-    #[test]\n-    fn x() {}\n")]
         self.assertIn("fix-has-test", failing(evaluate(fact=facts(files=files))))
 
+    def test_test_attribute_outside_rust_does_not_count(self):
+        files = [
+            triage.ChangedFile("src/app/release.rs", 3, 1, "@@ -1 +1 @@\n+    let x = 1;\n"),
+            triage.ChangedFile("docs/GUIDE.md", 3, 0, "@@ -1 +1 @@\n+#[test]\n+fn x() {}\n"),
+        ]
+        self.assertIn("fix-has-test", failing(evaluate(fact=facts(files=files))))
+
     def test_unknown_patch_is_not_held_against_the_author(self):
         files = [triage.ChangedFile("src/huge.rs", 5000, 0, None)]
         self.assertNotIn("fix-has-test", failing(evaluate(fact=facts(files=files))))
@@ -331,6 +338,17 @@ class StepsSyntaxTest(unittest.TestCase):
     def test_non_string_expectation_is_rejected_not_crashing(self):
         reasons = failing(evaluate(pr(body=self.body_with('[[step]]\nexpect = [1]'))))["steps-syntax"]
         self.assertTrue(reasons)
+
+    def test_steps_that_are_not_tables_are_rejected_not_crashing(self):
+        for block in ("step = [1]", 'step = ["actor"]', "step = [[1]]"):
+            with self.subTest(block=block):
+                reasons = failing(evaluate(pr(body=self.body_with(block))))["steps-syntax"]
+                self.assertTrue(reasons[0].startswith("`ortsom-steps`: "))
+
+    def test_unterminated_block_is_still_checked(self):
+        body = GOOD_BODY + '\n```ortsom-steps\n[[step]]\nactor = "alice"\ndo = "sleep"\n'
+        reasons = failing(evaluate(pr(body=body)))["steps-syntax"]
+        self.assertIn("unknown action `sleep`", reasons[0])
 
     def test_step_must_be_action_or_expectation(self):
         block = '[[step]]\nactor = "alice"\ndo = "release"\nexpect = "status"'

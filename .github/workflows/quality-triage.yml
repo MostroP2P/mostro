@@ -1,0 +1,47 @@
+name: Quality triage
+
+# The contribution quality bar's triage bot (docs/CONTRIBUTION_QUALITY_SPEC.md
+# § 7): checks a pull request's description, linked issue, commits and size,
+# then labels it `quality:ok` or `quality:needs-info` and keeps one comment
+# listing what is missing. Label-only: it never closes anything.
+#
+# pull_request_target runs this workflow and its scripts as they are on
+# `main`, with a write token. That is safe only because nothing here checks
+# out or runs pull request code: the title and description are read from the
+# event payload as data by run_triage.py, never interpolated into a shell,
+# and everything else comes from the API.
+
+on:
+  pull_request_target:
+    # labeled/unlabeled only matter for `quality:exempt` (see the job's if).
+    types: [opened, edited, reopened, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  # The neutral "Contribution quality bar" check run on the head commit.
+  checks: write
+
+concurrency:
+  group: quality-triage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    name: Triage
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'quality:exempt'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The base branch, never the pull request's head or merge ref.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Triage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/quality/run_triage.py

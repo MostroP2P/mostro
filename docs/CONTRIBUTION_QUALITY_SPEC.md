@@ -1,6 +1,6 @@
 # Contribution Quality Bar — Spec
 
-**Status:** Phase 1 (policy in `CONTRIBUTING.md`, pull request template, close message)
+**Status:** Phase 2 (triage bot, shadow). Phase 1: policy in `CONTRIBUTING.md`, pull request template, close message
 **Related:** [Ortsom on Pull Requests](./ORTSOM_PR_E2E_SPEC.md), the e2e
 gate proposed in [#975](https://github.com/MostroP2P/mostro/pull/975)
 **Initial mode:** label-only (shadow). Nothing is closed automatically
@@ -305,9 +305,11 @@ runs pull request code**. It reads metadata through the API, and its
 workflow and script come from `main`. That is what makes
 `pull_request_target`, which has a write token, safe here (§10).
 
-Its logic lives in `.github/quality/triage.py`, with unit tests in
-`.github/quality/tests/`, and its thresholds in
-`.github/quality/config.toml`.
+Its checks live in `.github/quality/triage.py` (pure functions over API
+data), the API calls and the labelling in `.github/quality/run_triage.py`,
+unit tests in `.github/quality/tests/` (run by `quality-scripts.yml`), and
+its thresholds in `.github/quality/config.toml`. A draft pull request is
+not triaged; `ready_for_review` triggers the first run.
 
 ### 7.1 Checks
 
@@ -316,7 +318,7 @@ Its logic lives in `.github/quality/triage.py`, with unit tests in
 | `issue` | A closing keyword links an issue labelled `status: accepted` | "No accepted issue is linked" |
 | `template` | Every heading of §5 is present, and none is empty or only its placeholder | "Section `<name>` is missing or empty" |
 | `manual-testing` | **Steps** has at least 2 numbered steps, each with an `Expected:` line; for type `fix`, one step is marked `(fails on main)` | "Manual testing: `<what is missing>`" |
-| `steps-syntax` | An `ortsom-steps` block, if present, parses against §9.2 | "`ortsom-steps`: `<parse error>`" |
+| `steps-syntax` | An `ortsom-steps` block, if present, parses against §9.2 (until `ortsom steps check` exists, §9.4: valid TOML, only `[[step]]` tables, each an action or an expectation from the closed vocabulary, scalar arguments, at most one `fails_on_main`) | "`ortsom-steps`: `<parse error>`" |
 | `fix-has-test` | For type `fix` (template field or `fix` title prefix), the diff adds at least one `#[test]` or `#[tokio::test]` function | "A fix needs a regression test" |
 | `signed` | Every commit is verified (`commit.verification.verified`) | "Commits `<shas>` are not signed" |
 | `size` | For a first-time contributor, at most `max_first_pr_lines` (default 400) changed lines, excluding `Cargo.lock` and `sqlx-data.json` | "First pull requests are limited to 400 changed lines; split it or discuss the scope in the issue" |
@@ -608,7 +610,8 @@ new capability.
 ## 10. Security
 
 - `quality-triage.yml` runs on `pull_request_target` with
-  `pull-requests: write`, `issues: write` and `contents: read`. It checks
+  `pull-requests: write`, `issues: write`, `checks: write` (for the
+  neutral check run of §7.2) and `contents: read`. It checks
   out `main` only, never the pull request's head or merge ref, and never
   interpolates the title, the description or branch names into shell:
   they reach `triage.py` through environment variables and are parsed

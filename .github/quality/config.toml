@@ -1,0 +1,27 @@
+# Contribution quality bar: triage bot settings.
+# Design: docs/CONTRIBUTION_QUALITY_SPEC.md § 7. Read from `main` only: the
+# bot runs on pull_request_target, so a pull request cannot change them.
+
+[limits]
+# Changed lines a first-time contributor's pull request may have.
+max_first_pr_lines = 400
+# Files that do not count toward max_first_pr_lines.
+size_exclude = ["Cargo.lock", "sqlx-data.json"]
+# Other open pull requests a first-time contributor may have.
+max_open_prs_new = 1
+# Only this much of the description is parsed.
+max_body_bytes = 65536
+
+[labels]
+accepted = "status: accepted"
+ok = "quality:ok"
+needs_info = "quality:needs-info"
+exempt = "quality:exempt"
+
+[authors]
+# author_association values that skip the content checks (§ 7.3).
+maintainers = ["OWNER", "MEMBER", "COLLABORATOR"]
+# author_association values of a first-time contributor (§ 7.1).
+first_time = ["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE"]
+# Accounts that skip every check.
+bots = ["dependabot[bot]", "github-actions[bot]"]

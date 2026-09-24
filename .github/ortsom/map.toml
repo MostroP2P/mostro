@@ -10,7 +10,7 @@
 
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
-ortsom_ref = "v0.3.0"
+ortsom_ref = "v0.3.1"
 # Tags every non-ignored selection includes.
 always_tags = ["smoke"]
 # Minimum eligible scenarios for the close verdict to be possible.

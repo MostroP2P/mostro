@@ -1,0 +1,17 @@
+# Build context of mostro.Dockerfile (BuildKit reads <Dockerfile>.dockerignore
+# next to the Dockerfile). mostro has no root .dockerignore, and a local
+# target/ can be many gigabytes. .git is kept: build.rs runs
+# `git rev-parse HEAD`.
+target/
+**/target/
+.env
+mostro.db*
+mostro.log
+settings.toml
+*-keys.json
+book/book/
+bin/
+.idea/
+.vscode/
+.cursor/
+docker/config/

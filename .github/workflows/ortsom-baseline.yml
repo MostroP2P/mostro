@@ -80,26 +80,44 @@ jobs:
         working-directory: ortsom
         run: cargo build --release --bin ortsom
 
+      # The same recipe and invocation as a pull request run (spec § 5,
+      # § 6.1), so baseline and pull request images always come from one
+      # Dockerfile. A failed build is retried once, because a download
+      # failing inside it looks the same as mostro not compiling.
+      - name: Build the daemon image
+        id: image
+        working-directory: mostro
+        run: |
+          set +e
+          build() {
+            docker build -f .github/ortsom/mostro.Dockerfile \
+              --build-arg MOSTRO_SHA="$GITHUB_SHA" \
+              -t "ortsom-baseline/mostro:$GITHUB_SHA" .
+          }
+          if build || { echo "::warning::image build failed; retrying once"; build; }; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bring up the stack
         id: stack
         working-directory: ortsom
-        # Exit codes (Ortsom docs/ci-regtest.md): 3 the daemon image could
-        # not be built, 4 the daemon never came up, anything else the
-        # runner or the rest of the world. A 3 is retried once, because a
-        # download failing inside `docker build` looks the same as mostro
-        # not compiling.
+        # Exit codes (Ortsom docs/ci-regtest.md): 4 the daemon never came
+        # up, anything else the runner or the rest of the world. 3 (image
+        # build) cannot happen with --mostro-image: the build is the step
+        # above.
+        env:
+          BUILT: ${{ steps.image.outputs.built }}
         run: |
           set +e
-          $ORTSOM stack up --ref "$GITHUB_SHA"
-          code=$?
-          if [ "$code" -eq 3 ]; then
-            echo "::warning::stack up exited 3; retrying once"
-            $ORTSOM stack up --ref "$GITHUB_SHA"
-            code=$?
+          if [ "$BUILT" != true ]; then
+            echo "stack=build_failed" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          case "$code" in
+          $ORTSOM stack up --mostro-image "ortsom-baseline/mostro:$GITHUB_SHA"
+          case "$?" in
             0) stack=ok ;;
-            3) stack=build_failed ;;
             4) stack=daemon_failed ;;
             *) stack=infra_failed ;;
           esac

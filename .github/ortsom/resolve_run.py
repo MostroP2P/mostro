@@ -59,6 +59,9 @@ def validate_meta(meta):
     for key in ("head_sha", "base_sha"):
         if not isinstance(meta[key], str) or not SHA.match(meta[key]):
             raise ResolveError(f"meta.json: {key} is not a 40-character lowercase hex SHA")
+    for key in ("skipped", "image"):
+        if meta[key] is not None and not isinstance(meta[key], str):
+            raise ResolveError(f"meta.json: {key} must be a string or null")
     if meta["skipped"] is not None and meta["skipped"] not in SKIP_REASONS:
         raise ResolveError("meta.json: skipped has an unknown reason")
     if meta["skipped"] is None and meta["image"] not in IMAGE_STATES:
@@ -258,7 +261,9 @@ def main(argv=None):
     except Superseded as e:
         outputs = {"proceed": "false", "reason": "superseded"}
         print(f"::notice::{e}")
-    except (ResolveError, json.JSONDecodeError, FileNotFoundError) as e:
+    # ValueError covers bad JSON and bad UTF-8; OSError covers a missing
+    # file and HTTPError/URLError from the API.
+    except (ResolveError, ValueError, OSError, RecursionError) as e:
         outputs = {"proceed": "false", "reason": "rejected"}
         print(f"::warning::rejected artifact: {e}")
     write_outputs(outputs)

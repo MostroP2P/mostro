@@ -12,6 +12,7 @@ pub fn prepare_variables_for_vote(
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
+    // Both parties must be set before either can rate the other.
     // Get needed info about users
     let (seller, buyer) = match (&order.seller_pubkey, &order.buyer_pubkey) {
         (Some(seller), Some(buyer)) => (seller.to_owned(), buyer.to_owned()),

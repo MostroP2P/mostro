@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 
 from resolve_run import api, current_skip
-from select_scenarios import parse_name_status
+from select_scenarios import matching_rules, parse_name_status
 
 GATE_DIR = Path(__file__).resolve().parent
 BASELINE_WORKFLOW = "ortsom-baseline.yml"
@@ -142,6 +142,38 @@ def count(rows):
     eligible = passed + regressed
     return {"pass": passed, "regression": regressed, "eligible": eligible,
             "ratio": regressed / eligible if eligible else 0.0}
+
+
+COMPARED = {"pass", "regression", "missing"}
+
+
+def blind_spots(rows, selection, changed, gate_map, registry):
+    """Rules the pull request matched whose own scenarios were none of them
+    compared: all skipped, unstable on `main` or new. The verdict stands,
+    but it says nothing about the files those rules cover, which the comment
+    must not let a reader assume (§ 7.4). `full`, `ignore` and `uncovered`
+    rules select no scenarios of their own and are left out."""
+    if not gate_map or not registry:
+        return []
+    classes = {r["name"]: r["class"] for r in rows}
+    matched = set(selection.get("matched_rules") or [])
+    spots = []
+    for rule in gate_map.get("rule", []):
+        if rule["name"] not in matched or rule.get("full") or rule.get("ignore") or "uncovered" in rule:
+            continue
+        tags = set(rule.get("tags", []))
+        targets = set(rule.get("scenarios", [])) | {s["name"] for s in registry if tags & set(s["tags"])}
+        if not targets or any(classes.get(t) in COMPARED for t in targets):
+            continue
+        by_class = {}
+        for t in sorted(targets):
+            by_class.setdefault(classes.get(t, "not selected"), []).append(t)
+        spots.append({
+            "rule": rule["name"],
+            "files": [f for f in changed if matching_rules(f, [rule])],
+            "scenarios": by_class,
+        })
+    return spots
 
 
 def precheck(meta, selection, changed, pr_summary):
@@ -344,6 +376,13 @@ def render_comment(outcome, meta, selection, ctx):
     if verdict == "would-close":
         lines += ["", "> Shadow mode: this pull request would have been closed. It stays open; "
                       "a maintainer reviews this verdict."]
+    for spot in outcome.get("blind_spots") or []:
+        why = "; ".join(f"{cls}: {', '.join(code(n) for n in names)}" for cls, names in sorted(spot["scenarios"].items()))
+        files = [code(f) for f in spot["files"][:FILES_MAX]]
+        if len(spot["files"]) > FILES_MAX:
+            files.append(f"and {len(spot['files']) - FILES_MAX} more")
+        lines += ["", f"> ⚠️ No scenario of the {code(spot['rule'])} rule was compared ({why}), "
+                      f"so this verdict says nothing about {', '.join(files)}."]
 
     lines += ["", f"Daemon `{meta.get('head_sha', '')[:12]}`, Ortsom `{meta.get('ortsom_ref', '')}`"
                   + (" (override)" if meta.get("ortsom_ref_overridden") else "")
@@ -452,9 +491,10 @@ def write_out(out, outcome, body):
     (out / "comment.md").write_text(body)
 
 
-def run(args, repo, get, send, find_history, settings):
+def run(args, repo, get, send, find_history, settings, gate_map=None, registry=None):
     """The verdict job. Returns the outcome it applied, or None when it left
-    the pull request untouched."""
+    the pull request untouched. `gate_map` and `registry` (main's map.toml
+    and scenarios.json) let it name blind spots."""
     pr, reason = args["pr"], args["reason"]
     pull = get(f"/repos/{repo}/pulls/{pr}")
     if reason == "ok":
@@ -492,6 +532,7 @@ def run(args, repo, get, send, find_history, settings):
                    "history": [], "caps": caps}
     else:
         outcome = judge(meta, selection["scenarios"], pr_summary, find_history(meta), settings, caps)
+        outcome["blind_spots"] = blind_spots(outcome["rows"], selection, changed, gate_map, registry)
 
     body = render_comment(outcome, meta, selection or {}, {"pr": pr, "run_url": args["run_url"], "settings": settings})
     write_out(args["out"], outcome, body)
@@ -548,7 +589,9 @@ def main(argv=None):
     repo, token = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"]
     run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
     with open(GATE_DIR / "map.toml", "rb") as f:
-        settings = tomllib.load(f)["settings"]
+        gate_map = tomllib.load(f)
+    settings = gate_map["settings"]
+    registry = json.loads((GATE_DIR / "scenarios.json").read_text())
 
     def get(path, params=""):
         return api(path, token, params)
@@ -558,7 +601,8 @@ def main(argv=None):
 
     job = {"pr": args.pr, "reason": args.reason, "head_sha": args.head_sha,
            "result": args.result, "out": args.out, "run_url": run_url}
-    outcome = run(job, repo, get, send, history_finder(get, lambda url: download(url, token), repo, settings), settings)
+    find = history_finder(get, lambda url: download(url, token), repo, settings)
+    outcome = run(job, repo, get, send, find, settings, gate_map=gate_map, registry=registry)
     if outcome and os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write((Path(args.out) / "comment.md").read_text().replace(MARKER + "\n", ""))

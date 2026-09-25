@@ -333,6 +333,57 @@ class BaselineZipTest(unittest.TestCase):
         self.assertIsNone(vd.read_baseline_zip(b"not a zip"))
 
 
+BLIND_MAP = {
+    "settings": SETTINGS,
+    "rule": [
+        {"name": "bonds", "paths": ["src/app/bond/**"], "tags": ["bond"]},
+        {"name": "rating", "paths": ["src/app/rate_user.rs"], "scenarios": ["s1"]},
+        {"name": "scheduler", "paths": ["src/scheduler.rs"], "full": True},
+        {"name": "rpc", "paths": ["src/rpc/**"], "uncovered": "no gRPC client"},
+    ],
+}
+BLIND_REGISTRY = [
+    {"name": "s1", "tags": ["smoke"]},
+    {"name": "bond_a", "tags": ["bond"]},
+    {"name": "bond_b", "tags": ["bond"]},
+]
+
+
+class BlindSpotTest(unittest.TestCase):
+    def row(self, name, cls):
+        return {"name": name, "class": cls, "pr": None, "baseline": None, "detail": "", "flaky": False}
+
+    def spots(self, rows, matched, changed):
+        sel = selection(*[r["name"] for r in rows], matched_rules=matched)
+        return vd.blind_spots(rows, sel, changed, BLIND_MAP, BLIND_REGISTRY)
+
+    def test_a_rule_whose_scenarios_were_all_skipped_is_a_blind_spot(self):
+        rows = [self.row("s1", "pass"), self.row("bond_a", "skipped"), self.row("bond_b", "skipped")]
+        got = self.spots(rows, ["bonds", "scheduler"], ["src/app/bond/flow.rs", "src/scheduler.rs"])
+        self.assertEqual(got, [{
+            "rule": "bonds",
+            "files": ["src/app/bond/flow.rs"],
+            "scenarios": {"skipped": ["bond_a", "bond_b"]},
+        }])
+
+    def test_one_compared_scenario_is_enough(self):
+        rows = [self.row("bond_a", "regression"), self.row("bond_b", "skipped")]
+        self.assertEqual(self.spots(rows, ["bonds"], ["src/app/bond/flow.rs"]), [])
+
+    def test_unstable_and_new_scenarios_do_not_count_as_compared(self):
+        rows = [self.row("bond_a", "unstable-on-main"), self.row("bond_b", "no-baseline")]
+        got = self.spots(rows, ["bonds"], ["src/app/bond/db.rs"])
+        self.assertEqual(got[0]["scenarios"], {"no-baseline": ["bond_b"], "unstable-on-main": ["bond_a"]})
+
+    def test_full_uncovered_and_unmatched_rules_are_not_blind_spots(self):
+        rows = [self.row("s1", "skipped")]
+        self.assertEqual(self.spots(rows, ["scheduler", "rpc"], ["src/scheduler.rs", "src/rpc/a.rs"]), [])
+
+    def test_without_the_map_there_are_none(self):
+        self.assertEqual(vd.blind_spots([self.row("s1", "skipped")], selection("s1", matched_rules=["rating"]),
+                                        ["src/app/rate_user.rs"], None, None), [])
+
+
 class CommentTest(unittest.TestCase):
     CTX = {
         "pr": 7,
@@ -397,6 +448,16 @@ class CommentTest(unittest.TestCase):
     def test_no_baseline_explains_the_harness_bump(self):
         body = self.render(self.outcome("inconclusive", "no-baseline", history=[]))
         self.assertIn("rebases onto a `main` whose new-harness baseline has finished", body)
+
+    def test_a_blind_spot_is_a_warning_before_the_details(self):
+        out = self.outcome("pass", "ok")
+        out["blind_spots"] = [{"rule": "bonds", "files": ["src/app/bond/flow.rs", "src/app/bond/db.rs"],
+                               "scenarios": {"skipped": ["bond_a", "bond_b"]}}]
+        body = self.render(out)
+        warning = ("> ⚠️ No scenario of the `bonds` rule was compared (skipped: `bond_a`, `bond_b`), "
+                   "so this verdict says nothing about `src/app/bond/flow.rs`, `src/app/bond/db.rs`.")
+        self.assertIn(warning, body)
+        self.assertLess(body.index(warning), body.index("Daemon `"))
 
     def test_a_cap_is_named(self):
         rows = [self.row(n, "regression", "failed") for n in FOUR]
@@ -543,6 +604,24 @@ class RunTest(unittest.TestCase):
         gh = FakeGitHub()
         self.assertIsNone(self.run_job(gh, res=res))
         self.assertEqual(gh.calls, [])
+
+    def test_a_pass_that_skipped_the_changed_code_says_so(self):
+        pr = summary(result("s1"), result("bond_a", "skipped"), result("bond_b", "skipped"))
+        base = summary(result("s1"), result("bond_a", "skipped"), result("bond_b", "skipped"))
+        sel = selection("s1", "bond_a", "bond_b", matched_rules=["bonds"])
+        res = self.write_result(meta(), sel, pr, changes="M\tsrc/app/bond/flow.rs\n")
+        gh = FakeGitHub()
+        out = vd.run(
+            {"pr": 7, "reason": "ok", "head_sha": HEAD, "result": res, "out": self.dir / "out",
+             "run_url": "https://example/run"},
+            REPO, gh.get, gh.send, lambda _m: [baseline(BASE, base)], SETTINGS,
+            gate_map=BLIND_MAP, registry=BLIND_REGISTRY,
+        )
+        self.assertEqual(out["verdict"], "pass")
+        self.assertEqual([b["rule"] for b in out["blind_spots"]], ["bonds"])
+        verdict = json.loads((self.dir / "out" / "verdict.json").read_text())
+        self.assertEqual(verdict["blind_spots"][0]["files"], ["src/app/bond/flow.rs"])
+        self.assertIn("says nothing about `src/app/bond/flow.rs`", (self.dir / "out" / "comment.md").read_text())
 
     def test_the_expected_break_label_caps_the_verdict(self):
         pr = summary(*(result(n, "failed") for n in FOUR))

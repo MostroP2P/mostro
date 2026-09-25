@@ -648,6 +648,14 @@ One sticky comment per pull request, found by the marker
   mentions, HTML or a comment marker;
 - collapsed sections for passes, skipped, `unstable-on-main` and
   `no-baseline` scenarios;
+- a warning for every **blind spot**: a rule the pull request matched
+  (other than `full`, `ignore` or `uncovered`) none of whose own
+  scenarios was compared, because they were all skipped, unstable on
+  `main` or new. It names the rule, those scenarios and the changed files
+  the rule covers, and says the verdict says nothing about them. It does
+  not change the verdict. Example: with the regtest stack's bonds off
+  (§ 14), a change under `src/app/bond/**` passes on the other scenarios
+  while every `bond` scenario is skipped;
 - `uncovered_files` with their reasons and `unmapped_files`, the code
   this run did not exercise;
 - links to the PR run, its artifacts, and the baseline run;

@@ -112,7 +112,7 @@ Each rule maps path globs to tags and/or scenario names.
 ```toml
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
-ortsom_ref = "v0.3.0"
+ortsom_ref = "v0.3.1"
 # Tags every non-ignored selection includes.
 always_tags = ["smoke"]
 # Minimum eligible scenarios for the close verdict to be possible.
@@ -323,10 +323,8 @@ compares against those measurements.
 - **Daemon image:** built with `.github/ortsom/mostro.Dockerfile` from
   the checkout, tagged `ortsom-baseline/mostro:<sha>`, and started with
   `ortsom stack up --mostro-image`, the same recipe and invocation as a
-  pull request (§6). Until Phase 3 ships that file the baseline uses
-  `ortsom stack up --ref <github.sha>`; the switch lands in the same pull
-  request as `ortsom-pr.yml`, so no verdict ever compares images built by
-  two recipes. With `--mostro-image` there is no build inside `stack up`,
+  pull request (§6). The baseline switched to it before `ortsom-pr.yml`
+  existed, so no verdict ever compares images built by two recipes. With `--mostro-image` there is no build inside `stack up`,
   so a failed `docker build` is recorded as `build_failed` directly.
 - **Concurrency:** group `ortsom-baseline`, `cancel-in-progress: false`.
   A push while a run is in flight waits behind it. GitHub keeps at most

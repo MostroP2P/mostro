@@ -3,7 +3,7 @@ request before anything runs against it (docs/ORTSOM_PR_E2E_SPEC.md § 6.2,
 § 8.2, § 9.1). Standard library only.
 
     resolve_run.py resolve --meta ortsom-pr/meta.json [--run-id N]
-    resolve_run.py changes --pr N --out changes.txt
+    resolve_run.py changes --pr N --head SHA --out changes.txt
 
 `resolve` writes `proceed`, `reason`, `pr`, `head_sha`, `base_sha`, `fork`,
 `image`, `ortsom_ref` and `ortsom_ref_overridden` to $GITHUB_OUTPUT. It fails
@@ -12,7 +12,9 @@ The triggering run comes from the workflow_run event, or from the API with
 --run-id (the workflow_dispatch path, for maintainers).
 
 `changes` writes the pull request's changed files, fetched through the API,
-as `git diff --name-status` lines for select_scenarios.py.
+as `git diff --name-status` lines for select_scenarios.py. It exits 3 when
+the list is incomplete (GitHub lists at most 3000 files) and 4 when the head
+moved: a partial list could select less than the pull request touches.
 """
 
 import argparse
@@ -101,6 +103,63 @@ def ortsom_ref_override(body):
     return None, "ortsom-ref line ignored: not a plain branch, tag or commit name"
 
 
+def checkout_ref(ref):
+    """An override as actions/checkout needs it: a bare number is an Ortsom
+    pull request (§ 8.2), anything else a branch, tag or commit."""
+    return f"refs/pull/{ref}/head" if ref.isdigit() else ref
+
+
+def current_skip(pull):
+    """Why the pull request should not run now, whatever the build said."""
+    if pull.get("draft"):
+        return "draft"
+    if "ortsom:skip" in {label.get("name") for label in pull.get("labels") or []}:
+        return "label"
+    if (pull.get("user") or {}).get("login") == "dependabot[bot]":
+        return "dependabot"
+    return None
+
+
+def decide(run, meta, pull, repo, pinned):
+    """resolve's outputs once the run, meta.json and the PR are fetched.
+    The association is checked first, skips included: a skip names a PR
+    and must be that run's PR before anything acts on it."""
+    check_association(run, pull, meta, repo)
+    skip = meta["skipped"] or current_skip(pull)
+    if skip:
+        return {"proceed": "false", "reason": f"skipped-{skip}", "pr": meta["pr"]}
+    ref, warning = ortsom_ref_override(pull.get("body"))
+    if warning:
+        print(f"::warning::{warning}")
+    return {
+        "proceed": "true",
+        "reason": "ok",
+        "pr": meta["pr"],
+        "head_sha": meta["head_sha"],
+        "base_sha": meta["base_sha"],
+        "fork": str(pull["head"]["repo"]["full_name"] != repo).lower(),
+        "image": meta["image"],
+        "ortsom_ref": checkout_ref(ref) if ref else pinned,
+        "ortsom_ref_overridden": str(ref is not None).lower(),
+    }
+
+
+def collect_changes(get, repo, pr, head):
+    """The complete changed-file list as name-status text, or an error: a
+    list GitHub cut at its 3000-file ceiling, or one for a head that has
+    moved, is not the pull request."""
+    files = paginate(get, f"/repos/{repo}/pulls/{pr}/files")
+    pull = get(f"/repos/{repo}/pulls/{pr}")
+    if (pull.get("head") or {}).get("sha") != head:
+        raise Superseded("the pull request's head moved while listing its files")
+    if len(files) != pull.get("changed_files"):
+        raise ResolveError(
+            f"GitHub listed {len(files)} of {pull.get('changed_files')} changed files; "
+            "a partial list could select less than the pull request touches"
+        )
+    return name_status(files)
+
+
 def name_status(files):
     """API `pulls/{n}/files` entries as `git diff --name-status` lines."""
     lines = []
@@ -134,10 +193,10 @@ def api(path, token, params=""):
         return json.loads(resp.read())
 
 
-def paginate(path, token):
+def paginate(get, path):
     items = []
     for page in range(1, MAX_PAGES + 1):
-        batch = api(path, token, f"?per_page={PER_PAGE}&page={page}")
+        batch = get(path, f"?per_page={PER_PAGE}&page={page}")
         items += batch
         if len(batch) < PER_PAGE:
             break
@@ -153,8 +212,11 @@ def write_outputs(values):
 
 
 def resolve(args, repo, token):
+    def get(path, params=""):
+        return api(path, token, params)
+
     if args.run_id:
-        run = api(f"/repos/{repo}/actions/runs/{args.run_id}", token)
+        run = get(f"/repos/{repo}/actions/runs/{args.run_id}")
     else:
         run = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["workflow_run"]
     if run.get("conclusion") != "success":
@@ -163,24 +225,8 @@ def resolve(args, repo, token):
     if len(raw) > MAX_META_BYTES:
         raise ResolveError("meta.json is too large")
     meta = validate_meta(json.loads(raw))
-    if meta["skipped"]:
-        return {"proceed": "false", "reason": f"skipped-{meta['skipped']}", "pr": meta["pr"]}
-    pull = api(f"/repos/{repo}/pulls/{meta['pr']}", token)
-    check_association(run, pull, meta, repo)
-    ref, warning = ortsom_ref_override(pull.get("body"))
-    if warning:
-        print(f"::warning::{warning}")
-    return {
-        "proceed": "true",
-        "reason": "ok",
-        "pr": meta["pr"],
-        "head_sha": meta["head_sha"],
-        "base_sha": meta["base_sha"],
-        "fork": str(pull["head"]["repo"]["full_name"] != repo).lower(),
-        "image": meta["image"],
-        "ortsom_ref": ref or pinned_ref(),
-        "ortsom_ref_overridden": str(ref is not None).lower(),
-    }
+    pull = get(f"/repos/{repo}/pulls/{meta['pr']}")
+    return decide(run, meta, pull, repo, pinned_ref())
 
 
 def main(argv=None):
@@ -191,13 +237,21 @@ def main(argv=None):
     p.add_argument("--run-id", type=int)
     c = sub.add_parser("changes")
     c.add_argument("--pr", type=int, required=True)
+    c.add_argument("--head", required=True)
     c.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     repo, token = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"]
 
     if args.command == "changes":
-        files = paginate(f"/repos/{repo}/pulls/{args.pr}/files", token)
-        args.out.write_text(name_status(files))
+        try:
+            text = collect_changes(lambda path, params="": api(path, token, params), repo, args.pr, args.head)
+        except Superseded as e:
+            print(f"::notice::{e}")
+            return 4
+        except ResolveError as e:
+            print(f"::warning::{e}")
+            return 3
+        args.out.write_text(text)
         return 0
     try:
         outputs = resolve(args, repo, token)

@@ -155,6 +155,78 @@ class OrtsomRefTest(unittest.TestCase):
         self.assertEqual(rr.ortsom_ref_override("```\nortsom-ref: x\n```")[0], "x")
 
 
+class DecideTest(unittest.TestCase):
+    """resolve's decision once the run, meta.json and the PR are fetched."""
+
+    def decide(self, run_doc=None, meta_doc=None, pull_doc=None):
+        return rr.decide(run_doc or run(), meta_doc or meta(), pull_doc or pull(), REPO, "v0.3.1")
+
+    def test_a_built_run_proceeds_with_the_pinned_harness(self):
+        out = self.decide()
+        self.assertEqual((out["proceed"], out["ortsom_ref"], out["ortsom_ref_overridden"]), ("true", "v0.3.1", "false"))
+        self.assertEqual(out["fork"], "true")
+
+    def test_a_same_repository_head_is_not_a_fork(self):
+        same = pull(head={"sha": HEAD, "ref": "fix/thing", "repo": {"full_name": REPO}})
+        out = self.decide(run_doc=run(head_repository={"full_name": REPO}), pull_doc=same)
+        self.assertEqual(out["fork"], "false")
+
+    def test_a_skip_is_checked_against_its_pull_request_first(self):
+        # A PR can upload a well-formed skip meta.json naming another PR.
+        forged = meta(pr=99, skipped="label", image=None)
+        victim = pull(number=99, head={"sha": "e" * 40, "ref": "other", "repo": {"full_name": "bob/mostro"}})
+        with self.assertRaises(rr.ResolveError):
+            self.decide(meta_doc=forged, pull_doc=victim)
+
+    def test_an_authenticated_skip_does_not_proceed_and_names_its_pr(self):
+        out = self.decide(meta_doc=meta(skipped="draft", image=None))
+        self.assertEqual((out["proceed"], out["reason"], out["pr"]), ("false", "skipped-draft", 7))
+
+    def test_a_pr_that_became_a_draft_since_the_build_is_skipped(self):
+        out = self.decide(pull_doc=pull(draft=True))
+        self.assertEqual((out["proceed"], out["reason"]), ("false", "skipped-draft"))
+
+    def test_a_pr_that_got_ortsom_skip_since_the_build_is_skipped(self):
+        out = self.decide(pull_doc=pull(labels=[{"name": "bug"}, {"name": "ortsom:skip"}]))
+        self.assertEqual((out["proceed"], out["reason"]), ("false", "skipped-label"))
+
+    def test_a_numeric_override_is_an_ortsom_pull_request(self):
+        out = self.decide(pull_doc=pull(body="ortsom-ref: 123"))
+        self.assertEqual((out["ortsom_ref"], out["ortsom_ref_overridden"]), ("refs/pull/123/head", "true"))
+
+    def test_a_named_override_is_passed_as_is(self):
+        out = self.decide(pull_doc=pull(body="ortsom-ref: feat/new-action"))
+        self.assertEqual(out["ortsom_ref"], "feat/new-action")
+
+
+class CollectChangesTest(unittest.TestCase):
+    def fake_api(self, files, changed_files, head=HEAD):
+        def api(path, params=""):
+            if path.endswith("/files"):
+                page = int(params.rsplit("&page=", 1)[1])
+                return files[(page - 1) * rr.PER_PAGE: page * rr.PER_PAGE]
+            return {"changed_files": changed_files, "head": {"sha": head}}
+        return api
+
+    def test_a_complete_list_becomes_name_status(self):
+        files = [{"filename": "src/db.rs", "status": "modified"}]
+        text = rr.collect_changes(self.fake_api(files, 1), REPO, 7, HEAD)
+        self.assertEqual(text, "M\tsrc/db.rs\n")
+
+    def test_a_list_cut_at_the_api_ceiling_is_refused(self):
+        # GitHub lists 3000 files at most; the 3001st (src/db.rs here) would
+        # make the selection `full`, the visible prefix makes it `none`.
+        files = [{"filename": f"docs/generated/{i}.md", "status": "added"} for i in range(3000)]
+        files.append({"filename": "src/db.rs", "status": "modified"})
+        with self.assertRaisesRegex(rr.ResolveError, "3001"):
+            rr.collect_changes(self.fake_api(files, 3001), REPO, 7, HEAD)
+
+    def test_a_head_that_moved_is_refused(self):
+        files = [{"filename": "src/db.rs", "status": "modified"}]
+        with self.assertRaises(rr.Superseded):
+            rr.collect_changes(self.fake_api(files, 1, head="f" * 40), REPO, 7, HEAD)
+
+
 class ChangesTest(unittest.TestCase):
     def test_api_files_become_name_status_lines(self):
         files = [

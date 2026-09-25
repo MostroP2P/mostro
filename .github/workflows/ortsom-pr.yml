@@ -10,7 +10,8 @@ name: Ortsom PR
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    # converted_to_draft takes the skip path, which cancels a suite in flight.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
 
 permissions:
   contents: read

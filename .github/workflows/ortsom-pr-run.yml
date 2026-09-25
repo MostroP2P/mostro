@@ -72,6 +72,27 @@ jobs:
           python3 .github/ortsom/resolve_run.py resolve --meta ortsom-pr/meta.json \
             ${RUN_ID:+--run-id "$RUN_ID"}
 
+  # An authenticated skip (a draft, `ortsom:skip`, Dependabot) runs no
+  # suite, so it would never enter the suite's concurrency group: this job
+  # enters it instead and cancels a suite still running or waiting for
+  # approval (§ 6.1). resolve has already tied the skip to its PR.
+  cancel:
+    name: Cancel a running suite
+    needs: resolve
+    if: startsWith(needs.resolve.outputs.reason, 'skipped-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    concurrency:
+      group: ortsom-pr-run-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: true
+    steps:
+      - name: Skip
+        env:
+          PR: ${{ needs.resolve.outputs.pr }}
+          REASON: ${{ needs.resolve.outputs.reason }}
+        run: echo "#$PR is $REASON; any suite still running for it is cancelled."
+
   suite:
     name: Suite
     needs: resolve
@@ -107,7 +128,16 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p ../result
-          python3 .github/ortsom/resolve_run.py changes --pr "$PR" --out "$RUNNER_TEMP/changes.txt"
+          # Exit 3: GitHub's list is incomplete (over 3000 files); 4: the
+          # head moved. Either way the selection would not be the PR's.
+          rc=0
+          python3 .github/ortsom/resolve_run.py changes --pr "$PR" --head "$HEAD_SHA" \
+            --out "$RUNNER_TEMP/changes.txt" || rc=$?
+          case "$rc" in
+            0) ;;
+            4) echo "state=superseded" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            *) echo "state=selection_error" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
           if ! python3 .github/ortsom/select_scenarios.py \
               --changes "$RUNNER_TEMP/changes.txt" --out ../result/selection.json; then
             echo "state=selection_error" >> "$GITHUB_OUTPUT"; exit 0
@@ -278,7 +308,9 @@ jobs:
         run: |
           docker compose -f ortsom/ci/regtest/compose.yml --profile daemon logs \
             --no-color --timestamps > result/stack.log 2>&1 || true
-          [ -d ortsom/artifacts ] && cp -r ortsom/artifacts result/ortsom-artifacts || true
+          if [ -d ortsom/artifacts ]; then
+            cp -r ortsom/artifacts result/ortsom-artifacts || true
+          fi
 
       - uses: actions/upload-artifact@v7
         if: always()

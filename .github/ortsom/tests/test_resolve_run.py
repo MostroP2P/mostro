@@ -1,8 +1,15 @@
 """Unit tests for resolve_run.py (docs/ORTSOM_PR_E2E_SPEC.md § 6.2, § 8.2, § 9.1)."""
 
+import io
+import json
+import os
 import sys
+import tempfile
 import unittest
+import urllib.error
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -81,6 +88,14 @@ class ValidateMetaTest(unittest.TestCase):
     def test_unknown_skip_reason_is_rejected(self):
         with self.assertRaisesRegex(rr.ResolveError, "skipped"):
             rr.validate_meta(meta(skipped="because", image=None))
+
+    def test_an_unhashable_skip_reason_is_rejected(self):
+        with self.assertRaises(rr.ResolveError):
+            rr.validate_meta(meta(skipped=["draft"], image=None))
+
+    def test_an_unhashable_image_state_is_rejected(self):
+        with self.assertRaises(rr.ResolveError):
+            rr.validate_meta(meta(image={"built": True}))
 
     def test_a_run_that_was_not_skipped_needs_an_image_state(self):
         with self.assertRaisesRegex(rr.ResolveError, "image"):
@@ -247,6 +262,61 @@ class ChangesTest(unittest.TestCase):
             rr.name_status([{"filename": "src/a\tb.rs", "status": "modified"}])
         with self.assertRaises(rr.ResolveError):
             rr.name_status([{"filename": "src/a\nM\tsrc/db.rs", "status": "modified"}])
+
+
+class ResolveFailsClosedTest(unittest.TestCase):
+    """Whatever the artifact or the API does, `resolve` writes proceed=false and a reason."""
+
+    def resolve_with(self, raw, api=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / "meta.json"
+            meta_path.write_bytes(raw)
+            event = Path(tmp) / "event.json"
+            event.write_text(json.dumps({"workflow_run": run()}))
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_TOKEN": "t", "GITHUB_EVENT_PATH": str(event)}
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(rr, "api", api or (lambda *a: pull())), \
+                    redirect_stdout(out):
+                os.environ.pop("GITHUB_OUTPUT", None)
+                rc = rr.main(["resolve", "--meta", str(meta_path)])
+        return rc, out.getvalue()
+
+    def assert_rejected(self, rc, out):
+        self.assertEqual(rc, 0)
+        self.assertIn("proceed=false\n", out)
+        self.assertIn("reason=rejected\n", out)
+
+    def test_meta_that_is_not_utf8_is_rejected(self):
+        self.assert_rejected(*self.resolve_with(b'{"pr": "\x80"}'))
+
+    def test_meta_nested_too_deeply_is_rejected(self):
+        # Python 3.12 decodes 4 KiB of brackets; older ones run out of stack.
+        loads = json.loads
+
+        def shallow_loads(doc):
+            if isinstance(doc, bytes):
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+            return loads(doc)
+
+        with mock.patch.object(rr.json, "loads", shallow_loads):
+            self.assert_rejected(*self.resolve_with(b"[" * 2000 + b"]" * 2000))
+
+    def test_meta_with_an_unhashable_field_is_rejected(self):
+        raw = json.dumps(meta(skipped=["draft"], image=None)).encode()
+        self.assert_rejected(*self.resolve_with(raw))
+
+    def test_an_api_error_is_rejected(self):
+        def api(*_):
+            raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+
+        self.assert_rejected(*self.resolve_with(json.dumps(meta()).encode(), api))
+
+    def test_a_network_error_is_rejected(self):
+        def api(*_):
+            raise urllib.error.URLError("timed out")
+
+        self.assert_rejected(*self.resolve_with(json.dumps(meta()).encode(), api))
 
 
 if __name__ == "__main__":

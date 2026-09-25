@@ -7,7 +7,9 @@ request before anything runs against it (docs/ORTSOM_PR_E2E_SPEC.md § 6.2,
 
 `resolve` writes `proceed`, `reason`, `pr`, `head_sha`, `base_sha`, `fork`,
 `image`, `ortsom_ref` and `ortsom_ref_overridden` to $GITHUB_OUTPUT. It fails
-closed: any check that does not pass sets `proceed=false` with the reason.
+closed: any check that does not pass sets `proceed=false` with the reason. A
+run cancelled by hand yields `reason=cancelled` and its `pr`, for the verdict
+job to clear what the last verdict left.
 The triggering run comes from the workflow_run event, or from the API with
 --run-id (the workflow_dispatch path, for maintainers).
 
@@ -23,6 +25,7 @@ import os
 import re
 import sys
 import tomllib
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -214,6 +217,31 @@ def write_outputs(values):
             f.write(text)
 
 
+def resolve_cancelled(run, get, repo):
+    """A cancelled `ortsom-pr.yml` run (§ 9.1). A newer run of the same head
+    repository and branch is its successor and will report. Without one it
+    was cancelled by hand and may have uploaded nothing, so the pull request
+    is found from the run's head and checked without meta.json."""
+    head_repo = run.get("head_repository") or {}
+    branch = run.get("head_branch") or ""
+    runs = get(
+        f"/repos/{repo}/actions/workflows/ortsom-pr.yml/runs",
+        f"?branch={urllib.parse.quote(branch, safe='')}&event=pull_request&per_page={PER_PAGE}",
+    )["workflow_runs"]
+    for other in runs:
+        if (other.get("id") != run.get("id")
+                and (other.get("head_repository") or {}).get("full_name") == head_repo.get("full_name")
+                and other.get("created_at", "") > run.get("created_at", "")):
+            raise Superseded(f"run {other.get('id')} of the same branch replaced the cancelled one")
+    owner = (head_repo.get("owner") or {}).get("login") or ""
+    head = urllib.parse.quote(f"{owner}:{branch}", safe="")
+    pulls = get(f"/repos/{repo}/pulls", f"?state=open&head={head}&per_page={PER_PAGE}")
+    if len(pulls) != 1:
+        raise ResolveError(f"{len(pulls)} open pull requests for the cancelled run's head")
+    check_association(run, pulls[0], {"head_sha": run.get("head_sha")}, repo)
+    return {"proceed": "false", "reason": "cancelled", "pr": pulls[0]["number"]}
+
+
 def resolve(args, repo, token):
     def get(path, params=""):
         return api(path, token, params)
@@ -222,6 +250,8 @@ def resolve(args, repo, token):
         run = get(f"/repos/{repo}/actions/runs/{args.run_id}")
     else:
         run = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["workflow_run"]
+    if run.get("conclusion") == "cancelled":
+        return resolve_cancelled(run, get, repo)
     if run.get("conclusion") != "success":
         raise ResolveError(f"triggering run concluded {run.get('conclusion')!r}")
     raw = Path(args.meta).read_bytes()

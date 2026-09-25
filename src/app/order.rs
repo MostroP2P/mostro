@@ -100,6 +100,16 @@ pub async fn order_action(
             return Err(MostroCantDo(cause));
         }
 
+        // A half-specified range is not a thing: reject it explicitly.
+        // Otherwise it slips past both `check_fiat_amount` (skipped below
+        // when either bound is set) and `check_range_order_limits` (which
+        // only enforces the amount == 0 rule when both bounds are set),
+        // and gets persisted with a fixed sats price and no fiat amount
+        // (issue #927, part 3).
+        if order.min_amount.is_some() != order.max_amount.is_some() {
+            return Err(MostroCantDo(CantDoReason::InvalidAmount));
+        }
+
         // `check_fiat_amount` in mostro-core requires fiat_amount > 0. Range orders set
         // min/max and use fiat_amount == 0, so only run it for single-amount orders.
         if order.min_amount.is_none() && order.max_amount.is_none() {

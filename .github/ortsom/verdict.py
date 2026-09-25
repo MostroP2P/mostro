@@ -152,8 +152,10 @@ def blind_spots(rows, selection, changed, gate_map, registry):
     compared: all skipped, unstable on `main` or new. The verdict stands,
     but it says nothing about the files those rules cover, which the comment
     must not let a reader assume (§ 7.4). `full`, `ignore` and `uncovered`
-    rules select no scenarios of their own and are left out."""
-    if not gate_map or not registry:
+    rules select no scenarios of their own and are left out. Without rows
+    nothing was classified (no baseline, a daemon that did not start), so
+    there is nothing to call a blind spot."""
+    if not rows or not gate_map or not registry:
         return []
     classes = {r["name"]: r["class"] for r in rows}
     matched = set(selection.get("matched_rules") or [])

@@ -379,6 +379,11 @@ class BlindSpotTest(unittest.TestCase):
         rows = [self.row("s1", "skipped")]
         self.assertEqual(self.spots(rows, ["scheduler", "rpc"], ["src/scheduler.rs", "src/rpc/a.rs"]), [])
 
+    def test_an_unjudged_run_has_no_blind_spots(self):
+        # No baseline or a daemon that did not start: no scenario was
+        # classified, so none is "not compared" (#988 review).
+        self.assertEqual(self.spots([], ["bonds"], ["src/app/bond/flow.rs"]), [])
+
     def test_without_the_map_there_are_none(self):
         self.assertEqual(vd.blind_spots([self.row("s1", "skipped")], selection("s1", matched_rules=["rating"]),
                                         ["src/app/rate_user.rs"], None, None), [])
@@ -622,6 +627,18 @@ class RunTest(unittest.TestCase):
         verdict = json.loads((self.dir / "out" / "verdict.json").read_text())
         self.assertEqual(verdict["blind_spots"][0]["files"], ["src/app/bond/flow.rs"])
         self.assertIn("says nothing about `src/app/bond/flow.rs`", (self.dir / "out" / "comment.md").read_text())
+
+    def test_a_daemon_that_did_not_start_reports_no_blind_spot(self):
+        sel = selection("s1", "bond_a", "bond_b", matched_rules=["bonds"])
+        res = self.write_result(meta(stack="daemon_failed", suite_exit=None), sel,
+                                changes="M\tsrc/app/bond/flow.rs\n")
+        out = vd.run(
+            {"pr": 7, "reason": "ok", "head_sha": HEAD, "result": res, "out": self.dir / "out",
+             "run_url": "https://example/run"},
+            REPO, FakeGitHub().get, FakeGitHub().send, lambda _m: [baseline(BASE, passing("s1"))], SETTINGS,
+            gate_map=BLIND_MAP, registry=BLIND_REGISTRY,
+        )
+        self.assertEqual((out["verdict"], out["blind_spots"]), ("would-close", []))
 
     def test_the_expected_break_label_caps_the_verdict(self):
         pr = summary(*(result(n, "failed") for n in FOUR))

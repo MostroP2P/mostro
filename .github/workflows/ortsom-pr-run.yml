@@ -7,9 +7,8 @@ name: Ortsom PR run
 # request built and runs the scenarios main's map selects. Pull request code
 # only ever runs inside the daemon's container. For a pull request from a
 # fork the suite waits for a maintainer in the `ortsom-fork` environment.
-#
-# Phase 3b: the result is an artifact only. Labels and the comment come
-# with the verdict job (Phase 3c).
+# `verdict` compares the result with the baseline of `main` and reports it
+# as one `ortsom:*` label and a sticky comment. Shadow mode: it never closes.
 
 on:
   workflow_run:
@@ -138,6 +137,8 @@ jobs:
             4) echo "state=superseded" >> "$GITHUB_OUTPUT"; exit 0 ;;
             *) echo "state=selection_error" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
+          # The verdict checks it for changes to the gate itself (§ 9.2).
+          cp "$RUNNER_TEMP/changes.txt" ../result/changes.txt
           if ! python3 .github/ortsom/select_scenarios.py \
               --changes "$RUNNER_TEMP/changes.txt" --out ../result/selection.json; then
             echo "state=selection_error" >> "$GITHUB_OUTPUT"; exit 0
@@ -325,3 +326,57 @@ jobs:
         run: |
           $ORTSOM stack down \
             || docker compose -f ci/regtest/compose.yml --profile daemon down -v
+
+  # Labels and the sticky comment (§ 7, § 9.1). It checks out main only and
+  # never runs pull request code: the result it reads was written by
+  # `suite`, which runs main's definition. A skip or a run cancelled by hand
+  # clears the verdict. A suite that failed still reports: a step timeout
+  # fails the job, yet its result is `incomplete-run` (§ 7.2). A cancelled
+  # suite does not: a newer run of the same pull request replaced it.
+  verdict:
+    name: Verdict
+    needs: [resolve, suite]
+    if: >-
+      always() && (
+        needs.resolve.outputs.reason == 'cancelled'
+        || startsWith(needs.resolve.outputs.reason, 'skipped-')
+        || (needs.resolve.outputs.proceed == 'true'
+          && (needs.suite.result == 'success' || needs.suite.result == 'failure')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: ortsom-verdict-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        if: needs.resolve.outputs.proceed == 'true'
+        with:
+          name: ortsom-pr-result
+          path: result
+
+      - name: Verdict
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          REASON: ${{ needs.resolve.outputs.reason }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+        run: |
+          python3 .github/ortsom/verdict.py --pr "$PR" --reason "$REASON" \
+            ${HEAD_SHA:+--head-sha "$HEAD_SHA"} --result result --out verdict
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ortsom-pr-verdict
+          path: verdict/
+          if-no-files-found: ignore
+          retention-days: 30

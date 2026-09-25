@@ -416,11 +416,11 @@ pub(crate) async fn notify_users_canceled_order(
     // Neutral wording on purpose: this helper serves several closure paths
     // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
     // specific cause is logged by each caller, not here.
+    // No party keys here: maker and taker in one line pairs the two
+    // counterparties, and the published order event carries neither.
     tracing::info!(
-        "Notifying maker {} and taker {} that order {} was not completed",
-        maker_pubkey.to_string(),
-        taker_pubkey.to_string(),
-        old_order.id
+        order_id = %old_order.id,
+        "notifying maker and taker that the order was not completed"
     );
 
     // get payload
@@ -707,10 +707,7 @@ async fn job_cancel_orders(ctx: AppContext) {
                             };
 
                         // Get edited order to use for update_order_event
-                        let edited_order = if let Ok(edited_order) = edited_order {
-                            println!("Edited order: {:?}", edited_order);
-                            edited_order
-                        } else {
+                        let Ok(edited_order) = edited_order else {
                             tracing::warn!("Error editing pubkeys in order {} cancel", order.id);
                             continue;
                         };

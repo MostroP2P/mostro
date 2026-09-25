@@ -23,6 +23,9 @@ from pathlib import Path
 
 GATE_DIR = Path(__file__).resolve().parent
 
+# The gate itself. A pull request that changes it is not judged: its
+# image may not have been built the way the baseline's was (§ 9.2).
+GATE_PATHS = (re.compile(r"^\.github/ortsom/"), re.compile(r"^\.github/workflows/ortsom-[^/]*\.yml$"))
 RULE_KEYS = {"name", "paths", "ignore", "full", "uncovered", "tags", "scenarios"}
 
 
@@ -155,6 +158,11 @@ def unmapped(files, gate_map):
     return sorted(f for f in files if not matching_rules(f, rules))
 
 
+def gate_files(files):
+    """The changed files that belong to the gate itself (§ 9.2)."""
+    return sorted(f for f in set(files) if any(p.match(f) for p in GATE_PATHS))
+
+
 def select(files, gate_map, registry):
     """The selection.json document of § 4.3 for these changed files."""
     validate_map(gate_map)
@@ -173,6 +181,7 @@ def select(files, gate_map, registry):
         "uncovered_files": {},
         "unmapped_files": [],
         "ignored_files": ignored,
+        "gate_files": gate_files(files),
     }
     if not remaining:
         return result

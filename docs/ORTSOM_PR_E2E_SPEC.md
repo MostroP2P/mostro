@@ -388,8 +388,9 @@ Steps:
 1. **Select, to save work.** Check out the merge commit with full
    history, list changed files with
    `git diff --name-status <base_sha>...<head_sha>` and run
-   `select_scenarios.py`. If `mode` is `none`, upload `meta.json` with
-   `image: "not-needed"` and stop. This selection only avoids a useless
+   `select_scenarios.py`. If `mode` is `none`, or the pull request
+   changes the gate itself (`gate_files` is not empty, § 9.2), upload
+   `meta.json` with `image: "not-needed"` and stop. This selection only avoids a useless
    build; the one that counts is recomputed on the trusted side (§6.2).
 2. **Build.** Check out `head_sha` (`persist-credentials: false`) and
    build `.github/ortsom/mostro.Dockerfile` with that checkout as the
@@ -465,7 +466,9 @@ Steps of `suite`:
    `main`'s map. GitHub lists at most 3000 files: when the list is
    shorter than the pull request's `changed_files`, or the head moved
    while listing, the outcome is `selection_error` or `superseded`, never
-   a selection computed from part of the diff. If `mode` is `none`, record it and stop. If the
+   a selection computed from part of the diff. If `mode` is `none`, record it and stop. If
+   `gate_files` is not empty, record `gate_modified` and stop: nothing
+   is built or run for a verdict decided in advance (§ 9.2). If the
    `ortsom-pr` meta says `build_failed`, the outcome is `build_failed`
    and nothing runs; `not-needed` while the trusted selection is not
    `none` is `inconclusive`, reason `no-image`.
@@ -522,8 +525,9 @@ Artifact `ortsom-pr-result` contains `meta.json`:
 failed in `ortsom-pr.yml`), `bad_image` (step 3), `no_image` (the PR run
 skipped the build but the trusted selection is not `none`),
 `selection_error` (a stale map, or an incomplete file list),
-`superseded` (the head moved during the run) or `not_run` (trusted
-selection `none`).
+`superseded` (the head moved during the run), `gate_modified` (the pull
+request changes the gate, § 9.2) or `not_run` (trusted selection
+`none`).
 
 plus `selection.json`, `summary.json` (if the run happened), `suite.log`,
 `stack.log` and Ortsom's per-scenario artifacts. This artifact is
@@ -782,6 +786,11 @@ it is limited to the image it hands over:
 - A pull request that touches `.github/ortsom/**` or any `ortsom-*.yml`
   workflow gets the verdict `inconclusive`, reason `gate-modified`: its
   image may not have been built the way the baseline's was.
+  `select_scenarios.py` lists those files as `gate_files`, and both sides
+  stop on them: the build side builds no image and the suite does not
+  run, since the verdict is decided in advance. Gate pull requests are
+  validated by the gate's unit tests instead, and a `gate-modified`
+  verdict does not count towards the `inconclusive` rate of § 11.
 
 ### 9.3 Running untrusted code
 
@@ -877,8 +886,9 @@ Documented in the README and `docs/ci-regtest.md`.
 
 - No `ortsom:false-positive` among the last 10 `would-close` verdicts, or
   a documented, fixed root cause for each one.
-- `inconclusive` below 20% of runs; otherwise the baseline or the stack
-  is too unreliable to enforce anything.
+- `inconclusive` below 20% of runs, not counting `gate-modified` (§ 9.2);
+  otherwise the baseline or the stack is too unreliable to enforce
+  anything.
 
 The review also tracks, per run, the number of **smoke-only** selections
 (files remained after ignores, but only `uncovered` or unmapped ones) and

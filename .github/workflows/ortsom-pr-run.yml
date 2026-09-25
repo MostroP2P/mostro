@@ -145,7 +145,10 @@ jobs:
           fi
           mode="$(jq -r .mode ../result/selection.json)"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          # A pull request that changes the gate is not judged (§ 9.2): no
+          # harness build, no stack, no suite.
           if [ "$mode" = none ]; then state=not_run
+          elif [ "$(jq '.gate_files | length > 0' ../result/selection.json)" = true ]; then state=gate_modified
           elif [ "$IMAGE_STATE" = build_failed ]; then state=build_failed
           elif [ "$IMAGE_STATE" != built ]; then state=no_image
           else state=go; fi

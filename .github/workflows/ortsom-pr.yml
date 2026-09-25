@@ -1,0 +1,140 @@
+name: Ortsom PR
+
+# Untrusted half of the Ortsom e2e gate (docs/ORTSOM_PR_E2E_SPEC.md § 6.1).
+# It compiles the pull request into a mostrod image and hands it over as an
+# artifact; ortsom-pr-run.yml, which runs main's definition with the Ortsom
+# deploy key, starts that image and runs the suite. This workflow has no
+# secrets and a read-only token, and never sees Ortsom: that is what lets it
+# run a fork's code.
+
+on:
+  pull_request:
+    branches: [main]
+    # converted_to_draft takes the skip path, which cancels a suite in flight.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  skip:
+    name: Skip
+    # Drafts, `ortsom:skip` and Dependabot run nothing, but still hand over
+    # a meta.json so the trusted side knows why (§ 6.1).
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled'
+        || contains(fromJSON('["ortsom:run","ortsom:skip","ortsom:expected-break"]'), github.event.label.name))
+      && (github.event.pull_request.draft
+        || contains(github.event.pull_request.labels.*.name, 'ortsom:skip')
+        || github.event.pull_request.user.login == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ortsom-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Write meta.json
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ortsom:skip') }}
+        run: |
+          if [ "$DRAFT" = true ]; then reason=draft
+          elif [ "$SKIP_LABEL" = true ]; then reason=label
+          else reason=dependabot; fi
+          mkdir -p out
+          jq -n --argjson pr "$PR" --arg head "$HEAD_SHA" --arg base "$BASE_SHA" --arg reason "$reason" \
+            '{pr: $pr, head_sha: $head, base_sha: $base, skipped: $reason, image: null}' > out/meta.json
+          cat out/meta.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ortsom-pr
+          path: out/meta.json
+          retention-days: 3
+
+  build:
+    name: Build image
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled'
+        || contains(fromJSON('["ortsom:run","ortsom:skip","ortsom:expected-break"]'), github.event.label.name))
+      && !github.event.pull_request.draft
+      && !contains(github.event.pull_request.labels.*.name, 'ortsom:skip')
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: ortsom-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      # The pull request's head, not the merge commit: that is the commit
+      # the image claims to be. Full history so base...head can be diffed.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Only to skip a useless build: the selection that counts is
+      # recomputed on the trusted side from main's map (§ 6.2).
+      - name: Select
+        id: select
+        run: |
+          git diff --name-status "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changes.txt"
+          if python3 .github/ortsom/select_scenarios.py \
+              --changes "$RUNNER_TEMP/changes.txt" --out "$RUNNER_TEMP/selection.json"; then
+            echo "mode=$(jq -r .mode "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=error" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A failed build is retried once: a download failing inside it looks
+      # the same as mostro not compiling.
+      - name: Build the daemon image
+        id: image
+        if: steps.select.outputs.mode != 'none'
+        run: |
+          set +e
+          build() {
+            docker build -f .github/ortsom/mostro.Dockerfile \
+              --build-arg MOSTRO_SHA="$HEAD_SHA" \
+              -t "ortsom-pr/mostro:$HEAD_SHA" .
+          }
+          if build || { echo "::warning::image build failed; retrying once"; build; }; then
+            mkdir -p image
+            docker save "ortsom-pr/mostro:$HEAD_SHA" | zstd -q -T0 -o image/mostro.tar.zst
+            ls -l image
+            echo "state=built" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=build_failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write meta.json
+        if: always()
+        env:
+          STATE: ${{ steps.image.outputs.state || 'not-needed' }}
+        run: |
+          mkdir -p out
+          jq -n --argjson pr "$PR" --arg head "$HEAD_SHA" --arg base "$BASE_SHA" --arg image "$STATE" \
+            '{pr: $pr, head_sha: $head, base_sha: $base, skipped: null, image: $image}' > out/meta.json
+          cat out/meta.json
+
+      - uses: actions/upload-artifact@v7
+        if: steps.image.outputs.state == 'built'
+        with:
+          name: ortsom-pr-image
+          path: image/mostro.tar.zst
+          retention-days: 3
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ortsom-pr
+          path: out/meta.json
+          retention-days: 3

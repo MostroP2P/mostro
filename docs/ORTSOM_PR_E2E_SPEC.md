@@ -356,7 +356,8 @@ the Ortsom deploy key (§3, §9.3).
 ### 6.1 Image build — `ortsom-pr.yml`
 
 - **Trigger:** `pull_request` on `opened`, `synchronize`, `reopened`,
-  `ready_for_review`, `labeled` and `unlabeled`, targeting `main`.
+  `ready_for_review`, `converted_to_draft`, `labeled` and `unlabeled`,
+  targeting `main`. Going back to draft takes the skip path.
 - **Label events.** Only three labels are relevant: `ortsom:run`
   (added), `ortsom:skip` (added or removed) and `ortsom:expected-break`
   (added or removed). Each of those proceeds as an ordinary run, so the
@@ -431,10 +432,19 @@ request that bumps `ortsom_ref`.
 - **Job `resolve`** (`actions: read`, `pull-requests: read`): downloads
   the `ortsom-pr` artifact from the triggering run the same way as the
   image (step 3 below), applies
-  every check of §9.1 to tie the run to its pull request, handles the
-  skip and cancel cases, and outputs the pull request number, `head_sha`,
-  `base_sha` and whether the head is a fork. Nothing else runs if it
-  rejects the run.
+  every check of §9.1 to tie the run to its pull request — skips
+  included, since a skip names a pull request too — and outputs the pull
+  request number, `head_sha`, `base_sha` and whether the head is a fork.
+  It re-reads the pull request's **current** state: one that is a draft,
+  carries `ortsom:skip` or is Dependabot's now is skipped even if the
+  build it resolves was not. A numeric `ortsom-ref:` (§8.2) is passed to
+  the checkout as `refs/pull/<n>/head`. Nothing else runs if it rejects
+  the run.
+- **Job `cancel`** (no permissions): runs when `resolve` authenticated a
+  skip. A skip schedules no suite, so it would never enter the suite's
+  concurrency group; this job enters it (`ortsom-pr-run-<number>`,
+  `cancel-in-progress: true`) and so cancels a suite still running or
+  waiting for approval.
 - **Job `suite`** (`contents: read`, `actions: read`,
   `pull-requests: read`): for a pull
   request from a fork it runs in the environment `ortsom-fork`, whose
@@ -442,12 +452,20 @@ request that bumps `ortsom_ref`.
   `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 330 min, suite
   step 300 min, as in §5.
 - **Job `verdict`**: see §7 and §9.1.
+- **`workflow_dispatch`** with the ID of an `ortsom-pr.yml` run re-runs
+  `resolve` and `suite` for it, for maintainers.
+- **Rust cache:** `suite` restores the baseline's Ortsom build cache
+  (`shared-key: ortsom`) and never saves one, since it runs pull request
+  code afterwards.
 
 Steps of `suite`:
 
 1. **Trusted selection.** Check out `main`. Fetch the changed files of
    the pull request through the API and run `select_scenarios.py` with
-   `main`'s map. If `mode` is `none`, record it and stop. If the
+   `main`'s map. GitHub lists at most 3000 files: when the list is
+   shorter than the pull request's `changed_files`, or the head moved
+   while listing, the outcome is `selection_error` or `superseded`, never
+   a selection computed from part of the diff. If `mode` is `none`, record it and stop. If the
    `ortsom-pr` meta says `build_failed`, the outcome is `build_failed`
    and nothing runs; `not-needed` while the trusted selection is not
    `none` is `inconclusive`, reason `no-image`.
@@ -465,7 +483,10 @@ Steps of `suite`:
    `github-token: ${{ github.token }}`, which `actions: read` allows; by
    default it only sees the current run) and `docker load` it. Exactly
    one image, tagged `ortsom-pr/mostro:<head_sha>`, with that revision
-   label, or the outcome is `inconclusive`, reason `bad-image`.
+   label, or the outcome is `inconclusive`, reason `bad-image`. `docker load`
+   must report exactly that one image: a tar that also carries another
+   tag could replace an image the stack trusts (LND, bitcoind, the
+   relay), which compose would then start without pulling.
 4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`.
    Compose starts a local image without pulling it. Exit 0 is `ok`, 4 is
    `daemon_failed`, anything else `infra_failed` (3 cannot happen: there
@@ -495,6 +516,14 @@ Artifact `ortsom-pr-result` contains `meta.json`:
   "suite_exit": 1
 }
 ```
+
+`stack` is one of `ok`, `daemon_failed`, `infra_failed`,
+`doctor_failed` (as for the baseline), `build_failed` (the image build
+failed in `ortsom-pr.yml`), `bad_image` (step 3), `no_image` (the PR run
+skipped the build but the trusted selection is not `none`),
+`selection_error` (a stale map, or an incomplete file list),
+`superseded` (the head moved during the run) or `not_run` (trusted
+selection `none`).
 
 plus `selection.json`, `summary.json` (if the run happened), `suite.log`,
 `stack.log` and Ortsom's per-scenario artifacts. This artifact is

@@ -92,6 +92,20 @@ class SelectTest(unittest.TestCase):
     def run_select(self, files, *rules, always_tags=("smoke",)):
         return sel.select(files, make_map(*rules, always_tags=always_tags), REGISTRY)
 
+    def test_files_of_the_gate_itself_are_listed(self):
+        files = [".github/ortsom/verdict.py", ".github/workflows/ortsom-pr.yml",
+                 ".github/workflows/rust.yml", "src/app/release.rs"]
+        result = self.run_select(files, TRADE)
+        self.assertEqual(result["gate_files"], [".github/ortsom/verdict.py", ".github/workflows/ortsom-pr.yml"])
+
+    def test_no_gate_file_is_an_empty_list(self):
+        self.assertEqual(self.run_select(["src/app/release.rs"], TRADE)["gate_files"], [])
+
+    def test_a_gate_file_under_an_ignore_rule_is_still_listed(self):
+        gate_docs = {"name": "docs", "paths": ["**/*.md"], "ignore": True}
+        result = self.run_select([".github/ortsom/README.md"], gate_docs)
+        self.assertEqual((result["mode"], result["gate_files"]), ("none", [".github/ortsom/README.md"]))
+
     def test_only_ignored_files_select_nothing(self):
         result = self.run_select(["README.md", "docs/a.md"], DOCS, TRADE)
         self.assertEqual(result["mode"], "none")

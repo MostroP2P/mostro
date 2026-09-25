@@ -81,7 +81,9 @@ jobs:
           persist-credentials: false
 
       # Only to skip a useless build: the selection that counts is
-      # recomputed on the trusted side from main's map (§ 6.2).
+      # recomputed on the trusted side from main's map (§ 6.2). A pull
+      # request that changes the gate is not judged (§ 9.2), so it needs no
+      # image either.
       - name: Select
         id: select
         run: |
@@ -89,6 +91,7 @@ jobs:
           if python3 .github/ortsom/select_scenarios.py \
               --changes "$RUNNER_TEMP/changes.txt" --out "$RUNNER_TEMP/selection.json"; then
             echo "mode=$(jq -r .mode "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
+            echo "gate=$(jq '(.gate_files // []) | length > 0' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
           else
             echo "mode=error" >> "$GITHUB_OUTPUT"
           fi
@@ -97,7 +100,7 @@ jobs:
       # the same as mostro not compiling.
       - name: Build the daemon image
         id: image
-        if: steps.select.outputs.mode != 'none'
+        if: steps.select.outputs.mode != 'none' && steps.select.outputs.gate != 'true'
         run: |
           set +e
           build() {

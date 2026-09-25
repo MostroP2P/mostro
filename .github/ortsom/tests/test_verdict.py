@@ -173,6 +173,10 @@ class PrecheckTest(unittest.TestCase):
         got = self.precheck(changed=[".github/ortsom/verdict.py"], summ=passing(*FOUR))
         self.assertEqual(got, ("inconclusive", "gate-modified"))
 
+    def test_a_suite_cut_for_touching_the_gate_is_gate_modified(self):
+        got = self.precheck(meta(stack="gate_modified", suite_exit=None))
+        self.assertEqual(got, ("inconclusive", "gate-modified"))
+
     def test_stack_failures_are_inconclusive_with_their_name(self):
         for stack, reason in [
             ("no_image", "no-image"),

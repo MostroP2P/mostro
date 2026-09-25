@@ -16,7 +16,6 @@ import argparse
 import io
 import json
 import os
-import re
 import sys
 import tomllib
 import urllib.error
@@ -26,7 +25,7 @@ import zipfile
 from pathlib import Path
 
 from resolve_run import api, current_skip
-from select_scenarios import matching_rules, parse_name_status
+from select_scenarios import gate_files, matching_rules, parse_name_status
 
 GATE_DIR = Path(__file__).resolve().parent
 BASELINE_WORKFLOW = "ortsom-baseline.yml"
@@ -41,7 +40,6 @@ VERDICT_LABELS = {
 }
 RUN_LABEL = "ortsom:run"
 EXPECTED_BREAK = "ortsom:expected-break"
-GATE_PATHS = (re.compile(r"^\.github/ortsom/"), re.compile(r"^\.github/workflows/ortsom-[^/]*\.yml$"))
 STACK_REASONS = {
     "no_image": "no-image",
     "bad_image": "bad-image",
@@ -81,7 +79,7 @@ def outcome_text(outcome):
 
 
 def gate_modified(files):
-    return any(p.match(f) for f in files for p in GATE_PATHS)
+    return bool(gate_files(files))
 
 
 # --- Classification (§ 7.2, § 7.3) -------------------------------------------
@@ -188,7 +186,7 @@ def precheck(meta, selection, changed, pr_summary):
         return ("not-applicable", "no-selection")
     if meta.get("registry_stale"):
         return ("inconclusive", "stale-registry")
-    if gate_modified(changed):
+    if stack == "gate_modified" or gate_modified(changed):
         return ("inconclusive", "gate-modified")
     if stack in STACK_REASONS:
         return ("inconclusive", STACK_REASONS[stack])

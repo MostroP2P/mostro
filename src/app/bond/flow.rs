@@ -1002,9 +1002,9 @@ async fn on_maker_bond_accepted(
     .bind(now)
     .bind(bond.id)
     .bind(BondState::Requested.to_string())
-    .bind(Status::Expired.to_string())
-    .bind(Status::CanceledByAdmin.to_string())
-    .bind(Status::Canceled.to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[0].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[1].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[2].to_string())
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1190,6 +1190,13 @@ async fn promote_taker_context_to_order(
     Ok(order)
 }
 
+/// The statuses [`close_unpublished_maker_order`] writes. The maker bond
+/// lock (`on_maker_bond_accepted`) refuses an order in any of them, and the
+/// stranded-bond retry in [`expire_unpaid_maker_bonds`] releases only under
+/// them: one list, so the two cannot drift apart.
+pub(crate) const UNPUBLISHED_CLOSE_STATUSES: [Status; 3] =
+    [Status::Expired, Status::CanceledByAdmin, Status::Canceled];
+
 /// Close an order that is still waiting for its maker bond (#942).
 ///
 /// Such an order was never published, so there is no NIP-33 event to
@@ -1215,6 +1222,11 @@ pub async fn close_unpublished_maker_order(
     status: Status,
     notice: Action,
 ) -> Result<bool, MostroError> {
+    if !UNPUBLISHED_CLOSE_STATUSES.contains(&status) {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "close_unpublished_maker_order: {status} is not a status the maker bond lock refuses"
+        ))));
+    }
     let closed = sqlx::query(
         "UPDATE orders SET status = ? WHERE id = ? AND status = ? \
          AND NOT EXISTS (SELECT 1 FROM bonds WHERE order_id = ? AND role = ? AND state = ?)",
@@ -1254,15 +1266,20 @@ pub async fn close_unpublished_maker_order(
     Ok(true)
 }
 
-/// Enforce `maker_bond_payment_timeout_seconds` (#942): every maker bond
-/// still `requested` past the deadline ends here.
+/// Enforce `maker_bond_payment_timeout_seconds` (#942), in two steps that
+/// both read the current rows, never a snapshot.
 ///
-/// While its order is still waiting for the bond, the order is closed as
-/// `expired` and the maker told ([`close_unpublished_maker_order`]). When
-/// the order has already left that status (it expired, or an earlier pass
-/// closed it but LND could not cancel the invoice then), only the stranded
-/// invoice is left: it is released again on every pass until LND cancels
-/// it, so a late payment cannot lock an HTLC for an order that is gone.
+/// 1. **Close** every order still `waiting-maker-bond` past the deadline,
+///    whatever its bond's state: `requested` (unpaid), `released` (a crash
+///    or failed close between `on_bond_invoice_canceled`'s two writes), or
+///    no bond row at all. [`close_unpublished_maker_order`] refuses one
+///    whose bond is `locked`.
+/// 2. **Release** every maker bond still `requested` whose order that close
+///    has already ended (LND could not cancel the invoice at close time).
+///    Only orders in [`UNPUBLISHED_CLOSE_STATUSES`] qualify: the bond lock
+///    refuses exactly those, so such a bond can never lock again and
+///    releasing it cannot refund a payment that won. Retried every pass
+///    until LND cancels it, so a late payment cannot strand an HTLC.
 ///
 /// Returns how many orders this pass closed.
 pub async fn expire_unpaid_maker_bonds(
@@ -1276,40 +1293,50 @@ pub async fn expire_unpaid_maker_bonds(
                 .maker_bond_payment_timeout_seconds
         });
     let cutoff = now.saturating_sub(i64::try_from(timeout).unwrap_or(i64::MAX));
-    let stale = sqlx::query_as::<_, Bond>(
-        "SELECT * FROM bonds WHERE role = ? AND state = ? AND parent_bond_id IS NULL \
-         AND created_at <= ? ORDER BY created_at ASC",
+
+    let overdue = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM orders WHERE status = ? AND created_at <= ? ORDER BY created_at ASC",
     )
-    .bind(BondRole::Maker.to_string())
-    .bind(BondState::Requested.to_string())
+    .bind(Status::WaitingMakerBond.to_string())
     .bind(cutoff)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
     let mut closed = 0;
-    for bond in stale.iter() {
-        match close_unpublished_maker_order(pool, bond.order_id, Status::Expired, Action::Canceled)
-            .await
+    for (order_id,) in overdue {
+        match close_unpublished_maker_order(pool, order_id, Status::Expired, Action::Canceled).await
         {
             Ok(true) => {
-                info!(order_id = %bond.order_id, "maker bond unpaid past the deadline; order expired");
+                info!(%order_id, "maker bond unpaid past the deadline; order expired");
                 closed += 1;
             }
-            Ok(false) => {
-                if let Err(e) = release_bond(pool, bond).await {
-                    warn!(
-                        bond_id = %bond.id,
-                        order_id = %bond.order_id,
-                        "expire_unpaid_maker_bonds: stranded bond release failed, retrying next pass: {}",
-                        e
-                    );
-                }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(%order_id, "expire_unpaid_maker_bonds: close failed, retrying next pass: {e}")
             }
-            Err(e) => warn!(
+        }
+    }
+
+    let stranded = sqlx::query_as::<_, Bond>(
+        "SELECT b.* FROM bonds b JOIN orders o ON o.id = b.order_id \
+         WHERE b.role = ? AND b.state = ? AND b.parent_bond_id IS NULL \
+         AND o.status IN (?, ?, ?)",
+    )
+    .bind(BondRole::Maker.to_string())
+    .bind(BondState::Requested.to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[0].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[1].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[2].to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    for bond in stranded.iter() {
+        if let Err(e) = release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
                 order_id = %bond.order_id,
-                "expire_unpaid_maker_bonds: close failed, retrying next pass: {}", e
-            ),
+                "expire_unpaid_maker_bonds: stranded bond release failed, retrying next pass: {e}"
+            );
         }
     }
     Ok(closed)

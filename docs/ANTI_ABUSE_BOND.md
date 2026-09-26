@@ -1879,7 +1879,9 @@ so the lifecycle scope is described in maker/taker terms:
   order ends the first of three ways, all through
   `bond::close_unpublished_maker_order`:
   - the scheduler (`job_expire_unpaid_maker_bonds`, every minute) finds the
-    maker bond still `requested` past the timeout;
+    order still `waiting-maker-bond` past the timeout, whatever its bond's
+    state (a bond already `released` by a close interrupted half-way
+    included);
   - LND cancels the invoice and `on_bond_invoice_canceled` sees a maker
     bond;
   - the order reaches its own `expires_at` (`job_expire_pending_older_orders`).
@@ -1889,7 +1891,10 @@ so the lifecycle scope is described in maker/taker terms:
   maker `canceled`. It is a CAS that refuses while the maker bond is
   `locked`, so a maker who pays at the last moment has their order
   published, not refunded. A bond that could not be canceled in LND at
-  close time is released again on every scheduler pass until it is.
+  close time is released again on every scheduler pass until it is, but
+  only while its order is in one of the statuses the close writes
+  (`UNPUBLISHED_CLOSE_STATUSES`): those are exactly the ones the lock
+  refuses, so the retry can never refund a payment that won.
 - **Operator cancel.** `CancelOrder` (and `admin-cancel` with the daemon
   key) also accepts a `waiting-maker-bond` order: same close, with
   `canceled-by-admin` and `admin-canceled`.

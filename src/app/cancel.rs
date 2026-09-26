@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
-use crate::db::{claim_order_status, edit_pubkeys_order, update_order_to_initial_state};
+use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::db::Crud;
@@ -505,27 +505,23 @@ async fn cancel_waiting_maker_bond_order(
     order
         .sent_from_maker(event.sender)
         .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
-    // The bond can lock while this cancel is in flight, and
-    // `resume_publish_after_maker_bond` then moves the row to `Pending`
-    // and publishes it. The cancel must lose that race: claim the status
-    // atomically, and once the order is `Pending` the maker cancels it
-    // through the regular pre-trade path. Winning it first makes the
-    // resume skip, and the release below refunds a bond that just locked.
-    if !claim_order_status(pool, order.id, Status::WaitingMakerBond, Status::Canceled).await? {
+    // The bond can lock while this cancel is in flight. Same close as the
+    // #942 deadline and the operator cancel: it refuses while the maker
+    // bond is `Locked`, so a maker who paid a moment before cancelling gets
+    // the order published, then cancels it as a `Pending` order. Once the
+    // close commits the bond can no longer lock (`Canceled` is in
+    // `UNPUBLISHED_CLOSE_STATUSES`), and the close releases it.
+    let closed = bond::close_unpublished_maker_order(
+        pool,
+        order.id,
+        Status::Canceled,
+        Action::Canceled,
+        request_id,
+    )
+    .await?;
+    if !closed {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
-    // Cancels the hold invoice, so it can no longer be paid; an invoice
-    // LND already canceled still marks the bond `Released`.
-    bond::release_bonds_for_order_or_warn(pool, order.id, "waiting_maker_bond_cancel").await;
-    enqueue_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Canceled,
-        None,
-        event.sender,
-        None,
-    )
-    .await;
     Ok(())
 }
 

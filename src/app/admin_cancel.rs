@@ -102,6 +102,7 @@ pub async fn admin_cancel_action(
             order.id,
             Status::CanceledByAdmin,
             Action::AdminCanceled,
+            None,
         )
         .await?;
         if !closed {

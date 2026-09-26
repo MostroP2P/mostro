@@ -1202,8 +1202,8 @@ pub(crate) const UNPUBLISHED_CLOSE_STATUSES: [Status; 3] =
 /// Such an order was never published, so there is no NIP-33 event to
 /// replace: publishing one would put a ghost entry in the book. The order
 /// moves to `status` in the DB only, its bonds are released and the maker is
-/// sent `notice`, so their client can end the bond screen instead of
-/// counting down to nothing.
+/// sent `notice` (on `request_id` when the maker asked for the close), so
+/// their client can end the bond screen instead of counting down to nothing.
 ///
 /// The transition is a compare-and-set on `waiting-maker-bond` that also
 /// refuses while the maker bond is `locked`, and `on_maker_bond_accepted`
@@ -1221,6 +1221,7 @@ pub async fn close_unpublished_maker_order(
     order_id: Uuid,
     status: Status,
     notice: Action,
+    request_id: Option<u64>,
 ) -> Result<bool, MostroError> {
     if !UNPUBLISHED_CLOSE_STATUSES.contains(&status) {
         return Err(MostroInternalErr(ServiceError::UnexpectedError(format!(
@@ -1256,7 +1257,7 @@ pub async fn close_unpublished_maker_order(
     match Order::by_id(pool, order_id).await {
         Ok(Some(order)) => match order.get_creator_pubkey() {
             Ok(maker) => {
-                enqueue_order_msg(None, Some(order_id), notice, None, maker, None).await;
+                enqueue_order_msg(request_id, Some(order_id), notice, None, maker, None).await;
             }
             Err(e) => warn!(%order_id, "close_unpublished_maker_order: no maker pubkey: {e}"),
         },
@@ -1304,7 +1305,8 @@ pub async fn expire_unpaid_maker_bonds(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let mut closed = 0;
     for (order_id,) in overdue {
-        match close_unpublished_maker_order(pool, order_id, Status::Expired, Action::Canceled).await
+        match close_unpublished_maker_order(pool, order_id, Status::Expired, Action::Canceled, None)
+            .await
         {
             Ok(true) => {
                 info!(%order_id, "maker bond unpaid past the deadline; order expired");
@@ -1398,9 +1400,14 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
     // canceled (its expiry passed) ends the unpublished order with it;
     // otherwise the order sat in `WaitingMakerBond` until its own expiry.
     if bond.role == BondRole::Maker.to_string() {
-        if let Err(e) =
-            close_unpublished_maker_order(pool, bond.order_id, Status::Expired, Action::Canceled)
-                .await
+        if let Err(e) = close_unpublished_maker_order(
+            pool,
+            bond.order_id,
+            Status::Expired,
+            Action::Canceled,
+            None,
+        )
+        .await
         {
             warn!(
                 order_id = %bond.order_id,
@@ -3130,7 +3137,7 @@ mod tests {
         let (order_id, _) = waiting_maker_bond_order(&pool, BondState::Locked).await;
 
         let closed =
-            close_unpublished_maker_order(&pool, order_id, Status::Expired, Action::Canceled)
+            close_unpublished_maker_order(&pool, order_id, Status::Expired, Action::Canceled, None)
                 .await
                 .unwrap();
 

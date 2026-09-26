@@ -1,4 +1,5 @@
 use crate::app::bond;
+use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::{do_payment, reconcile_inflight_payout};
@@ -534,9 +535,50 @@ async fn job_cancel_orders(ctx: AppContext) {
                     if order.status == Status::WaitingBuyerInvoice.to_string()
                         || order.status == Status::WaitingPayment.to_string()
                     {
+                        // Resolved before touching the escrow: an order whose
+                        // status or kind cannot be parsed must not have its
+                        // hold invoice canceled either, and the escrow guard
+                        // below needs the status.
+                        let (order_status, order_kind) =
+                            match (order.get_order_status(), order.get_order_kind()) {
+                                (Ok(status), Ok(kind)) => (status, kind),
+                                _ => {
+                                    tracing::warn!(
+                                        "Error getting order status or kind in order {} cancel",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                            };
                         // If hold invoice is paid return funds to seller
                         // We return funds to seller
                         if let Some(hash) = order.hash.as_ref() {
+                            // The seller may have paid in the gap between
+                            // `reconfirm_timeout_eligibility` above and this
+                            // moment — the timeout boundary is public, so this
+                            // is also where a seller can aim deliberately.
+                            // Canceling then refunds their live escrow while
+                            // `hold_invoice_paid` tells the buyer to send
+                            // fiat, so ask LND first and leave a paid escrow
+                            // alone: the next tick sees the order active (or
+                            // re-anchored) and skips it on its own.
+                            match decide_escrow_cancel(&mut ln_client, order_status, hash).await {
+                                EscrowCancelDecision::Cancel => {}
+                                EscrowCancelDecision::SkipPaid => {
+                                    warn!(
+                                        "scheduler_timeout: order {} has a funded escrow — the seller paid at the timeout boundary; leaving it for the trade to advance",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                                EscrowCancelDecision::SkipUnknown(cause) => {
+                                    warn!(
+                                        "scheduler_timeout: could not read the escrow state for order {} ({cause}); skipping so next tick retries",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                            }
                             // The cancel must succeed before we clear the
                             // order. Falling through on error would take the
                             // order out of `find_order_by_seconds`'s
@@ -546,7 +588,9 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // Same reasoning as the bond slash/release below:
                             // stay eligible and retry rather than persist a
                             // state that doesn't match the HTLC.
-                            if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
+                            if let Err(e) =
+                                cancel_escrow_idempotent(&mut ln_client, order.id, hash).await
+                            {
                                 error!(
                                     "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
                                     order.id
@@ -574,19 +618,6 @@ async fn job_cancel_orders(ctx: AppContext) {
                             order.amount = 0;
                             order.fee = 0;
                         }
-
-                        // Get order status and kind
-                        let (order_status, order_kind) =
-                            match (order.get_order_status(), order.get_order_kind()) {
-                                (Ok(status), Ok(kind)) => (status, kind),
-                                _ => {
-                                    tracing::warn!(
-                                        "Error getting order status or kind in order {} cancel",
-                                        order.id
-                                    );
-                                    continue;
-                                }
-                            };
 
                         // Phase 4: run the bond slash/release **before** any
                         // DB mutation that takes the order out of

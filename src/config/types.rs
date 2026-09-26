@@ -1014,6 +1014,29 @@ payout_claim_window_days = 30"#,
     }
 
     #[test]
+    fn toml_zero_hold_invoice_expiration_window_rejected() {
+        // 0 would reach LND as the taker bond invoice's `expiry: 0`, its
+        // 24 h default, and the info event would advertise a 0 s window.
+        let lightning = |window: u32| {
+            format!(
+                "lnd_cert_file = \"\"\nlnd_macaroon_file = \"\"\nlnd_grpc_host = \"\"\n\
+                 invoice_expiration_window = 3600\nhold_invoice_cltv_delta = 144\n\
+                 hold_invoice_expiration_window = {window}\npayment_attempts = 3\n\
+                 payment_retries_interval = 60\n"
+            )
+        };
+        let err = toml::from_str::<LightningSettings>(&lightning(0))
+            .expect_err("a zero hold invoice window must be rejected");
+        assert!(
+            err.to_string().contains("hold_invoice_expiration_window"),
+            "error message should name the field, got: {err}"
+        );
+        let short =
+            toml::from_str::<LightningSettings>(&lightning(30)).expect("a short window is valid");
+        assert_eq!(short.hold_invoice_expiration_window, 30);
+    }
+
+    #[test]
     fn toml_slash_node_share_pct_above_one_rejected() {
         #[derive(Debug, serde::Deserialize)]
         struct Stub {

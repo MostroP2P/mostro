@@ -1665,6 +1665,122 @@ mod tests {
         ));
     }
 
+    /// A sell order parked at `WaitingMakerBond`: created, never published,
+    /// its maker bond still `Requested`.
+    async fn waiting_maker_bond_order(pool: &SqlitePool, maker: PublicKey) -> Order {
+        let order = Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::WaitingMakerBond.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: maker.to_string(),
+            seller_pubkey: Some(maker.to_string()),
+            amount: 21_000,
+            ..Default::default()
+        }
+        .create(pool)
+        .await
+        .unwrap();
+        // `hash: None` keeps `release_bond` off the LND connect path.
+        crate::app::bond::Bond::new_requested(
+            order.id,
+            maker.to_string(),
+            crate::app::bond::BondRole::Maker,
+            1_000,
+        )
+        .create(pool)
+        .await
+        .unwrap();
+        order
+    }
+
+    /// #993: the maker walks away before paying the bond. The order closes
+    /// in the DB only (it was never published, so no event), the bond is
+    /// released so its invoice can no longer be paid, and the maker gets
+    /// `canceled` on its own request id.
+    #[tokio::test]
+    async fn maker_cancel_of_waiting_maker_bond_order_closes_it_without_publishing() {
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(ctx.pool(), maker).await;
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok(), "maker cancel must succeed: {result:?}");
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Canceled.to_string());
+        assert_eq!(
+            after.event_id, order.event_id,
+            "a never-published order must not get an event"
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert!(active.is_empty(), "the maker bond must be released");
+        let replies: Vec<_> = crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == maker)
+            .map(|(m, _)| {
+                let kind = m.get_inner_message_kind();
+                (kind.action.clone(), kind.request_id)
+            })
+            .collect();
+        assert_eq!(replies, vec![(Action::Canceled, Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn only_the_maker_can_cancel_a_waiting_maker_bond_order() {
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(ctx.pool(), maker).await;
+        let stranger = create_unwrapped_message_with_pubkey(Keys::generate().public_key());
+
+        // Act
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &stranger,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourOrder))
+        ));
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "a stranger must not release the maker bond"
+        );
+    }
+
     #[tokio::test]
     async fn notify_creator_enqueues_new_order_and_rejects_invalid_creator() {
         let maker = Keys::generate().public_key();

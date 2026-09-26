@@ -105,7 +105,10 @@ pub struct AntiAbuseBondSettings {
     /// cancels the bond, marks the unpublished order `expired` and tells the
     /// maker (#942). Without it an unpaid maker bond lived as long as LND's
     /// default invoice expiry (24 h) and its order until `expires_at`.
-    #[serde(default = "default_maker_bond_payment_timeout_seconds")]
+    #[serde(
+        default = "default_maker_bond_payment_timeout_seconds",
+        deserialize_with = "deserialize_maker_bond_payment_timeout_seconds"
+    )]
     pub maker_bond_payment_timeout_seconds: u64,
 }
 
@@ -147,6 +150,25 @@ where
         return Err(D::Error::custom(format!(
             "slash_node_share_pct must be in [0.0, 1.0], got {v}"
         )));
+    }
+    Ok(v)
+}
+
+/// Validating deserializer for `maker_bond_payment_timeout_seconds`.
+/// Rejects 0: LND reads an invoice `expiry` of 0 as its 24 h default, the
+/// opposite of what was configured, and the deadline job would close a
+/// maker's order on its next pass. Any positive value is coherent: LND
+/// enforces the expiry itself, so short regtest windows stay possible.
+fn deserialize_maker_bond_payment_timeout_seconds<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = u64::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(D::Error::custom(
+            "maker_bond_payment_timeout_seconds must be greater than 0",
+        ));
     }
     Ok(v)
 }
@@ -966,6 +988,29 @@ payout_claim_window_days = 30"#,
             msg.contains("slash_node_share_pct") && msg.contains("[0.0, 1.0]"),
             "error message should name the field and the valid range, got: {msg}"
         );
+    }
+
+    #[test]
+    fn toml_zero_maker_bond_payment_timeout_rejected() {
+        // 0 would reach LND as `expiry: 0`, its 24 h default, and make the
+        // deadline job close a maker order on its next pass.
+        #[derive(Debug, serde::Deserialize)]
+        struct Stub {
+            #[allow(dead_code)]
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let err =
+            toml::from_str::<Stub>("[anti_abuse_bond]\nmaker_bond_payment_timeout_seconds = 0")
+                .expect_err("a zero maker window must be rejected");
+        assert!(
+            err.to_string()
+                .contains("maker_bond_payment_timeout_seconds"),
+            "error message should name the field, got: {err}"
+        );
+        let short =
+            toml::from_str::<Stub>("[anti_abuse_bond]\nmaker_bond_payment_timeout_seconds = 30")
+                .expect("a short window is valid");
+        assert_eq!(short.anti_abuse_bond.maker_bond_payment_timeout_seconds, 30);
     }
 
     #[test]

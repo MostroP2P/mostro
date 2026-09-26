@@ -11,6 +11,7 @@ pub mod lnurl;
 pub mod messages;
 pub mod nip33;
 pub mod price;
+pub mod publish;
 pub mod rpc;
 pub mod scheduler;
 pub mod spam_gate;

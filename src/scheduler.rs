@@ -45,6 +45,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -1239,35 +1240,23 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                     // Going through `update_order_event` would publish a
                     // brand-new Expired/Canceled event for an order that
                     // never appeared in the book — a ghost entry the
-                    // §10.4 acceptance forbids. Mark it Expired directly
-                    // in the DB and release any bond row instead.
+                    // §10.4 acceptance forbids. The shared close marks it
+                    // Expired in the DB only, releases the bond and tells
+                    // the maker (#942). Bonds are Lightning-only (CF-1), and
+                    // the close skips the release on a cashu node.
                     if order.status == Status::WaitingMakerBond.to_string() {
-                        let order_id = order.id;
-                        let mut expired = order.clone();
-                        expired.status = Status::Expired.to_string();
-                        match expired.update(pool).await {
-                            Ok(_) => {
-                                // Bonds are Lightning-only and mutually exclusive
-                                // with Cashu mode (CF-1), which has no LND — the
-                                // release helpers open `LndConnector::new()`, so
-                                // skip them here. A cashu node should carry no
-                                // bond rows; any left over (e.g. a reused DB) are
-                                // a misconfiguration, not this job's concern.
-                                if !Settings::is_cashu_enabled() {
-                                    bond::release_bonds_for_order_or_warn(
-                                        pool,
-                                        order_id,
-                                        "maker_bond_expiry",
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "maker_bond_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
-                                    order_id, e
-                                );
-                            }
+                        if let Err(e) = bond::close_unpublished_maker_order(
+                            pool,
+                            order.id,
+                            Status::Expired,
+                            Action::Canceled,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "maker_bond_expiry: close failed for order {} ({}); will retry next tick",
+                                order.id, e
+                            );
                         }
                         continue;
                     }
@@ -1364,6 +1353,24 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
         loop {
             bond::reconcile_stranded_range_maker_bonds(pool).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// #942: give the maker a deadline to pay the maker bond. Every minute,
+/// orders whose maker bond is still unpaid past
+/// `maker_bond_payment_timeout_seconds` are closed as `expired` (DB only,
+/// they were never published) and the maker is told. Before this, nothing
+/// but LND's 24 h default invoice expiry and the order's own `expires_at`
+/// ended them.
+async fn job_expire_unpaid_maker_bonds(ctx: AppContext) {
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            if let Err(e) = bond::expire_unpaid_maker_bonds(pool, Utc::now().timestamp()).await {
+                warn!("expire_unpaid_maker_bonds: {e}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
 }

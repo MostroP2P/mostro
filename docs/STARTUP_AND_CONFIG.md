@@ -107,7 +107,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `lnd_grpc_host` (String): LND gRPC endpoint URL
 - `invoice_expiration_window` (u32): Required invoice validity window in seconds (default: 3600)
 - `hold_invoice_cltv_delta` (u32): Hold invoice CLTV delta in blocks (default: 144)
-- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300)
+- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300). Also the taker bond invoice expiry, so it must be greater than 0; mostrod refuses to start with 0.
 - `payment_attempts` (u32): Max payment retry attempts (default: 3)
 - `payment_retries_interval` (u32): Retry interval in seconds (default: 60)
 - `max_final_cltv_expiry_delta` (u32): Upper bound, in blocks, on the `min_final_cltv_expiry_delta` of a user-supplied payout invoice (buyer payout, bond payout, dev fee). It bounds how long that payee can hold the outgoing HTLC without settling — the node cannot cancel a locked-in HTLC. 144 (~1 day) is the top of the range real wallets ask for; raise it only if a legitimate wallet is rejected, and never set it to 0 (the check is `delta > bound`, and BOLT11 substitutes 18 when the field is absent, so 0 rejects every invoice) (default: 144)

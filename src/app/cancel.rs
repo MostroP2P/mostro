@@ -1868,6 +1868,44 @@ mod tests {
         );
     }
 
+    /// The bond locked but the deferred publish has not moved the order to
+    /// `Pending` yet. Same rule as the #942 close: a locked maker bond wins,
+    /// so the order gets published instead of the payment being refunded.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_refuses_a_locked_bond_before_publish() {
+        // Arrange
+        let pool = setup_pool().await;
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(&pool, maker).await;
+        sqlx::query("UPDATE bonds SET state = 'locked' WHERE order_id = ?1")
+            .bind(order.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_waiting_maker_bond_order(&pool, &event, &order, Some(1)).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        assert_eq!(
+            order_by_id(&pool, order.id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(&pool, order.id)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1, "the locked maker bond must stay");
+        assert!(
+            queued_actions_for(maker).await.is_empty(),
+            "a refused cancel must not tell the maker the order is canceled"
+        );
+    }
+
     #[tokio::test]
     async fn notify_creator_enqueues_new_order_and_rejects_invalid_creator() {
         let maker = Keys::generate().public_key();

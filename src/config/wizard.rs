@@ -13,6 +13,7 @@ use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
 };
+use super::util;
 
 const TEMPLATE_BYTES: &[u8] = include_bytes!("../../settings.tpl.toml");
 
@@ -43,7 +44,7 @@ pub fn run_setup_menu(
             Ok(settings)
         }
         _ => {
-            std::fs::write(config_file_path, TEMPLATE_BYTES)
+            util::write_private_file(config_file_path, TEMPLATE_BYTES)
                 .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
             println!(
                 "Created settings file from template at {} - Edit it to configure your Mostro instance",
@@ -82,29 +83,8 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
     let toml_content = toml::to_string_pretty(&settings)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
-    {
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(config_file_path)
-        };
-        #[cfg(not(unix))]
-        let file = {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(config_file_path)
-        };
-        let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-        file.write_all(toml_content.as_bytes())
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    }
+    util::write_private_file(config_file_path, toml_content.as_bytes())
+        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
     println!("\nConfiguration saved to {}\n", config_file_path.display());
 

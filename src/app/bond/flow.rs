@@ -482,6 +482,12 @@ pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
 /// - Operators see a structured `warn` event with `bond_id`, `order_id`,
 ///   and the classified outcome so they can spot and intervene if a
 ///   bond stays stuck.
+///
+/// **The state write is a compare-and-swap** from the caller's observed
+/// `state`. A miss — the sweep's stale `Requested` snapshot racing a
+/// `Locked` winner — returns without cancelling the hold invoice, and
+/// without writing the snapshot back over the row. A transient cancel
+/// failure rolls that claim back so the bond stays active for retry.
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
     // Parse `state` once into the enum so callers don't depend on the
     // `Display` form for control flow (and a malformed value short-
@@ -496,66 +502,99 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
         return Ok(());
     }
 
+    // Claim the transition before touching LND. `Bond::update` writes
+    // every column `WHERE id = ?`, so a stale `Requested` snapshot would
+    // overwrite a concurrent `Locked` row — including `locked_at` — after
+    // cancelling the winner's HTLC. A miss means that row already moved;
+    // leave it, and do not cancel.
+    let released_at = Utc::now().timestamp();
+    let claimed =
+        sqlx::query("UPDATE bonds SET state = ?, released_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::Released.to_string())
+            .bind(released_at)
+            .bind(bond.id)
+            .bind(&bond.state)
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if claimed.rows_affected() == 0 {
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "release_bond: bond left state {}; not cancelling the hold invoice",
+            bond.state
+        );
+        return Ok(());
+    }
+
     if let Some(hash) = bond.hash.as_ref() {
-        match LndConnector::new().await {
-            Ok(mut ln) => {
-                if let Err(e) = ln.cancel_hold_invoice(hash).await {
-                    match classify_cancel_error(&e) {
-                        CancelOutcome::AlreadyDone => {
-                            // Common race with the subscriber, or the
-                            // invoice was never created in the first place
-                            // (request_taker_bond bailed before the row got
-                            // a hash). HTLC is verifiably gone — fall
-                            // through to mark Released.
-                            info!(
-                                bond_id = %bond.id,
-                                order_id = %bond.order_id,
-                                "cancel_hold_invoice reports already-done ({}); marking Released",
-                                e
-                            );
-                        }
-                        CancelOutcome::Transient => {
-                            warn!(
-                                bond_id = %bond.id,
-                                order_id = %bond.order_id,
-                                outcome = "transient",
-                                "cancel_hold_invoice failed transiently ({}); leaving bond {} for retry",
-                                e, bond.state
-                            );
-                            return Err(e);
-                        }
+        let cancel_err = match LndConnector::new().await {
+            Ok(mut ln) => match ln.cancel_hold_invoice(hash).await {
+                Ok(_) => None,
+                Err(e) => match classify_cancel_error(&e) {
+                    CancelOutcome::AlreadyDone => {
+                        // Common race with the subscriber, or the
+                        // invoice was never created in the first place
+                        // (request_taker_bond bailed before the row got
+                        // a hash). HTLC is verifiably gone.
+                        info!(
+                            bond_id = %bond.id,
+                            order_id = %bond.order_id,
+                            "cancel_hold_invoice reports already-done ({}); marking Released",
+                            e
+                        );
+                        None
                     }
-                }
-            }
+                    CancelOutcome::Transient => Some(e),
+                },
+            },
             Err(e) => {
                 // LND unreachable: definitionally transient. Don't pretend
                 // the HTLC is gone.
+                Some(e)
+            }
+        };
+        if let Some(e) = cancel_err {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                outcome = "transient",
+                "cancel_hold_invoice failed transiently ({}); restoring bond {} for retry",
+                e, bond.state
+            );
+            if let Err(revert_err) = revert_bond_release_claim(pool, bond.id, &bond.state).await {
                 warn!(
                     bond_id = %bond.id,
                     order_id = %bond.order_id,
-                    outcome = "transient",
-                    "could not connect to LND for cancel ({}); leaving bond {} for retry",
-                    e, bond.state
+                    "release_bond: failed to restore bond after transient cancel: {revert_err}"
                 );
-                return Err(e);
             }
+            return Err(e);
         }
     }
 
-    let mut updated = bond.clone();
-    updated.state = BondState::Released.to_string();
-    updated.released_at = Some(Utc::now().timestamp());
-    let id = updated.id;
-    let order_id = updated.order_id;
-    updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
     info!(
         "Bond {} released for order {} (was state={})",
-        id, order_id, bond.state
+        bond.id, bond.order_id, bond.state
     );
+    Ok(())
+}
+
+/// Undo [`release_bond`]'s compare-and-swap after a transient LND
+/// failure. Only the row we just marked `Released` is restored, so a
+/// concurrent writer that moved it on is left alone.
+async fn revert_bond_release_claim(
+    pool: &Pool<Sqlite>,
+    bond_id: Uuid,
+    previous_state: &str,
+) -> Result<(), MostroError> {
+    sqlx::query("UPDATE bonds SET state = ?, released_at = NULL WHERE id = ? AND state = ?")
+        .bind(previous_state)
+        .bind(bond_id)
+        .bind(BondState::Released.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(())
 }
 
@@ -1325,20 +1364,19 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
 /// Scheduler sweep (issue #927 part 2): bound the taker-bond window
 /// independently of the LND cancel callback.
 ///
-/// Normally LND's cancel of an expired bond hold invoice drives
-/// `on_bond_invoice_canceled` → [`maybe_drop_waiting_taker_bond`]
-/// within `hold_invoice_expiration_window` seconds. If that signal is
-/// missed (daemon restart before `resubscribe_active_bonds` re-attaches,
-/// dropped subscription, LND unreachable during the cancel), the order
-/// sits at `WaitingTakerBond` — publishing as `pending` — until the
-/// 24 h expiry sweep. This sweep releases the demonstrably stale
-/// `Requested` taker bonds and drops the order back to `Pending`. Safe
-/// to run redundantly with the LND path: every step no-ops when the
-/// order or bond has already moved on.
+/// Ideal path: LND cancels an expired bond hold invoice and drives
+/// `on_bond_invoice_canceled` → [`maybe_drop_waiting_taker_bond`]. Until
+/// bond invoices set an explicit `expiry` (issue #990), LND keeps them
+/// payable for its 24 h default, so this sweep is the practical closer:
+/// it releases `Requested` taker bonds older than
+/// `hold_invoice_expiration_window` plus a grace margin and drops the
+/// order back to `Pending`. Safe to run redundantly with the LND path:
+/// every step no-ops when the order or bond has already moved on.
 pub async fn reconcile_stranded_taker_bonds(pool: &Pool<Sqlite>) {
     // Margin past `hold_invoice_expiration_window` before a `Requested`
-    // bond counts as stale, so the sweep never races LND's own
-    // expiration cancel on a healthy subscription.
+    // bond counts as stale. Until #990 sets invoice expiry, payment can
+    // still land after this cutoff; [`release_bond`]'s state CAS is what
+    // keeps a concurrent lock from being cancelled or overwritten.
     const STALE_GRACE_SECONDS: i64 = 60;
     let window = Settings::get_ln().hold_invoice_expiration_window as i64;
     let stale_cutoff = Utc::now().timestamp() - window - STALE_GRACE_SECONDS;
@@ -1372,12 +1410,13 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale
 /// cutoff — are released; anything fresher is skipped here and makes
 /// `maybe_drop_waiting_taker_bond`'s CAS no-op below.
 ///
-/// The inverse race (a stale `Requested` bond locking between the fetch
-/// and the release) cannot happen: its hold invoice expired at least
-/// the grace margin ago, so LND no longer accepts payment on it. A
-/// transient LND failure during the cancel leaves the bond active and
-/// the CAS no-ops until the next tick — never a false release of a
-/// possibly-encumbered HTLC.
+/// A stale `Requested` bond can still lock between this fetch and the
+/// release (payment accepted while the invoice remains payable, or a
+/// delayed Accepted callback). [`release_bond`] compare-and-swaps from
+/// the observed state and, on a miss, does not cancel the hold invoice
+/// — so that winner is not refunded and its `Locked` row is not
+/// overwritten. A transient LND failure during the cancel rolls the
+/// claim back and the next tick retries.
 async fn sweep_stranded_taker_bond_order(pool: &Pool<Sqlite>, order_id: Uuid, stale_cutoff: i64) {
     match find_active_bonds_for_order(pool, order_id).await {
         Ok(bonds) => {

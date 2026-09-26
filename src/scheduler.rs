@@ -1369,13 +1369,13 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
     });
 }
 
-/// Belt-and-braces bound on the taker-bond window (issue #927 part 2).
-/// Normally LND's cancel of the expired bond hold invoice drops a
-/// `WaitingTakerBond` order back to `Pending`; if that signal is missed
-/// (daemon restart before resubscribe, dropped subscription, LND
-/// unreachable during the cancel), the order — and its published
-/// `pending` event — would otherwise linger until the 24 h expiry
-/// sweep. This job sweeps such orders within ~10 minutes instead.
+/// Bound the taker-bond window (issue #927 part 2). Until bond invoices
+/// set an explicit `expiry` (issue #990), LND keeps them payable for
+/// ~24 h, so LND's cancel is not a timely closer. This job releases
+/// stale `Requested` taker bonds after `hold_invoice_expiration_window`
+/// plus grace and drops the order back to `Pending` (about 6–11
+/// minutes with defaults). Remains useful after #990 as a belt-and-
+/// braces path when the cancel signal is missed.
 async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
     let interval = 300u64;
 

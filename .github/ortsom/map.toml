@@ -87,7 +87,7 @@ tags = ["bond"]
 name = "core plumbing"
 paths = [
   "src/flow.rs", "src/db.rs", "src/app.rs", "src/main.rs", "src/config/**",
-  "src/escrow.rs", "src/app/context.rs",
+  "src/escrow.rs", "src/app/context.rs", "src/publish.rs",
   "migrations/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
 ]
 full = true

@@ -1250,6 +1250,7 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                             order.id,
                             Status::Expired,
                             Action::Canceled,
+                            None,
                         )
                         .await
                         {

@@ -1898,6 +1898,13 @@ so the lifecycle scope is described in maker/taker terms:
 - **Operator cancel.** `CancelOrder` (and `admin-cancel` with the daemon
   key) also accepts a `waiting-maker-bond` order: same close, with
   `canceled-by-admin` and `admin-canceled`.
+- **Maker cancel (#993).** The maker may `cancel` while the order is
+  `waiting-maker-bond`: same close, with `canceled`, answered on the
+  maker's request id. The order moves to `canceled` in the DB only (it was
+  never published, so no event is emitted) and the bond is released, which
+  cancels its hold invoice. If the bond has locked, the close refuses and
+  the cancel answers `NotAllowedByStatus`: the order is published, and the
+  maker then cancels it as a `pending` order.
 
 ### 10.2 Slash hooks (buyer/seller via the unified mechanism)
 

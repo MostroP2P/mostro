@@ -2922,7 +2922,99 @@ mod tests {
         let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
         maker.state = bond_state.to_string();
         let bond = create_bond(pool, maker).await.unwrap();
+        // The deadline runs from the order's creation, which the fixture
+        // leaves at 0: align it with the bond's.
+        sqlx::query("UPDATE orders SET created_at = ? WHERE id = ?")
+            .bind(bond.created_at)
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
         (order_id, bond)
+    }
+
+    async fn set_order_status(pool: &Pool<Sqlite>, order_id: Uuid, status: Status) {
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn maker_bond_state(pool: &Pool<Sqlite>, order_id: Uuid) -> String {
+        super::super::db::find_bond_by_order_and_role(pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    #[tokio::test]
+    async fn a_requested_bond_whose_order_left_the_window_is_not_released() {
+        // The payment won: by the time the pass looks, the order is no longer
+        // waiting for the bond (the lock committed and the order was
+        // published). A close that loses must never be followed by a
+        // release, or the winner's bond is refunded under a live order.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        set_order_status(&pool, order_id, Status::Pending).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        assert_eq!(
+            maker_bond_state(&pool, order_id).await,
+            BondState::Requested.to_string()
+        );
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bond_locked_past_the_deadline_keeps_its_order() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Locked).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        assert_eq!(
+            maker_bond_state(&pool, order_id).await,
+            BondState::Locked.to_string()
+        );
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_released_bond_never_closed_it_expires() {
+        // A crash (or a failed close) between on_bond_invoice_canceled's two
+        // writes leaves the bond Released and the order still waiting. The
+        // next pass must close it rather than leave it to its expires_at.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Released).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 1);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
     }
 
     #[tokio::test]

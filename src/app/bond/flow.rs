@@ -136,10 +136,15 @@ pub struct TakerContext {
     pub dev_fee: i64,
 }
 
-/// Invoice expiry, in seconds, of a taker bond's hold invoice; `None`
-/// leaves LND's default of 24 h.
-fn taker_bond_invoice_expiry(_ln: &crate::config::types::LightningSettings) -> Option<i64> {
-    None
+/// Invoice expiry, in seconds, of a taker bond's hold invoice (#990).
+///
+/// It is `hold_invoice_expiration_window`, the time the info event tells
+/// a taker they have to pay. Without it LND keeps the invoice payable for
+/// its 24 h default, and the order sits at `WaitingTakerBond` that long.
+/// With it LND cancels the unpaid invoice when the window closes, even
+/// while the daemon is down, and `on_bond_invoice_canceled` ends the take.
+fn taker_bond_invoice_expiry(ln: &crate::config::types::LightningSettings) -> Option<i64> {
+    Some(i64::from(ln.hold_invoice_expiration_window))
 }
 
 /// Create a hold invoice for the taker's bond, persist a `Bond` row in

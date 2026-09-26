@@ -511,11 +511,12 @@ pub fn order_to_tags(
             Tag::custom("premium", vec![order.premium.to_string()]),
             Tag::custom("network", vec![ln_network]),
             Tag::custom("layer", vec!["lightning".to_string()]),
-            // When the order was created (NIP-69). The event's own
-            // `created_at` moves on every revision of this addressable event;
-            // this one does not, so clients can show the order's real age.
+            // When the order was created (NIP-69), named `published_at` as in
+            // NIP-23. The event's own `created_at` moves on every revision of
+            // this addressable event; this one does not, so clients can show
+            // the order's real age.
             // Kept after the positional `rating` / `source` inserts below.
-            Tag::custom("created_at", vec![order.created_at.to_string()]),
+            Tag::custom("published_at", vec![order.created_at.to_string()]),
             Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
                 "expiration",

@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
-use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
+use crate::db::{claim_order_status, edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::db::Crud;
@@ -489,6 +489,46 @@ async fn cancel_pending_order_from_maker(
     Ok(())
 }
 
+/// Cancel an order whose maker has not paid the bond yet (#993).
+///
+/// The order was never published, so it is closed in the DB only: an
+/// event would put a ghost entry in the book. This ends in the same state
+/// as the `WaitingMakerBond` branch of `job_expire_pending_older_orders`,
+/// a closed row and a released bond, but as `Canceled` rather than
+/// `Expired`.
+async fn cancel_waiting_maker_bond_order(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedMessage,
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    order
+        .sent_from_maker(event.sender)
+        .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
+    // The bond can lock while this cancel is in flight, and
+    // `resume_publish_after_maker_bond` then moves the row to `Pending`
+    // and publishes it. The cancel must lose that race: claim the status
+    // atomically, and once the order is `Pending` the maker cancels it
+    // through the regular pre-trade path. Winning it first makes the
+    // resume skip, and the release below refunds a bond that just locked.
+    if !claim_order_status(pool, order.id, Status::WaitingMakerBond, Status::Canceled).await? {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    // Cancels the hold invoice, so it can no longer be paid; an invoice
+    // LND already canceled still marks the bond `Released`.
+    bond::release_bonds_for_order_or_warn(pool, order.id, "waiting_maker_bond_cancel").await;
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Canceled,
+        None,
+        event.sender,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
 /// Cancel action entry point using dependency-injected context.
 ///
 /// The database connection pool and other dependencies are extracted from `ctx`.
@@ -590,6 +630,9 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
     // Do the appropriate cancellation flow based on the order status
     // Route to the appropriate cancellation flow based on active vs not-active states.
     match order.get_order_status().map_err(MostroInternalErr)? {
+        Status::WaitingMakerBond => {
+            cancel_waiting_maker_bond_order(pool, event, &order, request_id).await?
+        }
         Status::WaitingPayment | Status::WaitingBuyerInvoice => {
             cancel_not_active_order(pool, event, order, my_keys, request_id, ln_client).await?
         }
@@ -1778,6 +1821,50 @@ mod tests {
             active.len(),
             1,
             "a stranger must not release the maker bond"
+        );
+    }
+
+    /// The maker paid a moment before cancelling: the bond locked and the
+    /// deferred publish moved the order to `Pending` after the cancel read
+    /// it. The cancel must lose, leaving the published order and its locked
+    /// bond alone; the maker cancels it as a `Pending` order instead.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_loses_once_the_bond_locked() {
+        // Arrange
+        let pool = setup_pool().await;
+        let maker = Keys::generate().public_key();
+        let stale = waiting_maker_bond_order(&pool, maker).await;
+        sqlx::query("UPDATE orders SET status = 'pending' WHERE id = ?1")
+            .bind(stale.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE bonds SET state = 'locked' WHERE order_id = ?1")
+            .bind(stale.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_waiting_maker_bond_order(&pool, &event, &stale, Some(1)).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        assert_eq!(
+            order_by_id(&pool, stale.id).await.status,
+            Status::Pending.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(&pool, stale.id)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1, "the locked maker bond must stay");
+        assert!(
+            queued_actions_for(maker).await.is_empty(),
+            "a lost cancel must not tell the maker the order is canceled"
         );
     }
 

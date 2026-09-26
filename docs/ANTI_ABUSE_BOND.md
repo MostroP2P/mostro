@@ -1867,6 +1867,12 @@ so the lifecycle scope is described in maker/taker terms:
   `Locked`.
 - Once the bond subscriber reports `Accepted`, continue the existing
   `publish_order` work (compute tags, emit event, set `event_id`).
+- The maker may `cancel` while the order is `WaitingMakerBond` (#993).
+  The node releases the maker bond, which cancels its hold invoice, marks
+  the order `Canceled` in the DB only (it was never published, so no
+  event is emitted), and answers `canceled`. If the bond locks first, the
+  order is already `Pending` and the cancel answers `NotAllowedByStatus`;
+  the maker then cancels it as a `Pending` order.
 
 ### 10.2 Slash hooks (buyer/seller via the unified mechanism)
 

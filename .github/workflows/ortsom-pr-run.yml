@@ -243,7 +243,12 @@ jobs:
         working-directory: ortsom
         run: |
           set +e
-          $ORTSOM stack up --mostro-image "ortsom-pr/mostro:$HEAD_SHA"
+          # From `main`'s map (the trusted checkout), like the scenario
+          # selection: the stack must match the baselines it is compared with.
+          bonds="$(python3 -c 'import tomllib; print(tomllib.load(open("../mostro/.github/ortsom/map.toml", "rb"))["settings"].get("stack_with_bonds", False))')"
+          bonds_flag=""
+          if [ "$bonds" = True ]; then bonds_flag="--with-bonds"; fi
+          $ORTSOM stack up --mostro-image "ortsom-pr/mostro:$HEAD_SHA" $bonds_flag
           case "$?" in
             0) stack=ok ;;
             4) stack=daemon_failed ;;

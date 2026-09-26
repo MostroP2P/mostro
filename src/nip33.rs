@@ -1363,6 +1363,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 5,
             payout_claim_window_days: 30,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let tags = bond_tags(Some(&bond));
@@ -1863,6 +1864,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 3,
             payout_claim_window_days: 14,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let take_tags = bond_tags(Some(&base));

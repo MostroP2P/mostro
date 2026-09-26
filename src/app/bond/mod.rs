@@ -19,7 +19,8 @@ pub mod slash;
 pub mod types;
 
 pub use flow::{
-    maker_bond_required, release_bond, release_bonds_for_order, release_bonds_for_order_or_warn,
+    close_unpublished_maker_order, expire_unpaid_maker_bonds, maker_bond_required, release_bond,
+    release_bonds_for_order, release_bonds_for_order_or_warn,
     release_taker_bonds_for_order_or_warn, request_maker_bond, request_taker_bond,
     resubscribe_active_bonds, taker_bond_required, trade_committed_by_locked_taker_bond,
     TakerContext,

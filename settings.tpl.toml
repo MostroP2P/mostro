@@ -285,6 +285,9 @@ port = 50051
 # # Days the winner has to claim their share by submitting a bolt11; after
 # # this the bond closes as `forfeited` and the node retains everything.
 # payout_claim_window_days = 15
+# # Seconds a maker has to pay the maker bond (apply_to = "make" | "both").
+# # Past it the unpublished order expires and the maker is told.
+# maker_bond_payment_timeout_seconds = 900
 
 # Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
 # the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens

@@ -356,9 +356,13 @@ pub async fn request_maker_bond(
     let amount = compute_bond_amount(notional_sats, cfg);
     let memo = format!("mostro bond order_id={}", order.id);
 
+    // The invoice stops being payable when the maker's window closes, so LND
+    // enforces the deadline even while the daemon is down (#942);
+    // `expire_unpaid_maker_bonds` enforces it on the order side.
+    let expiry = i64::try_from(cfg.maker_bond_payment_timeout_seconds).unwrap_or(i64::MAX);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice(&memo, amount)
+        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry))
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -983,15 +987,27 @@ async fn on_maker_bond_accepted(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let now = Utc::now().timestamp();
-    let result =
-        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Locked.to_string())
-            .bind(now)
-            .bind(bond.id)
-            .bind(BondState::Requested.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // The lock and `close_unpublished_maker_order` exclude each other: the
+    // bond does not lock once the close has ended its order, and the close
+    // refuses while the bond is locked. Each is one statement, so whichever
+    // commits first wins (#942). A payment racing a close that already won
+    // leaves the bond `Requested`; the close's release (or the next
+    // `expire_unpaid_maker_bonds` pass) cancels the HTLC and refunds it.
+    let result = sqlx::query(
+        "UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ? \
+         AND NOT EXISTS (SELECT 1 FROM orders WHERE id = bonds.order_id \
+                         AND status IN (?, ?, ?))",
+    )
+    .bind(BondState::Locked.to_string())
+    .bind(now)
+    .bind(bond.id)
+    .bind(BondState::Requested.to_string())
+    .bind(Status::Expired.to_string())
+    .bind(Status::CanceledByAdmin.to_string())
+    .bind(Status::Canceled.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Re-read so a concurrent release (e.g. the order expired and its
     // bond was cancelled) is visible before we try to publish.
@@ -1174,6 +1190,131 @@ async fn promote_taker_context_to_order(
     Ok(order)
 }
 
+/// Close an order that is still waiting for its maker bond (#942).
+///
+/// Such an order was never published, so there is no NIP-33 event to
+/// replace: publishing one would put a ghost entry in the book. The order
+/// moves to `status` in the DB only, its bonds are released and the maker is
+/// sent `notice`, so their client can end the bond screen instead of
+/// counting down to nothing.
+///
+/// The transition is a compare-and-set on `waiting-maker-bond` that also
+/// refuses while the maker bond is `locked`, and `on_maker_bond_accepted`
+/// does not lock the bond of an order this function has closed (the statuses
+/// it writes: `expired`, `canceled-by-admin`, `canceled`). The two exclude
+/// each other, so a payment and a deadline cannot both win:
+/// a bond that locked first gets its order published, and once the close has
+/// committed the bond can no longer lock, so a payment arriving at that
+/// instant is refunded together with the closed order.
+///
+/// Returns whether this call closed the order; `false` means another path
+/// already owns its status.
+pub async fn close_unpublished_maker_order(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    status: Status,
+    notice: Action,
+) -> Result<bool, MostroError> {
+    let closed = sqlx::query(
+        "UPDATE orders SET status = ? WHERE id = ? AND status = ? \
+         AND NOT EXISTS (SELECT 1 FROM bonds WHERE order_id = ? AND role = ? AND state = ?)",
+    )
+    .bind(status.to_string())
+    .bind(order_id)
+    .bind(Status::WaitingMakerBond.to_string())
+    .bind(order_id)
+    .bind(BondRole::Maker.to_string())
+    .bind(BondState::Locked.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if closed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    info!("Unpublished maker-bond order {order_id} closed as {status}");
+
+    // Bonds are Lightning-only and mutually exclusive with Cashu mode
+    // (CF-1), whose node has no LND for the release helpers to open.
+    if !Settings::is_cashu_enabled() {
+        release_bonds_for_order_or_warn(pool, order_id, "close_unpublished_maker_order").await;
+    }
+
+    // The notice is best effort: the order is closed either way, and a
+    // client that misses it still ends the window at the invoice's expiry.
+    match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => match order.get_creator_pubkey() {
+            Ok(maker) => {
+                enqueue_order_msg(None, Some(order_id), notice, None, maker, None).await;
+            }
+            Err(e) => warn!(%order_id, "close_unpublished_maker_order: no maker pubkey: {e}"),
+        },
+        Ok(None) => warn!(%order_id, "close_unpublished_maker_order: order vanished"),
+        Err(e) => warn!(%order_id, "close_unpublished_maker_order: reload failed: {e}"),
+    }
+    Ok(true)
+}
+
+/// Enforce `maker_bond_payment_timeout_seconds` (#942): every maker bond
+/// still `requested` past the deadline ends here.
+///
+/// While its order is still waiting for the bond, the order is closed as
+/// `expired` and the maker told ([`close_unpublished_maker_order`]). When
+/// the order has already left that status (it expired, or an earlier pass
+/// closed it but LND could not cancel the invoice then), only the stranded
+/// invoice is left: it is released again on every pass until LND cancels
+/// it, so a late payment cannot lock an HTLC for an order that is gone.
+///
+/// Returns how many orders this pass closed.
+pub async fn expire_unpaid_maker_bonds(
+    pool: &Pool<Sqlite>,
+    now: i64,
+) -> Result<usize, MostroError> {
+    let timeout = Settings::get_bond()
+        .map(|cfg| cfg.maker_bond_payment_timeout_seconds)
+        .unwrap_or_else(|| {
+            crate::config::types::AntiAbuseBondSettings::default()
+                .maker_bond_payment_timeout_seconds
+        });
+    let cutoff = now.saturating_sub(i64::try_from(timeout).unwrap_or(i64::MAX));
+    let stale = sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds WHERE role = ? AND state = ? AND parent_bond_id IS NULL \
+         AND created_at <= ? ORDER BY created_at ASC",
+    )
+    .bind(BondRole::Maker.to_string())
+    .bind(BondState::Requested.to_string())
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let mut closed = 0;
+    for bond in stale.iter() {
+        match close_unpublished_maker_order(pool, bond.order_id, Status::Expired, Action::Canceled)
+            .await
+        {
+            Ok(true) => {
+                info!(order_id = %bond.order_id, "maker bond unpaid past the deadline; order expired");
+                closed += 1;
+            }
+            Ok(false) => {
+                if let Err(e) = release_bond(pool, bond).await {
+                    warn!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "expire_unpaid_maker_bonds: stranded bond release failed, retrying next pass: {}",
+                        e
+                    );
+                }
+            }
+            Err(e) => warn!(
+                order_id = %bond.order_id,
+                "expire_unpaid_maker_bonds: close failed, retrying next pass: {}", e
+            ),
+        }
+    }
+    Ok(closed)
+}
+
 /// Subscriber callback for `InvoiceState::Canceled`: bond never locked
 /// (taker abandoned the invoice, LND auto-canceled on expiration, or
 /// the bond was cancelled by `release_bond` because another concurrent
@@ -1224,6 +1365,21 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
             order_id = %bond.order_id,
             "on_bond_invoice_canceled: failed to flip status back to Pending: {}", e
         );
+    }
+
+    // #942: the maker-side twin. An unpaid maker bond invoice that LND
+    // canceled (its expiry passed) ends the unpublished order with it;
+    // otherwise the order sat in `WaitingMakerBond` until its own expiry.
+    if bond.role == BondRole::Maker.to_string() {
+        if let Err(e) =
+            close_unpublished_maker_order(pool, bond.order_id, Status::Expired, Action::Canceled)
+                .await
+        {
+            warn!(
+                order_id = %bond.order_id,
+                "on_bond_invoice_canceled: failed to close the unpublished order: {}", e
+            );
+        }
     }
     Ok(())
 }
@@ -2739,6 +2895,167 @@ mod tests {
         assert_eq!(after.state, BondState::Released.to_string());
         let order = load_order(&pool, order_id).await;
         assert_eq!(order.status, Status::Expired.to_string());
+    }
+
+    /// The deadline `expire_unpaid_maker_bonds` enforces under the settings
+    /// this test process happened to install.
+    fn maker_timeout() -> i64 {
+        let secs = Settings::get_bond()
+            .map(|cfg| cfg.maker_bond_payment_timeout_seconds)
+            .unwrap_or_else(|| {
+                crate::config::types::AntiAbuseBondSettings::default()
+                    .maker_bond_payment_timeout_seconds
+            });
+        i64::try_from(secs).unwrap()
+    }
+
+    async fn waiting_maker_bond_order(pool: &Pool<Sqlite>, bond_state: BondState) -> (Uuid, Bond) {
+        let order_id = Uuid::new_v4();
+        insert_order(pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingMakerBond.to_string())
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        // No hash: the release marks the row without an LND round-trip.
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = bond_state.to_string();
+        let bond = create_bond(pool, maker).await.unwrap();
+        (order_id, bond)
+    }
+
+    #[tokio::test]
+    async fn unpaid_maker_bond_past_the_deadline_expires_its_order() {
+        // Arrange
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+
+        // Act
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(closed, 1);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
+        let after = super::super::db::find_bond_by_order_and_role(&pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn unpaid_maker_bond_within_the_deadline_is_left_alone() {
+        // Arrange
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+
+        // Act
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout() - 1)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(closed, 0);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_maker_bond_on_a_closed_order_is_released() {
+        // An earlier close could not cancel the invoice (LND down): the order
+        // is already expired, the bond still requested. The next pass must
+        // retry the release, and must not count or touch the order again.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::Expired.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        let after = super::super::db::find_bond_by_order_and_role(&pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_maker_bond_wins_over_the_close() {
+        // The maker paid at the last moment: the bond is Locked and the
+        // publication is resuming. The close must refuse, so the order is
+        // published and the payment is not refunded behind the maker's back.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, _) = waiting_maker_bond_order(&pool, BondState::Locked).await;
+
+        let closed =
+            close_unpublished_maker_order(&pool, order_id, Status::Expired, Action::Canceled)
+                .await
+                .unwrap();
+
+        assert!(!closed);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payment_after_the_close_cannot_lock_the_bond() {
+        // The close committed first; LND reports the maker's payment a
+        // moment later. The bond must not lock (the close's release refunds
+        // it), and the closed order must stay closed.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, _) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        sqlx::query("UPDATE bonds SET hash = ? WHERE order_id = ?")
+            .bind("c".repeat(64))
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::Expired.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        on_bond_invoice_accepted(&"c".repeat(64), &pool, None)
+            .await
+            .expect("a lock that loses to the close is not an error");
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Requested.to_string());
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
     }
 
     #[tokio::test]

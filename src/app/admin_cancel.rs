@@ -43,8 +43,8 @@ use tracing::{error, info, warn};
 ///
 /// Returns `MostroError` if:
 /// - Solver is not assigned to the dispute
-/// - A pre-trade (`Pending` / `WaitingTakerBond`) order is cancelled by
-///   anything but the daemon key
+/// - A pre-trade (`Pending` / `WaitingTakerBond` / `WaitingMakerBond`)
+///   order is cancelled by anything but the daemon key
 /// - Order/dispute not found
 /// - The dispute initiator flags are unset or ambiguous, or a counterparty
 ///   pubkey is missing/unparseable — both are checked before the refund, so
@@ -86,6 +86,33 @@ pub async fn admin_cancel_action(
             return Err(MostroCantDo(CantDoReason::NotAuthorized));
         }
         return admin_cancel_pending_order(pool, &order, my_keys, ln_client).await;
+    }
+
+    // #942: an order still waiting for its maker bond was never published,
+    // so the pre-trade cancel above (which replaces the NIP-33 event) does
+    // not fit: it is closed in the DB only, its bond released and the maker
+    // told. Same daemon-key gate. Lets a drain close these instead of
+    // waiting for the maker's deadline.
+    if order.check_status(Status::WaitingMakerBond).is_ok() {
+        if event.identity != my_keys.public_key() {
+            return Err(MostroCantDo(CantDoReason::NotAuthorized));
+        }
+        let closed = bond::close_unpublished_maker_order(
+            pool,
+            order.id,
+            Status::CanceledByAdmin,
+            Action::AdminCanceled,
+        )
+        .await?;
+        if !closed {
+            // The bond locked (or another path closed the order) meanwhile.
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+        info!(
+            "Order Id {}: unpublished maker-bond order cancelled by operator",
+            order.id
+        );
+        return Ok(());
     }
 
     // Check if the solver is assigned to the order
@@ -1133,6 +1160,96 @@ mod tests {
         assert!(queued_actions_for(taker)
             .await
             .contains(&Action::AdminCanceled));
+    }
+
+    /// #942: an order waiting for its maker bond was never published. The
+    /// operator can close it: DB only, the maker bond released and the
+    /// maker told.
+    #[tokio::test]
+    async fn daemon_key_cancels_waiting_maker_bond_order_and_releases_bond() {
+        use crate::app::bond::{db::create_bond, model::Bond, BondRole, BondState};
+
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let mut order = pending_sell_order(maker);
+        order.status = Status::WaitingMakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        let bond = create_bond(
+            ctx.pool(),
+            Bond {
+                id: uuid::Uuid::new_v4(),
+                order_id: order.id,
+                pubkey: maker.to_string(),
+                role: BondRole::Maker.to_string(),
+                amount_sats: 1_000,
+                state: BondState::Requested.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Act
+        admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(daemon.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await
+        .expect("operator cancel during the maker bond window succeeds");
+
+        // Assert
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
+        assert!(
+            stored.event_id.is_empty(),
+            "a never-published order must not get a NIP-33 event"
+        );
+        let stored_bond = crate::app::bond::db::find_bond_by_id(ctx.pool(), bond.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_bond.state, BondState::Released.to_string());
+        assert!(queued_actions_for(maker)
+            .await
+            .contains(&Action::AdminCanceled));
+    }
+
+    /// The maker-bond close keeps the daemon-key gate of the pre-trade one.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_refuses_non_daemon_identity() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let solver = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let mut order = pending_sell_order(maker);
+        order.status = Status::WaitingMakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(solver.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::WaitingMakerBond.to_string());
+        assert!(queued_actions_for(maker).await.is_empty());
     }
 
     /// A take that commits between the operator's read and the CAS wins:

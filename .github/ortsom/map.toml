@@ -11,6 +11,11 @@
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
 ortsom_ref = "v0.3.1"
+# Run the regtest stack with anti-abuse bonds (`ortsom stack up
+# --with-bonds`), so the `bond` scenarios run instead of being skipped.
+# Part of a baseline's identity, like `ortsom_ref`: a pull request is only
+# compared with baselines measured the same way (§ 7.1).
+stack_with_bonds = true
 # Tags every non-ignored selection includes.
 always_tags = ["smoke"]
 # Minimum eligible scenarios for the close verdict to be possible.

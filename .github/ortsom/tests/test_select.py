@@ -217,6 +217,11 @@ class ValidateMapTest(unittest.TestCase):
         with self.assertRaisesRegex(sel.SelectionError, "ortsom_ref"):
             sel.validate_map({"settings": {"always_tags": []}, "rule": [TRADE]})
 
+    def test_non_boolean_stack_with_bonds_is_rejected(self):
+        settings = {"ortsom_ref": "v0.3.1", "stack_with_bonds": "yes"}
+        with self.assertRaisesRegex(sel.SelectionError, "stack_with_bonds"):
+            sel.validate_map({"settings": settings, "rule": [TRADE]})
+
 
 class MainTest(unittest.TestCase):
     def test_writes_selection_json(self):

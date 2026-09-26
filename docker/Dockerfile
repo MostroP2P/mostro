@@ -26,8 +26,12 @@ FROM debian:bookworm-slim
 # Install dependencies
 RUN apt-get update && apt-get install -y --reinstall ca-certificates
 
-# Add a non-root user
-RUN useradd -m mostrouser
+# Add a non-root user. uid/gid are pinned because compose defaults
+# MOSTRO_CONTAINER_USER to 1000:1000 and the deployment docs have operators
+# hand ./config over with `chown -R 1000:1000`: letting useradd pick the next
+# free id would break both the moment the base image grows an account of its
+# own.
+RUN groupadd -g 1000 mostrouser && useradd -m -u 1000 -g 1000 mostrouser
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod

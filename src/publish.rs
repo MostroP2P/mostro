@@ -1,11 +1,22 @@
-//! Publishing an event to the node's relays.
+//! Publishing an event to the node's relays without waiting for the slowest.
+//!
+//! `Client::send_event` resolves only once **every** relay has answered `OK`
+//! or reached its 10 s timeout, and nostr-sdk 0.45 has no first-success ack
+//! policy. One relay that keeps its socket open and never answers therefore
+//! costs every publish the full timeout. The event loop in `app.rs` handles
+//! events one at a time and awaits order-book updates inline, and the reply
+//! queue in `scheduler.rs` sends one message at a time, so that cost adds up:
+//! requests waiting behind it outlived the 10 s freshness check and were
+//! dropped, and replies reached clients after they had stopped waiting
+//! (#991).
 //!
 //! [`send_event_first_ack`] is the one entry point for events whose sender
 //! is waiting on the publish: daemon replies (`send_dm`) and order-book
-//! updates, which the event loop in `app.rs` awaits inline.
+//! updates.
 
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use tokio::sync::{mpsc, oneshot};
 
 /// Where one publication landed, per relay.
 #[derive(Debug, Default)]
@@ -17,10 +28,18 @@ pub struct PublishReport {
     pub failed: Vec<(RelayUrl, String)>,
 }
 
-/// Publish `event` to every write relay of `client`.
+/// Publish `event` to every write relay of `client`, and resolve as soon as
+/// the **first** relay accepts it.
 ///
-/// `on_settled` receives the per-relay [`PublishReport`] once every relay has
-/// answered or timed out. Fails when no relay accepted the event.
+/// Every relay still gets the event: each send runs in its own task, with
+/// nostr-sdk's own per-relay handling (authentication, `OK` timeout), and
+/// keeps running after this returns. `on_settled` receives the per-relay
+/// [`PublishReport`] once every relay has answered or timed out, which may be
+/// after this function has returned. It is called exactly once, also when no
+/// relay accepted the event or there was no write relay at all.
+///
+/// Fails only when no relay accepted the event, that is once every relay has
+/// refused or timed out, or at once when there is no write relay.
 pub async fn send_event_first_ack<F>(
     client: &Client,
     event: &Event,
@@ -29,23 +48,69 @@ pub async fn send_event_first_ack<F>(
 where
     F: FnOnce(PublishReport) + Send + 'static,
 {
+    let urls: Vec<RelayUrl> = client
+        .relays()
+        .with_capabilities(RelayCapabilities::WRITE)
+        .await
+        .into_keys()
+        .collect();
+
+    // One task per relay, reporting its outcome on `outcomes`. Only the tasks
+    // hold senders, so the channel closes once all of them have reported.
+    let (outcomes_tx, mut outcomes) = mpsc::unbounded_channel();
+    for url in urls {
+        let (client, event, outcomes_tx) = (client.clone(), event.clone(), outcomes_tx.clone());
+        tokio::spawn(async move {
+            let outcome = send_to(&client, &event, &url).await;
+            let _ = outcomes_tx.send((url, outcome));
+        });
+    }
+    drop(outcomes_tx);
+
+    // The collector owns the report, so it outlives this call: it wakes the
+    // caller on the first acceptance and hands the report over at the end.
+    let (first_ack_tx, first_ack) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut first_ack_tx = Some(first_ack_tx);
+        let mut report = PublishReport::default();
+        while let Some((url, outcome)) = outcomes.recv().await {
+            match outcome {
+                Ok(()) => {
+                    report.success.push(url);
+                    if let Some(tx) = first_ack_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(reason) => report.failed.push((url, reason)),
+            }
+        }
+        // Dropping the sender unanswered tells the caller nobody accepted.
+        drop(first_ack_tx);
+        on_settled(report);
+    });
+
+    first_ack.await.map_err(|_| {
+        MostroInternalErr(ServiceError::NostrError(
+            "no relay accepted the event".to_string(),
+        ))
+    })
+}
+
+/// Send `event` to the single relay `url` and reduce the outcome to accepted
+/// or the reason it was not.
+async fn send_to(client: &Client, event: &Event, url: &RelayUrl) -> Result<(), String> {
     let output = client
         .send_event(event)
+        .to([url])
         .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    let report = PublishReport {
-        success: output.success.into_keys().collect(),
-        failed: output.failed.into_iter().collect(),
-    };
-    let accepted = !report.success.is_empty();
-    on_settled(report);
-    if accepted {
-        Ok(())
-    } else {
-        Err(MostroInternalErr(ServiceError::NostrError(
-            "no relay accepted the event".to_string(),
-        )))
+        .map_err(|e| e.to_string())?;
+    if let Some((_, reason)) = output.failed.into_iter().next() {
+        return Err(reason);
     }
+    if output.success.is_empty() {
+        return Err("not sent".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -130,7 +195,7 @@ mod tests {
         // Arrange
         let silent = silent_relay().await;
         let silent_url = silent.url().await;
-        let client = connected_client(&[silent_url.clone()]).await;
+        let client = connected_client(std::slice::from_ref(&silent_url)).await;
         let (report_tx, report_rx) = tokio::sync::oneshot::channel();
 
         // Act

@@ -694,6 +694,11 @@ never has to lean on memo parsing in the wild.
     the order, transition `WaitingTakerBond` → `Pending` and
     republish. If other `Requested` bonds remain (a fresh concurrent
     taker is still in flight), leave the order in `WaitingTakerBond`.
+  - **Deadline to pay (#990).** The taker bond hold invoice is created
+    with `expiry = hold_invoice_expiration_window`, the time the info
+    event advertises for a taker to pay. LND cancels it unpaid when the
+    window closes, even with the daemon down, and `on_bond_invoice_canceled`
+    releases the bond as above. Before this, LND's 24 h default applied.
   - The trade hold invoice continues to ship as `Action::PayInvoice`
     — only the bond switches.
 - **Bump the `mostro-core` pin** in this repo's `Cargo.toml` from

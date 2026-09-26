@@ -136,6 +136,17 @@ pub struct TakerContext {
     pub dev_fee: i64,
 }
 
+/// Invoice expiry, in seconds, of a taker bond's hold invoice (#990).
+///
+/// It is `hold_invoice_expiration_window`, the time the info event tells
+/// a taker they have to pay. Without it LND keeps the invoice payable for
+/// its 24 h default, and the order sits at `WaitingTakerBond` that long.
+/// With it LND cancels the unpaid invoice when the window closes, even
+/// while the daemon is down, and `on_bond_invoice_canceled` ends the take.
+fn taker_bond_invoice_expiry(ln: &crate::config::types::LightningSettings) -> Option<i64> {
+    Some(i64::from(ln.hold_invoice_expiration_window))
+}
+
 /// Create a hold invoice for the taker's bond, persist a `Bond` row in
 /// `Requested`, ship the bolt11 to the taker, and start the LND
 /// subscriber that flips the row to `Locked` once the taker pays.
@@ -167,9 +178,10 @@ pub async fn request_taker_bond(
     let amount = compute_bond_amount(taker_ctx.amount, cfg);
     let memo = format!("mostro bond order_id={}", order.id);
 
+    let expiry = taker_bond_invoice_expiry(Settings::get_ln());
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice(&memo, amount)
+        .create_hold_invoice_with_expiry(&memo, amount, expiry)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -1623,6 +1635,25 @@ mod tests {
     use super::*;
     use crate::app::bond::types::BondRole;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    /// #990: the taker's bond invoice must stop being payable when the
+    /// window the info event advertises closes, not after LND's 24 h
+    /// default. LND then cancels it and `on_bond_invoice_canceled` ends the
+    /// take, as the bond code expects.
+    #[test]
+    fn taker_bond_invoice_expires_with_the_advertised_window() {
+        // Arrange
+        let ln = crate::config::types::LightningSettings {
+            hold_invoice_expiration_window: 300,
+            ..Default::default()
+        };
+
+        // Act
+        let expiry = taker_bond_invoice_expiry(&ln);
+
+        // Assert
+        assert_eq!(expiry, Some(300));
+    }
 
     async fn setup_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()

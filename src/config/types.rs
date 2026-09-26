@@ -510,7 +510,9 @@ pub struct LightningSettings {
     pub invoice_expiration_window: u32,
     /// Hold invoice CLTV delta
     pub hold_invoice_cltv_delta: u32,
-    /// Hold invoice expiration window in seconds
+    /// Hold invoice expiration window in seconds. It is also the taker
+    /// bond invoice's `expiry` (#990), so it must be positive.
+    #[serde(deserialize_with = "deserialize_hold_invoice_expiration_window")]
     pub hold_invoice_expiration_window: u32,
     /// Number of payment attempts
     pub payment_attempts: u32,
@@ -624,6 +626,24 @@ fn default_max_inflight_payouts_per_destination() -> u32 {
 /// guardian job's tick.
 fn default_escrow_deadline_margin_blocks() -> u32 {
     24
+}
+
+/// Validating deserializer for `hold_invoice_expiration_window`.
+/// Rejects 0: the taker bond hold invoice is created with this window as
+/// its `expiry` (#990), and LND reads an `expiry` of 0 as its 24 h
+/// default, the opposite of what was configured.
+fn deserialize_hold_invoice_expiration_window<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = u32::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(D::Error::custom(
+            "hold_invoice_expiration_window must be greater than 0",
+        ));
+    }
+    Ok(v)
 }
 
 // Hand-written so `max_final_cltv_expiry_delta` defaults to the real bound
@@ -1011,6 +1031,29 @@ payout_claim_window_days = 30"#,
             toml::from_str::<Stub>("[anti_abuse_bond]\nmaker_bond_payment_timeout_seconds = 30")
                 .expect("a short window is valid");
         assert_eq!(short.anti_abuse_bond.maker_bond_payment_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn toml_zero_hold_invoice_expiration_window_rejected() {
+        // 0 would reach LND as the taker bond invoice's `expiry: 0`, its
+        // 24 h default, and the info event would advertise a 0 s window.
+        let lightning = |window: u32| {
+            format!(
+                "lnd_cert_file = \"\"\nlnd_macaroon_file = \"\"\nlnd_grpc_host = \"\"\n\
+                 invoice_expiration_window = 3600\nhold_invoice_cltv_delta = 144\n\
+                 hold_invoice_expiration_window = {window}\npayment_attempts = 3\n\
+                 payment_retries_interval = 60\n"
+            )
+        };
+        let err = toml::from_str::<LightningSettings>(&lightning(0))
+            .expect_err("a zero hold invoice window must be rejected");
+        assert!(
+            err.to_string().contains("hold_invoice_expiration_window"),
+            "error message should name the field, got: {err}"
+        );
+        let short =
+            toml::from_str::<LightningSettings>(&lightning(30)).expect("a short window is valid");
+        assert_eq!(short.hold_invoice_expiration_window, 30);
     }
 
     #[test]

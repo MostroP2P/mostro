@@ -2547,6 +2547,32 @@ mod tests {
         );
     }
 
+    /// A `Requested` snapshot must not cancel or overwrite a bond that
+    /// locked after the snapshot was taken. `hash = None` so a missing
+    /// state predicate would mark the row `Released` instead of failing
+    /// on LND and hiding the overwrite. (ermeme P1 / Matobi98 on #928/#986)
+    #[tokio::test]
+    async fn release_bond_leaves_a_concurrent_lock_untouched() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        let mut stale = created.clone();
+        stale.state = BondState::Requested.to_string();
+        stale.locked_at = None;
+        release_bond(&pool, &stale).await.unwrap();
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
+        assert!(after.locked_at.is_some());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
     #[tokio::test]
     async fn release_bonds_for_order_swallows_per_bond_failures() {
         // The order-level helper warns and continues on individual bond

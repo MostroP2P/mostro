@@ -1746,15 +1746,18 @@ mod tests {
     }
 
     /// Issue #927: any publish of a range order in `WaitingTakerBond`
-    /// (e.g. the orderbook reconciler, from the DB row) must match the
-    /// `Pending` event: `s: pending`, `amt: 0`, `fa: [min, max]`.
+    /// must match the `Pending` event: `s: pending`, `amt: 0`,
+    /// `fa: [min, max]` — even when the in-memory struct already holds
+    /// the taker's sats quote (the mutation `take_sell` / `take_buy`
+    /// apply before a republish).
     #[test]
     fn waiting_taker_bond_range_order_publishes_unpriced_range() {
         init_test_settings();
         let mut order = make_pending_order();
         order.status = Status::WaitingTakerBond.to_string();
-        order.amount = 0;
-        order.fiat_amount = 0;
+        // Mutated take-time quote — must not leak into `amt`.
+        order.amount = 199_399;
+        order.fiat_amount = 800_000;
         order.min_amount = Some(500_000);
         order.max_amount = Some(2_000_000);
 

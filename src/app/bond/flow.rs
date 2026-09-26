@@ -2709,6 +2709,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_callback_expires_unpublished_maker_order() {
+        // #942: LND cancels the unpaid maker bond invoice. The order was
+        // never published, so it must end with the bond instead of sitting
+        // in WaitingMakerBond until its own expiry.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingMakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("a".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("cancel path returns Ok");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::Expired.to_string());
+    }
+
+    #[tokio::test]
     async fn canceled_callback_releases_last_bond_and_drops_to_pending() {
         // The last active taker bond is canceled by LND: the row flips
         // to Released and the order drops WaitingTakerBond → Pending.

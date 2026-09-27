@@ -1406,7 +1406,7 @@ mod tests {
     // ── Dispute event tag list: end-to-end y-tag emission (kind 38386) ──────────
 
     /// Verifies that [`create_dispute_event_tags`] emits status, initiator,
-    /// stable open-time `created_at`, platform `y`, and `z=dispute`.
+    /// stable open-time `published_at`, platform `y`, and `z=dispute`.
     #[test]
     fn dispute_event_tags_emit_y_tag_matching_platform_helper() {
         init_test_settings();
@@ -1440,10 +1440,13 @@ mod tests {
             "initiator tag must match"
         );
         assert_eq!(
-            get_tag_value(&tags, "created_at").as_deref(),
+            get_tag_value(&tags, "published_at").as_deref(),
             Some("1700000100"),
-            "created_at tag must carry the SQLite dispute open time"
+            "published_at tag must carry the SQLite dispute open time"
         );
+        // Nostr names this tag `published_at` (NIP-23); the old name must
+        // not be published alongside it.
+        assert_eq!(get_tag_value(&tags, "created_at"), None);
         assert_eq!(
             get_tag_value(&tags, "z").as_deref(),
             Some("dispute"),
@@ -1452,7 +1455,7 @@ mod tests {
     }
 
     /// Kind-38386 `event.created_at` stays "signed now"; the business open
-    /// time lives only on the `created_at` tag so NIP-33 replace still works.
+    /// time lives only on the `published_at` tag so NIP-33 replace still works.
     ///
     /// Uses a `d` tag unique to this test: `created_at` is now stamped
     /// monotonically per dispute, so a first revision only equals wall-clock
@@ -1474,7 +1477,7 @@ mod tests {
             "event.created_at must be wall-clock now, not the open-time tag"
         );
         assert_eq!(
-            get_tag_value(&event.tags, "created_at").as_deref(),
+            get_tag_value(&event.tags, "published_at").as_deref(),
             Some("1600000000")
         );
         assert_ne!(event.created_at.as_secs() as i64, opened_at);

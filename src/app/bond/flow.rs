@@ -3091,6 +3091,42 @@ mod tests {
         assert_eq!(active.len(), 1);
     }
 
+    /// Exit path: a `Locked` snapshot released after a concurrent slash
+    /// moved the row to `PendingPayout` must not claim `Released` — the
+    /// HTLC is already settled and Phase 3 owns the payout
+    /// (CodeRabbit on #986). Fails while the retry only bails on
+    /// `is_terminal()` (PendingPayout is neither terminal nor active).
+    #[tokio::test]
+    async fn release_bond_leaves_pending_payout_alone() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut locked = make_bond(order_id, BondState::Locked);
+        locked.hash = None;
+        locked.locked_at = Some(Utc::now().timestamp());
+        let created = create_bond(&pool, locked).await.unwrap();
+
+        // Concurrent slash: HTLC settled, payout job owns the row.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::PendingPayout.to_string())
+            .bind(created.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut stale = created.clone();
+        stale.state = BondState::Locked.to_string();
+        release_bond(&pool, &stale).await.unwrap();
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            BondState::PendingPayout.to_string(),
+            "release must not overwrite PendingPayout"
+        );
+        assert!(after.released_at.is_none());
+    }
+
     /// Exit path: a `Requested` snapshot released after the row locked
     /// must still cancel — re-read and retry from `Locked` so expiry /
     /// cancel jobs do not strand the HTLC (grunch on #986).

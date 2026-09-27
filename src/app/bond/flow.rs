@@ -2030,6 +2030,8 @@ async fn resume_take_after_bond(
 mod tests {
     use super::*;
     use crate::app::bond::types::BondRole;
+    use crate::lightning::lookup_invoice_error;
+    use fedimint_tonic_lnd::tonic::Status as Status_;
     use sqlx::sqlite::SqlitePoolOptions;
 
     /// #990: the taker's bond invoice must stop being payable when the
@@ -2670,11 +2672,38 @@ mod tests {
         );
     }
 
-    /// Recording stub for [`HoldInvoiceProbe`]: returns a fixed
-    /// accepted-HTLC height and counts lookups.
+    /// Recording stub for [`HoldInvoiceProbe`] + [`CancelLightning`]:
+    /// returns a fixed lookup result (height or error) and counts
+    /// lookups, subscriber re-arms and cancels.
     struct StubHoldProbe {
         height: Option<u32>,
+        lookup_err: Option<String>,
         calls: std::sync::atomic::AtomicUsize,
+        rearms: std::sync::atomic::AtomicUsize,
+        cancels: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubHoldProbe {
+        fn with_height(height: Option<u32>) -> Self {
+            Self {
+                height,
+                lookup_err: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                rearms: std::sync::atomic::AtomicUsize::new(0),
+                cancels: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with_lookup_err(msg: &str) -> Self {
+            Self {
+                lookup_err: Some(msg.to_string()),
+                ..Self::with_height(None)
+            }
+        }
+
+        fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl HoldInvoiceProbe for StubHoldProbe {
@@ -2683,14 +2712,19 @@ mod tests {
             _hash: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let height = self.height;
-            Box::pin(async move { Ok(height) })
+            let result = match &self.lookup_err {
+                Some(msg) => Err(MostroInternalErr(ServiceError::LnNodeError(msg.clone()))),
+                None => Ok(self.height),
+            };
+            Box::pin(async move { result })
         }
 
         fn rearm_subscriber<'a>(
             &'a mut self,
             _hash: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            self.rearms
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
     }
@@ -2700,8 +2734,144 @@ mod tests {
             &'a mut self,
             _hash: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            self.cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
+    }
+
+    async fn bond_state(pool: &Pool<Sqlite>, bond_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// grunch on #986: an accepted HTLC seen by the sweep must re-arm the
+    /// bond subscriber — the startup one may have died on a stream error
+    /// and would never deliver the `Accepted` that locks the bond.
+    #[tokio::test]
+    async fn sweep_rearms_subscriber_for_accepted_htlc() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe = StubHoldProbe::with_height(Some(800_000));
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(
+            StubHoldProbe::count(&probe.rearms),
+            1,
+            "accepted HTLC must re-arm the subscriber"
+        );
+        assert_eq!(StubHoldProbe::count(&probe.cancels), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Requested.to_string()
+        );
+    }
+
+    /// grunch on #986: a `NotFound` lookup means LND has no invoice to
+    /// protect, so the sweep must release instead of pinning the order.
+    #[tokio::test]
+    async fn sweep_releases_bond_when_invoice_gone_at_lnd() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe =
+            StubHoldProbe::with_lookup_err("code=NotFound message=there are no existing invoices");
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(StubHoldProbe::count(&probe.rearms), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Released.to_string(),
+            "invoice unknown to LND must not block the release"
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// A transient lookup failure keeps failing closed: the HTLC state is
+    /// unknown, so the bond stays `Requested` for the next tick.
+    #[tokio::test]
+    async fn sweep_skips_bond_when_probe_unavailable() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe =
+            StubHoldProbe::with_lookup_err("code=Unavailable message=connection refused");
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(StubHoldProbe::count(&probe.cancels), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Requested.to_string()
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    /// LND reports a missing invoice on lookup as `NotFound`; the mapped
+    /// error must carry the gRPC code so `classify_cancel_error` sees it.
+    #[test]
+    fn lookup_invoice_error_keeps_grpc_code() {
+        let err = lookup_invoice_error(Status_::not_found("there are no existing invoices"));
+        assert_eq!(classify_cancel_error(&err), CancelOutcome::AlreadyDone);
+
+        let err = lookup_invoice_error(Status_::unavailable("connection refused"));
+        assert_eq!(classify_cancel_error(&err), CancelOutcome::Transient);
+    }
+
+    /// CodeRabbit on #986: a race loser that finds the row already
+    /// `Released` (a claim whose LND cancel may not have landed) must
+    /// still cancel the hold invoice best-effort.
+    #[tokio::test]
+    async fn race_loser_cancels_htlc_behind_released_claim() {
+        init_test_settings();
+        let pool = setup_pool().await;
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let bond = make_bond(order_id, BondState::Released);
+        assert!(bond.hash.is_some());
+
+        let mut ln = StubHoldProbe::with_height(None);
+        release_race_loser(&pool, &bond, BondState::Released, &mut ln).await;
+        assert_eq!(
+            StubHoldProbe::count(&ln.cancels),
+            1,
+            "Released race loser must cancel the HTLC"
+        );
+
+        let slashed = make_bond(order_id, BondState::Slashed);
+        let mut ln = StubHoldProbe::with_height(None);
+        release_race_loser(&pool, &slashed, BondState::Slashed, &mut ln).await;
+        assert_eq!(
+            StubHoldProbe::count(&ln.cancels),
+            0,
+            "Slashed bond's HTLC was settled; nothing to cancel"
+        );
     }
 
     /// A stale `Requested` bond whose invoice lookup returns an accepted
@@ -2719,10 +2889,7 @@ mod tests {
         let bond_id = bond.id;
         create_bond(&pool, bond).await.unwrap();
 
-        let mut probe = StubHoldProbe {
-            height: Some(800_000),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        };
+        let mut probe = StubHoldProbe::with_height(Some(800_000));
         sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
 
         assert_eq!(

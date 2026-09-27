@@ -421,6 +421,18 @@ pub(crate) fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroE
     Ok(bytes)
 }
 
+/// Map a failed `lookup_invoice` call to a [`MostroError`], keeping the
+/// gRPC code in the same `code=… message=…` shape as
+/// `cancel_hold_invoice` so callers can tell `NotFound` from transport
+/// failures.
+pub(crate) fn lookup_invoice_error(status: fedimint_tonic_lnd::tonic::Status) -> MostroError {
+    MostroInternalErr(ServiceError::LnNodeError(format!(
+        "code={:?} message={}",
+        status.code(),
+        status.message()
+    )))
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -591,7 +603,7 @@ impl LndConnector {
                 ..Default::default()
             })
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .map_err(lookup_invoice_error)?
             .into_inner();
 
         Ok(invoice

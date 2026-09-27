@@ -45,6 +45,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_reconcile_stranded_taker_bonds(ctx.clone()).await;
         job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
@@ -1354,6 +1355,28 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
         loop {
             bond::reconcile_stranded_range_maker_bonds(pool).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Bound the taker-bond window (issue #927 part 2). LND cancels the bond
+/// hold invoice at `hold_invoice_expiration_window` (#990 / #999); this
+/// job is the belt-and-braces path when that cancel signal is missed. It
+/// releases stale `Requested` taker bonds after the window plus grace and
+/// drops the order back to `Pending`.
+///
+/// Sleeps one interval before the first tick so startup
+/// `resubscribe_active_bonds` can deliver replayed `Accepted` events and
+/// lock paid bonds before the sweep runs (otherwise a still-`Requested`
+/// row with an accepted HTLC is cancelled — grunch on #986).
+async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            bond::reconcile_stranded_taker_bonds(pool).await;
         }
     });
 }

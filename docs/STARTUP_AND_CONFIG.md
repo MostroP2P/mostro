@@ -100,6 +100,12 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `relays` (Vec<String>): List of Nostr relay URLs for event broadcasting
   - Default: `['ws://localhost:7000']`
   - Note: At least one relay required
+  - Relays that require NIP-42 authentication are supported: Mostro answers the
+    challenge with its own key. No configuration is needed.
+  - A relay that ends Mostro's inbox subscription is re-subscribed
+    automatically, and a watchdog audits the subscription every 30 seconds. If
+    no relay is serving it, the log carries `Mostro inbox is BLIND` and order
+    timeouts are held until it recovers. See `docs/EVENT_ROUTING.md`.
 
 **Lightning** (`src/config/types.rs:27-46`):
 - `lnd_cert_file` (String): Path to LND TLS certificate

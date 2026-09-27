@@ -37,7 +37,7 @@ pub static NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();
 ///
 /// Kept separate from [`NOSTR_CLIENT`] so `verify_subscriptions(true)` (and
 /// the REQ `limit` it enforces) applies only to price fetches — not to the
-/// daemon's long-lived `.limit(0)` inbox subscription in `main.rs`, where
+/// daemon's long-lived `.limit(0)` inbox subscription (`crate::inbox`), where
 /// pre-EOSE filter verification would reject matching trade messages
 /// (hermeme, PR #841).
 pub static PRICE_NOSTR_CLIENT: OnceLock<Client> = OnceLock::new();

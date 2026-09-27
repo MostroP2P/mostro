@@ -6,6 +6,53 @@ How Nostr events become actions and side effects.
 - Source: `src/app.rs:run`
 - Steps: POW check → signature verify → recency guard → NIP-59 unwrap → parse `mostro_core::Message` → inner verify → `check_trade_index` → dispatch.
 
+## The Inbox Subscription
+- Source: `src/inbox/mod.rs` (subscription, keeper, watchdog audit) and `src/inbox/health.rs` (the health record the scheduler reads)
+- Every trade message reaches Mostro over a single long-lived subscription, sent by the event loop (`app::run` / `app::run_cashu`) right after it takes its notification stream — a receiver created after the REQ would miss the relay's `EOSE` — with a stable id (`InboxSubscription`) so that later frames can be attributed to it. Its filter is p-tagged to the node, restricted to the configured transport's event kind, and carries `limit(0)`: only live traffic is wanted.
+- `run` consumes the whole notification stream, not just events. `ClientNotification::Message` carries the relay control plane and goes to `InboxKeeper`; `ClientNotification::Shutdown` ends the loop.
+
+### Recovering a lost ear
+A relay can end a subscription at any time by sending `CLOSED`. The nostr-sdk removes the subscription for almost every reason prefix, and a removed subscription is never re-REQ'd, not even after a reconnect — so without handling, one frame from one relay leaves the daemon running, connected, and unable to receive anything.
+
+The exceptions are `auth-required` and `rate-limited`, which the SDK only *marks*: the subscription stays registered and the SDK re-sends the REQ itself, after the NIP-42 round-trip in the first case and on the next reconnect in the second. The keeper stands down on the REQ for those two rather than racing it.
+
+It does not stand down on the health verdict. `MarkAsClosed` leaves the entry in the SDK's subscription map, so the relay keeps *looking* subscribed, and the SDK does not always get around to re-sending: `rate-limited` has no retry timer at all (only the next reconnect, which never comes on a healthy connection), and an `auth-required` whose AUTH the relay then rejects ends without a re-subscribe. The relay's acknowledgement is therefore dropped either way, which hands the case to the watchdog below — the right pace for a relay that has just asked to be left alone, and the difference between recovering and being silently deaf for the life of the connection.
+
+Two mechanisms keep the subscription alive:
+
+- `InboxKeeper::on_relay_message` reacts to a `CLOSED` naming the inbox by re-sending the REQ to that relay.
+- `check_inbox_health`, run every 30 seconds by `job_inbox_watchdog`, audits each connected read relay and re-subscribes any that is no longer serving the inbox. This covers the losses that produce no frame the loop can see: a notification channel that dropped messages under lag, a REQ that failed to go out, a relay added after startup.
+
+Both go through `resubscribe_relay`, which owns the pacing so neither can bypass it: one per-relay budget in `InboxHealth`, immediate first retry, doubling to a five-minute ceiling, reset when the relay answers with `EOSE`. Because the doublings start well below the 30-second audit interval, a relay that merely lost the inbox is re-subscribed on the next pass, while one that refuses it on principle converges on the five-minute figure rather than drawing a REQ every 30 seconds indefinitely.
+
+Health is judged by the subscription, never by traffic volume: an instance with no trades in flight is legitimately silent.
+
+A relay counts as serving the inbox only once **it** has said so, by answering the REQ with an `EOSE` that the event loop recorded in `InboxHealth`. The SDK's own subscription map is not evidence — it records what Mostro sent, so a relay that holds the connection open and quietly drops the REQ still appears subscribed there, and the daemon would resume order timeouts while deaf. The same rule means a relay re-subscribed during an audit does not count until it answers, which costs one interval before recovery is declared and errs toward keeping the timeout clock frozen slightly longer than strictly needed.
+
+### NIP-42
+The daemon and price clients are built with a `SignerAuthenticator` over the node's keys (`src/util.rs:connect_nostr`). Without it a relay that gates reads behind authentication answers the REQ with `CLOSED "auth-required: …"`, which the SDK treats as permanent. The AUTH event is bound to the relay's challenge and URL, so it cannot be replayed elsewhere.
+
+### Messages lost while blind are not recovered
+`accept_event` rejects anything whose `created_at` is older than ten seconds. A message sent while the inbox was down is therefore already too old to be accepted by the time the subscription returns, and re-subscribing with `since` instead of `limit(0)` would not change that. Whoever sent it has to send it again.
+
+Because those messages are lost rather than delayed, order timeouts cannot be trusted while the inbox is down — a user who answered on time would look silent. `job_cancel_orders` therefore skips its tick entirely unless an audit has confirmed the daemon is listening (`InboxHealth::is_confirmed_listening`): no slash, no refund, no republish. Startup counts as unconfirmed, since the daemon subscribes before the watchdog's first pass.
+
+Once the inbox recovers, each order is credited the downtime **it** waited through. `InboxHealth` keeps the wall-clock windows during which the node was deaf; `blind_seconds_since(taken_at)` intersects them with the order's own wait. An order already waiting when a relay went quiet is owed all of that outage; one taken after it ended is owed nothing. `find_order_by_seconds` selects on the nominal deadline alone — the credit is applied only in the scheduler's loop, order by order, where it can only ever spare.
+
+The credit has to be per order rather than one global allowance: a single figure either under-credits an order that waited through the whole outage or hands the same credit to one taken long afterwards.
+
+The credit is also bounded, by the same three-hour ceiling that bounds the timeout pause below (`src/scheduler.rs`, `fn downtime_credit`). Outage windows are retained for days, so an inbox that flaps — blind long enough to keep accruing windows, listening just often enough to keep the tick running — would otherwise accrue credit faster than the clock runs it down and its orders would never time out, holding escrows to CLTV expiry: the state the three-hour bound exists to prevent, reached through a path its continuous-stretch measure never sees. An order whose `taken_at` was never persisted (a value of zero) receives no credit: with no anchor there is no wait to intersect the windows with.
+
+The ceiling is the tightest bound that is safe. One expiration window is the tempting cap and is the wrong one: an order is spared only while its wait is shorter than the deadline plus its credit, and on the first tick after an outage its wait already includes the whole outage — so a cap of one window spares nobody once the outage runs to two, and every order still waiting is cancelled and its bond slashed for a silence that was the node's. The blameless path does not catch that case either, because it arms only while the inbox is unconfirmed and recovery clears that before the tick runs. Capping at three hours instead bounds the flapping hazard just as firmly — an escrow is held at worst one expiration window past the ceiling, against a CLTV horizon of about twenty-two hours — without charging a user for downtime they sat through.
+
+Outage history does not survive a restart. `InboxHealth` keeps its windows in memory, so an order that waited through an outage preceding a crash, deploy or restart is credited nothing for it once the daemon comes back: the per-order fairness described here holds within one process lifetime. Recording the gap across restarts needs persistence and a rule for how much a single restart may claim — a node deliberately offline for a week must not reopen as a week-long outage — and is tracked as follow-up work rather than solved here.
+
+Deferring cannot be unconditional, though. The same pass that slashes a bond is the one that releases it and the one that cancels the seller's hold invoice, so waiting forever on a permanently broken inbox would leave escrows encumbered until CLTV expiry and honest takers' bonds locked indefinitely. After three hours without a confirmed inbox, timed-out orders are unwound anyway — but blamelessly: bonds are released rather than settled (`bond::release_on_timeout_without_slashing`), and the downtime credit is skipped: the unwind is already blameless, so deferring it further would only keep escrows encumbered for longer. A failed release keeps the order in its waiting state so the next tick retries, exactly as the slashing path does: cancelling first would take the order out of `find_order_by_seconds`'s eligibility window with the bond still `Locked` and nothing left to look at it again.
+
+Only `job_cancel_orders` is gated on inbox health. `job_expire_pending_older_orders` runs throughout, and that is correct only because of what it does: it expires orders that were never taken and releases the bonds it touches, so the worst an outage costs there is a maker who has to republish. It takes no slash decision of its own — the one bond it can settle, a range maker bond at close, is carrying out a slash an earlier slice already decided. That is a property of the job as it stands today, not a licence: any future path there that settles a bond on a user's silence needs the same `is_confirmed_listening` gate this one has. A `TakeSell` lost to a blind inbox still expires an order unfairly, which is tracked separately (issue #926).
+
+The unwind's notifications share the outage. The cancellation and republish messages go out through the same relays that stopped answering, so after a blameless unwind users may not receive them and will discover the outcome only by refreshing the order book once the relays are back. This is inherent — there is no second channel — but an operator recovering a node should expect a wave of "my order disappeared" reports rather than assume the messages were delivered.
+
 ## Dispatch
 - Router: `src/app.rs:handle_message_action`
 - Maps `Action` → module function under `src/app/*`.
@@ -26,20 +73,57 @@ How Nostr events become actions and side effects.
 ```mermaid
 sequenceDiagram
   participant Relay as Nostr Relay
-  participant Loop as app.rs (run)
+  participant EventLoop as app.rs (run)
+  participant Keeper as InboxKeeper
   participant Router as handle_message_action
   participant Mod as app/*
   participant DB as DB
   participant LND as LND
 
-  Relay-->>Loop: GiftWrap Event
-  Loop->>Loop: POW + verify + freshness
-  Loop->>Loop: unwrap + parse Message
-  Loop->>DB: check_trade_index
-  Loop->>Router: dispatch(Action)
+  Relay-->>EventLoop: GiftWrap Event
+  EventLoop->>EventLoop: POW + verify + freshness
+  EventLoop->>EventLoop: unwrap + parse Message
+  EventLoop->>DB: check_trade_index
+  EventLoop->>Router: dispatch(Action)
   Router->>Mod: handler(...)
   par side-effects
     Mod->>DB: read/write
     Mod->>LND: hold/settle/cancel/pay
+  end
+
+  Relay-->>EventLoop: CLOSED (inbox subscription)
+  EventLoop->>Keeper: on_relay_message
+  Keeper->>Relay: REQ (same subscription id)
+```
+
+The watchdog runs on its own schedule, independently of the loop above:
+
+```mermaid
+sequenceDiagram
+  participant Job as job_inbox_watchdog
+  participant Relay as connected read relays
+  participant Health as InboxHealth
+  participant Timeouts as job_cancel_orders
+
+  loop every 30s
+    Job->>Relay: still serving the inbox subscription?
+    alt not serving it
+      Job->>Relay: REQ (same subscription id)
+    end
+    alt none were serving it
+      Job->>Health: Blind
+    else at least one was
+      Job->>Health: Listening
+    end
+  end
+
+  loop every 60s
+    Timeouts->>Health: is_confirmed_listening?
+    alt not confirmed
+      Timeouts->>Timeouts: skip the tick
+    else confirmed
+      Timeouts->>Health: blind_seconds_since(taken_at) per order
+      Timeouts->>Timeouts: run, each order credited its own downtime
+    end
   end
 ```

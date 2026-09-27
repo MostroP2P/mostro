@@ -715,7 +715,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits a real Nostr relay; run explicitly for manual verification"]
     async fn live_relay_fetch_returns_real_rates() {
-        let client = crate::util::price_nostr_client_options().build();
+        let client = crate::util::price_nostr_client_options(None).build();
         client
             .add_relay("wss://relay.mostro.network")
             .await

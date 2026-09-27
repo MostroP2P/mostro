@@ -2591,8 +2591,7 @@ mod tests {
             &'a mut self,
             _hash: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let height = self.height;
             Box::pin(async move { Ok(height) })
         }

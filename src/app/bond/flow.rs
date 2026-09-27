@@ -2520,6 +2520,65 @@ mod tests {
         );
     }
 
+    /// Recording stub for [`HoldInvoiceProbe`]: returns a fixed
+    /// accepted-HTLC height and counts lookups.
+    struct StubHoldProbe {
+        height: Option<u32>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HoldInvoiceProbe for StubHoldProbe {
+        fn get_hold_invoice_expiry_height<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let height = self.height;
+            Box::pin(async move { Ok(height) })
+        }
+    }
+
+    /// A stale `Requested` bond whose invoice lookup returns an accepted
+    /// HTLC must not be released — the subscriber still needs to lock it
+    /// (grunch on #986: Accepted-but-not-Locked at startup).
+    #[tokio::test]
+    async fn sweep_skips_requested_bond_with_accepted_htlc() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe = StubHoldProbe {
+            height: Some(800_000),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "sweep must probe LND before cancelling a hashed bond"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            BondState::Requested.to_string(),
+            "accepted HTLC must block the sweep release"
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
     /// Issue #927 part 2: the sweep releases the stale `Requested` taker
     /// bond and drops the order back to `Pending` with no LND callback
     /// involved. Uses a bond without a hash (the `request_taker_bond`

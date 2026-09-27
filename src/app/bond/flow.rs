@@ -55,6 +55,7 @@ use tokio::sync::mpsc::channel;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::app::cancel::CancelLightning;
 use crate::config::settings::Settings;
 use crate::lightning::{InvoiceMessage, LndConnector};
 use crate::util::{
@@ -509,6 +510,16 @@ pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
 /// `Locked` winner alone. A transient cancel failure rolls the claim
 /// back so the bond stays active for retry.
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
+    release_bond_with(pool, bond, &mut LazyLndCancel::default()).await
+}
+
+/// [`release_bond`] with an injectable LND canceller, so tests can run the
+/// release path without a live node.
+pub(crate) async fn release_bond_with<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    ln: &mut L,
+) -> Result<(), MostroError> {
     // Exit paths mean "this bond must go". A stale `Requested` snapshot
     // that races a lock must still cancel the HTLC once we see `Locked`
     // — otherwise an expiry/cancel job can strand a Locked bond on a
@@ -518,7 +529,7 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
     const MAX_ATTEMPTS: usize = 3;
     let mut snapshot = bond.clone();
     for attempt in 0..MAX_ATTEMPTS {
-        match release_bond_if_state(pool, &snapshot).await? {
+        match release_bond_if_state_with(pool, &snapshot, ln).await? {
             ReleaseBondOutcome::Released | ReleaseBondOutcome::AlreadyTerminal => return Ok(()),
             ReleaseBondOutcome::StateMoved => {
                 let Some(fresh) = Bond::by_id(pool, bond.id)
@@ -580,9 +591,19 @@ pub(crate) enum ReleaseBondOutcome {
 /// Release only if the bond is still in `bond.state`. Used by the
 /// stranded-taker sweep: a `Requested` snapshot that lost to a lock
 /// must not cancel the winner's HTLC.
+#[cfg(test)]
 pub(crate) async fn release_bond_if_state(
     pool: &Pool<Sqlite>,
     bond: &Bond,
+) -> Result<ReleaseBondOutcome, MostroError> {
+    release_bond_if_state_with(pool, bond, &mut LazyLndCancel::default()).await
+}
+
+/// [`release_bond_if_state`] with an injectable LND canceller.
+pub(crate) async fn release_bond_if_state_with<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    ln: &mut L,
 ) -> Result<ReleaseBondOutcome, MostroError> {
     // Parse `state` once into the enum so callers don't depend on the
     // `Display` form for control flow (and a malformed value short-
@@ -623,31 +644,26 @@ pub(crate) async fn release_bond_if_state(
     }
 
     if let Some(hash) = bond.hash.as_ref() {
-        let cancel_err = match LndConnector::new().await {
-            Ok(mut ln) => match ln.cancel_hold_invoice(hash).await {
-                Ok(_) => None,
-                Err(e) => match classify_cancel_error(&e) {
-                    CancelOutcome::AlreadyDone => {
-                        // Common race with the subscriber, or the
-                        // invoice was never created in the first place
-                        // (request_taker_bond bailed before the row got
-                        // a hash). HTLC is verifiably gone.
-                        info!(
-                            bond_id = %bond.id,
-                            order_id = %bond.order_id,
-                            "cancel_hold_invoice reports already-done ({}); marking Released",
-                            e
-                        );
-                        None
-                    }
-                    CancelOutcome::Transient => Some(e),
-                },
+        // An unreachable LND surfaces here as the connect error, which
+        // classifies as transient: don't pretend the HTLC is gone.
+        let cancel_err = match ln.cancel_hold_invoice(hash).await {
+            Ok(()) => None,
+            Err(e) => match classify_cancel_error(&e) {
+                CancelOutcome::AlreadyDone => {
+                    // Common race with the subscriber, or the
+                    // invoice was never created in the first place
+                    // (request_taker_bond bailed before the row got
+                    // a hash). HTLC is verifiably gone.
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "cancel_hold_invoice reports already-done ({}); marking Released",
+                        e
+                    );
+                    None
+                }
+                CancelOutcome::Transient => Some(e),
             },
-            Err(e) => {
-                // LND unreachable: definitionally transient. Don't pretend
-                // the HTLC is gone.
-                Some(e)
-            }
         };
         if let Some(e) = cancel_err {
             warn!(
@@ -673,6 +689,27 @@ pub(crate) async fn release_bond_if_state(
         bond.id, bond.order_id, bond.state
     );
     Ok(ReleaseBondOutcome::Released)
+}
+
+/// [`CancelLightning`] that opens the LND connection on first use, so
+/// callers only connect when a hold invoice actually needs cancelling
+/// (hashless bonds and CAS misses never touch LND).
+#[derive(Default)]
+pub(crate) struct LazyLndCancel(Option<LndConnector>);
+
+impl CancelLightning for LazyLndCancel {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move {
+            let ln = match &mut self.0 {
+                Some(ln) => ln,
+                slot => slot.insert(LndConnector::new().await?),
+            };
+            ln.cancel_hold_invoice(hash).await.map(|_| ())
+        })
+    }
 }
 
 /// Undo [`release_bond_if_state`]'s compare-and-swap after a transient LND
@@ -965,14 +1002,7 @@ async fn on_bond_invoice_accepted(
             "Bond {} lost concurrent-bonds race (current state={}) — releasing and notifying taker",
             current.id, current.state
         );
-        if !current_state.is_terminal() {
-            if let Err(e) = release_bond(pool, &current).await {
-                warn!(
-                    bond_id = %current.id,
-                    "release_bond on race-loser failed: {}", e
-                );
-            }
-        }
+        release_race_loser(pool, &current, current_state, &mut LazyLndCancel::default()).await;
         notify_loser(&current).await;
         return Ok(());
     }
@@ -1077,6 +1107,25 @@ async fn on_bond_invoice_accepted(
 
     let my_keys = get_keys()?;
     resume_take_after_bond(pool, order, my_keys, request_id).await
+}
+
+/// Tear down a taker bond whose `Accepted` lost the lock `UPDATE` in
+/// [`on_bond_invoice_accepted`]: another bond on the order locked first,
+/// or another path claimed this row meanwhile.
+async fn release_race_loser<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    current: &Bond,
+    current_state: BondState,
+    ln: &mut L,
+) {
+    if !current_state.is_terminal() {
+        if let Err(e) = release_bond_with(pool, current, ln).await {
+            warn!(
+                bond_id = %current.id,
+                "release_bond on race-loser failed: {}", e
+            );
+        }
+    }
 }
 
 /// Subscriber callback path for a **maker** bond reaching `Accepted`.
@@ -1665,6 +1714,14 @@ pub trait HoldInvoiceProbe {
         &'a mut self,
         hash: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>>;
+
+    /// Attach a fresh LND subscriber to the bond hold invoice `hash`
+    /// (hex). `SubscribeSingleInvoice` replays the current state, so an
+    /// already-accepted HTLC reaches [`on_bond_invoice_accepted`].
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>>;
 }
 
 impl HoldInvoiceProbe for LndConnector {
@@ -1673,6 +1730,20 @@ impl HoldInvoiceProbe for LndConnector {
         hash: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
         Box::pin(async move { LndConnector::get_hold_invoice_expiry_height(self, hash).await })
+    }
+
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = Vec::<u8>::from_hex(hash).map_err(|e| {
+                MostroInternalErr(ServiceError::UnexpectedError(format!(
+                    "malformed bond hash {hash}: {e}"
+                )))
+            })?;
+            bond_invoice_subscribe(bytes, None).await
+        })
     }
 }
 
@@ -1689,6 +1760,23 @@ impl HoldInvoiceProbe for NoAcceptedHtlc {
         _hash: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
         Box::pin(async move { Ok(None) })
+    }
+
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+impl CancelLightning for NoAcceptedHtlc {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -1748,9 +1836,12 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale
     reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut NoAcceptedHtlc).await;
 }
 
-/// Like [`reconcile_stranded_taker_bonds_at`], with an injectable
-/// [`HoldInvoiceProbe`] for the accepted-HTLC guard.
-pub(crate) async fn reconcile_stranded_taker_bonds_at_with<P: HoldInvoiceProbe + Send>(
+/// Like [`reconcile_stranded_taker_bonds_at`], with an injectable LND
+/// seam: [`HoldInvoiceProbe`] for the accepted-HTLC guard and
+/// [`CancelLightning`] for the release.
+pub(crate) async fn reconcile_stranded_taker_bonds_at_with<
+    P: HoldInvoiceProbe + CancelLightning + Send,
+>(
     pool: &Pool<Sqlite>,
     stale_cutoff: i64,
     probe: &mut P,
@@ -1789,7 +1880,7 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at_with<P: HoldInvoiceProbe +
 /// winner is not refunded. Exit paths use [`release_bond`], which
 /// retries from the fresh state. A transient LND failure during the
 /// cancel rolls the claim back and the next tick retries.
-async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + Send>(
+async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     stale_cutoff: i64,
@@ -1825,7 +1916,7 @@ async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + Send>(
                         }
                     }
                 }
-                if let Err(e) = release_bond_if_state(pool, bond).await {
+                if let Err(e) = release_bond_if_state_with(pool, bond, probe).await {
                     warn!(
                         bond_id = %bond.id,
                         order_id = %order_id,
@@ -2594,6 +2685,22 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let height = self.height;
             Box::pin(async move { Ok(height) })
+        }
+
+        fn rearm_subscriber<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    impl CancelLightning for StubHoldProbe {
+        fn cancel_hold_invoice<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 

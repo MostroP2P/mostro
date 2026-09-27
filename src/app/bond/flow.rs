@@ -38,6 +38,8 @@
 //! losing the lock race), if no other active bond remains on the
 //! order, the status flips back to `Pending`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1643,6 +1645,40 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     Ok(())
 }
 
+/// LND lookup the stranded-taker sweep needs before cancelling a still-
+/// `Requested` bond: whether an accepted HTLC already backs the hold
+/// invoice. Mirrors [`crate::app::cancel::CancelLightning`] so tests can
+/// pass a stub instead of a live [`LndConnector`].
+pub trait HoldInvoiceProbe {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>>;
+}
+
+impl HoldInvoiceProbe for LndConnector {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { LndConnector::get_hold_invoice_expiry_height(self, hash).await })
+    }
+}
+
+/// Probe that always reports no accepted HTLC. Production uses this until
+/// the accepted-HTLC gate is wired; unit tests that exercise the hashless
+/// bail-early release path also use it so they never open LND.
+pub(crate) struct NoAcceptedHtlc;
+
+impl HoldInvoiceProbe for NoAcceptedHtlc {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(None) })
+    }
+}
+
 /// Scheduler sweep (issue #927 part 2): bound the taker-bond window
 /// independently of the LND cancel callback.
 ///
@@ -1667,8 +1703,20 @@ pub async fn reconcile_stranded_taker_bonds(pool: &Pool<Sqlite>) {
 }
 
 /// Testable core of [`reconcile_stranded_taker_bonds`]: the cutoff is
-/// injected so tests don't depend on global LN settings.
+/// injected so tests don't depend on global LN settings. Uses
+/// [`NoAcceptedHtlc`] — call [`reconcile_stranded_taker_bonds_at_with`]
+/// when the probe outcome matters.
 pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale_cutoff: i64) {
+    reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut NoAcceptedHtlc).await;
+}
+
+/// Like [`reconcile_stranded_taker_bonds_at`], with an injectable
+/// [`HoldInvoiceProbe`] for the accepted-HTLC guard.
+pub(crate) async fn reconcile_stranded_taker_bonds_at_with<P: HoldInvoiceProbe + Send>(
+    pool: &Pool<Sqlite>,
+    stale_cutoff: i64,
+    probe: &mut P,
+) {
     let stale = match super::db::find_stale_waiting_taker_bond_orders(pool, stale_cutoff).await {
         Ok(orders) => orders,
         Err(e) => {
@@ -1677,7 +1725,7 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale
         }
     };
     for order in stale {
-        sweep_stranded_taker_bond_order(pool, order.id, stale_cutoff).await;
+        sweep_stranded_taker_bond_order(pool, order.id, stale_cutoff, probe).await;
     }
 }
 
@@ -1701,7 +1749,16 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale
 /// overwritten. Exit paths use [`release_bond`], which retries from the
 /// fresh state. A transient LND failure during the cancel rolls the
 /// claim back and the next tick retries.
-async fn sweep_stranded_taker_bond_order(pool: &Pool<Sqlite>, order_id: Uuid, stale_cutoff: i64) {
+///
+/// `probe` is accepted so tests can inject a [`HoldInvoiceProbe`]; the
+/// accepted-HTLC gate is wired in a follow-up (issue #927 part 2 review).
+async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + Send>(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    stale_cutoff: i64,
+    probe: &mut P,
+) {
+    let _ = probe;
     match find_active_bonds_for_order(pool, order_id).await {
         Ok(bonds) => {
             let taker_role = BondRole::Taker.to_string();
@@ -2530,7 +2587,7 @@ mod tests {
         let locked_id = locked.id;
         create_bond(&pool, locked).await.unwrap();
 
-        sweep_stranded_taker_bond_order(&pool, order_id, now - 360).await;
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut NoAcceptedHtlc).await;
 
         let fresh_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
             .bind(fresh_id)

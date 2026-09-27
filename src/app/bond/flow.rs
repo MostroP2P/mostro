@@ -500,11 +500,87 @@ pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
 ///   bond stays stuck.
 ///
 /// **The state write is a compare-and-swap** from the caller's observed
-/// `state`. A miss — the sweep's stale `Requested` snapshot racing a
-/// `Locked` winner — returns without cancelling the hold invoice, and
-/// without writing the snapshot back over the row. A transient cancel
-/// failure rolls that claim back so the bond stays active for retry.
+/// `state`. Exit paths ([`release_bond`]) re-read and retry on a miss so a
+/// bond that locked meanwhile is still cancelled — matching pre-CAS
+/// behaviour when the order is leaving the book. The stranded-taker
+/// sweep uses [`release_bond_if_state`], which leaves a concurrent
+/// `Locked` winner alone. A transient cancel failure rolls the claim
+/// back so the bond stays active for retry.
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
+    // Exit paths mean "this bond must go". A stale `Requested` snapshot
+    // that races a lock must still cancel the HTLC once we see `Locked`
+    // — otherwise an expiry/cancel job can strand a Locked bond on a
+    // terminal or republished order (grunch on #986). Cap retries: one
+    // re-read covers Requested→Locked; further misses mean another
+    // writer already finished or the row vanished.
+    const MAX_ATTEMPTS: usize = 3;
+    let mut snapshot = bond.clone();
+    for attempt in 0..MAX_ATTEMPTS {
+        match release_bond_if_state(pool, &snapshot).await? {
+            ReleaseBondOutcome::Released | ReleaseBondOutcome::AlreadyTerminal => return Ok(()),
+            ReleaseBondOutcome::StateMoved => {
+                let Some(fresh) = Bond::by_id(pool, bond.id)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+                else {
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "release_bond: bond row gone after CAS miss; done"
+                    );
+                    return Ok(());
+                };
+                let fresh_state = BondState::from_str(&fresh.state).map_err(|e| {
+                    MostroInternalErr(ServiceError::UnexpectedError(format!(
+                        "Bond {} has unparseable state {:?}: {}",
+                        fresh.id, fresh.state, e
+                    )))
+                })?;
+                if fresh_state.is_terminal() {
+                    return Ok(());
+                }
+                info!(
+                    bond_id = %bond.id,
+                    order_id = %bond.order_id,
+                    attempt,
+                    from = %snapshot.state,
+                    to = %fresh.state,
+                    "release_bond: state moved; retrying release from fresh row"
+                );
+                snapshot = fresh;
+            }
+        }
+    }
+    warn!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        "release_bond: exhausted retries after concurrent state moves; leaving for the next exit path"
+    );
+    Ok(())
+}
+
+/// Outcome of a single compare-and-swap release attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseBondOutcome {
+    /// Row claimed `Released` and the hold invoice was cancelled (or
+    /// had no hash / was already gone).
+    Released,
+    /// Caller's snapshot was already terminal — no-op.
+    AlreadyTerminal,
+    /// Row left the observed state before the claim; invoice was **not**
+    /// cancelled. The stranded-taker sweep treats this as success (leave
+    /// a concurrent `Locked` alone). Exit paths re-read and retry via
+    /// [`release_bond`].
+    StateMoved,
+}
+
+/// Release only if the bond is still in `bond.state`. Used by the
+/// stranded-taker sweep: a `Requested` snapshot that lost to a lock
+/// must not cancel the winner's HTLC.
+pub(crate) async fn release_bond_if_state(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+) -> Result<ReleaseBondOutcome, MostroError> {
     // Parse `state` once into the enum so callers don't depend on the
     // `Display` form for control flow (and a malformed value short-
     // circuits to "no-op" instead of falsely transitioning).
@@ -515,7 +591,7 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
         )))
     })?;
     if state.is_terminal() {
-        return Ok(());
+        return Ok(ReleaseBondOutcome::AlreadyTerminal);
     }
 
     // Claim the transition before touching LND. `Bond::update` writes
@@ -537,10 +613,10 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
         info!(
             bond_id = %bond.id,
             order_id = %bond.order_id,
-            "release_bond: bond left state {}; not cancelling the hold invoice",
+            "release_bond_if_state: bond left state {}; not cancelling the hold invoice",
             bond.state
         );
-        return Ok(());
+        return Ok(ReleaseBondOutcome::StateMoved);
     }
 
     if let Some(hash) = bond.hash.as_ref() {
@@ -593,10 +669,10 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
         "Bond {} released for order {} (was state={})",
         bond.id, bond.order_id, bond.state
     );
-    Ok(())
+    Ok(ReleaseBondOutcome::Released)
 }
 
-/// Undo [`release_bond`]'s compare-and-swap after a transient LND
+/// Undo [`release_bond_if_state`]'s compare-and-swap after a transient LND
 /// failure. Only the row we just marked `Released` is restored, so a
 /// concurrent writer that moved it on is left alone.
 async fn revert_bond_release_claim(
@@ -955,26 +1031,30 @@ async fn on_bond_invoice_accepted(
     if order.status != Status::Pending.to_string()
         && order.status != Status::WaitingTakerBond.to_string()
     {
-        // A canceled order means this taker's bond locked against a trade
-        // that will never start — the maker's cancel beat the promotion,
-        // or the cancel-side release hit a transient LND failure. Release
-        // the bond here (idempotent: the cancel path may already have
-        // done it) and tell the taker, so their sats are not stranded
-        // until the bond invoice's CLTV expiry. Any other non-pre-trade
-        // status is a live trade the bond still backs — leave it alone.
+        // A closed order means this taker's bond locked against a trade
+        // that will never start — the maker's cancel / admin cancel /
+        // pending-expiry beat the promotion, or the cancel-side release
+        // hit a transient LND failure. Release the bond here (idempotent:
+        // the cancel path may already have done it) and tell the taker,
+        // so their sats are not stranded until the bond invoice's CLTV
+        // expiry. Any other non-pre-trade status is a live trade the bond
+        // still backs — leave it alone.
         if matches!(
             order.get_order_status(),
-            Ok(Status::Canceled | Status::CooperativelyCanceled | Status::CanceledByAdmin)
+            Ok(Status::Canceled
+                | Status::CooperativelyCanceled
+                | Status::CanceledByAdmin
+                | Status::Expired)
         ) && !current_state.is_terminal()
         {
             info!(
-                "Bond {} locked on canceled order {} — releasing and notifying taker",
-                current.id, order.id
+                "Bond {} locked on closed order {} ({}) — releasing and notifying taker",
+                current.id, order.id, order.status
             );
             if let Err(e) = release_bond(pool, &current).await {
                 warn!(
                     bond_id = %current.id,
-                    "release_bond on canceled order failed ({}); the next exit path retries", e
+                    "release_bond on closed order failed ({}); the next exit path retries", e
                 );
             }
             notify_loser(&current).await;
@@ -1615,10 +1695,11 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale
 ///
 /// A stale `Requested` bond can still lock between this fetch and the
 /// release (payment accepted while the invoice remains payable, or a
-/// delayed Accepted callback). [`release_bond`] compare-and-swaps from
-/// the observed state and, on a miss, does not cancel the hold invoice
-/// — so that winner is not refunded and its `Locked` row is not
-/// overwritten. A transient LND failure during the cancel rolls the
+/// delayed Accepted callback). [`release_bond_if_state`] compare-and-swaps
+/// from the observed state and, on a miss, does not cancel the hold
+/// invoice — so that winner is not refunded and its `Locked` row is not
+/// overwritten. Exit paths use [`release_bond`], which retries from the
+/// fresh state. A transient LND failure during the cancel rolls the
 /// claim back and the next tick retries.
 async fn sweep_stranded_taker_bond_order(pool: &Pool<Sqlite>, order_id: Uuid, stale_cutoff: i64) {
     match find_active_bonds_for_order(pool, order_id).await {
@@ -1628,7 +1709,7 @@ async fn sweep_stranded_taker_bond_order(pool: &Pool<Sqlite>, order_id: Uuid, st
             for bond in bonds.iter().filter(|b| {
                 b.role == taker_role && b.state == requested && b.created_at < stale_cutoff
             }) {
-                if let Err(e) = release_bond(pool, bond).await {
+                if let Err(e) = release_bond_if_state(pool, bond).await {
                     warn!(
                         bond_id = %bond.id,
                         order_id = %order_id,
@@ -2808,12 +2889,13 @@ mod tests {
         );
     }
 
-    /// A `Requested` snapshot must not cancel or overwrite a bond that
-    /// locked after the snapshot was taken. `hash = None` so a missing
-    /// state predicate would mark the row `Released` instead of failing
-    /// on LND and hiding the overwrite. (ermeme P1 / Matobi98 on #928/#986)
+    /// Sweep path: a `Requested` snapshot must not cancel or overwrite a
+    /// bond that locked after the snapshot was taken. `hash = None` so a
+    /// missing state predicate would mark the row `Released` instead of
+    /// failing on LND and hiding the overwrite. (ermeme P1 / Matobi98 /
+    /// grunch on #928/#986)
     #[tokio::test]
-    async fn release_bond_leaves_a_concurrent_lock_untouched() {
+    async fn release_bond_if_state_leaves_a_concurrent_lock_untouched() {
         let pool = setup_pool().await;
         let order_id = Uuid::new_v4();
         insert_order(&pool, order_id).await;
@@ -2825,7 +2907,8 @@ mod tests {
         let mut stale = created.clone();
         stale.state = BondState::Requested.to_string();
         stale.locked_at = None;
-        release_bond(&pool, &stale).await.unwrap();
+        let outcome = release_bond_if_state(&pool, &stale).await.unwrap();
+        assert_eq!(outcome, ReleaseBondOutcome::StateMoved);
 
         let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
         assert_eq!(after.state, BondState::Locked.to_string());
@@ -2855,6 +2938,26 @@ mod tests {
         let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
         assert_eq!(after.state, BondState::Released.to_string());
         assert!(after.released_at.is_some());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    /// Same exit-path contract through the order-level helper the pending
+    /// expiry job uses.
+    #[tokio::test]
+    async fn release_taker_bonds_releases_after_concurrent_lock() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        release_taker_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
         let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
         assert!(active.is_empty());
     }

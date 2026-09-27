@@ -2834,6 +2834,31 @@ mod tests {
         assert_eq!(active.len(), 1);
     }
 
+    /// Exit path: a `Requested` snapshot released after the row locked
+    /// must still cancel — re-read and retry from `Locked` so expiry /
+    /// cancel jobs do not strand the HTLC (grunch on #986).
+    #[tokio::test]
+    async fn release_bond_retries_and_releases_a_concurrent_lock() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        let mut stale = created.clone();
+        stale.state = BondState::Requested.to_string();
+        stale.locked_at = None;
+        release_bond(&pool, &stale).await.unwrap();
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert!(after.released_at.is_some());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
+    }
+
     #[tokio::test]
     async fn release_bonds_for_order_swallows_per_bond_failures() {
         // The order-level helper warns and continues on individual bond

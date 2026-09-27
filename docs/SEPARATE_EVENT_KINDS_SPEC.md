@@ -347,15 +347,23 @@ client.send_event(&new_event).await?;
     ["d", "660e8400-e29b-41d4-a716-446655440001"],
     ["s", "pending"],
     ["initiator", "buyer"],
-    ["created_at", "1700000100"],
+    ["published_at", "1700000100"],
     ["y", "mostro"],
     ["z", "dispute"]
   ]
 }
 ```
 
-The `created_at` tag is the dispute open time from SQLite (`disputes.created_at`).
-It is independent of the Nostr event's `created_at` field, which remains the
+The `published_at` tag is the dispute open time from SQLite (`disputes.created_at`).
+Nodes from v0.18.5 until the rename publish it as a `created_at` tag.
+Clients resolve the dispute open time in this order:
+
+1. The `published_at` tag.
+2. The legacy `created_at` tag.
+3. The event's `created_at` field when neither tag is present. This is the
+   wall-clock time of the latest revision, so it may not equal the open time.
+
+The tag is independent of the Nostr event's `created_at` field, which remains the
 wall-clock time of the latest NIP-33 publish/replace.
 
 ## Client Query Examples

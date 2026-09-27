@@ -1112,6 +1112,11 @@ async fn on_bond_invoice_accepted(
 /// Tear down a taker bond whose `Accepted` lost the lock `UPDATE` in
 /// [`on_bond_invoice_accepted`]: another bond on the order locked first,
 /// or another path claimed this row meanwhile.
+///
+/// A row already `Released` is not left alone: the claimer may have run
+/// its LND cancel before this HTLC was accepted, so the hold invoice is
+/// cancelled again best-effort. Other terminal states need nothing — a
+/// `Slashed` HTLC was settled and `Failed` / `Forfeited` hold no funds.
 async fn release_race_loser<L: CancelLightning + Send>(
     pool: &Pool<Sqlite>,
     current: &Bond,
@@ -1123,6 +1128,21 @@ async fn release_race_loser<L: CancelLightning + Send>(
             warn!(
                 bond_id = %current.id,
                 "release_bond on race-loser failed: {}", e
+            );
+        }
+        return;
+    }
+    if current_state != BondState::Released {
+        return;
+    }
+    let Some(hash) = current.hash.as_deref() else {
+        return;
+    };
+    if let Err(e) = ln.cancel_hold_invoice(hash).await {
+        if classify_cancel_error(&e) == CancelOutcome::Transient {
+            warn!(
+                bond_id = %current.id,
+                "cancel_hold_invoice on Released race-loser failed: {}", e
             );
         }
     }
@@ -1875,7 +1895,13 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at_with<
 /// delayed `Accepted` callback after resubscribe). The CAS in
 /// [`release_bond_if_state`] only helps once the lock `UPDATE` has
 /// committed; before that the sweep probes LND and skips cancel when an
-/// accepted HTLC is present, leaving the subscriber to promote the row.
+/// accepted HTLC is present. It also re-arms the bond subscriber: the
+/// one attached at startup returns on its first stream error, and
+/// without a live subscriber nothing would ever lock the row.
+/// `SubscribeSingleInvoice` replays the current state, and a duplicate
+/// `Accepted` is absorbed by the lock and promotion CAS guards. A lookup
+/// that fails because LND does not know the invoice falls through to the
+/// release; any other lookup failure skips the bond until the next tick.
 /// When the row is already `Locked`, the CAS miss skips cancel so the
 /// winner is not refunded. Exit paths use [`release_bond`], which
 /// retries from the fresh state. A transient LND failure during the
@@ -1899,11 +1925,20 @@ async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + CancelLightning +
                             info!(
                                 bond_id = %bond.id,
                                 order_id = %order_id,
-                                "reconcile_taker_bonds: skipping stale Requested bond with accepted HTLC; leaving for subscriber"
+                                "reconcile_taker_bonds: stale Requested bond has an accepted HTLC; re-arming subscriber"
                             );
+                            if let Err(e) = probe.rearm_subscriber(hash).await {
+                                warn!(
+                                    bond_id = %bond.id,
+                                    order_id = %order_id,
+                                    "reconcile_taker_bonds: re-arming bond subscriber failed: {e}"
+                                );
+                            }
                             continue;
                         }
                         Ok(_) => {}
+                        // LND has no such invoice: nothing to protect.
+                        Err(e) if classify_cancel_error(&e) == CancelOutcome::AlreadyDone => {}
                         Err(e) => {
                             // Fail closed: do not cancel if we cannot tell
                             // whether an accepted HTLC is still held.

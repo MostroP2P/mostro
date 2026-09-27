@@ -443,6 +443,19 @@ impl LndConnector {
         description: &str,
         amount: i64,
     ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
+        self.create_hold_invoice_with_expiry(description, amount, None)
+            .await
+    }
+
+    /// [`Self::create_hold_invoice`] with an explicit invoice expiry in
+    /// seconds. `None` leaves LND's default (86 400 s), which is what every
+    /// hold invoice got before #942.
+    pub async fn create_hold_invoice_with_expiry(
+        &mut self,
+        description: &str,
+        amount: i64,
+        expiry_secs: Option<i64>,
+    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
@@ -454,6 +467,7 @@ impl LndConnector {
             memo: description.to_string(),
             value: amount,
             cltv_expiry,
+            expiry: expiry_secs.unwrap_or_default(),
             ..Default::default()
         };
         let holdinvoice = self

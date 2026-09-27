@@ -51,6 +51,8 @@ jobs:
         run: |
           ref="$(python3 -c 'import tomllib; print(tomllib.load(open("mostro/.github/ortsom/map.toml", "rb"))["settings"]["ortsom_ref"])')"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          bonds="$(python3 -c 'import tomllib; print(str(tomllib.load(open("mostro/.github/ortsom/map.toml", "rb"))["settings"].get("stack_with_bonds", False)).lower())')"
+          echo "bonds=$bonds" >> "$GITHUB_OUTPUT"
           mkdir -p baseline
           echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
@@ -112,13 +114,16 @@ jobs:
         # above.
         env:
           BUILT: ${{ steps.image.outputs.built }}
+          WITH_BONDS: ${{ steps.pin.outputs.bonds }}
         run: |
           set +e
           if [ "$BUILT" != true ]; then
             echo "stack=build_failed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          $ORTSOM stack up --mostro-image "ortsom-baseline/mostro:$GITHUB_SHA"
+          bonds_flag=""
+          if [ "$WITH_BONDS" = true ]; then bonds_flag="--with-bonds"; fi
+          $ORTSOM stack up --mostro-image "ortsom-baseline/mostro:$GITHUB_SHA" $bonds_flag
           case "$?" in
             0) stack=ok ;;
             4) stack=daemon_failed ;;
@@ -146,6 +151,7 @@ jobs:
         env:
           ORTSOM_REF: ${{ steps.pin.outputs.ref }}
           STACK: ${{ steps.stack.outputs.stack || 'infra_failed' }}
+          WITH_BONDS: ${{ steps.pin.outputs.bonds }}
           STARTED_AT: ${{ steps.pin.outputs.started_at }}
         run: |
           mkdir -p baseline
@@ -160,6 +166,7 @@ jobs:
           meta = {
               "sha": os.environ["GITHUB_SHA"],
               "ortsom_ref": os.environ["ORTSOM_REF"],
+              "stack_with_bonds": os.environ["WITH_BONDS"] == "true",
               "stack": os.environ["STACK"],
               "suite_exit": suite_exit,
               "run_id": int(os.environ["GITHUB_RUN_ID"]),

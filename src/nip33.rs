@@ -525,11 +525,12 @@ pub fn order_to_tags(
             Tag::custom("premium", vec![order.premium.to_string()]),
             Tag::custom("network", vec![ln_network]),
             Tag::custom("layer", vec!["lightning".to_string()]),
-            // When the order was created (NIP-69). The event's own
-            // `created_at` moves on every revision of this addressable event;
-            // this one does not, so clients can show the order's real age.
+            // When the order was created (NIP-69), named `published_at` as in
+            // NIP-23. The event's own `created_at` moves on every revision of
+            // this addressable event; this one does not, so clients can show
+            // the order's real age.
             // Kept after the positional `rating` / `source` inserts below.
-            Tag::custom("created_at", vec![order.created_at.to_string()]),
+            Tag::custom("published_at", vec![order.created_at.to_string()]),
             Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
                 "expiration",
@@ -971,12 +972,12 @@ mod tests {
         );
     }
 
-    // ── order_to_tags: created_at tag (NIP-69) ───────────────────────────────────
+    // ── order_to_tags: published_at tag (NIP-69) ─────────────────────────────────
 
     /// The tag carries the order's own creation time, not the revision's,
     /// and is the same on a later revision with another status.
     #[test]
-    fn order_to_tags_created_at_is_the_orders_and_stable_across_revisions() {
+    fn order_to_tags_published_at_is_the_orders_and_stable_across_revisions() {
         init_test_settings();
         let pending = Order {
             created_at: 1_702_548_701,
@@ -994,11 +995,14 @@ mod tests {
                 .expect("order_to_tags must not error")
                 .expect("order must produce Some(tags)");
             assert_eq!(
-                get_tag_value(&tags, "created_at").as_deref(),
+                get_tag_value(&tags, "published_at").as_deref(),
                 Some("1702548701"),
                 "status {}",
                 order.status
             );
+            // Nostr names this tag `published_at` (NIP-23); the old name
+            // must not be published alongside it.
+            assert_eq!(get_tag_value(&tags, "created_at"), None);
         }
     }
 
@@ -1006,7 +1010,7 @@ mod tests {
     /// after them so their indices, and so the tags other clients read by
     /// position, are unchanged.
     #[test]
-    fn order_to_tags_created_at_precedes_expires_at_and_leaves_the_positional_tags_alone() {
+    fn order_to_tags_published_at_precedes_expires_at_and_leaves_the_positional_tags_alone() {
         init_test_settings();
         let order = make_pending_order();
 
@@ -1024,11 +1028,11 @@ mod tests {
 
         assert_eq!(names[7], "rating");
         assert_eq!(names[8], "source");
-        let created = names
+        let published = names
             .iter()
-            .position(|n| n == "created_at")
-            .expect("created_at");
-        assert_eq!(names[created + 1], "expires_at");
+            .position(|n| n == "published_at")
+            .expect("published_at");
+        assert_eq!(names[published + 1], "expires_at");
     }
 
     // ── order_to_tags: source tag with Mostro pubkey (kind 38383) ───────────────
@@ -1377,6 +1381,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 5,
             payout_claim_window_days: 30,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let tags = bond_tags(Some(&bond));
@@ -1954,6 +1959,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 3,
             payout_claim_window_days: 14,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let take_tags = bond_tags(Some(&base));

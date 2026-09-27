@@ -33,7 +33,7 @@ def run(**over):
         "conclusion": "success",
         "head_sha": HEAD,
         "head_branch": "fix/thing",
-        "head_repository": {"full_name": "alice/mostro"},
+        "head_repository": {"full_name": "alice/mostro", "owner": {"login": "alice"}},
     }
     doc.update(over)
     return doc
@@ -262,6 +262,47 @@ class ChangesTest(unittest.TestCase):
             rr.name_status([{"filename": "src/a\tb.rs", "status": "modified"}])
         with self.assertRaises(rr.ResolveError):
             rr.name_status([{"filename": "src/a\nM\tsrc/db.rs", "status": "modified"}])
+
+
+class CancelledRunTest(unittest.TestCase):
+    """A cancelled `ortsom-pr.yml` run (§ 9.1): a successor reports, or it was
+    cancelled by hand and its pull request is found from the run's head."""
+
+    CANCELLED = run(conclusion="cancelled", id=50, created_at="2026-09-25T10:00:00Z")
+
+    def get_with(self, runs=(), pulls=None):
+        def get(path, params=""):
+            if path.endswith("/actions/workflows/ortsom-pr.yml/runs"):
+                return {"workflow_runs": list(runs)}
+            if path.endswith("/pulls"):
+                self.pulls_query = params
+                return [pull()] if pulls is None else pulls
+            raise AssertionError(path)
+        return get
+
+    def test_a_newer_run_of_the_same_branch_is_a_successor(self):
+        newer = run(id=51, created_at="2026-09-25T10:05:00Z")
+        with self.assertRaises(rr.Superseded):
+            rr.resolve_cancelled(self.CANCELLED, self.get_with([self.CANCELLED, newer]), REPO)
+
+    def test_a_newer_run_from_another_fork_is_not_a_successor(self):
+        other = run(id=51, created_at="2026-09-25T10:05:00Z", head_repository={"full_name": "bob/mostro"})
+        got = rr.resolve_cancelled(self.CANCELLED, self.get_with([self.CANCELLED, other]), REPO)
+        self.assertEqual(got, {"proceed": "false", "reason": "cancelled", "pr": 7})
+
+    def test_a_cancel_by_hand_names_the_pull_request_of_the_head(self):
+        got = rr.resolve_cancelled(self.CANCELLED, self.get_with([self.CANCELLED]), REPO)
+        self.assertEqual(got["reason"], "cancelled")
+        self.assertIn("head=alice%3Afix%2Fthing", self.pulls_query)
+
+    def test_no_open_pull_request_for_the_head_is_rejected(self):
+        with self.assertRaises(rr.ResolveError):
+            rr.resolve_cancelled(self.CANCELLED, self.get_with([self.CANCELLED], pulls=[]), REPO)
+
+    def test_a_pull_request_with_another_base_is_rejected(self):
+        wrong = pull(base={"ref": "dev", "repo": {"full_name": REPO}})
+        with self.assertRaises(rr.ResolveError):
+            rr.resolve_cancelled(self.CANCELLED, self.get_with([self.CANCELLED], pulls=[wrong]), REPO)
 
 
 class ResolveFailsClosedTest(unittest.TestCase):

@@ -41,6 +41,7 @@ Nothing in this design needs a new test harness. Ortsom already provides:
 | Capability | How |
 |---|---|
 | Build mostrod from any ref | `ortsom stack up --ref <branch\|tag\|sha\|PR>`, image `ortsom/mostro:<commit>` |
+| Anti-abuse bonds on the daemon | `ortsom stack up --with-bonds` (Ortsom ≥ v0.3.1) appends Ortsom's `[anti_abuse_bond]` table, so the `bond` scenarios run instead of being skipped |
 | Self-contained world, no secrets | bitcoind regtest, 3 LND nodes, in-memory relay, mostrod with a per-run identity and solver |
 | Readiness gate | `ortsom doctor` (exits non-zero on an unusable stack) |
 | Scenario selection | `ortsom run <names…>` or `ortsom run --tag <tag>` |
@@ -113,6 +114,9 @@ Each rule maps path globs to tags and/or scenario names.
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
 ortsom_ref = "v0.3.1"
+# Run the stack with anti-abuse bonds (`stack up --with-bonds`). Part of a
+# baseline's identity, like ortsom_ref (§ 7.1).
+stack_with_bonds = true
 # Tags every non-ignored selection includes.
 always_tags = ["smoke"]
 # Minimum eligible scenarios for the close verdict to be possible.
@@ -322,7 +326,8 @@ compares against those measurements.
   for every scenario it runs.
 - **Daemon image:** built with `.github/ortsom/mostro.Dockerfile` from
   the checkout, tagged `ortsom-baseline/mostro:<sha>`, and started with
-  `ortsom stack up --mostro-image`, the same recipe and invocation as a
+  `ortsom stack up --mostro-image` (plus `--with-bonds` when
+  `stack_with_bonds` is set), the same recipe and invocation as a
   pull request (§6). The baseline switched to it before `ortsom-pr.yml`
   existed, so no verdict ever compares images built by two recipes. With `--mostro-image` there is no build inside `stack up`,
   so a failed `docker build` is recorded as `build_failed` directly.
@@ -333,7 +338,7 @@ compares against those measurements.
   none, which `baseline_max_distance` (§7.1) absorbs.
 - **Output:** artifact `ortsom-baseline`, retention 90 days, containing:
   - `summary.json` as written by Ortsom,
-  - `meta.json` with `sha`, `ortsom_ref`, `stack`
+  - `meta.json` with `sha`, `ortsom_ref`, `stack_with_bonds`, `stack`
     (`ok`, `build_failed`, `daemon_failed`, `infra_failed` or
     `doctor_failed`, classified as in §6), `run_id` and `started_at`,
   - `suite.log`, `stack.log`, `events.jsonl` for debugging.
@@ -388,8 +393,9 @@ Steps:
 1. **Select, to save work.** Check out the merge commit with full
    history, list changed files with
    `git diff --name-status <base_sha>...<head_sha>` and run
-   `select_scenarios.py`. If `mode` is `none`, upload `meta.json` with
-   `image: "not-needed"` and stop. This selection only avoids a useless
+   `select_scenarios.py`. If `mode` is `none`, or the pull request
+   changes the gate itself (`gate_files` is not empty, § 9.2), upload
+   `meta.json` with `image: "not-needed"` and stop. This selection only avoids a useless
    build; the one that counts is recomputed on the trusted side (§6.2).
 2. **Build.** Check out `head_sha` (`persist-credentials: false`) and
    build `.github/ortsom/mostro.Dockerfile` with that checkout as the
@@ -465,7 +471,9 @@ Steps of `suite`:
    `main`'s map. GitHub lists at most 3000 files: when the list is
    shorter than the pull request's `changed_files`, or the head moved
    while listing, the outcome is `selection_error` or `superseded`, never
-   a selection computed from part of the diff. If `mode` is `none`, record it and stop. If the
+   a selection computed from part of the diff. If `mode` is `none`, record it and stop. If
+   `gate_files` is not empty, record `gate_modified` and stop: nothing
+   is built or run for a verdict decided in advance (§ 9.2). If the
    `ortsom-pr` meta says `build_failed`, the outcome is `build_failed`
    and nothing runs; `not-needed` while the trusted selection is not
    `none` is `inconclusive`, reason `no-image`.
@@ -487,7 +495,10 @@ Steps of `suite`:
    must report exactly that one image: a tar that also carries another
    tag could replace an image the stack trusts (LND, bitcoind, the
    relay), which compose would then start without pulling.
-4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`.
+4. **Stack.** `ortsom stack up --mostro-image ortsom-pr/mostro:<head_sha>`,
+   plus `--with-bonds` when `main`'s map sets `stack_with_bonds`: the
+   setting is read from the trusted checkout, like the selection, so the
+   stack always matches the baselines it is compared with.
    Compose starts a local image without pulling it. Exit 0 is `ok`, 4 is
    `daemon_failed`, anything else `infra_failed` (3 cannot happen: there
    is nothing to build).
@@ -522,8 +533,9 @@ Artifact `ortsom-pr-result` contains `meta.json`:
 failed in `ortsom-pr.yml`), `bad_image` (step 3), `no_image` (the PR run
 skipped the build but the trusted selection is not `none`),
 `selection_error` (a stale map, or an incomplete file list),
-`superseded` (the head moved during the run) or `not_run` (trusted
-selection `none`).
+`superseded` (the head moved during the run), `gate_modified` (the pull
+request changes the gate, § 9.2) or `not_run` (trusted selection
+`none`).
 
 plus `selection.json`, `summary.json` (if the run happened), `suite.log`,
 `stack.log` and Ortsom's per-scenario artifacts. This artifact is
@@ -547,8 +559,11 @@ decision.
    `baseline_max_distance` commits. Only baselines measured with the
    **same harness** as the PR run are candidates: `meta.ortsom_ref` equal
    to the `ortsom_ref` pinned in `main`'s `map.toml`, which is also the one
-   the PR run used unless it was overridden (§8.2). Comparing across
-   harness revisions would blame the pull request for a harness change.
+   the PR run used unless it was overridden (§8.2), and
+   `meta.stack_with_bonds` equal to `main`'s `stack_with_bonds` (a
+   baseline without the field ran without bonds). Comparing across
+   harness revisions or daemon configurations would blame the pull
+   request for a change of the gate.
    Only candidates whose `stack` is `ok` carry results; the others are
    passed over.
 3. The **reference baseline** is the most recent candidate whose
@@ -557,7 +572,8 @@ decision.
    the same walk, the reference included. Fewer than `stability_window`
    candidates is fine; the rule then uses the ones there are.
 5. No reference baseline → verdict `inconclusive`, reason
-   `no-baseline`. After `ortsom_ref` is bumped on `main`, this is the
+   `no-baseline`. After `ortsom_ref` is bumped, or `stack_with_bonds`
+   changed, on `main`, this is the
    verdict of every pull request whose merge-base predates the bump:
    the suite runs with the pin of the current `main` (§6.2 reads it from
    `main`, not from the pull request), while every baseline on its walk
@@ -648,6 +664,14 @@ One sticky comment per pull request, found by the marker
   mentions, HTML or a comment marker;
 - collapsed sections for passes, skipped, `unstable-on-main` and
   `no-baseline` scenarios;
+- a warning for every **blind spot**: a rule the pull request matched
+  (other than `full`, `ignore` or `uncovered`) none of whose own
+  scenarios was compared, because they were all skipped, unstable on
+  `main` or new. It names the rule, those scenarios and the changed files
+  the rule covers, and says the verdict says nothing about them. It does
+  not change the verdict. Example: with `stack_with_bonds = false`, a
+  change under `src/app/bond/**` passes on the other scenarios while every
+  `bond` scenario is skipped;
 - `uncovered_files` with their reasons and `unmapped_files`, the code
   this run did not exercise;
 - links to the PR run, its artifacts, and the baseline run;
@@ -774,6 +798,11 @@ it is limited to the image it hands over:
 - A pull request that touches `.github/ortsom/**` or any `ortsom-*.yml`
   workflow gets the verdict `inconclusive`, reason `gate-modified`: its
   image may not have been built the way the baseline's was.
+  `select_scenarios.py` lists those files as `gate_files`, and both sides
+  stop on them: the build side builds no image and the suite does not
+  run, since the verdict is decided in advance. Gate pull requests are
+  validated by the gate's unit tests instead, and a `gate-modified`
+  verdict does not count towards the `inconclusive` rate of § 11.
 
 ### 9.3 Running untrusted code
 
@@ -869,8 +898,9 @@ Documented in the README and `docs/ci-regtest.md`.
 
 - No `ortsom:false-positive` among the last 10 `would-close` verdicts, or
   a documented, fixed root cause for each one.
-- `inconclusive` below 20% of runs; otherwise the baseline or the stack
-  is too unreliable to enforce anything.
+- `inconclusive` below 20% of runs, not counting `gate-modified` (§ 9.2);
+  otherwise the baseline or the stack is too unreliable to enforce
+  anything.
 
 The review also tracks, per run, the number of **smoke-only** selections
 (files remained after ignores, but only `uncovered` or unmapped ones) and
@@ -918,10 +948,12 @@ Baseline: about four scheduled runs a day plus one per merge.
 
 ## 14. Known gaps
 
-- **Bonds.** The regtest stack runs with `[anti_abuse_bond]` off, so the
-  `bond` scenarios are always skipped: a pull request touching
-  `src/app/bond/**` gets no signal. A bonds-enabled stack variant is
-  follow-up work in Ortsom.
+- **Bonds.** The stack runs with bonds (`stack_with_bonds`), but
+  Ortsom's bond table sets `apply_to = "take"`: the maker bond
+  (`waiting-maker-bond`, the maker's deadline) has no scenario yet, and
+  `bond_race_loser_is_told` needs a second, competing taker, so it is
+  skipped. Maker-bond coverage is follow-up work in Ortsom, followed by
+  an `ortsom_ref` bump.
 - **Uncovered code.** The admin gRPC surface (`src/rpc/**`,
   `proto/**`), Cashu, session restore, trade-key bookkeeping, the daemon
   CLI and LNURL have no Ortsom scenarios. The map lists them as

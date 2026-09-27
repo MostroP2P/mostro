@@ -182,7 +182,8 @@ impl AdminServiceImpl {
     }
 
     /// `CancelOrderRequest.pretrade_only`: refuse anything that is not
-    /// still `pending` / `waiting-taker-bond`, so operator tooling that
+    /// still `pending` / `waiting-taker-bond` / `waiting-maker-bond`, so
+    /// operator tooling that
     /// means "cancel this pending order" can never resolve a dispute by a
     /// mistyped id. Returns the operator-facing reason on refusal.
     async fn ensure_pretrade(&self, order_id: &str) -> Result<(), String> {
@@ -195,6 +196,7 @@ impl AdminServiceImpl {
             .ok_or_else(|| format!("order {order_id} not found"))?;
         if order.check_status(OrderStatus::Pending).is_ok()
             || order.check_status(OrderStatus::WaitingTakerBond).is_ok()
+            || order.check_status(OrderStatus::WaitingMakerBond).is_ok()
         {
             return Ok(());
         }

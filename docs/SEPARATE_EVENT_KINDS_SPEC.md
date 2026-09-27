@@ -356,7 +356,14 @@ client.send_event(&new_event).await?;
 
 The `published_at` tag is the dispute open time from SQLite (`disputes.created_at`).
 Nodes from v0.18.5 until the rename publish it as a `created_at` tag.
-It is independent of the Nostr event's `created_at` field, which remains the
+Clients resolve the dispute open time in this order:
+
+1. The `published_at` tag.
+2. The legacy `created_at` tag.
+3. The event's `created_at` field when neither tag is present. This is the
+   wall-clock time of the latest revision, so it may not equal the open time.
+
+The tag is independent of the Nostr event's `created_at` field, which remains the
 wall-clock time of the latest NIP-33 publish/replace.
 
 ## Client Query Examples

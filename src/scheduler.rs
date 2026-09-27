@@ -1364,14 +1364,19 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
 /// job is the belt-and-braces path when that cancel signal is missed. It
 /// releases stale `Requested` taker bonds after the window plus grace and
 /// drops the order back to `Pending`.
+///
+/// Sleeps one interval before the first tick so startup
+/// `resubscribe_active_bonds` can deliver replayed `Accepted` events and
+/// lock paid bonds before the sweep runs (otherwise a still-`Requested`
+/// row with an accepted HTLC is cancelled — grunch on #986).
 async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
     let interval = 300u64;
 
     tokio::spawn(async move {
         let pool = ctx.pool();
         loop {
-            bond::reconcile_stranded_taker_bonds(pool).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            bond::reconcile_stranded_taker_bonds(pool).await;
         }
     });
 }

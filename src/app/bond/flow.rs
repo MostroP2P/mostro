@@ -1645,6 +1645,16 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     Ok(())
 }
 
+/// Whether an LND lookup that found an accepted hold-invoice HTLC must
+/// block the stranded-taker sweep from releasing a still-`Requested`
+/// bond row. `Some(expiry_height)` means LND already accepted an HTLC
+/// ([`LndConnector::get_hold_invoice_expiry_height`]); cancelling then
+/// would refund the payer before the subscriber can promote the row to
+/// `Locked`.
+pub(crate) fn accepted_htlc_blocks_stale_release(accepted_expiry_height: Option<u32>) -> bool {
+    accepted_expiry_height.is_some()
+}
+
 /// LND lookup the stranded-taker sweep needs before cancelling a still-
 /// `Requested` bond: whether an accepted HTLC already backs the hold
 /// invoice. Mirrors [`crate::app::cancel::CancelLightning`] so tests can
@@ -1665,11 +1675,13 @@ impl HoldInvoiceProbe for LndConnector {
     }
 }
 
-/// Probe that always reports no accepted HTLC. Production uses this until
-/// the accepted-HTLC gate is wired; unit tests that exercise the hashless
-/// bail-early release path also use it so they never open LND.
+/// Probe that always reports no accepted HTLC. Unit tests that exercise
+/// the hashless bail-early release path never open LND; this keeps the
+/// sweep callable without a connector.
+#[cfg(test)]
 pub(crate) struct NoAcceptedHtlc;
 
+#[cfg(test)]
 impl HoldInvoiceProbe for NoAcceptedHtlc {
     fn get_hold_invoice_expiry_height<'a>(
         &'a mut self,
@@ -1690,22 +1702,47 @@ impl HoldInvoiceProbe for NoAcceptedHtlc {
 /// margin and drops the order back to `Pending`. Safe to run
 /// redundantly with the LND path: every step no-ops when the order or
 /// bond has already moved on.
+///
+/// Before cancelling, the sweep asks LND whether the invoice already has
+/// an accepted HTLC. `Some(_)` means payment landed but
+/// [`on_bond_invoice_accepted`] has not locked the row yet (common at
+/// startup after `resubscribe_active_bonds`); the release is skipped so
+/// the subscriber can promote the bond. Cancel only when the lookup
+/// returns `None`.
 pub async fn reconcile_stranded_taker_bonds(pool: &Pool<Sqlite>) {
     // Margin past `hold_invoice_expiration_window` before a `Requested`
     // bond counts as stale. Invoice expiry and the scheduler clock are
-    // not synchronized, so a late Accepted can still race this cutoff;
-    // [`release_bond`]'s state CAS keeps a concurrent lock from being
-    // cancelled or overwritten.
+    // not synchronized; the LND accepted-HTLC probe (and the state CAS
+    // once the lock has committed) keep a concurrent payment from being
+    // cancelled.
     const STALE_GRACE_SECONDS: i64 = 60;
     let window = Settings::get_ln().hold_invoice_expiration_window as i64;
     let stale_cutoff = Utc::now().timestamp() - window - STALE_GRACE_SECONDS;
-    reconcile_stranded_taker_bonds_at(pool, stale_cutoff).await;
+
+    // Cheap pre-check so an idle node never opens LND just to find nothing.
+    match super::db::find_stale_waiting_taker_bond_orders(pool, stale_cutoff).await {
+        Ok(orders) if orders.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("reconcile_taker_bonds: scan for stranded WaitingTakerBond orders failed: {e}");
+            return;
+        }
+    }
+    let mut ln = match LndConnector::new().await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("reconcile_taker_bonds: cannot connect to LND to probe/cancel stale bonds: {e}");
+            return;
+        }
+    };
+    reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut ln).await;
 }
 
 /// Testable core of [`reconcile_stranded_taker_bonds`]: the cutoff is
 /// injected so tests don't depend on global LN settings. Uses
 /// [`NoAcceptedHtlc`] — call [`reconcile_stranded_taker_bonds_at_with`]
 /// when the probe outcome matters.
+#[cfg(test)]
 pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale_cutoff: i64) {
     reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut NoAcceptedHtlc).await;
 }
@@ -1741,24 +1778,22 @@ pub(crate) async fn reconcile_stranded_taker_bonds_at_with<P: HoldInvoiceProbe +
 /// cutoff — are released; anything fresher is skipped here and makes
 /// `maybe_drop_waiting_taker_bond`'s CAS no-op below.
 ///
-/// A stale `Requested` bond can still lock between this fetch and the
-/// release (payment accepted while the invoice remains payable, or a
-/// delayed Accepted callback). [`release_bond_if_state`] compare-and-swaps
-/// from the observed state and, on a miss, does not cancel the hold
-/// invoice — so that winner is not refunded and its `Locked` row is not
-/// overwritten. Exit paths use [`release_bond`], which retries from the
-/// fresh state. A transient LND failure during the cancel rolls the
-/// claim back and the next tick retries.
-///
-/// `probe` is accepted so tests can inject a [`HoldInvoiceProbe`]; the
-/// accepted-HTLC gate is wired in a follow-up (issue #927 part 2 review).
+/// A stale `Requested` row can still back an **accepted** HTLC that the
+/// daemon has not locked yet (payment while mostrod was down, or a
+/// delayed `Accepted` callback after resubscribe). The CAS in
+/// [`release_bond_if_state`] only helps once the lock `UPDATE` has
+/// committed; before that the sweep probes LND and skips cancel when an
+/// accepted HTLC is present, leaving the subscriber to promote the row.
+/// When the row is already `Locked`, the CAS miss skips cancel so the
+/// winner is not refunded. Exit paths use [`release_bond`], which
+/// retries from the fresh state. A transient LND failure during the
+/// cancel rolls the claim back and the next tick retries.
 async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + Send>(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     stale_cutoff: i64,
     probe: &mut P,
 ) {
-    let _ = probe;
     match find_active_bonds_for_order(pool, order_id).await {
         Ok(bonds) => {
             let taker_role = BondRole::Taker.to_string();
@@ -1766,6 +1801,29 @@ async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + Send>(
             for bond in bonds.iter().filter(|b| {
                 b.role == taker_role && b.state == requested && b.created_at < stale_cutoff
             }) {
+                if let Some(hash) = bond.hash.as_deref() {
+                    match probe.get_hold_invoice_expiry_height(hash).await {
+                        Ok(height) if accepted_htlc_blocks_stale_release(height) => {
+                            info!(
+                                bond_id = %bond.id,
+                                order_id = %order_id,
+                                "reconcile_taker_bonds: skipping stale Requested bond with accepted HTLC; leaving for subscriber"
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            // Fail closed: do not cancel if we cannot tell
+                            // whether an accepted HTLC is still held.
+                            warn!(
+                                bond_id = %bond.id,
+                                order_id = %order_id,
+                                "reconcile_taker_bonds: hold-invoice probe failed; skipping release: {e}"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if let Err(e) = release_bond_if_state(pool, bond).await {
                     warn!(
                         bond_id = %bond.id,

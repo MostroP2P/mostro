@@ -198,7 +198,8 @@ pub fn new_dispute_event(
 /// Builds the standard tag set for a kind-38386 dispute event.
 ///
 /// `created_at` is the dispute open time from SQLite (`disputes.created_at`),
-/// carried as a business tag so clients can show when the dispute was opened.
+/// carried as a `published_at` tag (named as in NIP-23) so clients can show
+/// when the dispute was opened.
 /// It is independent of the Nostr event's `created_at`, which stays "now"
 /// (bumped past the dispute's previous revision when they share a second, see
 /// [`new_dispute_event`]) so NIP-33 replacement keeps resolving to the latest
@@ -212,7 +213,7 @@ pub fn create_dispute_event_tags(
     Tags::from_list(vec![
         Tag::custom("s", vec![status.into()]),
         Tag::custom("initiator", vec![initiator.into()]),
-        Tag::custom("created_at", vec![created_at.to_string()]),
+        Tag::custom("published_at", vec![created_at.to_string()]),
         Tag::custom("y", create_platform_tag_values(platform_name)),
         Tag::custom("z", vec!["dispute".to_string()]),
     ])

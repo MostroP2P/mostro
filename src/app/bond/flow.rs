@@ -538,7 +538,7 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
                         fresh.id, fresh.state, e
                     )))
                 })?;
-                if fresh_state.is_terminal() {
+                if !fresh_state.is_active() {
                     return Ok(());
                 }
                 info!(
@@ -567,7 +567,8 @@ pub(crate) enum ReleaseBondOutcome {
     /// Row claimed `Released` and the hold invoice was cancelled (or
     /// had no hash / was already gone).
     Released,
-    /// Caller's snapshot was already terminal — no-op.
+    /// Caller's snapshot was already terminal or otherwise not
+    /// releaseable (`PendingPayout`) — no-op.
     AlreadyTerminal,
     /// Row left the observed state before the claim; invoice was **not**
     /// cancelled. The stranded-taker sweep treats this as success (leave
@@ -592,7 +593,7 @@ pub(crate) async fn release_bond_if_state(
             bond.id, bond.state, e
         )))
     })?;
-    if state.is_terminal() {
+    if !state.is_active() {
         return Ok(ReleaseBondOutcome::AlreadyTerminal);
     }
 

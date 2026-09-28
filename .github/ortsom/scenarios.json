@@ -21,7 +21,8 @@
       "bond"
     ],
     "requires": [
-      "anti_abuse_bond"
+      "anti_abuse_bond",
+      "third_taker"
     ],
     "timeout_secs": 300
   },
@@ -89,6 +90,15 @@
     "timeout_secs": 300
   },
   {
+    "name": "dispute_answers_external_solver",
+    "tags": [
+      "dispute",
+      "external-solver"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
     "name": "dispute_by_buyer",
     "tags": [
       "dispute"
@@ -103,6 +113,14 @@
     ],
     "requires": [],
     "timeout_secs": 300
+  },
+  {
+    "name": "dispute_chat_roundtrip",
+    "tags": [
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 420
   },
   {
     "name": "dispute_resolved_for_buyer",

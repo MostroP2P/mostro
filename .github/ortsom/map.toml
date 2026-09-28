@@ -10,7 +10,7 @@
 
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
-ortsom_ref = "v0.3.1"
+ortsom_ref = "v0.3.2"
 # Run the regtest stack with anti-abuse bonds (`ortsom stack up
 # --with-bonds`), so the `bond` scenarios run instead of being skipped.
 # Part of a baseline's identity, like `ortsom_ref`: a pull request is only

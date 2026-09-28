@@ -60,8 +60,14 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file
-    settings_init()?;
+    // Init MOSTRO_SETTINGS oncelock with all settings variables from TOML file.
+    // Print a bad configuration with `Display`, not `Debug`, so an operator
+    // reads the reason (e.g. a leftover `transport = "gift-wrap"`) as text
+    // instead of an escaped, single-line error value.
+    if let Err(e) = settings_init() {
+        eprintln!("Could not load settings: {e}");
+        exit(1);
+    }
 
     // Build and install the multi-source price manager (spec §9 Phase 1).
     // Done immediately after settings load so every later subsystem
@@ -83,12 +89,10 @@ async fn main() -> Result<()> {
     // Get mostro keys
     let mostro_keys = util::get_keys()?;
 
-    // Subscribe only to the configured transport's kind: 14 (protocol v2
-    // NIP-44 direct, the default) or 1059 (protocol v1 gift wrap, explicit
-    // opt-in only). See docs/TRANSPORT_V2_SPEC.md.
-    // DEPRECATED(v0.19.0, #786): the `transport` knob disappears in v0.19.0
-    // and this subscription becomes unconditionally kind 14.
-    #[allow(deprecated)]
+    // Subscribe only to the configured transport's kind. The only transport
+    // is protocol v2 (NIP-44 direct, kind 14); it is still read from the
+    // settings so kind, envelope and advertised version share one source.
+    // See docs/TRANSPORT_V2_SPEC.md §8.
     let transport = Settings::get_mostro().transport;
     tracing::info!(
         "Transport: {} (protocol v{}, event kind {})",
@@ -96,16 +100,6 @@ async fn main() -> Result<()> {
         transport.protocol_version(),
         transport.event_kind().as_u16()
     );
-    #[allow(deprecated)]
-    if transport == mostro_core::transport::Transport::GiftWrap {
-        tracing::warn!(
-            "transport = \"gift-wrap\" (protocol v1) is DEPRECATED and will be removed in \
-             v0.19.0; mostrod will then run protocol v2 (transport = \"nip44\") only. You \
-             opted into it explicitly in settings.toml — remove the line (or set \
-             transport = \"nip44\", the default) once the clients your community uses \
-             support protocol v2. See https://github.com/MostroP2P/mostro/issues/786"
-        );
-    }
     let subscription = Filter::new()
         .pubkey(mostro_keys.public_key())
         .kind(transport.event_kind())
@@ -370,8 +364,7 @@ async fn main() -> Result<()> {
 /// Install the protocol-v2 anti-spam gate and warm its active-trade-pubkey
 /// cache before the event loop starts, so the very first kind-14 events are
 /// already pre-filtered against known keys (spec §6 Phase 2). The cache is
-/// kept fresh afterwards by `job_refresh_active_pubkeys`. Inert on the v1
-/// (gift-wrap) transport, which never consults the gate.
+/// kept fresh afterwards by `job_refresh_active_pubkeys`.
 ///
 /// Shared by both boot paths (Lightning `run` and Cashu `run_cashu`, CF-5) so
 /// the warm-up logic exists in exactly one place.

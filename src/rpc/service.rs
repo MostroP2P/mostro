@@ -15,7 +15,7 @@ use crate::rpc::admin::{
     TakeDisputeRequest, TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use crate::rpc::rate_limiter::RateLimiter;
-use mostro_core::nip59::UnwrappedMessage;
+use mostro_core::transport::UnwrappedMessage;
 use nostr_sdk::prelude::Keys;
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Pool, Sqlite};

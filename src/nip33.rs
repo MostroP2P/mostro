@@ -565,32 +565,15 @@ pub fn order_to_tags(
 /// clear on this node — the value published in the `pow_first_contact` tag of
 /// the kind-38385 info event.
 ///
-/// Transport-dependent because the Phase 2 gate is v2-only: on `nip44` an
-/// unknown sender must clear `pow_first_contact` before the daemon decrypts,
-/// while on `gift-wrap` that gate is skipped entirely (the throwaway outer key
-/// carries no pre-validatable signal), so a first event only has to clear the
-/// base `pow`. Advertising the v2 number on a v1 node would make clients grind
-/// work nobody checks.
-///
-/// The v2 arm takes the **maximum** of the two knobs because the event loop
-/// applies them in sequence — the base `pow` check runs first, then the
-/// first-contact one — so a config with `pow_first_contact` *below* `pow` still
-/// enforces `pow`. Publishing the lower number would tell clients to mine less
-/// work than the node accepts, and their first event would be dropped silently.
-///
-/// DEPRECATED(v0.19.0, #786): with the v1 path gone this collapses to
-/// `max(pow, effective_pow_first_contact())`.
-#[allow(deprecated)]
+/// It is the **maximum** of the two knobs because the event loop applies
+/// them in sequence — the base `pow` check runs first, then the first-contact
+/// one — so a config with `pow_first_contact` *below* `pow` still enforces
+/// `pow`. Publishing the lower number would tell clients to mine less work
+/// than the node accepts, and their first event would be dropped silently.
 fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
-    match mostro_settings.transport {
-        Transport::Nip44Direct => mostro_settings
-            .pow
-            .max(mostro_settings.effective_pow_first_contact()),
-        // Matched explicitly rather than with a catch-all: a future transport
-        // variant must fail the build here instead of silently advertising the
-        // base `pow` for a gate whose behaviour nobody has considered yet.
-        Transport::GiftWrap => mostro_settings.pow,
-    }
+    mostro_settings
+        .pow
+        .max(mostro_settings.effective_pow_first_contact())
 }
 
 /// The two invoice windows the info event advertises, each under its own name.
@@ -630,9 +613,6 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
     let bond_settings = Settings::get_bond();
-    // DEPRECATED(v0.19.0, #786): once the `transport` knob is gone the
-    // `protocol_version` tag is hardcoded to the crate-wide `PROTOCOL_VER`.
-    #[allow(deprecated)]
     let protocol_version = mostro_settings.transport.protocol_version();
 
     let mut tags_vec: Vec<Tag> = vec![
@@ -674,19 +654,17 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         // fallback rules. Under-powered events are dropped before decryption
         // with no reply, so discovery has to come from here.
         //
-        // This is a per-*event* requirement, not a one-off toll on the first
-        // one: the cache is rebuilt periodically, so a trade key stays
-        // unrecognized for up to one `active_pubkeys_refresh_interval` after
-        // its first accepted event and its follow-ups must carry the same
-        // work. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
+        // Only the event that introduces a trade key pays it. The daemon
+        // recognizes a key only on the next cache rebuild, a known gap whose
+        // fix is pending. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
             "pow_first_contact",
             vec![advertised_first_contact_pow(mostro_settings).to_string()],
         ),
         // Capability advertisement: which Mostro protocol version this node
-        // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
-        // `transport` setting so clients pick the right wire format before
-        // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        // speaks, derived from the `transport` setting so clients pick the
+        // right wire format (or refuse the node) before sending anything.
+        // See docs/TRANSPORT_V2_SPEC.md §3.1.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
             "hold_invoice_cltv_delta",
@@ -1218,7 +1196,7 @@ mod tests {
         // Both values compared below are plain config data, not something the
         // code under test derives — the resolution rules, including what the
         // shipped defaults advertise, are pinned against literals in
-        // `advertised_first_contact_pow_is_transport_dependent`.
+        // `advertised_first_contact_pow_resolution`.
         let live = &MOSTRO_CONFIG
             .get()
             .expect("init_test_settings installs a config")
@@ -1236,9 +1214,8 @@ mod tests {
         // `>= live.pow`: this assertion is about *wiring* — that the resolved
         // difficulty is what reaches the `pow_first_contact` tag, and not, say,
         // the base `pow`, which a bound would happily accept. What the resolver
-        // must itself return per transport, shipped defaults included, is
-        // pinned against literals in
-        // `advertised_first_contact_pow_is_transport_dependent`.
+        // must itself return, shipped defaults included, is pinned against
+        // literals in `advertised_first_contact_pow_resolution`.
         let expected = super::advertised_first_contact_pow(live);
         assert_eq!(
             first_contact, expected,
@@ -1249,54 +1226,40 @@ mod tests {
         );
     }
 
-    /// Per-transport branches of the advertised first-contact difficulty.
+    /// Resolution rules of the advertised first-contact difficulty.
     /// Exercised through the pure helper because `info_to_tags` reads settings
     /// from the process-wide `MOSTRO_CONFIG` OnceLock, which cannot be mutated
     /// mid-run (same reason as `bond_tags` below).
     #[test]
-    #[allow(deprecated)]
-    fn advertised_first_contact_pow_is_transport_dependent() {
+    fn advertised_first_contact_pow_resolution() {
         use crate::config::types::MostroSettings;
 
-        // v2: the gate runs, so the stiffer explicit value is what a
+        // The stiffer explicit value is what a
         // first-contact sender must actually clear.
-        let v2 = MostroSettings {
+        let explicit = MostroSettings {
             pow: 4,
             pow_first_contact: Some(16),
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2), 16);
+        assert_eq!(super::advertised_first_contact_pow(&explicit), 16);
 
-        // v2 without an explicit override falls back to the base `pow`.
-        let v2_default = MostroSettings {
+        // Without an explicit override falls back to the base `pow`.
+        let fallback = MostroSettings {
             pow: 4,
             pow_first_contact: None,
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2_default), 4);
+        assert_eq!(super::advertised_first_contact_pow(&fallback), 4);
 
-        // v2 with an override BELOW the base `pow`: the base check runs first
+        // An override BELOW the base `pow`: the base check runs first
         // and still rejects, so the enforced difficulty is `pow`. Advertising
         // the lower number would make clients under-mine and be dropped.
-        let v2_below = MostroSettings {
+        let below = MostroSettings {
             pow: 8,
             pow_first_contact: Some(2),
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2_below), 8);
-
-        // v1: the gate is skipped, so a configured `pow_first_contact` is not
-        // enforced and must NOT be advertised — only the base `pow` is real.
-        let v1 = MostroSettings {
-            pow: 4,
-            pow_first_contact: Some(16),
-            transport: Transport::GiftWrap,
-            ..Default::default()
-        };
-        assert_eq!(super::advertised_first_contact_pow(&v1), 4);
+        assert_eq!(super::advertised_first_contact_pow(&below), 8);
 
         // The shipped defaults (`pow = 0`, `pow_first_contact` unset) must
         // advertise "0" — identical in meaning to the pre-tag behaviour, so a

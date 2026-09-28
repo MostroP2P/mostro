@@ -19,9 +19,6 @@
 //! first-contact lane; that is also where spam concentrates, so PoW (plus
 //! relay-side rate limiting) is the toll there.
 //!
-//! Only the v2 (`nip44`) transport uses this gate — v1 gift wraps are authored
-//! by throwaway keys that carry no pre-validatable signal.
-//!
 //! Follows the established global-singleton pattern (`OnceLock`, like
 //! `PRICE_MANAGER` / `MOSTRO_CONFIG`); the cache is an inner `RwLock` and the
 //! replay guard a `Mutex`, matching the daemon's single-consumer event loop.

@@ -37,7 +37,7 @@ flowchart LR
 ```
 
 - Entry: `src/main.rs` initializes settings, DB, Nostr, LND, RPC, builds `AppContext`, starts scheduler, then calls `app::run`.
-- Routing: `src/app.rs` unwraps Nostr GiftWrap events, verifies POW/signature/timestamp, parses `mostro_core::Message`, and dispatches to `src/app/*`.
+- Routing: `src/app.rs` unwraps protocol v2 kind-14 events (NIP-44), verifies POW/signature/timestamp, parses `mostro_core::Message`, and dispatches to `src/app/*`.
 - Lightning: `src/lightning/mod.rs` provides hold invoices, settle/cancel, and outgoing payments.
 - RPC: `src/rpc/server.rs` serves admin operations when enabled.
 - DI Context: `src/app/context.rs` provides `AppContext` for dependency injection across handlers and scheduler.
@@ -163,9 +163,9 @@ sequenceDiagram
   participant L as LND
   participant DB as DB
 
-  Relay-->>APP: GiftWrap Event
+  Relay-->>APP: kind-14 Event
   APP->>APP: check_pow + verify + freshness
-  APP->>APP: unwrap (NIP-59) + parse Message
+  APP->>APP: unwrap (NIP-44) + parse Message
   APP->>APP: verify inner message
   APP->>DB: check_trade_index() (monotonicity/signature)
   APP->>R: dispatch(Action)

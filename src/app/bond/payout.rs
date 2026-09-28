@@ -66,8 +66,8 @@ use mostro_core::error::{
     ServiceError,
 };
 use mostro_core::message::{Action, BondPayoutRequest, Message, Payload};
-use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::order::{Order, SmallOrder};
+use mostro_core::transport::UnwrappedMessage;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::mpsc::channel;

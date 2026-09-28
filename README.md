@@ -65,20 +65,17 @@ While @lnp2pBot works excellently, it relies on Telegram—a platform potentiall
 ### Developer Tools
 - **Comprehensive Docs** - Architecture guides, event routing, Lightning operations, RPC reference
 - **SQLite Backend** - Lightweight, embedded database with full migration support
-- **Nostr Protocol** - Protocol v2 (NIP-44 encrypted kind-14 direct messages, default) with a deprecated protocol-v1 (NIP-59 GiftWrap) opt-in, NIP-33 replaceable events
+- **Nostr Protocol** - Protocol v2 (NIP-44 encrypted kind-14 direct messages), NIP-33 replaceable events
 - **Observability** - Structured logging with `tracing`, configurable log levels
 
 ### Nostr Event Kinds Used by the Daemon
 
-Mostro uses a small set of Nostr event kinds. Some are part of the public protocol, and some depend on the wire transport the node is configured with (see [Protocol Transport](#protocol-transport-v1-vs-v2) below). A node speaks exactly one transport: `nip44` (protocol v2, kind `14`, the default) or `gift-wrap` (protocol v1, kind `1059`, deprecated opt-in).
+Mostro uses a small set of Nostr event kinds. Protocol messages travel as protocol v2 kind-`14` events (see [Protocol Transport](#protocol-transport) below).
 
 | Kind | Name / Constant | Used for | Notes |
 | --- | --- | --- | --- |
 | `0` | `Metadata` | Mostro profile metadata | Standard Nostr profile event published at startup when metadata is configured. |
-| `14` | `DM_EVENT_KIND` | Protocol v2 direct message | **Default transport.** Signed kind-14 event with NIP-44 encrypted content, sent directly between the client's trade key and Mostro's pubkey. Carries a NIP-40 `expiration` tag (`[expiration] dm_days`). This is the relay-visible kind Mostro subscribes to when `transport = "nip44"`. |
-| `1` | `TextNote` | Inner rumor in NIP-59 | Protocol v1 only, transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
-| `13` | `Seal` | Inner sealed envelope in NIP-59 | Protocol v1 only, transport-only. Mostro creates and reads it *inside* GiftWrap; it is not published as a standalone public event. |
-| `1059` | `GiftWrap` | NIP-59 outer envelope | Protocol v1 (**deprecated**, removed in v0.19.0). The relay-visible kind Mostro subscribes to only when the operator explicitly sets `transport = "gift-wrap"`. |
+| `14` | `DM_EVENT_KIND` | Protocol v2 direct message | Signed kind-14 event with NIP-44 encrypted content, sent directly between the client's trade key and Mostro's pubkey. Carries a NIP-40 `expiration` tag (`[expiration] dm_days`). This is the relay-visible kind Mostro subscribes to. |
 | `10002` | `RelayList` | Relay metadata | Standard Nostr relay list event published periodically by the scheduler. |
 | `8383` | `DEV_FEE_AUDIT_EVENT_KIND` | Dev fee audit event | Public audit event used for transparent fee accounting. |
 | `30078` | `NOSTR_EXCHANGE_RATES_EVENT_KIND` | Exchange rates | NIP-33 replaceable event for BTC/fiat rate publishing. |
@@ -87,18 +84,13 @@ Mostro uses a small set of Nostr event kinds. Some are part of the public protoc
 | `38385` | `NOSTR_INFO_EVENT_KIND` | Mostro info | NIP-33 replaceable event for operator / node metadata. |
 | `38386` | `NOSTR_DISPUTE_EVENT_KIND` | Disputes | NIP-33 replaceable event for dispute publications. |
 
-> Note: `kind 1` and `kind 13` are *inside* the `kind 1059` GiftWrap transport (protocol v1). They are created and verified by the wrapping/unwrapping code, but they are not emitted or consumed as standalone public relay events by the daemon. On the default `nip44` transport none of `1`/`13`/`1059` are used at all.
+### Protocol Transport
 
-### Protocol Transport (v1 vs v2)
+Mostro speaks **protocol v2**: signed kind-`14` events with NIP-44 encrypted content, sent directly between the client's trade key and Mostro. Relays can rate-limit by sender, and first-contact senders can be required to grind extra PoW (`pow_first_contact`).
 
-Mostro speaks **one** wire protocol per node, selected with `[mostro] transport` in `settings.toml`:
+Protocol v1 (NIP-59 gift wrap, kind `1059`) was removed in v0.19.0 ([#786](https://github.com/MostroP2P/mostro/issues/786)). The two protocols are incompatible. A node that still has `transport = "gift-wrap"` in `settings.toml` refuses to start and says why; remove the line to run on v2, or stay on 0.18.x to keep serving v1 clients.
 
-| `transport` | Protocol | Relay-visible kind | Status |
-| --- | --- | --- | --- |
-| `"nip44"` | v2 — signed kind-14 events with NIP-44 encrypted content, sent directly between the client's trade key and Mostro | `14` | **Default.** A node with no `transport` line starts here. Rate-limitable by relays; first-contact senders can be required to grind extra PoW (`pow_first_contact`). |
-| `"gift-wrap"` | v1 — NIP-59 GiftWrap (rumor → seal → wrap) | `1059` | **Deprecated, explicit opt-in only.** Never selected automatically; write `transport = "gift-wrap"` to keep serving v1-only clients during the transition. Removed in v0.19.0 ([#786](https://github.com/MostroP2P/mostro/issues/786)). |
-
-The node advertises its protocol in the kind `38385` info event via the `protocol_version` tag (`"1"` or `"2"`) so v2-capable clients pick the matching wire format. Full details in [docs/TRANSPORT_V2_SPEC.md](docs/TRANSPORT_V2_SPEC.md).
+The node advertises its protocol in the kind `38385` info event via the `protocol_version` tag (`"2"`), which clients read before sending anything. Full details in [docs/TRANSPORT_V2_SPEC.md](docs/TRANSPORT_V2_SPEC.md).
 
 ---
 
@@ -317,7 +309,7 @@ Mostro is a Rust-based daemon with a modular architecture:
 ```mermaid
 flowchart TB
     subgraph "External Systems"
-        Nostr[Nostr Relays<br/>kind 14 NIP-44 DMs<br/>or NIP-59 GiftWrap]
+        Nostr[Nostr Relays<br/>kind 14 NIP-44 DMs]
         LND[LND Node<br/>Hold Invoices]
         API[Price API<br/>Yadio]
     end
@@ -376,7 +368,7 @@ flowchart TB
 ```
 
 **Key Components**:
-- **Event Router** (`app.rs`): Unwraps incoming protocol messages (NIP-44 kind-14 by default, NIP-59 GiftWrap on the deprecated v1 transport), validates PoW/signatures, routes to action handlers
+- **Event Router** (`app.rs`): Unwraps incoming protocol messages (NIP-44 kind-14), validates PoW/signatures, routes to action handlers
 - **Action Handlers** (`app/*`): 17 modules handling order lifecycle, disputes, admin operations
 - **Lightning Client** (`lightning/*`): Creates hold invoices, settles/cancels, manages payments
 - **RPC Server** (`rpc/*`): gRPC interface for direct admin communication (optional)
@@ -385,7 +377,7 @@ flowchart TB
 
 **Technology Stack**:
 - **Runtime**: Tokio async executor
-- **Nostr**: `nostr-sdk` v0.43 (NIP-44 kind-14 direct messages, NIP-59 GiftWrap for the deprecated v1 transport, NIP-33 replaceable events)
+- **Nostr**: `nostr-sdk` v0.43 (NIP-44 kind-14 direct messages, NIP-33 replaceable events)
 - **Lightning**: `fedimint-tonic-lnd` v0.3 (LND gRPC client)
 - **Database**: SQLite via `sqlx` v0.9 (runtime queries; migrations embedded with `sqlx::migrate!`)
 - **RPC**: `tonic` + `prost` (Protocol Buffers)
@@ -643,11 +635,8 @@ expiration_seconds = 900       # 15 minutes for taker to complete payment
 # Proof-of-Work requirement (0 = disabled)
 pow = 0  # Set to 10-20 to prevent spam
 
-# Wire transport: "nip44" (protocol v2, default) or "gift-wrap" (protocol v1,
-# DEPRECATED — explicit opt-in only, removed in v0.19.0). Omit for nip44.
-transport = "nip44"
-# Extra PoW demanded from first-contact senders on the nip44 transport
-# (unset = same as `pow`). No effect on gift-wrap.
+# Extra PoW demanded from first-contact senders
+# (unset = same as `pow`).
 # pow_first_contact = 16
 
 # Development sustainability fee (0.30 = 30% of Mostro fee goes to dev fund)
@@ -664,8 +653,7 @@ bitcoin_price_api_url = "https://api.yadio.io"
 - `fee`: Your Mostro's fee percentage (default 0.6% split between buyer/seller)
 - `dev_fee_percentage`: Portion of your fee donated to Mostro development (default 30%)
 - `pow`: Increase to 10-20 if experiencing spam (higher = slower client messages)
-- `transport`: Defaults to `"nip44"` (protocol v2). Set `"gift-wrap"` **explicitly** only if you must keep serving protocol-v1 clients — it is deprecated and goes away in v0.19.0
-- `pow_first_contact`: On `nip44`, a stiffer PoW for senders not yet part of an active trade (anti-spam, checked before decryption)
+- `pow_first_contact`: A stiffer PoW for senders not yet part of an active trade (anti-spam, checked before decryption)
 - `fiat_currencies_accepted`: Restrict supported currencies (empty array = accept all)
 
 ---
@@ -859,8 +847,8 @@ cargo install --path .
 
 Features:
 - Complete trading (create, take, and cancel orders)
-- Encrypted P2P chat (ECDH shared key + NIP-59 gift wrapping, Blossom servers for multimedia)
-- Key management (NIP-06 and NIP-59, unique keys per trade)
+- Encrypted P2P chat (ECDH shared key + NIP-44 kind-14 envelope, Blossom servers for multimedia)
+- Key management (NIP-06, unique keys per trade)
 - Real-time order book updates
 - Multi-language support (English, Spanish, Italian)
 - Push notifications
@@ -912,9 +900,9 @@ let order = Order { /* ... */ };
 let message = Message::new(Action::NewOrder, order);
 
 // Send as a protocol-v2 kind-14 NIP-44 direct message to Mostro's pubkey
-// (default). Check the node's `protocol_version` tag in its kind-38385
-// info event: "2" → NIP-44 kind 14, "1" → legacy NIP-59 GiftWrap.
-// mostro-core ships helpers for both wire formats.
+// (mostro_core::transport::wrap_message_with). Check the node's
+// `protocol_version` tag in its kind-38385 info event first: "2" is the
+// only protocol this version speaks.
 // ...
 ```
 
@@ -1215,7 +1203,7 @@ Join the operator community:
 ### Technical Documentation (This Repository)
 - **[Architecture Overview](docs/ARCHITECTURE.md)** - System design, module map, startup sequence
 - **[Event Routing](docs/EVENT_ROUTING.md)** - Message handling, unwrapping of protocol messages
-- **[Transport v2 Spec](docs/TRANSPORT_V2_SPEC.md)** - Protocol v2 (NIP-44 kind 14) vs deprecated v1 (NIP-59 GiftWrap), migration timeline
+- **[Transport v2 Spec](docs/TRANSPORT_V2_SPEC.md)** - Protocol v2 (NIP-44 kind 14), the v1 removal and the migration path
 - **[Lightning Operations](docs/LIGHTNING_OPS.md)** - Hold invoice lifecycle, payment flows
 - **[Orders & Actions](docs/ORDERS_AND_ACTIONS.md)** - Order state machine, action handlers
 - **[Admin RPC & Disputes](docs/ADMIN_RPC_AND_DISPUTES.md)** - Dispute resolution, admin interface

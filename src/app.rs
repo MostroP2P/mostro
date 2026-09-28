@@ -62,8 +62,8 @@ use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
-use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::transport::unwrap_incoming;
+use mostro_core::transport::UnwrappedMessage;
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 
@@ -337,22 +337,15 @@ async fn accept_event(
     // the victim's id. Verifying here (cheap Schnorr, pre-decrypt) is what
     // makes the spam gate's dedup safe: only ids that are provably the
     // author's own are ever recorded, so a forged copy cannot get the genuine
-    // event dropped as a replay.
-    //
-    // It is also the only outer-event check on the v1 path: `unwrap_incoming`
-    // re-verifies the event itself on v2 only (`unwrap_message_nip44` calls
-    // `event.verify()`), while v1's `nip59::unwrap_message` decrypts the wrap
-    // and verifies the *seal's* signature alone — never the outer gift wrap's
-    // id or signature. Do not delete this as redundant.
+    // event dropped as a replay. `unwrap_incoming` verifies the event again,
+    // but only after the gate has run, so this check is not redundant.
     if event.verify().is_err() {
         tracing::warn!("Dropping event {} with an invalid signature", event.id);
         return None;
     }
-    // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
-    // cheap pre-validation BEFORE paying the NIP-44 decrypt
-    // cost. `None` means the gate does not apply: v1 gift wraps
-    // (throwaway outer key, no pre-validatable signal) or no
-    // gate installed (fail-open).
+    // Phase 2 anti-spam gate: cheap pre-validation BEFORE paying
+    // the NIP-44 decrypt cost. `None` means no gate is installed
+    // (fail-open).
     if let Some(gate) = gate {
         let now = chrono::Utc::now().timestamp();
         // Dedup: drop a re-sent identical event (defense in
@@ -386,12 +379,9 @@ async fn accept_event(
         }
     }
 
-    // Mostro-core dispatches on the event kind: the gift wrap
-    // path handles the dual-key layout (identity key signs
-    // seal, trade key authors rumor), the kind-14 path the
-    // 3-element tuple with its in-ciphertext identity proof.
-    // Both decode and verify signatures in one shot and yield
-    // the same transport-agnostic `UnwrappedMessage`.
+    // Mostro-core dispatches on the event kind and opens the
+    // kind-14 3-element tuple with its in-ciphertext identity
+    // proof, verifying every signature in one shot.
     let unwrapped = match unwrap_incoming(event, my_keys).await {
         Ok(Some(u)) => u,
         // NIP-44 decrypt failed: not addressed to this node.
@@ -482,24 +472,6 @@ async fn finalize_dispatch(
     }
 }
 
-/// Resolve the anti-spam gate for a transport, once per event loop.
-///
-/// The gate applies to the v2 (kind-14) transport only: there the visible
-/// author is the trade key, so the daemon can pre-validate before decrypting.
-/// `None` fail-opens — v1 gift wraps (throwaway outer key, no pre-validatable
-/// signal) or no gate installed. Shared by `run` and `run_cashu` so the single
-/// v2-only policy cannot drift between the two loops.
-///
-/// `install_spam_gate` (`main.rs`) runs before both loops, so the `OnceLock`
-/// load is loop-invariant and stays out of the per-event path.
-fn gate_for(is_v2: bool) -> Option<&'static SpamGate> {
-    if is_v2 {
-        SpamGate::global()
-    } else {
-        None
-    }
-}
-
 /// Main event loop that processes incoming Nostr events.
 /// Handles message verification, POW checking, and routes valid messages to appropriate handlers.
 ///
@@ -511,20 +483,17 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
-    // The node speaks exactly one transport (protocol v1 gift wrap or v2
-    // NIP-44 direct); events of any other kind are dropped before any
-    // decryption work. See docs/TRANSPORT_V2_SPEC.md.
-    // DEPRECATED(v0.19.0, #786): with the `transport` knob gone this becomes
-    // unconditionally kind 14 and the v1/v2 branching below collapses.
-    #[allow(deprecated)]
+    // The node speaks exactly one transport; events of any other kind are
+    // dropped before any decryption work. See docs/TRANSPORT_V2_SPEC.md.
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
-    // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): on the v2 (kind
-    // 14) transport the visible author is the trade key, so the daemon can
-    // pre-validate before decrypting. Unknown (first-contact) senders must
-    // clear `pow_first_contact`; known active-trade keys need only `pow`. The
-    // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
+    // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): the visible
+    // author is the trade key, so the daemon can pre-validate before
+    // decrypting. Unknown (first-contact) senders must clear
+    // `pow_first_contact`; known active-trade keys need only `pow`.
+    // `install_spam_gate` (`main.rs`) runs before both loops, so the lookup
+    // stays out of the per-event path.
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+    let gate = SpamGate::global();
 
     loop {
         let mut notifications = client.notifications();
@@ -572,10 +541,9 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
-    #[allow(deprecated)]
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+    let gate = SpamGate::global();
 
     loop {
         let mut notifications = client.notifications();
@@ -655,7 +623,6 @@ mod tests {
     use mostro_core::message::Action;
 
     use nostr_sdk::prelude::{Keys, Kind as NostrKind, Timestamp};
-    use secp256k1::schnorr::Signature;
 
     // Helper function to create test keys
     fn create_test_keys() -> Keys {
@@ -777,8 +744,7 @@ mod tests {
     mod accept_event_ordering_tests {
         use super::*;
         use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
-        use mostro_core::nip59::{wrap_message, WrapOptions};
-        use mostro_core::transport::wrap_message_nip44;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A protocol-v2 (kind 14) event addressed to `mostro`, in full-privacy
         /// mode (trade key doubles as identity, so no identity proof is needed).
@@ -814,9 +780,8 @@ mod tests {
             mostro: &Keys,
             gate: &SpamGate,
         ) -> Option<(Action, Message, UnwrappedMessage)> {
-            // Same kind constant the event loops use to identify v2 before
-            // calling `gate_for`, so the test fails if it drifts from
-            // `Transport::Nip44Direct`'s kind.
+            // Same kind constant the event loops accept, so the test fails if
+            // it drifts from `Transport::Nip44Direct`'s kind.
             accept_event(
                 ctx,
                 event,
@@ -886,65 +851,6 @@ mod tests {
             .await;
             assert!(accepted.is_none());
         }
-
-        /// A protocol-v1 gift wrap addressed to `mostro`, in full-privacy mode
-        /// (trade key doubles as identity).
-        async fn v1_event(mostro: &Keys) -> Event {
-            let trade = create_test_keys();
-            let message = create_test_message(Action::FiatSent, None);
-            wrap_message(
-                &message,
-                &trade,
-                &trade,
-                mostro.public_key(),
-                WrapOptions::default(),
-            )
-            .await
-            .expect("wrap gift wrap event")
-        }
-
-        /// The v1 path takes `gate = None` and `nip59::unwrap_message` never
-        /// checks the outer event, so `accept_event`'s own `verify()` is the
-        /// only thing standing between a malformed gift wrap and the decrypt.
-        /// The second assertion is the one that pins the behaviour change:
-        /// well-formed gift wraps still go through.
-        #[tokio::test]
-        async fn v1_gift_wrap_with_invalid_signature_is_dropped() {
-            let ctx = create_migrated_ctx().await;
-            let mostro = create_test_keys();
-            let genuine = v1_event(&mostro).await;
-            let forged = with_tampered_signature(&genuine);
-
-            assert!(
-                accept_event(&ctx, &forged, &mostro, 0, 0, NostrKind::GiftWrap, None)
-                    .await
-                    .is_none(),
-                "a gift wrap with an invalid signature must be dropped"
-            );
-            assert!(
-                accept_event(&ctx, &genuine, &mostro, 0, 0, NostrKind::GiftWrap, None)
-                    .await
-                    .is_some(),
-                "a well-formed gift wrap must still be accepted"
-            );
-        }
-
-        /// The v2-only policy lives in one place now; both event loops read it
-        /// from here, so this is where it gets covered.
-        #[test]
-        fn gate_applies_to_v2_only() {
-            assert!(gate_for(false).is_none(), "v1 must fail open");
-            // Force the installed state rather than reading it: asserting
-            // against `SpamGate::global()` compares `gate_for` with itself and
-            // passes vacuously while nothing has installed yet. Install wins
-            // here or another test's already did; either way a second one is
-            // refused, not a panic.
-            let _ = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
-            assert!(
-                gate_for(true).is_some(),
-                "v2 must resolve the installed gate"
-            );
-        }
     }
 
     /// Maintenance (drain) mode gate in [`accept_event`]: the three actions
@@ -954,9 +860,8 @@ mod tests {
         use super::*;
         use crate::config::MESSAGE_QUEUES;
         use crate::db::is_user_present;
-        use mostro_core::nip59::WrapOptions;
         use mostro_core::prelude::Payload;
-        use mostro_core::transport::wrap_message_nip44;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A kind-14 event in full-privacy mode (trade key doubles as
         /// identity) so no inner signature is needed.
@@ -1594,47 +1499,6 @@ mod tests {
 
             assert!(meets_pow);
             assert!(!fails_pow);
-        }
-    }
-
-    mod event_processing_tests {
-        use super::*;
-
-        #[test]
-        fn test_gift_wrap_processing_structure() {
-            // Test the structure of gift wrap event processing
-            let kind = NostrKind::GiftWrap;
-
-            match kind {
-                NostrKind::GiftWrap => {
-                    // This is the expected path for gift wrap events
-                    // No-op
-                }
-                _ => unreachable!("Only GiftWrap events are considered in this test scope"),
-            }
-        }
-
-        #[test]
-        fn test_message_parsing_structure() {
-            // Test message parsing logic structure
-            let test_content = r#"[{"order":{"version":1,"request_id":1,"trade_index":null,"id":"550e8400-e29b-41d4-a716-446655440000","action":"new-order","payload":null}}, null]"#;
-
-            let result = serde_json::from_str::<(Message, Option<Signature>)>(test_content);
-            match result {
-                Ok((message, signature)) => {
-                    // Test the structure of message parsing
-                    // Note: message.verify() may fail without proper payload setup
-                    // We're testing the parsing structure, not the validation logic
-                    assert!(signature.is_none());
-
-                    // Test that we got a message of some kind
-                    if let Message::Order(_) = message {}
-                }
-                Err(_) => {
-                    // Parsing error is handled gracefully
-                    // No-op
-                }
-            }
         }
     }
 }

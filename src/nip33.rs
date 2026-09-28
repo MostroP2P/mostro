@@ -654,9 +654,11 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         // fallback rules. Under-powered events are dropped before decryption
         // with no reply, so discovery has to come from here.
         //
-        // Only the event that introduces a trade key pays it. The daemon
-        // recognizes a key only on the next cache rebuild, a known gap whose
-        // fix is pending. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
+        // The protocol rule is that only the event introducing a trade key
+        // pays it. Today the daemon keeps charging it until the next cache
+        // rebuild recognizes the key, so a follow-up sent before then must
+        // clear it too or is dropped. That gap is known and its fix is
+        // pending. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
             "pow_first_contact",
             vec![advertised_first_contact_pow(mostro_settings).to_string()],

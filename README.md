@@ -884,8 +884,8 @@ Mostro clients communicate via Nostr using the [mostro-core](https://github.com/
 ```rust
 // Add to Cargo.toml
 [dependencies]
-mostro-core = "0.6.57"
-nostr-sdk = "0.43"
+mostro-core = "0.16"
+nostr-sdk = "0.45"
 
 // Basic client structure
 use mostro_core::{Message, Action, Order};

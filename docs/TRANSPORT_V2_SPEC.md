@@ -161,7 +161,7 @@ path in dual clients becomes dead code they can remove at their own pace.
 There is **no dual mode**: a node speaks exactly one protocol version.
 This section describes the 0.18.x settings. v0.19.0 removes the
 `"gift-wrap"` value and takes the field out of the template. The field
-itself stays, for a future protocol v3 (§5, §6 Phase 4, §8).
+itself stays, as part of the migration path (§5, §6 Phase 4, §8).
 
 ```toml
 [mostro]
@@ -208,13 +208,13 @@ with the clients that community uses.
   its docs. The **versioning mechanism stays**: the `transport` setting
   (out of the template, `nip44` its only valid value), the per-node
   protocol that drives kind, wrap, inner `version` and the
-  `protocol_version` tag, so that a protocol v3 can be rolled out the same
-  way v2 was (§8). The info event keeps publishing
+  `protocol_version` tag, so that any future protocol change can be
+  rolled out the same way v2 was (§8). The info event keeps publishing
   `["protocol_version", "2"]`: it is what app v1 and the other dual
   clients read to choose kind 14, and what app v2 checks before it talks
-  to the node. mostro-core keeps its gift-wrap helpers
-  for the dual clients until they drop v1 themselves; removing them is a
-  separate mostro-core release, not part of this cutover.
+  to the node. mostro-core removes gift wrap in its own breaking release
+  after v0.19.0 ships (mostro-core#174); mostro-cli and mostrix drop v1
+  when they bump to it.
 
 ## 6. Implementation phases
 
@@ -354,7 +354,7 @@ the specs first, so that the code PRs have something to be checked against.
    knob leaves `settings.tpl.toml` (a new install has no reason to see it)
    and the gift-wrap deprecation warning leaves `src/main.rs`, but the
    optional `[mostro] transport` field stays, defaulting to `nip44`: it is
-   the per-node protocol selector a future v3 needs back (§8), and keeping
+   the per-node protocol selector a future migration needs back (§8), and keeping
    it avoids deleting it now only to reintroduce it. Its only valid value
    in v0.19.0 is `nip44`; any other value is a startup error. A
    `settings.toml` that still carries the line is handled on purpose:
@@ -376,7 +376,7 @@ the specs first, so that the code PRs have something to be checked against.
    (`src/util.rs`) keep going through the configured transport
    (`transport.event_kind()`, `unwrap_incoming`, `wrap_message_with`)
    instead of calling the NIP-44 functions directly. With a single variant
-   those calls cost nothing, and they are exactly where a v3 arm plugs in.
+   those calls cost nothing, and they are where a new transport would plug in.
    What goes is every `GiftWrap` branch and the gift-wrap-only checks.
    `send_dm` always sets the NIP-40 expiration.
 4. **Keep the version stamping, drop its v1 test** (#785). The inner
@@ -385,10 +385,9 @@ the specs first, so that the code PRs have something to be checked against.
    version and the advertised tag have one source of truth. Only its
    `DEPRECATED(v0.19.0, #786)` markers and the gift-wrap assertions go.
    This replaces #786's "revert #785": the revert would hardcode
-   `PROTOCOL_VER`, which is the thing a v3 migration would have to undo.
-5. **Simplify the anti-spam gate.** The gate keys off "the transport
-   authenticates the sender" (v2 does, v1 did not), not off kind 14, so it always runs today and stays correct for a v3 with a
-   signed envelope. `advertised_first_contact_pow` in `src/nip33.rs` loses
+   `PROTOCOL_VER`, which a future migration would have to undo.
+5. **Simplify the anti-spam gate.** Without v1 there is no transport
+   the gate skips, so it always runs. `advertised_first_contact_pow` in `src/nip33.rs` loses
    its gift-wrap arm, and tests that pin the "v2 only" behavior (for
    example `gate_applies_to_v2_only`) are rewritten or deleted.
 6. **Keep the capability tag.** The info event publishes
@@ -422,8 +421,8 @@ than `dm_days`. Operators whose disputes can last longer should raise
 `dm_days` accordingly.
 
 Out of scope for the cutover: transport metrics (message counts, decrypt
-failures as a spam signal) and removing the gift-wrap helpers from
-mostro-core.
+failures as a spam signal). Removing gift wrap from mostro-core is its own
+release (mostro-core#174), after v0.19.0.
 
 ## 7. Security notes
 
@@ -443,11 +442,12 @@ mostro-core.
   unchanged to both transports because both yield the same
   `UnwrappedMessage`.
 
-## 8. Room for protocol v3
+## 8. Keeping the migration path
 
 Removing v1 must not remove the machinery that made the v1 → v2 move
-orderly. A future v3 should be able to follow the same playbook, and
-v0.19.0 keeps every piece it needs.
+orderly. No new protocol is planned; the point is that if one ever comes,
+it can follow the same playbook without trauma, and v0.19.0 keeps every
+piece that playbook uses.
 
 ### 8.1 The playbook (what v1 → v2 did)
 
@@ -470,14 +470,14 @@ v0.19.0 keeps every piece it needs.
 
 ### 8.2 What v0.19.0 keeps for that
 
-| piece | where | why v3 needs it |
+| piece | where | what it did in the v1 → v2 migration |
 |---|---|---|
-| `protocol_version` tag | kind 38385, `src/nip33.rs` | the only way a client knows which protocol a node speaks (§3.1) |
-| `[mostro] transport` setting | `src/config/types.rs`, out of the template | the per-node selector for step 2 and 5 |
-| transport-driven wrap, unwrap and subscription | `src/main.rs`, `src/app.rs`, `src/util.rs` | a v3 arm plugs in without touching handlers |
-| version stamping from the transport | `stamp_protocol_version` | inner `version` stays consistent with the wire format |
-| startup refusal for a removed protocol | config validation | the same rule applies to v2 when v3 replaces it |
-| startup log of the active protocol | `src/main.rs` | operators see what their node speaks |
+| `protocol_version` tag | kind 38385, `src/nip33.rs` | told each client which protocol a node speaks (§3.1) |
+| `[mostro] transport` setting | `src/config/types.rs`, out of the template | let each operator choose when to switch (steps 2 and 5) |
+| transport-driven wrap, unwrap and subscription | `src/main.rs`, `src/app.rs`, `src/util.rs` | added v2 next to v1 with zero handler changes |
+| version stamping from the transport | `stamp_protocol_version` | kept the inner `version` consistent with the wire format |
+| startup refusal for a removed protocol | config validation | stops a node from switching protocol behind its operator's back |
+| startup log of the active protocol | `src/main.rs` | shows operators what their node speaks |
 
 ### 8.3 What the clients must do now
 
@@ -485,7 +485,8 @@ A client that meets a `protocol_version` it does not know must treat the
 node as **unsupported** and say so. It must not guess. A guess is a
 silent failure: the node never answers a message in the wrong format
 (§3.1). The v2 app already does this. The others do not yet, and should
-fix it before they drop their v1 code:
+fix it before they drop their v1 code (mobile#737, mostro-cli#200,
+mostrix#198):
 
 | client | unknown `protocol_version` today |
 |---|---|
@@ -499,8 +500,8 @@ which speaks v1.
 
 ### 8.4 mostro-core
 
-When mostro-core removes `Transport::GiftWrap` (a breaking release),
-the same release should mark `Transport` `#[non_exhaustive]`. A future v3
-variant then lands as a minor release, and every client `match` already
-has the arm that handles an unknown protocol.
-
+mostro-core removes everything related to gift wrap in a breaking release
+after v0.19.0 (mostro-core#174). It keeps the same pieces for the same
+reason: the `Transport` enum (`event_kind()`, `protocol_version()`), the
+`wrap_message_with` / `unwrap_incoming` dispatchers, and `UnwrappedMessage`
+as the single result every transport returns.

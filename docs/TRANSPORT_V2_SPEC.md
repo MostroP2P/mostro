@@ -303,29 +303,24 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   in sequence, so a `pow_first_contact` below `pow` still enforces `pow` — and
   on `gift-wrap` just `pow`, since the gate never runs there and advertising the
   stiffer number would make clients grind work nobody checks.
-- **Recognition is eventually consistent — the lane is not "the first event
-  only".** Accepting a create or take does *not* insert that trade key into the
-  cache synchronously; `job_refresh_active_pubkeys` is the only writer after
-  startup and rebuilds the whole set on its interval. A trade key whose event
-  was just accepted therefore keeps being classified as first contact until the
-  next rebuild lands — up to one full `active_pubkeys_refresh_interval`
-  (default 60 s), and longer if a reload fails and the previous snapshot is
-  retained. A client that mined `pow_first_contact` once and then dropped back
-  to `pow` for an immediate follow-up (the `take-sell` right after a
-  `new-order`, or the invoice message that follows a take) would have that
-  follow-up silently discarded.
+- **Known gap: recognition lags acceptance.** Accepting a create or take
+  does *not* insert that trade key into the cache;
+  `job_refresh_active_pubkeys` is the only writer after startup and rebuilds
+  the whole set on its interval. Until the next rebuild — up to one
+  `active_pubkeys_refresh_interval` (default 60 s), longer if a reload fails —
+  the key is still treated as first contact, so a follow-up mined at `pow`
+  (the invoice right after a take, for example) is silently dropped on a node
+  whose `pow_first_contact` is above `pow`.
 
-  The client-side rule is therefore: **mine `pow_first_contact` for every event
-  sent from a trade key, not just for its first one.** Recognition is not
-  observable from the client side — the daemon publishes no per-key signal and
-  does not advertise the refresh interval — so there is no bound a client can
-  safely wait out; it must keep using the higher difficulty for the lifetime of
-  the trade key. On nodes where `pow_first_contact` resolves to `pow` (the
-  default) the rule costs nothing; on nodes that set it higher it is the
-  difference between working and failing silently. Making recognition
-  synchronous at accept time, so the rule can be relaxed to a bounded window,
-  is follow-up work — the advertised value is correct either way, because it
-  always reports the difficulty the gate enforces on an unrecognized sender.
+  The protocol rule stays the simple one: **only the event that introduces a
+  trade key pays `pow_first_contact`**; everything after it pays `pow`. That is
+  what the clients implement (app v2 and mostrix on new-order and take; app v1
+  and mostro-cli do not read `pow_first_contact` at all), and asking clients to
+  mine the higher difficulty on every event would only move a daemon bug into
+  every client. The daemon closes the gap instead: when it accepts the event
+  that ties a trade key to an order, it adds that key to the cache right away,
+  and the periodic rebuild stays as the way keys leave the set. On nodes where
+  `pow_first_contact` equals `pow` (the default) the gap has no effect.
 
 New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
 and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,
@@ -353,8 +348,8 @@ the specs first, so that the code PRs have something to be checked against.
    chooses (§3.1), and what v0.19.0 removes.
 2. **Remove the `transport` setting.** Drop the field and its default from
    `src/config/types.rs` / `src/config/settings.rs`, the knob from
-   `settings.tpl.toml`, and the gift-wrap deprecation warning in
-   `src/main.rs`. The wire format is hardcoded to kind 14.
+   `settings.tpl.toml` (a new install has no reason to see the field), and
+   the gift-wrap deprecation warning in `src/main.rs`. The wire format is hardcoded to kind 14.
    A `settings.toml` that still carries the line is handled on purpose,
    not ignored by accident (the settings structs do not deny unknown
    fields):
@@ -362,8 +357,15 @@ the specs first, so that the code PRs have something to be checked against.
      error that says v0.19.0 speaks protocol v2 only. That operator chose
      v1 explicitly; switching their community to another protocol behind
      their back is exactly the silent mismatch §3.1 describes.
-   - `transport = "nip44"` → start normally, log a warning that the line is
-     obsolete.
+   - `transport = "nip44"` → start normally and say nothing about it. The
+     line is no longer needed, but it describes exactly what the node does,
+     so there is nothing to warn about.
+
+   The error for `gift-wrap` says why, and what to do: this version speaks
+   protocol v2 only, clients on protocol v1 cannot use this node, remove the
+   `transport` line to start on v2 or stay on 0.18.x to keep serving v1.
+   Whatever the settings say, mostrod logs the protocol it speaks at startup
+   (`protocol v2, event kind 14`), as it does today with the transport.
 3. **Remove the v1 receive and send paths.** `src/main.rs` subscribes to
    kind 14 only; the event loop in `src/app.rs` accepts kind 14 only and
    unwraps with `unwrap_message_nip44` directly; `send_dm` in `src/util.rs`

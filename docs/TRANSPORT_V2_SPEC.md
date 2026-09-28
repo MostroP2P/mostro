@@ -212,9 +212,10 @@ with the clients that community uses.
   rolled out the same way v2 was (§8). The info event keeps publishing
   `["protocol_version", "2"]`: it is what app v1 and the other dual
   clients read to choose kind 14, and what app v2 checks before it talks
-  to the node. mostro-core removes gift wrap in its own breaking release
-  after v0.19.0 ships (mostro-core#174); mostro-cli and mostrix drop v1
-  when they bump to it.
+  to the node. mostrod v0.19.0 is built on **mostro-core 0.16**, which
+  removes gift wrap first (mostro-core#174); mostro-cli, mostrix and the
+  v2 app then bump to 0.16 too, and the two dual Rust clients drop v1
+  with that bump.
 
 ## 6. Implementation phases
 
@@ -350,7 +351,16 @@ the specs first, so that the code PRs have something to be checked against.
 1. **Specs.** This document and the protocol repo's
    `transport_migration.md`: v1 and v2 are incompatible, how each client
    chooses (§3.1), and what v0.19.0 removes.
-2. **Take `transport` out of the template, keep it in the code.** The
+2. **mostro-core 0.16 first** (mostro-core#174): gift wrap removed,
+   `Transport` left with `Nip44Direct` only. mostrod bumps to it, and
+   the steps below are done against it: without `GiftWrap` in core, the
+   compiler points at every v1 branch left in mostrod. The same order as
+   the v1 → v2 rollout, where Phase 0 was mostro-core. After mostrod,
+   mostro-cli, mostrix and the v2 app bump to 0.16. The two Rust clients
+   ship their unknown-version fix (mostro-cli#200, mostrix#198) in that
+   same bump, because from then on `"1"` is a version they no longer
+   speak. Mostro Mobile does not depend on mostro-core.
+3. **Take `transport` out of the template, keep it in the code.** The
    knob leaves `settings.tpl.toml` (a new install has no reason to see it)
    and the gift-wrap deprecation warning leaves `src/main.rs`, but the
    optional `[mostro] transport` field stays, defaulting to `nip44`: it is
@@ -361,7 +371,10 @@ the specs first, so that the code PRs have something to be checked against.
    - `transport = "gift-wrap"` → mostrod **refuses to start** with an
      error that says v0.19.0 speaks protocol v2 only. That operator chose
      v1 explicitly; switching their community to another protocol behind
-     their back is exactly the silent mismatch §3.1 describes.
+     their back is exactly the silent mismatch §3.1 describes. mostro-core
+     0.16 no longer parses `"gift-wrap"`, so mostrod has to recognize the
+     value itself and turn it into this error. The generic "unknown
+     variant" error that serde would raise does not say what to do.
    - `transport = "nip44"` → start normally and say nothing about it. The
      line is no longer needed, but it describes exactly what the node does,
      so there is nothing to warn about.
@@ -371,7 +384,7 @@ the specs first, so that the code PRs have something to be checked against.
    `transport` line to start on v2 or stay on 0.18.x to keep serving v1.
    Whatever the settings say, mostrod logs the protocol it speaks at startup
    (`protocol v2, event kind 14`), as it does today with the transport.
-3. **Remove the v1 receive and send paths, keep the seam.** Subscription
+4. **Remove the v1 receive and send paths, keep the seam.** Subscription
    (`src/main.rs`), event loop (`src/app.rs`) and `send_dm`
    (`src/util.rs`) keep going through the configured transport
    (`transport.event_kind()`, `unwrap_incoming`, `wrap_message_with`)
@@ -379,28 +392,28 @@ the specs first, so that the code PRs have something to be checked against.
    those calls cost nothing, and they are where a new transport would plug in.
    What goes is every `GiftWrap` branch and the gift-wrap-only checks.
    `send_dm` always sets the NIP-40 expiration.
-4. **Keep the version stamping, drop its v1 test** (#785). The inner
+5. **Keep the version stamping, drop its v1 test** (#785). The inner
    `version` keeps coming from the active transport
    (`stamp_protocol_version`), so the kind, the envelope, the inner
    version and the advertised tag have one source of truth. Only its
    `DEPRECATED(v0.19.0, #786)` markers and the gift-wrap assertions go.
    This replaces #786's "revert #785": the revert would hardcode
    `PROTOCOL_VER`, which a future migration would have to undo.
-5. **Simplify the anti-spam gate.** Without v1 there is no transport
+6. **Simplify the anti-spam gate.** Without v1 there is no transport
    the gate skips, so it always runs. `advertised_first_contact_pow` in `src/nip33.rs` loses
    its gift-wrap arm, and tests that pin the "v2 only" behavior (for
    example `gate_applies_to_v2_only`) are rewritten or deleted.
-6. **Keep the capability tag.** The info event publishes
+7. **Keep the capability tag.** The info event publishes
    `["protocol_version", "2"]`, still derived from the transport. Removing it would make every
    node look like a pre-0.18.0 v1 daemon to the clients (§3.1).
-7. **Tests and docs.** Every `DEPRECATED(v0.19.0, #786)` marker goes. Tests
+8. **Tests and docs.** Every `DEPRECATED(v0.19.0, #786)` marker goes. Tests
    that only exist for v1 are deleted; tests of the kept seam (stamping,
    transport parsing) lose their gift-wrap cases and keep the rest. The v1
    fixtures in mostrod go (mostro-core keeps its own). Update
    `README.md`, `docs/STARTUP_AND_CONFIG.md`, and the sequence diagrams in
    `docs/ARCHITECTURE.md`, `docs/EVENT_ROUTING.md` and
    `docs/ORDERS_AND_ACTIONS.md`, which still say "GiftWrap".
-8. **Release notes** for v0.19.0 say, in this order: v1 is gone; nodes that
+9. **Release notes** for v0.19.0 say, in this order: v1 is gone; nodes that
    still run `transport = "gift-wrap"` will not start until the line is
    removed; users on that node need app v1 ≥ v1.3.0, app v2, mostro-cli or
    mostrix, all of which speak v2.
@@ -421,8 +434,7 @@ than `dm_days`. Operators whose disputes can last longer should raise
 `dm_days` accordingly.
 
 Out of scope for the cutover: transport metrics (message counts, decrypt
-failures as a spam signal). Removing gift wrap from mostro-core is its own
-release (mostro-core#174), after v0.19.0.
+failures as a spam signal).
 
 ## 7. Security notes
 
@@ -500,8 +512,8 @@ which speaks v1.
 
 ### 8.4 mostro-core
 
-mostro-core removes everything related to gift wrap in a breaking release
-after v0.19.0 (mostro-core#174). It keeps the same pieces for the same
+mostro-core 0.16 removes everything related to gift wrap, before
+mostrod v0.19.0 (mostro-core#174). It keeps the same pieces for the same
 reason: the `Transport` enum (`event_kind()`, `protocol_version()`), the
 `wrap_message_with` / `unwrap_incoming` dispatchers, and `UnwrappedMessage`
 as the single result every transport returns.

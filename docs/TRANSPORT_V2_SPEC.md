@@ -319,13 +319,20 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
 
   The protocol rule stays the simple one: **only the event that introduces a
   trade key pays `pow_first_contact`**; everything after it pays `pow`. That is
-  what the clients implement (app v2 and mostrix on new-order and take; app v1
-  and mostro-cli do not read `pow_first_contact` at all), and asking clients to
-  mine the higher difficulty on every event would only move a daemon bug into
-  every client. The daemon closes the gap instead: when it accepts the event
-  that ties a trade key to an order, it adds that key to the cache right away,
-  and the periodic rebuild stays as the way keys leave the set. On nodes where
-  `pow_first_contact` equals `pow` (the default) the gap has no effect.
+  what app v2 and mostrix implement (on new-order and take), and asking
+  clients to mine the higher difficulty on every event would only move a
+  daemon bug into every client. The fix belongs in the daemon and is
+  **pending**: when it accepts the event that ties a trade key to an order,
+  it must add that key to the cache right away, with the periodic rebuild
+  staying as the way keys leave the set. Today the daemon does not do this.
+  On nodes where `pow_first_contact` equals `pow` (the default) the gap has
+  no effect.
+
+  app v1 and mostro-cli do not read `pow_first_contact` at all: they mine
+  every event at `pow`. On a node that sets `pow_first_contact` above `pow`,
+  their new orders and takes are dropped without a reply. Until they read the
+  tag, a node that serves those clients must keep `pow_first_contact` equal
+  to `pow`.
 
 New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
 and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,
@@ -371,10 +378,12 @@ the specs first, so that the code PRs have something to be checked against.
    - `transport = "gift-wrap"` → mostrod **refuses to start** with an
      error that says v0.19.0 speaks protocol v2 only. That operator chose
      v1 explicitly; switching their community to another protocol behind
-     their back is exactly the silent mismatch §3.1 describes. mostro-core
-     0.16 no longer parses `"gift-wrap"`, so mostrod has to recognize the
-     value itself and turn it into this error. The generic "unknown
-     variant" error that serde would raise does not say what to do.
+     their back is the silent mismatch §3.1 describes. mostro-core 0.16
+     no longer parses `"gift-wrap"`, so mostrod has to check the raw
+     `[mostro].transport` value while loading `settings.toml`, before or
+     instead of handing it to serde, and turn it into this error. The
+     generic "unknown variant" error that serde would raise does not say
+     what to do.
    - `transport = "nip44"` → start normally and say nothing about it. The
      line is no longer needed, but it describes exactly what the node does,
      so there is nothing to warn about.

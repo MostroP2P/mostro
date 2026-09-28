@@ -170,7 +170,12 @@ parallel
  1. collect PerBtc quotes  → per-currency candidate lists (the "anchors")
  2. resolve PerBase quotes → currency/BTC = value × aggregate(base/BTC)   (§6.3)
  3. aggregate per currency → median + outlier guard / mean / single       (§6.2)
- 4. write store: { currency -> AggregatedPrice { value, as_of: now, sources } }
+ 4. write store: { currency -> AggregatedPrice { value, as_of: observed_at, written_at, sources } }
+    - `observed_at` is the tick's `now` for a directly-fetched rate, and the
+      source event's own `created_at` for one relayed over Nostr (§6.4).
+    - `written_at` is always the tick's `now`, even for a relayed rate — it
+      answers "did our tick refresh it?" (the freshness warning), while
+      `as_of` answers "how old is this price?" (the TTL).
     - currencies with zero fresh contributors this tick keep their prior
       AggregatedPrice (last-known-good, old `as_of`).
         │
@@ -338,18 +343,61 @@ El Toque's CUP/MLC need at least one direct USD source to be live.
 
 ### 6.4 Staleness (last-known-good + TTL)
 
-Each currency's stored `AggregatedPrice` carries `as_of` = the timestamp
-of the last tick that produced a fresh aggregate for it.
+Each currency's stored `AggregatedPrice` carries `as_of` = the time the
+served value was **observed**, which is not in general the time of the tick
+that stored it (see the first bullet).
 
-- A tick that yields a fresh value overwrites the entry with `as_of = now`.
+- A tick that yields a fresh value overwrites the entry with `as_of` = when
+  the value was **observed**. For a directly-fetched rate that is the tick's
+  `now` (the HTTP request returns the rate as of now). For a rate relayed
+  over Nostr it is the source event's own `created_at`, so the provider's
+  acceptance window and this serving window do not stack: a relayed price is
+  bounded at one `max_price_staleness_seconds` from observation, whatever age
+  the event arrived with (issue #860). The same applies to a fiat-cross
+  currency resolved against a Nostr-sourced anchor
+  (`nostr_anchor_dependent`, §6.3), which is no fresher than that anchor.
+- A **backdated** write never moves `as_of` backwards: one carrying an
+  observation older than the one already stored is dropped, so a relayed rate
+  predating a direct fetch cannot shorten a currency's remaining serving
+  window. The guard defers only to a stamp the writing clock could still
+  have produced (`prior.as_of <= now`): after a backwards clock step the
+  held stamp sits in the future while every event the provider can still
+  accept (`created_at <= now`) predates it, so an unconditional guard would
+  drop every relayed write until the clock climbed back — the same freeze,
+  one layer down. A **directly-fetched** write is not guarded at all, on
+  purpose — it is this node's own authoritative observation and must land
+  even when the wall clock has stepped backwards behind a stamp already
+  held, since dropping it would freeze the price while still serving it as
+  fresh.
 - A tick with zero contributors for a currency leaves the prior entry
   untouched (old `as_of`).
+- Because `as_of` can predate the tick, a fresh aggregate is **not** the same
+  thing as a servable one: a relayed event admitted at the edge of the
+  provider's acceptance window can already be past the TTL when it is
+  written. The tick report therefore carries `servable_currencies` — every
+  stored entry inside the TTL, which is what `get_price` would serve right
+  now. It is deliberately not "fresh": an entry counted there may be old
+  enough to trigger the stale warning while still being served, and it may
+  come from an earlier tick. Both narrower counts mislead the operator, in
+  opposite directions — the size of the tick's aggregate map names
+  currencies the tick just stamped past the TTL, while restricting to the
+  tick's own currencies omits the last-known-good values a partial outage
+  leaves behind.
 - `PriceManager::get_price(ccy)`:
   - entry missing → `Err(NoCurrency)`.
   - `now - as_of <= max_price_staleness_seconds` → `Ok(value)` (a `warn!`
-    is logged once the value is older than one update interval).
+    is logged once the value is older than one update interval, measured
+    from `written_at` — when this node last wrote it — so a relayed rate
+    whose backdated `as_of` is already older than one interval does not warn
+    on a healthy node every tick).
   - else → `Err(PriceTooStale)` (§10.2). Market-priced create/take for
     that currency is refused with a clear message.
+
+  The two warnings measure different clocks and say so in the log line:
+  "not refreshed for Ns" (`written_at`) asks whether our tick is keeping
+  up, "observed Ns ago" (`as_of`) how old the price itself is. For a
+  relayed currency the two ages differ, so adjacent lines about one value
+  are not the same measurement repeated.
 
 `max_price_staleness_seconds` defaults to **1800** (30 min) — long enough
 to ride out short API outages, short enough that nobody trades on an
@@ -502,7 +550,7 @@ Phases 3 and 4 both depend on Phase 2 and can land in either order.
   `resolve_per_base(quotes, anchors) -> per_currency_candidates` (§6.3),
   `aggregate_tick(provider_results, cfg) -> HashMap<String, f64>` (steps
   1–3 of §5.3). No I/O, no globals.
-- `src/price/store.rs`: `AggregatedPrice { value, as_of, source_count }`,
+- `src/price/store.rs`: `AggregatedPrice { value, as_of, written_at, source_count }`,
   the `RwLock<HashMap<String, AggregatedPrice>>` store, and
   staleness-checked `get` (§6.4).
 - `src/price/config.rs`: `PriceSettings` + `ProviderConfig` serde types
@@ -883,6 +931,15 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
   with no in-provider outlier guard; operators mitigate by choosing
   `trusted_nodes` they actually trust, same as any other single-sourced
   provider.
+- **Publish cadence bounds the serving window.** A relayed rate is stamped
+  with the source event's `created_at`, not with when it arrived (§6.4), so
+  its serving window on this node is `max_price_staleness_seconds` **minus
+  the event's age on arrival** — not a full TTL from ingestion. A trusted
+  node publishing anywhere near the TTL cadence produces currencies that go
+  unservable rather than merely stale, where `main` before the #860 fix
+  served them. Choose `trusted_nodes` whose publish cadence
+  (`update_interval_seconds`, with `publish_to_nostr` enabled) is well under
+  this node's `max_price_staleness_seconds`.
 - **Client-side pubkey verification.** Even though the relay-side `authors`
   filter already restricts the query, the adapter re-checks each returned
   event's `pubkey` against `trusted_nodes` before trusting its content —

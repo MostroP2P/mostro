@@ -8,6 +8,7 @@ use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use std::str::FromStr;
 
 use mostro_core::db::Crud;
 use uuid::Uuid;
@@ -226,16 +227,17 @@ pub async fn dispute_action(
 ///
 /// This is a best-effort operation: if the dispute update or event publishing fails,
 /// errors are logged but not propagated, since the primary order operation has already
-/// succeeded.
+/// succeeded. The solver is notified via DM when one is assigned and the dispute
+/// reaches a terminal status. Non-terminal statuses do not trigger a notification.
 ///
 /// # Arguments
-/// * `pool` - Database connection pool
+/// * `ctx` - Application context containing the database pool and Nostr client
 /// * `order` - The order associated with the dispute
 /// * `new_status` - The new dispute status: `Released` after a release,
 ///   `SellerRefunded` after a cooperative cancel. Never `Settled`, which marks
 ///   a solver's `admin-settle`.
 /// * `my_keys` - Mostro's keys for signing the dispute event
-/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
+/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel", "release")
 pub async fn close_dispute_after_user_resolution(
     ctx: &AppContext,
     order: &Order,
@@ -247,6 +249,10 @@ pub async fn close_dispute_after_user_resolution(
     if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
         let dispute_id = dispute.id;
         let opened_at = dispute.created_at;
+
+        // Clone solver_pubkey before update, as dispute.update() consumes the struct
+        let solver_pubkey_opt = dispute.solver_pubkey.clone();
+
         dispute.status = new_status.to_string();
 
         if let Err(e) = dispute.update(pool).await {
@@ -275,7 +281,7 @@ pub async fn close_dispute_after_user_resolution(
                         dispute_id,
                         order.id,
                         order.seller_dispute,
-                        order.buyer_dispute,
+                        order.buyer_dispute
                     );
                     "unknown"
                 }
@@ -303,6 +309,38 @@ pub async fn close_dispute_after_user_resolution(
                         dispute_id,
                         e
                     );
+                }
+            }
+
+            // --- NOTIFY SOLVER ---
+            let solver_action = match new_status {
+                DisputeStatus::CooperativelyCanceled => Some(Action::CooperativeCancelAccepted),
+                DisputeStatus::SellerRefunded => Some(Action::CooperativeCancelAccepted),
+                DisputeStatus::Settled | DisputeStatus::Released => Some(Action::Released),
+                DisputeStatus::Initiated | DisputeStatus::InProgress => None,
+            };
+
+            if let (Some(action), Some(pk_str)) = (solver_action, solver_pubkey_opt.as_ref()) {
+                match PublicKey::from_str(pk_str) {
+                    Ok(solver_pubkey) => {
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            action,
+                            Some(Payload::Dispute(dispute_id, None)),
+                            solver_pubkey,
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse solver pubkey for dispute {} on order {}: {}",
+                            dispute_id,
+                            order.id,
+                            e
+                        );
+                    }
                 }
             }
         }

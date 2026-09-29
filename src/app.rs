@@ -853,6 +853,155 @@ mod tests {
         }
     }
 
+    /// Synchronous recognition (#857): a successful create, take or dispute
+    /// take adds the sender's trade key to the spam gate at once, so the
+    /// follow-up needs only the base `pow` without waiting for the periodic
+    /// rebuild. A failed dispatch, or any other action, grants nothing.
+    mod sync_recognition_tests {
+        use super::*;
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        /// Far above anything an unmined test event reaches by chance
+        /// (2^-20), so "dropped at first contact" is deterministic.
+        const FIRST_CONTACT_POW: u8 = 20;
+
+        /// A fresh, unmined kind-14 event from `trade` (full-privacy mode).
+        fn follow_up_from(trade: &Keys, mostro: &Keys) -> Event {
+            wrap_message_nip44(
+                &create_test_message(Action::FiatSent, None),
+                trade,
+                trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event")
+        }
+
+        async fn accepted(ctx: &AppContext, event: &Event, mostro: &Keys, gate: &SpamGate) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                FIRST_CONTACT_POW,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                Some(gate),
+            )
+            .await
+            .is_some()
+        }
+
+        fn unwrapped_from(trade: &Keys, action: Action) -> UnwrappedMessage {
+            UnwrappedMessage {
+                message: create_test_message(action, None),
+                signature: None,
+                sender: trade.public_key(),
+                identity: trade.public_key(),
+                created_at: Timestamp::now(),
+            }
+        }
+
+        async fn dispatch(gate: &SpamGate, trade: &Keys, action: Action, result: Result<()>) {
+            let unwrapped = unwrapped_from(trade, action.clone());
+            finalize_dispatch(
+                result,
+                unwrapped.message.clone(),
+                unwrapped,
+                &action,
+                Some(gate),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn follow_up_after_accepted_new_order_needs_only_base_pow() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+
+            assert!(
+                !accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "an unknown key below pow_first_contact is dropped"
+            );
+
+            dispatch(&gate, &trade, Action::NewOrder, Ok(())).await;
+
+            assert!(
+                accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "the follow-up must pass on base pow right after the create is accepted"
+            );
+        }
+
+        #[tokio::test]
+        async fn successful_create_take_and_dispute_take_recognize_the_sender() {
+            for action in [
+                Action::NewOrder,
+                Action::TakeSell,
+                Action::TakeBuy,
+                Action::AdminTakeDispute,
+            ] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+                dispatch(&gate, &trade, action.clone(), Ok(())).await;
+                assert!(
+                    gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} accepted must recognize the sender"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn failed_dispatch_grants_nothing() {
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let trade = create_test_keys();
+            let cant_do: Result<()> =
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidOrderStatus).into());
+
+            dispatch(&gate, &trade, Action::TakeSell, cant_do).await;
+
+            assert!(
+                !gate.is_known(&trade.public_key().to_string()),
+                "a cant-do must not open the known lane"
+            );
+        }
+
+        #[tokio::test]
+        async fn other_successful_actions_grant_nothing() {
+            // These succeed for any sender and tie no key to an order, so
+            // recognizing them would let one mined event buy a fast path.
+            for action in [
+                Action::Orders,
+                Action::LastTradeIndex,
+                Action::RestoreSession,
+                Action::FiatSent,
+            ] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+                dispatch(&gate, &trade, action.clone(), Ok(())).await;
+                assert!(
+                    !gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} must not recognize the sender"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn no_gate_installed_is_a_no_op() {
+            let trade = create_test_keys();
+            let unwrapped = unwrapped_from(&trade, Action::NewOrder);
+            finalize_dispatch(
+                Ok(()),
+                unwrapped.message.clone(),
+                unwrapped,
+                &Action::NewOrder,
+                None,
+            )
+            .await;
+        }
+    }
+
     /// Maintenance (drain) mode gate in [`accept_event`]: the three actions
     /// that open new escrow are answered with `CantDo(MaintenanceMode)` and
     /// persist nothing; everything else passes through unchanged.

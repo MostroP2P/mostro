@@ -2298,6 +2298,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_active_trade_pubkeys_keeps_takers_with_a_pending_bond() {
+        // A bonded take does not write the taker onto the order until the bond
+        // locks: the key lives only in `bonds`. The event loop recognizes it
+        // when the take is accepted (#857), and the rebuild must not undo that.
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        let waiting = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(
+            &pool,
+            waiting,
+            "waiting-taker-bond",
+            Some("maker"),
+            None,
+            None,
+        )
+        .await;
+        insert_bond(&pool, waiting, "taker_pending", "requested", 0).await;
+
+        // Terminal order: its taker bond is over, the key must drop out.
+        let done = uuid::Uuid::new_v4();
+        insert_order_with_pubkeys(&pool, done, "canceled", Some("maker_done"), None, None).await;
+        insert_bond(&pool, done, "taker_done", "requested", 0).await;
+
+        let keys: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert!(keys.contains("taker_pending"));
+        assert!(!keys.contains("taker_done"));
+    }
+
+    #[tokio::test]
     async fn find_active_trade_pubkeys_covers_active_and_disputed_excludes_terminal() {
         let pool = setup_orders_db().await.unwrap();
         setup_disputes_table(&pool).await;

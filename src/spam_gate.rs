@@ -186,6 +186,22 @@ mod tests {
     }
 
     #[test]
+    fn add_known_inserts_one_key_and_the_rebuild_still_prunes_it() {
+        let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+        gate.set_known(["a".to_string()]);
+
+        gate.add_known("b".to_string());
+        assert!(gate.is_known("a"), "an insert does not drop other keys");
+        assert!(gate.is_known("b"));
+        assert_eq!(gate.known_count(), 2);
+
+        // The periodic rebuild stays the only way out: a key that never became
+        // a real participant is gone after the next snapshot.
+        gate.set_known(["a".to_string()]);
+        assert!(!gate.is_known("b"));
+    }
+
+    #[test]
     fn replay_first_seen_then_duplicate() {
         let gate = SpamGate::new(REPLAY_WINDOW_SECS);
         let id = an_event_id("dup");
@@ -263,6 +279,8 @@ mod tests {
         assert_eq!(gate.known_count(), 0, "poisoned count degrades to 0");
         gate.set_known(["other".to_string()]); // must log-and-skip, not panic
         assert!(!gate.is_known("other"));
+        gate.add_known("added".to_string()); // same for a single insert
+        assert!(!gate.is_known("added"));
     }
 
     #[test]

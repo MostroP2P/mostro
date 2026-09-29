@@ -738,4 +738,136 @@ mod tests {
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
         assert_eq!(dispute.status, DisputeStatus::Released.to_string());
     }
+
+    /// When a dispute has a solver assigned and users resolve it via
+    /// cooperative cancel (SellerRefunded), the solver must receive
+    /// Action::CooperativeCancelAccepted so their client knows the case is closed.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_notifies_solver() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let solver = Keys::generate();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+
+        let mut dispute = Dispute::new(order.id, Status::Active.to_string());
+        dispute.solver_pubkey = Some(solver.public_key().to_string());
+        dispute.create(&pool).await.unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::CooperativelyCanceled,
+            &Keys::generate(),
+            "cooperative cancel",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let solver_msgs: Vec<_> = queue
+            .iter()
+            .filter(|(msg, dest)| {
+                *dest == solver.public_key()
+                    && msg.get_inner_message_kind().action == Action::CooperativeCancelAccepted
+                    && msg.get_inner_message_kind().id == Some(order.id)
+            })
+            .collect();
+
+        assert_eq!(solver_msgs.len(), 1);
+
+        // Verify the payload contains the dispute_id
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        let (msg, _) = solver_msgs[0];
+        assert!(matches!(
+            msg.get_inner_message_kind().payload,
+            Some(Payload::Dispute(id, None)) if id == dispute.id
+        ));
+    }
+
+    /// When a dispute has a solver assigned and users resolve it via
+    /// release (Settled), the solver must receive Action::Released
+    /// so their client knows the case is closed.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_notifies_solver_on_settled() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let solver = Keys::generate();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+
+        let mut dispute = Dispute::new(order.id, Status::Active.to_string());
+        dispute.solver_pubkey = Some(solver.public_key().to_string());
+        dispute.create(&pool).await.unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::Settled,
+            &Keys::generate(),
+            "release",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let solver_msgs: Vec<_> = queue
+            .iter()
+            .filter(|(msg, dest)| {
+                *dest == solver.public_key()
+                    && msg.get_inner_message_kind().action == Action::Released
+                    && msg.get_inner_message_kind().id == Some(order.id)
+            })
+            .collect();
+
+        assert_eq!(solver_msgs.len(), 1);
+
+        // Verify the payload contains the dispute_id
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        let (msg, _) = solver_msgs[0];
+        assert!(matches!(
+            msg.get_inner_message_kind().payload,
+            Some(Payload::Dispute(id, None)) if id == dispute.id
+        ));
+    }
+
+    /// When no solver is assigned (solver_pubkey is None), no DM is queued.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_skips_notification_without_solver() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+        Dispute::new(order.id, Status::Active.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::SellerRefunded,
+            &Keys::generate(),
+            "cooperative cancel",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        assert!(
+            queue
+                .iter()
+                .all(|(msg, _)| msg.get_inner_message_kind().id != Some(order.id)),
+            "No message should be queued when solver is not assigned"
+        );
+    }
 }

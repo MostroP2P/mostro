@@ -1,3 +1,4 @@
+use crate::app::bond::BondState;
 use crate::config::settings::Settings;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
@@ -127,6 +128,28 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
                 if !pk.is_empty() {
                     keys.insert(pk);
                 }
+            }
+        }
+    }
+
+    // Bonded parties of still-active orders. A bonded take writes the taker
+    // onto the order only once the bond locks; until then the key is only in
+    // `bonds`. The event loop adds it when the take is accepted (#857), and
+    // this keeps the rebuild from dropping it again before the lock.
+    let bond_query = format!(
+        "SELECT b.pubkey FROM bonds b JOIN orders o ON o.id = b.order_id \
+         WHERE b.state IN (?, ?) AND o.status NOT IN ({TERMINAL_ORDER_STATUSES})"
+    );
+    let bond_rows = sqlx::query(AssertSqlSafe(bond_query))
+        .bind(BondState::Requested.to_string())
+        .bind(BondState::Locked.to_string())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    for row in bond_rows {
+        if let Ok(pk) = row.try_get::<String, _>("pubkey") {
+            if !pk.is_empty() {
+                keys.insert(pk);
             }
         }
     }

@@ -449,18 +449,40 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
-/// Shared post-dispatch error handling (identical in both loops). A handler
-/// `Err` is downcast to a `MostroError` and turned into the right reply
-/// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
-/// with [`accept_event`] so `run` and `run_cashu` share one error tail (CF-5).
+/// Actions whose successful dispatch ties the sender's trade key to an order
+/// (creator or taker) or to a dispute (solver) — the same keys
+/// `find_active_trade_pubkeys` returns on the next rebuild. Anything that
+/// succeeds for any sender (`Orders`, `RestoreSession`, …) is left out, or one
+/// event mined at `pow_first_contact` would put its key on the fast lane.
+fn introduces_trade_key(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewOrder | Action::TakeSell | Action::TakeBuy | Action::AdminTakeDispute
+    )
+}
+
+/// Shared post-dispatch tail (identical in both loops). A handler `Err` is
+/// downcast to a `MostroError` and turned into the right reply
+/// (`manage_errors`) or logged (`warning_msg`). On `Ok`, an action that
+/// introduces a trade key adds it to the spam gate at once (#857), so the
+/// follow-up needs only the base `pow`. Factored out with [`accept_event`] so
+/// `run` and `run_cashu` share one tail (CF-5).
 async fn finalize_dispatch(
     result: Result<()>,
     message: Message,
     unwrapped: UnwrappedMessage,
     action: &Action,
+    gate: Option<&SpamGate>,
 ) {
-    if let Err(e) = result {
-        match e.downcast::<MostroError>() {
+    match result {
+        Ok(()) => {
+            if let Some(gate) = gate.filter(|_| introduces_trade_key(action)) {
+                // `sender` is the kind-14 author the gate checks, not the
+                // identity key.
+                gate.add_known(unwrapped.sender.to_string());
+            }
+        }
+        Err(e) => match e.downcast::<MostroError>() {
             Ok(err) => {
                 manage_errors(*err, message, unwrapped, action).await;
             }
@@ -468,7 +490,7 @@ async fn finalize_dispatch(
                 tracing::error!("Unexpected error type: {}", e);
                 warning_msg(action, ServiceError::UnexpectedError(e.to_string()));
             }
-        }
+        },
     }
 }
 
@@ -522,7 +544,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                     &ctx,
                 )
                 .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(result, message, unwrapped, &action, gate).await;
             }
         }
     }
@@ -565,7 +587,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                 };
                 let result =
                     dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(result, message, unwrapped, &action, gate).await;
             }
         }
     }

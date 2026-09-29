@@ -63,9 +63,9 @@ pub async fn start_scheduler(ctx: AppContext) {
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
 /// cache from the DB (spec §6 Phase 2). Status mutations are scattered across
 /// many handlers with no single choke-point, so a periodic full reload is the
-/// robust, low-coupling refresh strategy: a just-taken order's keys begin
-/// fast-pathing within one `active_pubkeys_refresh_interval`. Inert on the v1
-/// transport (the event loop only consults the gate for kind-14 events).
+/// robust, low-coupling refresh strategy. The event loop also adds a key the
+/// moment it accepts a create or take (#857); this rebuild is what prunes keys
+/// whose orders have gone terminal.
 async fn job_refresh_active_pubkeys(ctx: AppContext) {
     let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
     tokio::spawn(async move {

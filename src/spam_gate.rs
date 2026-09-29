@@ -8,7 +8,8 @@
 //! 1. **Active-trade-pubkey cache** — the set of trade keys that legitimately
 //!    message Mostro right now (participants of non-terminal orders + active
 //!    dispute solvers). Rebuilt periodically from the DB by a scheduler job
-//!    (`job_refresh_active_pubkeys`) and warmed once at startup.
+//!    (`job_refresh_active_pubkeys`), warmed once at startup, and topped up
+//!    one key at a time when a create or take is accepted (#857).
 //! 2. **Replay guard** — a short-window dedup of seen event ids, so a flood of
 //!    re-sent identical events is dropped before decryption (defense in depth).
 //!
@@ -117,6 +118,20 @@ impl SpamGate {
                 *set = keys.into_iter().collect();
             }
             Err(_) => tracing::error!("spam_gate: known-keys lock poisoned; skipping refresh"),
+        }
+    }
+
+    /// Add one key the moment the daemon accepts the event that ties it to an
+    /// order or dispute (#857), so its follow-ups need only the base `pow`
+    /// without waiting for the next rebuild. There is no single-key removal:
+    /// [`SpamGate::set_known`] rebuilds stay the only way a key leaves the set.
+    /// A poisoned lock is logged and skipped, like `set_known`.
+    pub fn add_known(&self, pubkey: String) {
+        match self.known.write() {
+            Ok(mut set) => {
+                set.insert(pubkey);
+            }
+            Err(_) => tracing::error!("spam_gate: known-keys lock poisoned; skipping insert"),
         }
     }
 

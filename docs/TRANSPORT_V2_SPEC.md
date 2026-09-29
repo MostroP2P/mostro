@@ -318,16 +318,30 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   invoice right after a take.
 
   So `finalize_dispatch` (`src/app.rs`), the tail both event loops share,
-  adds the sender's trade key to the cache (`SpamGate::add_known`) as soon as
-  a `new-order`, `take-sell`, `take-buy` or `admin-take-dispute` is handled
-  **without error** — the actions that tie a key to an order or a dispute. A
-  `cant-do` adds nothing, and neither does any action that succeeds for any
-  sender (`orders`, `restore-session`, …): otherwise one event mined at
-  `pow_first_contact` would put a key on the fast lane. The next rebuild
-  prunes a key that never became a participant. `find_active_trade_pubkeys`
-  also returns the key of a bond in `requested` or `locked` on a non-terminal
-  order, because a bonded take writes the taker onto the order only once the
-  bond locks, and the rebuild must not drop that taker in between.
+  checks the sender after every `new-order`, `take-sell`, `take-buy` or
+  `admin-take-dispute`: if `db::is_active_trade_pubkey` says the DB now ties
+  that trade key to an order or dispute, the key goes into the cache
+  (`SpamGate::add_known`). The answer comes from committed state, not from
+  the handler result, because a handler can store the order and then fail a
+  later step (the broadcast), and a `cant-do` stores nothing. The lookup
+  applies the same three arms as `find_active_trade_pubkeys`, pinned by a
+  test, so recognition grants exactly the keys the next rebuild would: a
+  rejected request buys nothing, and no other action triggers a lookup.
+
+  `find_active_trade_pubkeys` also returns the key of a bond in `requested`
+  or `locked` on a non-terminal order, because a bonded take writes the
+  taker onto the order only once the bond locks.
+
+  A rebuild reads the DB before it replaces the set, so a create committed
+  in between would be dropped by its stale snapshot. The scheduler takes a
+  mark (`begin_rebuild`) before the read, and `finish_rebuild` keeps every
+  key added after the mark; the following rebuild judges those on its own
+  snapshot, so pruning is late by one interval at most.
+
+  A dispute take stores the solver's **identity**, and that is the key the
+  rebuild returns. Solvers are therefore recognized when they send from
+  their identity, which is what the admin clients do; a solver that sends
+  from a separate trade key keeps paying `pow_first_contact`.
 
   app v1 and mostro-cli do not read `pow_first_contact` at all: they mine
   every event at `pow`. On a node that sets `pow_first_contact` above `pow`,

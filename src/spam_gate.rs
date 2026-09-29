@@ -78,9 +78,24 @@ impl ReplayGuard {
     }
 }
 
+/// Taken by [`SpamGate::begin_rebuild`] before a rebuild reads the DB, and
+/// handed back to [`SpamGate::finish_rebuild`] with the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildMark(u64);
+
+/// The known-keys set, plus the keys [`SpamGate::add_known`] inserted and when
+/// (a sequence number), so a rebuild can tell which of them its snapshot may
+/// have missed.
+#[derive(Default)]
+struct KnownKeys {
+    set: HashSet<String>,
+    added: HashMap<String, u64>,
+    next_seq: u64,
+}
+
 /// The anti-spam gate: known-keys cache + replay guard.
 pub struct SpamGate {
-    known: RwLock<HashSet<String>>,
+    known: RwLock<KnownKeys>,
     replay: Mutex<ReplayGuard>,
 }
 
@@ -88,7 +103,7 @@ impl SpamGate {
     /// Build an empty gate with the given replay window.
     pub fn new(replay_window_secs: i64) -> Self {
         Self {
-            known: RwLock::new(HashSet::new()),
+            known: RwLock::new(KnownKeys::default()),
             replay: Mutex::new(ReplayGuard::new(replay_window_secs)),
         }
     }
@@ -108,28 +123,57 @@ impl SpamGate {
         SPAM_GATE.get()
     }
 
-    /// Replace the known-keys set wholesale with the latest snapshot from the
-    /// DB. A poisoned lock is logged and skipped — a stale cache only costs a
-    /// few legitimate keys a trip through the first-contact lane, never a
-    /// crash.
+    /// Replace the known-keys set wholesale (the startup warm, before the
+    /// event loop runs). A poisoned lock is logged and skipped — a stale cache
+    /// only costs a few legitimate keys a trip through the first-contact lane,
+    /// never a crash. The periodic rebuild uses
+    /// [`SpamGate::begin_rebuild`] / [`SpamGate::finish_rebuild`] instead.
     pub fn set_known<I: IntoIterator<Item = String>>(&self, keys: I) {
         match self.known.write() {
-            Ok(mut set) => {
-                *set = keys.into_iter().collect();
+            Ok(mut known) => {
+                known.set = keys.into_iter().collect();
+                known.added.clear();
             }
             Err(_) => tracing::error!("spam_gate: known-keys lock poisoned; skipping refresh"),
         }
     }
 
-    /// Add one key the moment the daemon accepts the event that ties it to an
-    /// order or dispute (#857), so its follow-ups need only the base `pow`
+    /// Mark the start of a periodic rebuild. Call it **before** reading the
+    /// DB: a key added after this point may belong to a commit the snapshot
+    /// did not see, so [`SpamGate::finish_rebuild`] keeps it.
+    pub fn begin_rebuild(&self) -> RebuildMark {
+        RebuildMark(self.known.read().map(|known| known.next_seq).unwrap_or(0))
+    }
+
+    /// Replace the set with a DB snapshot taken after `mark`, keeping the keys
+    /// added since `mark` (#857). Without that, a rebuild that read the DB
+    /// just before a create or take committed would drop the key the event
+    /// loop added right after. A kept key is judged by the next rebuild, so it
+    /// outlives a snapshot that does not contain it by one interval at most.
+    pub fn finish_rebuild<I: IntoIterator<Item = String>>(&self, mark: RebuildMark, keys: I) {
+        match self.known.write() {
+            Ok(mut known) => {
+                known.added.retain(|_, seq| *seq >= mark.0);
+                let mut set: HashSet<String> = keys.into_iter().collect();
+                set.extend(known.added.keys().cloned());
+                known.set = set;
+            }
+            Err(_) => tracing::error!("spam_gate: known-keys lock poisoned; skipping refresh"),
+        }
+    }
+
+    /// Add one key the moment the event loop sees it tied to an order or
+    /// dispute in the DB (#857), so its follow-ups need only the base `pow`
     /// without waiting for the next rebuild. There is no single-key removal:
-    /// [`SpamGate::set_known`] rebuilds stay the only way a key leaves the set.
-    /// A poisoned lock is logged and skipped, like `set_known`.
+    /// rebuilds stay the only way a key leaves the set. A poisoned lock is
+    /// logged and skipped, like `set_known`.
     pub fn add_known(&self, pubkey: String) {
         match self.known.write() {
-            Ok(mut set) => {
-                set.insert(pubkey);
+            Ok(mut known) => {
+                let seq = known.next_seq;
+                known.next_seq += 1;
+                known.added.insert(pubkey.clone(), seq);
+                known.set.insert(pubkey);
             }
             Err(_) => tracing::error!("spam_gate: known-keys lock poisoned; skipping insert"),
         }
@@ -141,13 +185,13 @@ impl SpamGate {
     pub fn is_known(&self, pubkey: &str) -> bool {
         self.known
             .read()
-            .map(|set| set.contains(pubkey))
+            .map(|known| known.set.contains(pubkey))
             .unwrap_or(false)
     }
 
     /// Number of cached active keys (diagnostics / tests).
     pub fn known_count(&self) -> usize {
-        self.known.read().map(|set| set.len()).unwrap_or(0)
+        self.known.read().map(|known| known.set.len()).unwrap_or(0)
     }
 
     /// Record `id` and report whether it is a replay to drop. A poisoned lock
@@ -201,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn add_known_inserts_one_key_and_the_rebuild_still_prunes_it() {
+    fn add_known_inserts_one_key_and_a_later_rebuild_prunes_it() {
         let gate = SpamGate::new(REPLAY_WINDOW_SECS);
         gate.set_known(["a".to_string()]);
 
@@ -210,10 +254,32 @@ mod tests {
         assert!(gate.is_known("b"));
         assert_eq!(gate.known_count(), 2);
 
-        // The periodic rebuild stays the only way out: a key that never became
-        // a real participant is gone after the next snapshot.
-        gate.set_known(["a".to_string()]);
+        // A rebuild that starts after the insert saw the DB as it stood then:
+        // a key missing from that snapshot is gone.
+        let mark = gate.begin_rebuild();
+        gate.finish_rebuild(mark, ["a".to_string()]);
         assert!(!gate.is_known("b"));
+    }
+
+    #[test]
+    fn insert_during_a_rebuild_survives_the_stale_snapshot() {
+        let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+        gate.set_known(["a".to_string()]);
+
+        // The rebuild reads the DB, then the create commits and the event
+        // loop adds its key, then the rebuild installs its (stale) snapshot.
+        let mark = gate.begin_rebuild();
+        gate.add_known("new".to_string());
+        gate.finish_rebuild(mark, ["a".to_string()]);
+        assert!(gate.is_known("new"), "a stale snapshot must not drop it");
+
+        // The next rebuild judges it on its own snapshot.
+        let mark = gate.begin_rebuild();
+        gate.finish_rebuild(mark, ["a".to_string(), "new".to_string()]);
+        assert!(gate.is_known("new"), "still active in the DB");
+        let mark = gate.begin_rebuild();
+        gate.finish_rebuild(mark, ["a".to_string()]);
+        assert!(!gate.is_known("new"), "pruned once the DB drops it");
     }
 
     #[test]

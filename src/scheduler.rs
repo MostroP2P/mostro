@@ -70,11 +70,15 @@ async fn job_refresh_active_pubkeys(ctx: AppContext) {
     let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
     tokio::spawn(async move {
         loop {
+            let gate = crate::spam_gate::SpamGate::global();
+            // Before the DB read, so keys the event loop adds while it runs
+            // survive this snapshot (#857).
+            let mark = gate.map(|gate| gate.begin_rebuild());
             match find_active_trade_pubkeys(ctx.pool()).await {
                 Ok(keys) => {
-                    if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                    if let (Some(gate), Some(mark)) = (gate, mark) {
                         let n = keys.len();
-                        gate.set_known(keys);
+                        gate.finish_rebuild(mark, keys);
                         tracing::debug!(
                             "spam_gate: refreshed active-trade-pubkey cache ({n} keys)"
                         );

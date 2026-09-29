@@ -174,6 +174,39 @@ pub async fn find_active_trade_pubkeys(pool: &SqlitePool) -> Result<Vec<String>,
     Ok(keys.into_iter().collect())
 }
 
+/// Would [`find_active_trade_pubkeys`] return `pubkey` right now? The same
+/// three arms, asked for one key, so the event loop can recognize a trade key
+/// from committed state the moment a create or take is handled (#857),
+/// whatever the handler returned. `pinned_same_keys_as_the_rebuild` keeps the
+/// two in step.
+pub async fn is_active_trade_pubkey(pool: &SqlitePool, pubkey: &str) -> Result<bool, MostroError> {
+    if pubkey.is_empty() {
+        return Ok(false);
+    }
+    // `?1` is the key. The bare `?` inside `HAS_CLAIMABLE_BOND_PAYOUT` comes
+    // after it, so SQLite numbers it `?2`; the bond states are `?3` and `?4`.
+    // `HAS_CLAIMABLE_BOND_PAYOUT` refers to `orders.id`, so the first arm
+    // keeps the table unaliased.
+    let query = format!(
+        "SELECT EXISTS (SELECT 1 FROM orders \
+             WHERE ?1 IN (buyer_pubkey, seller_pubkey, creator_pubkey) \
+             AND (status NOT IN ({TERMINAL_ORDER_STATUSES}) OR {HAS_CLAIMABLE_BOND_PAYOUT})) \
+         OR EXISTS (SELECT 1 FROM bonds b JOIN orders o ON o.id = b.order_id \
+             WHERE b.pubkey = ?1 AND b.state IN (?3, ?4) \
+             AND o.status NOT IN ({TERMINAL_ORDER_STATUSES})) \
+         OR EXISTS (SELECT 1 FROM disputes \
+             WHERE solver_pubkey = ?1 AND status IN ({ACTIVE_DISPUTE_STATUSES}))"
+    );
+    sqlx::query_scalar::<_, bool>(AssertSqlSafe(query))
+        .bind(pubkey)
+        .bind(claim_window_cutoff())
+        .bind(BondState::Requested.to_string())
+        .bind(BondState::Locked.to_string())
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Removes deprecated `buyer_token` and `seller_token` columns from the disputes table if present.
 ///
 /// Both drops run inside a single transaction so either both succeed or neither does.
@@ -2353,6 +2386,116 @@ mod tests {
 
         assert!(keys.contains("taker_pending"));
         assert!(!keys.contains("taker_done"));
+    }
+
+    /// `is_active_trade_pubkey` must agree with the rebuild key by key, on
+    /// every arm: a key it recognizes that the rebuild would drop, or the
+    /// reverse, brings back the lag #857 removes.
+    #[tokio::test]
+    async fn is_active_trade_pubkey_pinned_same_keys_as_the_rebuild() {
+        let pool = setup_orders_db().await.unwrap();
+        setup_disputes_table(&pool).await;
+
+        let order = |status: &'static str, prefix: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let id = uuid::Uuid::new_v4();
+                let (c, b, s) = (
+                    format!("{prefix}_creator"),
+                    format!("{prefix}_buyer"),
+                    format!("{prefix}_seller"),
+                );
+                insert_order_with_pubkeys(&pool, id, status, Some(&c), Some(&b), Some(&s)).await;
+                id
+            }
+        };
+        order("active", "active").await;
+        order("dispute", "disputed").await;
+        order("success", "done").await;
+        let owed = order("canceled-by-admin", "owed").await;
+        insert_bond(
+            &pool,
+            owed,
+            "owed_buyer",
+            "pending-payout",
+            slashed_at_within_window(),
+        )
+        .await;
+        let failed_old = order("canceled-by-admin", "failed_old").await;
+        insert_bond(
+            &pool,
+            failed_old,
+            "failed_old_buyer",
+            "failed",
+            slashed_at_outside_window(),
+        )
+        .await;
+        let bonded = order("waiting-taker-bond", "bonded").await;
+        insert_bond(&pool, bonded, "bond_taker", "requested", 0).await;
+        let bonded_done = order("expired", "bonded_done").await;
+        insert_bond(&pool, bonded_done, "bond_taker_done", "locked", 0).await;
+        for (status, solver) in [("in-progress", "solver_active"), ("settled", "solver_done")] {
+            sqlx::query(
+                "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+                 VALUES (?1, ?2, ?3, 'fiat-sent', ?4, 1700000000)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(solver)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let rebuilt: HashSet<String> = super::find_active_trade_pubkeys(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut candidates: Vec<String> = [
+            "active",
+            "disputed",
+            "done",
+            "owed",
+            "failed_old",
+            "bonded",
+            "bonded_done",
+        ]
+        .iter()
+        .flat_map(|p| ["creator", "buyer", "seller"].map(|r| format!("{p}_{r}")))
+        .collect();
+        candidates.extend(
+            [
+                "bond_taker",
+                "bond_taker_done",
+                "solver_active",
+                "solver_done",
+                "stranger",
+                "",
+            ]
+            .map(String::from),
+        );
+
+        for key in &candidates {
+            assert_eq!(
+                super::is_active_trade_pubkey(&pool, key).await.unwrap(),
+                rebuilt.contains(key),
+                "is_active_trade_pubkey and the rebuild disagree on {key:?}"
+            );
+        }
+        // The fixture exercises both answers on every arm.
+        for key in ["active_buyer", "owed_seller", "bond_taker", "solver_active"] {
+            assert!(rebuilt.contains(key), "{key} should be active");
+        }
+        for key in [
+            "done_buyer",
+            "failed_old_buyer",
+            "bond_taker_done",
+            "solver_done",
+        ] {
+            assert!(!rebuilt.contains(key), "{key} should not be active");
+        }
     }
 
     #[tokio::test]

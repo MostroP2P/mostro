@@ -173,17 +173,54 @@ pub async fn dispute_action(
     order
         .setup_dispute(is_buyer_dispute)
         .map_err(MostroCantDo)?;
-    order
-        .clone()
-        .update(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
-    // Save dispute to database
-    let dispute = dispute
-        .create(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    // The dispute row and the order's flag + status land together or not at
+    // all: either half alone strands the order (#921).
+    //
+    // Raw sqlx because `Crud::create`/`update` take `&Pool<Sqlite>`, not an
+    // executor, so they cannot join a transaction. sqlx-crud, which
+    // mostro-core#154 replaced, was generic over the executor; this works
+    // around what that rewrite narrowed. The column list mirrors
+    // `Crud::create`'s, so a new `disputes` column upstream has to be added
+    // here too — until an executor-generic `Crud` makes this call site
+    // unnecessary.
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
+         created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(dispute.id)
+    .bind(dispute.order_id)
+    .bind(&dispute.status)
+    .bind(&dispute.order_previous_status)
+    .bind(&dispute.solver_pubkey)
+    .bind(dispute.created_at)
+    .bind(dispute.taken_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Only what `setup_dispute` changed, not the whole row from a snapshot,
+    // and only if the order is still in the status `get_valid_order` admitted
+    // — `dispute.order_previous_status` is that status. Matching on `id`
+    // alone would let a release or a `fiat_sent` that committed in between be
+    // dragged back to `Dispute`; a miss rolls the inserted row back with it.
+    let updated = sqlx::query(
+        "UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? \
+         WHERE id = ? AND status = ?",
+    )
+    .bind(&order.status)
+    .bind(order.buyer_dispute)
+    .bind(order.seller_dispute)
+    .bind(order.id)
+    .bind(&dispute.order_previous_status)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    tx.commit().await.map_err(db_err)?;
 
     // Get pubkeys of initiator and counterpart
     let (initiator_pubkey, counterpart_pubkey) = if is_buyer_dispute {

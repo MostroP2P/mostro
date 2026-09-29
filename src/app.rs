@@ -449,16 +449,55 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
-/// Shared post-dispatch error handling (identical in both loops). A handler
-/// `Err` is downcast to a `MostroError` and turned into the right reply
-/// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
-/// with [`accept_event`] so `run` and `run_cashu` share one error tail (CF-5).
+/// Actions that can tie the sender's trade key to an order (creator or taker)
+/// or to a dispute (solver). Only these are worth a recognition lookup after
+/// dispatch; every other action either needs no new key or already came from
+/// a recognized one.
+fn introduces_trade_key(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewOrder | Action::TakeSell | Action::TakeBuy | Action::AdminTakeDispute
+    )
+}
+
+/// Add the sender's trade key to the spam gate if the DB now ties it to an
+/// order or dispute (#857), so its follow-up needs only the base `pow`.
+///
+/// It asks the DB rather than trusting the handler result, for two reasons:
+/// a handler can commit and then fail on a later step (a new order is stored
+/// before its broadcast), and a handler can succeed without storing anything.
+/// Recognition then grants exactly the keys the next rebuild would, never one
+/// that a rejected request introduced.
+///
+/// A dispute take stores the solver's identity, so a solver is recognized when
+/// it sends from that identity (as the admin clients do); a solver sending
+/// from a separate key keeps paying `pow_first_contact`, as before.
+async fn recognize_sender(ctx: &AppContext, gate: &SpamGate, unwrapped: &UnwrappedMessage) {
+    let sender = unwrapped.sender.to_string();
+    match crate::db::is_active_trade_pubkey(ctx.pool(), &sender).await {
+        Ok(true) => gate.add_known(sender),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("spam_gate: recognition lookup failed: {e}"),
+    }
+}
+
+/// Shared post-dispatch tail (identical in both loops). An action that may
+/// introduce a trade key is first checked for recognition
+/// ([`recognize_sender`]); then a handler `Err` is downcast to a `MostroError`
+/// and turned into the right reply (`manage_errors`) or logged
+/// (`warning_msg`). Factored out with [`accept_event`] so `run` and
+/// `run_cashu` share one tail (CF-5).
 async fn finalize_dispatch(
+    ctx: &AppContext,
     result: Result<()>,
     message: Message,
     unwrapped: UnwrappedMessage,
     action: &Action,
+    gate: Option<&SpamGate>,
 ) {
+    if let Some(gate) = gate.filter(|_| introduces_trade_key(action)) {
+        recognize_sender(ctx, gate, &unwrapped).await;
+    }
     if let Err(e) = result {
         match e.downcast::<MostroError>() {
             Ok(err) => {
@@ -522,7 +561,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                     &ctx,
                 )
                 .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }
     }
@@ -565,7 +604,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                 };
                 let result =
                     dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }
     }
@@ -850,6 +889,246 @@ mod tests {
             )
             .await;
             assert!(accepted.is_none());
+        }
+    }
+
+    /// Synchronous recognition (#857): after a create, take or dispute take,
+    /// the sender's trade key enters the spam gate as soon as the DB ties it
+    /// to an order or dispute, so the follow-up needs only the base `pow`
+    /// without waiting for the periodic rebuild. The handler result does not
+    /// decide it: committed state does.
+    mod sync_recognition_tests {
+        use super::*;
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        use mostro_core::order::{Kind as OrderKind, SmallOrder};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        /// Far above anything an unmined test event reaches by chance
+        /// (2^-20), so "dropped at first contact" is deterministic.
+        const FIRST_CONTACT_POW: u8 = 20;
+
+        /// A fresh, unmined kind-14 event from `trade` (full-privacy mode).
+        fn follow_up_from(trade: &Keys, mostro: &Keys) -> Event {
+            wrap_message_nip44(
+                &create_test_message(Action::FiatSent, None),
+                trade,
+                trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event")
+        }
+
+        async fn accepted(ctx: &AppContext, event: &Event, mostro: &Keys, gate: &SpamGate) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                FIRST_CONTACT_POW,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                Some(gate),
+            )
+            .await
+            .is_some()
+        }
+
+        async fn dispatch(
+            ctx: &AppContext,
+            gate: &SpamGate,
+            trade: &Keys,
+            action: Action,
+            result: Result<()>,
+        ) {
+            let unwrapped = UnwrappedMessage {
+                message: create_test_message(action.clone(), None),
+                signature: None,
+                sender: trade.public_key(),
+                identity: trade.public_key(),
+                created_at: Timestamp::now(),
+            };
+            finalize_dispatch(
+                ctx,
+                result,
+                unwrapped.message.clone(),
+                unwrapped,
+                &action,
+                Some(gate),
+            )
+            .await;
+        }
+
+        /// Store a pending sell order made by `trade` the way the real
+        /// `new-order` handler does. The offline test client cannot broadcast,
+        /// so, like on a node whose relays are down, `publish_order` commits
+        /// the row and then returns an error.
+        async fn store_order_failing_at_broadcast(ctx: &AppContext, trade: &Keys) -> Result<()> {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let _ = crate::config::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
+            let order = SmallOrder {
+                kind: Some(OrderKind::Sell),
+                amount: 1_000,
+                fiat_code: "USD".to_string(),
+                fiat_amount: 100,
+                payment_method: "SEPA".to_string(),
+                ..Default::default()
+            };
+            let pk = trade.public_key();
+            let result = crate::util::publish_order(
+                ctx.pool(),
+                &create_test_keys(),
+                &order,
+                pk,
+                pk,
+                pk,
+                Some(1),
+                Some(1),
+            )
+            .await;
+            assert!(result.is_err(), "the broadcast must fail offline");
+            result.map_err(Into::into)
+        }
+
+        #[tokio::test]
+        async fn follow_up_after_a_stored_order_needs_only_base_pow_even_if_publishing_failed() {
+            let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+
+            assert!(
+                !accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "an unknown key below pow_first_contact is dropped"
+            );
+
+            let result = store_order_failing_at_broadcast(&ctx, &trade).await;
+            dispatch(&ctx, &gate, &trade, Action::NewOrder, result).await;
+
+            assert!(
+                accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "the order is stored, so its follow-up must pass on base pow"
+            );
+        }
+
+        #[tokio::test]
+        async fn every_introducing_action_recognizes_a_stored_key() {
+            for action in [
+                Action::NewOrder,
+                Action::TakeSell,
+                Action::TakeBuy,
+                Action::AdminTakeDispute,
+            ] {
+                let ctx = create_migrated_ctx().await;
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+                let _ = store_order_failing_at_broadcast(&ctx, &trade).await;
+
+                dispatch(&ctx, &gate, &trade, action.clone(), Ok(())).await;
+
+                assert!(
+                    gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} must recognize a key the DB ties to an order"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn nothing_stored_grants_nothing_whatever_the_result() {
+            let ctx = create_migrated_ctx().await;
+            let cant_do: Result<()> =
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidOrderStatus).into());
+            for result in [cant_do, Ok(())] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+
+                dispatch(&ctx, &gate, &trade, Action::TakeSell, result).await;
+
+                assert!(
+                    !gate.is_known(&trade.public_key().to_string()),
+                    "a key tied to nothing must not open the known lane"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn other_actions_are_left_to_the_rebuild() {
+            // No lookup for actions that cannot introduce a key, even when the
+            // key is active: the periodic rebuild already covers them.
+            let ctx = create_migrated_ctx().await;
+            let trade = create_test_keys();
+            let _ = store_order_failing_at_broadcast(&ctx, &trade).await;
+            for action in [
+                Action::Orders,
+                Action::LastTradeIndex,
+                Action::RestoreSession,
+                Action::FiatSent,
+            ] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                dispatch(&ctx, &gate, &trade, action.clone(), Ok(())).await;
+                assert!(
+                    !gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} must not trigger recognition"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn solver_is_recognized_by_the_identity_the_dispute_stores() {
+            // `admin-take-dispute` stores the solver's identity; the rebuild
+            // returns that key and nothing else, so recognition follows it: a
+            // solver sending from its identity is fast-pathed, a separate
+            // trade key is not (it would be dropped again at the next rebuild).
+            let ctx = create_migrated_ctx().await;
+            let solver = create_test_keys();
+            let other_key = create_test_keys();
+            sqlx::query(
+                "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+                 VALUES (?1, ?2, 'in-progress', 'fiat-sent', ?3, 1700000000)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(uuid::Uuid::new_v4())
+            .bind(solver.public_key().to_string())
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let from_other_key = UnwrappedMessage {
+                message: create_test_message(Action::AdminTakeDispute, None),
+                signature: None,
+                sender: other_key.public_key(),
+                identity: solver.public_key(),
+                created_at: Timestamp::now(),
+            };
+            finalize_dispatch(
+                &ctx,
+                Ok(()),
+                from_other_key.message.clone(),
+                from_other_key,
+                &Action::AdminTakeDispute,
+                Some(&gate),
+            )
+            .await;
+            assert!(!gate.is_known(&other_key.public_key().to_string()));
+
+            dispatch(&ctx, &gate, &solver, Action::AdminTakeDispute, Ok(())).await;
+            assert!(gate.is_known(&solver.public_key().to_string()));
+        }
+
+        #[tokio::test]
+        async fn no_gate_installed_is_a_no_op() {
+            let ctx = create_migrated_ctx().await;
+            let unwrapped = create_test_unwrapped_message();
+            finalize_dispatch(
+                &ctx,
+                Ok(()),
+                unwrapped.message.clone(),
+                unwrapped,
+                &Action::NewOrder,
+                None,
+            )
+            .await;
         }
     }
 

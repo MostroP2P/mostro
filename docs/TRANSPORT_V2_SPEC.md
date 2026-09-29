@@ -268,7 +268,10 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   `active_pubkeys_refresh_interval` seconds (default 60) by
   `scheduler::job_refresh_active_pubkeys` — a periodic full reload, chosen
   because status mutations are scattered across handlers with no single
-  choke-point. Global-singleton (`OnceLock`), mirroring `PriceManager`.
+  choke-point. Keys are also added one at a time when the daemon accepts the
+  event that introduces them (see "Recognition at acceptance" below); the
+  rebuild stays the only way a key leaves the set. Global-singleton
+  (`OnceLock`), mirroring `PriceManager`.
 - **Cheap pre-validation in the event loop** (`src/app.rs`), for kind 14,
   **before** `unwrap_incoming` decrypts: check `event.pubkey` against the
   cache.
@@ -303,30 +306,42 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
   reply — it never reaches a handler — so the info event is the only way a
   client can learn what the first-contact lane costs. The published value is
-  the *enforced* difficulty (`advertised_first_contact_pow`): on `nip44`
+  the *enforced* difficulty (`advertised_first_contact_pow`):
   `max(pow, effective_pow_first_contact())` — a max because the two checks run
-  in sequence, so a `pow_first_contact` below `pow` still enforces `pow` — and
-  on `gift-wrap` just `pow`, since the gate never runs there and advertising the
-  stiffer number would make clients grind work nobody checks.
-- **Known gap: recognition lags acceptance.** Accepting a create or take
-  does *not* insert that trade key into the cache;
-  `job_refresh_active_pubkeys` is the only writer after startup and rebuilds
-  the whole set on its interval. Until the next rebuild — up to one
-  `active_pubkeys_refresh_interval` (default 60 s), longer if a reload fails —
-  the key is still treated as first contact, so a follow-up mined at `pow`
-  (the invoice right after a take, for example) is silently dropped on a node
-  whose `pow_first_contact` is above `pow`.
+  in sequence, so a `pow_first_contact` below `pow` still enforces `pow`.
+- **Recognition at acceptance (#857).** The protocol rule is the simple one:
+  **only the event that introduces a trade key pays `pow_first_contact`**;
+  everything after it pays `pow`. That is what app v2 and mostrix implement
+  (on new-order and take). For the daemon to honor it, a key must be in the
+  cache before its follow-up arrives, and the periodic rebuild alone could
+  lag by up to one `active_pubkeys_refresh_interval`, silently dropping the
+  invoice right after a take.
 
-  The protocol rule stays the simple one: **only the event that introduces a
-  trade key pays `pow_first_contact`**; everything after it pays `pow`. That is
-  what app v2 and mostrix implement (on new-order and take), and asking
-  clients to mine the higher difficulty on every event would only move a
-  daemon bug into every client. The fix belongs in the daemon and is
-  **pending**: when it accepts the event that ties a trade key to an order,
-  it must add that key to the cache right away, with the periodic rebuild
-  staying as the way keys leave the set. Today the daemon does not do this.
-  On nodes where `pow_first_contact` equals `pow` (the default) the gap has
-  no effect.
+  So `finalize_dispatch` (`src/app.rs`), the tail both event loops share,
+  checks the sender after every `new-order`, `take-sell`, `take-buy` or
+  `admin-take-dispute`: if `db::is_active_trade_pubkey` says the DB now ties
+  that trade key to an order or dispute, the key goes into the cache
+  (`SpamGate::add_known`). The answer comes from committed state, not from
+  the handler result, because a handler can store the order and then fail a
+  later step (the broadcast), and a `cant-do` stores nothing. The lookup
+  applies the same three arms as `find_active_trade_pubkeys`, pinned by a
+  test, so recognition grants exactly the keys the next rebuild would: a
+  rejected request buys nothing, and no other action triggers a lookup.
+
+  `find_active_trade_pubkeys` also returns the key of a bond in `requested`
+  or `locked` on a non-terminal order, because a bonded take writes the
+  taker onto the order only once the bond locks.
+
+  A rebuild reads the DB before it replaces the set, so a create committed
+  in between would be dropped by its stale snapshot. The scheduler takes a
+  mark (`begin_rebuild`) before the read, and `finish_rebuild` keeps every
+  key added after the mark; the following rebuild judges those on its own
+  snapshot, so pruning is late by one interval at most.
+
+  A dispute take stores the solver's **identity**, and that is the key the
+  rebuild returns. Solvers are therefore recognized when they send from
+  their identity, which is what the admin clients do; a solver that sends
+  from a separate trade key keeps paying `pow_first_contact`.
 
   app v1 and mostro-cli do not read `pow_first_contact` at all: they mine
   every event at `pow`. On a node that sets `pow_first_contact` above `pow`,

@@ -390,16 +390,22 @@ the Ortsom deploy key (§3, §9.3).
 
 Steps:
 
-1. **Select, to save work.** Check out the merge commit with full
-   history, list changed files with
-   `git diff --name-status <base_sha>...<head_sha>` and run
+0. **Gate from the base.** Check out `head_sha` with full history
+   (`persist-credentials: false`) and extract `.github/ortsom/` from
+   `base_sha` with `git archive` into a directory of its own. Steps 1
+   and 2 use that copy, never the head's: a pull request branched before
+   the gate existed has no `.github/ortsom/`, and a missing recipe would
+   be reported as `build_failed`, as if mostro did not compile. A pull
+   request that edits those files is not judged anyway (§ 9.2).
+1. **Select, to save work.** List changed files with
+   `git diff --name-status <base_sha>...<head_sha>` and run the base's
    `select_scenarios.py`. If `mode` is `none`, or the pull request
    changes the gate itself (`gate_files` is not empty, § 9.2), upload
    `meta.json` with `image: "not-needed"` and stop. This selection only avoids a useless
    build; the one that counts is recomputed on the trusted side (§6.2).
-2. **Build.** Check out `head_sha` (`persist-credentials: false`) and
-   build `.github/ortsom/mostro.Dockerfile` with that checkout as the
-   build context, tagged `ortsom-pr/mostro:<head_sha>`. A failed build is
+2. **Build.** Build the base's `mostro.Dockerfile` with the `head_sha`
+   checkout as the build context (BuildKit reads the
+   `mostro.Dockerfile.dockerignore` next to it), tagged `ortsom-pr/mostro:<head_sha>`. A failed build is
    retried once, because a download failing inside it looks the same as
    mostro not compiling.
 3. **Hand over.** `docker save` the image, compressed, as artifact
@@ -783,9 +789,11 @@ pull request code.
 ### 9.2 A pull request can edit its own workflow
 
 For `pull_request` events GitHub runs the workflow files of the pull
-request's merge commit, so a pull request can change `ortsom-pr.yml`,
-`mostro.Dockerfile`, `map.toml` or `select_scenarios.py`. What that buys
-it is limited to the image it hands over:
+request's merge commit, so a pull request can change `ortsom-pr.yml`
+and, through it, which `mostro.Dockerfile`, `map.toml` or
+`select_scenarios.py` the build side uses (as written, it takes them
+from `base_sha`, § 6.1). What that buys it is limited to the image it
+hands over:
 
 - The selection that counts is **recomputed** in `ortsom-pr-run.yml`
   from `main`'s map and the changed-file list fetched through the API.

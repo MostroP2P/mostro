@@ -38,6 +38,7 @@ Before settings initialization, the daemon performs (see `src/main.rs`):
 - Parses TOML into Settings struct
 - Stores in global `config::MOSTRO_CONFIG` via `init_mostro_settings()`
 - Accessible via `Settings::get_*()` methods throughout application
+- Logs the node's pubkey (npub and hex) right after the keys load, before `Settings correctly loaded!`. Nothing is logged earlier on a normal start, so it is the first line of the log
 
 ### Database Connection (db::connect)
 
@@ -66,6 +67,7 @@ Before settings initialization, the daemon performs (see `src/main.rs`):
 
 1) Settings init: `cli::settings_init()` loads `settings.toml` (template: `settings.tpl.toml`).
 2) DB connect: `db::connect()` sets `config::DB_POOL`.
+   - Serbero: when `serbero_pubkey` is set, `app::serbero::serbero_guard` makes sure that key is a read-only solver, registering it when it has no row yet, and logs `Serbero <npub> configured: ...`. A key that is a write solver, a user that is not a solver, or the node's own key stops the boot with `REFUSING TO START`; the row is never changed. See [SOLVER_PERMISSION_LEVELS.md](SOLVER_PERMISSION_LEVELS.md#serbero).
 3) Nostr: `util::connect_nostr()` sets `config::NOSTR_CLIENT`.
 4) NIP-01 Kind 0 Metadata: If any metadata fields (`name`, `about`, `picture`, `website`) are configured, publishes a kind 0 metadata event so clients can display the Mostro instance's profile.
 5) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
@@ -147,6 +149,9 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Market Support:*
 - `fiat_currencies_accepted` (Vec<String>): Accepted fiat currencies; empty list accepts all (default: ['USD', 'EUR', 'ARS', 'CUP'])
+
+*Dispute assistant (optional):*
+- `serbero_pubkey` (Option\<String\>): Public key (npub or hex) of the node's [Serbero](https://github.com/MostroP2P/serbero). Registered at startup as a read-only solver and announced in the info event's `serbero` tag. A malformed key stops the load; a blank value means none (default: None). See [SOLVER_PERMISSION_LEVELS.md](SOLVER_PERMISSION_LEVELS.md#serbero)
 
 *NIP-01 Kind 0 Metadata (optional):*
 - `name` (Option\<String\>): Human-readable name for this Mostro instance (default: None)

@@ -1,6 +1,6 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
-use crate::config::types::{BondApplyTo, MostroSettings};
+use crate::config::types::{AntiAbuseBondSettings, BondApplyTo, LightningSettings, MostroSettings};
 use crate::lightning::LnStatus;
 use crate::util::{
     get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp,
@@ -610,9 +610,25 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
 pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
-    let mostro_settings = Settings::get_mostro();
-    let ln_settings = Settings::get_ln();
-    let bond_settings = Settings::get_bond();
+    build_info_tags(
+        Settings::get_mostro(),
+        Settings::get_ln(),
+        Settings::get_bond(),
+        ln_status,
+        maintenance,
+    )
+}
+
+/// Body of [`info_to_tags`] with the settings passed in, so unit tests can
+/// build the whole info event from settings other than the process-wide
+/// `MOSTRO_CONFIG` OnceLock.
+fn build_info_tags(
+    mostro_settings: &MostroSettings,
+    ln_settings: &LightningSettings,
+    bond_settings: Option<&AntiAbuseBondSettings>,
+    ln_status: &LnStatus,
+    maintenance: bool,
+) -> Tags {
     let protocol_version = mostro_settings.transport.protocol_version();
 
     let mut tags_vec: Vec<Tag> = vec![
@@ -688,12 +704,30 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
 
     tags_vec.extend(invoice_window_tags(ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
+    tags_vec.extend(serbero_tags(mostro_settings));
     tags_vec.push(Tag::custom(
         "maintenance_mode",
         vec![maintenance.to_string()],
     ));
 
     Tags::from_list(tags_vec)
+}
+
+/// The `serbero` tag of the info event: the hex pubkey of the node's
+/// Serbero, the dispute assistant, when one is configured. Clients compare it
+/// with the solver pubkey of `admin-took-dispute` to tell the assistant from a
+/// human solver. Boot registered that key as a read-only solver or refused to
+/// start (`app::serbero`), so the tag also tells clients it cannot settle or
+/// cancel. Absent when no Serbero is configured.
+///
+/// Split out from [`info_to_tags`] so unit tests can exercise it without the
+/// `MOSTRO_CONFIG` OnceLock.
+fn serbero_tags(mostro_settings: &MostroSettings) -> Vec<Tag> {
+    mostro_settings
+        .serbero_pubkey()
+        .map(|serbero| Tag::custom("serbero", vec![serbero.to_hex()]))
+        .into_iter()
+        .collect()
 }
 
 /// Build the bond policy tag block for the info event.
@@ -1226,6 +1260,56 @@ mod tests {
              (pow = {}, pow_first_contact = {:?})",
             live.pow, live.pow_first_contact
         );
+    }
+
+    #[test]
+    fn serbero_tag_announces_the_configured_serbero_in_hex() {
+        use crate::config::types::MostroSettings;
+        let serbero = Keys::generate().public_key();
+
+        for configured in [serbero.to_bech32().unwrap(), serbero.to_hex()] {
+            let settings = MostroSettings {
+                serbero_pubkey: Some(configured),
+                ..Default::default()
+            };
+            let tags = super::serbero_tags(&settings);
+            assert_eq!(tags.len(), 1);
+            assert_eq!(
+                tags[0].clone().to_vec(),
+                vec!["serbero".to_string(), serbero.to_hex()]
+            );
+        }
+    }
+
+    /// The info event itself must carry the tag, so dropping the
+    /// `serbero_tags` call from the info event is caught even though the
+    /// helper is tested above.
+    #[test]
+    fn info_event_announces_the_configured_serbero() {
+        let serbero = Keys::generate().public_key();
+        let mut settings = test_settings();
+        settings.mostro.serbero_pubkey = Some(serbero.to_bech32().unwrap());
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            &make_ln_status(),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "serbero"), Some(serbero.to_hex()));
+    }
+
+    #[test]
+    fn serbero_tag_is_absent_without_a_serbero() {
+        use crate::config::types::MostroSettings;
+        assert!(super::serbero_tags(&MostroSettings::default()).is_empty());
+        let blank = MostroSettings {
+            serbero_pubkey: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(super::serbero_tags(&blank).is_empty());
     }
 
     /// Resolution rules of the advertised first-contact difficulty.

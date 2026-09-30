@@ -80,6 +80,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The selector and the build recipe come from the base, not from the
+      # head: a pull request branched before the gate existed has no
+      # .github/ortsom, and its build would fail as if mostro did not
+      # compile. A pull request that edits these files is not judged
+      # anyway (§ 9.2). The full-history checkout already holds BASE_SHA.
+      - name: Gate from base
+        run: |
+          mkdir -p "$RUNNER_TEMP/gate"
+          git archive "$BASE_SHA" .github/ortsom | tar -x -C "$RUNNER_TEMP/gate"
+          echo "GATE=$RUNNER_TEMP/gate/.github/ortsom" >> "$GITHUB_ENV"
+          ls "$RUNNER_TEMP/gate/.github/ortsom"
+
       # Only to skip a useless build: the selection that counts is
       # recomputed on the trusted side from main's map (§ 6.2). A pull
       # request that changes the gate is not judged (§ 9.2), so it needs no
@@ -88,7 +100,7 @@ jobs:
         id: select
         run: |
           git diff --name-status "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changes.txt"
-          if python3 .github/ortsom/select_scenarios.py \
+          if python3 "$GATE/select_scenarios.py" \
               --changes "$RUNNER_TEMP/changes.txt" --out "$RUNNER_TEMP/selection.json"; then
             echo "mode=$(jq -r .mode "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
             echo "gate=$(jq '(.gate_files // []) | length > 0' "$RUNNER_TEMP/selection.json")" >> "$GITHUB_OUTPUT"
@@ -104,7 +116,7 @@ jobs:
         run: |
           set +e
           build() {
-            docker build -f .github/ortsom/mostro.Dockerfile \
+            docker build -f "$GATE/mostro.Dockerfile" \
               --build-arg MOSTRO_SHA="$HEAD_SHA" \
               -t "ortsom-pr/mostro:$HEAD_SHA" .
           }

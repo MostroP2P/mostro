@@ -347,5 +347,33 @@ mod tests {
                 Err(MostroInternalErr(ServiceError::DbAccessError(_)))
             ));
         }
+
+        /// The Serbero registered at boot stays read-only: re-adding its key
+        /// with write permission fails like any duplicate, and the row keeps
+        /// its category (docs/SOLVER_PERMISSION_LEVELS.md, "Serbero").
+        #[tokio::test]
+        async fn cannot_raise_the_serbero_to_write() {
+            let pool = create_test_pool().await;
+            let ctx = build_ctx(&pool);
+            let my_keys = Keys::generate();
+            let event = create_event(my_keys.public_key());
+            let serbero = Keys::generate().public_key();
+            crate::app::serbero::serbero_guard(&pool, &serbero, &my_keys.public_key())
+                .await
+                .unwrap();
+
+            let npub = serbero.to_bech32().unwrap();
+            let result = admin_add_solver_action(
+                &ctx,
+                add_solver_msg(Some(Payload::TextMessage(format!("{npub}:write")))),
+                &event,
+                &my_keys,
+            )
+            .await;
+
+            assert!(result.is_err());
+            let user = is_user_present(&pool, serbero.to_string()).await.unwrap();
+            assert_eq!(user.category, SOLVER_CATEGORY_READ_ONLY);
+        }
     }
 }

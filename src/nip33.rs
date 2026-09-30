@@ -688,12 +688,30 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
 
     tags_vec.extend(invoice_window_tags(ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
+    tags_vec.extend(serbero_tags(mostro_settings));
     tags_vec.push(Tag::custom(
         "maintenance_mode",
         vec![maintenance.to_string()],
     ));
 
     Tags::from_list(tags_vec)
+}
+
+/// The `serbero` tag of the info event: the hex pubkey of the node's
+/// Serbero, the dispute assistant, when one is configured. Clients compare it
+/// with the solver pubkey of `admin-took-dispute` to tell the assistant from a
+/// human solver. Boot registered that key as a read-only solver or refused to
+/// start (`app::serbero`), so the tag also tells clients it cannot settle or
+/// cancel. Absent when no Serbero is configured.
+///
+/// Split out from [`info_to_tags`] so unit tests can exercise it without the
+/// `MOSTRO_CONFIG` OnceLock.
+fn serbero_tags(mostro_settings: &MostroSettings) -> Vec<Tag> {
+    mostro_settings
+        .serbero_pubkey()
+        .map(|serbero| Tag::custom("serbero", vec![serbero.to_hex()]))
+        .into_iter()
+        .collect()
 }
 
 /// Build the bond policy tag block for the info event.
@@ -1226,6 +1244,36 @@ mod tests {
              (pow = {}, pow_first_contact = {:?})",
             live.pow, live.pow_first_contact
         );
+    }
+
+    #[test]
+    fn serbero_tag_announces_the_configured_serbero_in_hex() {
+        use crate::config::types::MostroSettings;
+        let serbero = Keys::generate().public_key();
+
+        for configured in [serbero.to_bech32().unwrap(), serbero.to_hex()] {
+            let settings = MostroSettings {
+                serbero_pubkey: Some(configured),
+                ..Default::default()
+            };
+            let tags = super::serbero_tags(&settings);
+            assert_eq!(tags.len(), 1);
+            assert_eq!(
+                tags[0].clone().to_vec(),
+                vec!["serbero".to_string(), serbero.to_hex()]
+            );
+        }
+    }
+
+    #[test]
+    fn serbero_tag_is_absent_without_a_serbero() {
+        use crate::config::types::MostroSettings;
+        assert!(super::serbero_tags(&MostroSettings::default()).is_empty());
+        let blank = MostroSettings {
+            serbero_pubkey: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(super::serbero_tags(&blank).is_empty());
     }
 
     /// Resolution rules of the advertised first-contact difficulty.

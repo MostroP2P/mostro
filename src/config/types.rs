@@ -5,6 +5,7 @@ use crate::config::constants::{
 };
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
+use nostr_sdk::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Scope of the anti-abuse bond enforcement.
@@ -791,9 +792,24 @@ pub struct MostroSettings {
     /// just-taken order's keys fast-path sooner); higher = less DB load.
     #[serde(default = "default_active_pubkeys_refresh_interval")]
     pub active_pubkeys_refresh_interval: u64,
+    /// Public key (npub or hex) of the node's Serbero, the dispute assistant,
+    /// if the operator runs one. At startup mostrod registers it as a
+    /// read-only solver, or refuses to start when the key is a write solver,
+    /// another user or the node itself; the info event announces it in a
+    /// `serbero` tag (docs/SOLVER_PERMISSION_LEVELS.md, "Serbero").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serbero_pubkey: Option<String>,
 }
 
 impl MostroSettings {
+    /// The configured Serbero pubkey. Settings loading rejects a value that
+    /// does not parse, so `None` means none is configured (or it is blank).
+    pub fn serbero_pubkey(&self) -> Option<PublicKey> {
+        self.serbero_pubkey
+            .as_deref()
+            .and_then(|key| PublicKey::parse(key.trim()).ok())
+    }
+
     /// Effective first-contact PoW difficulty: the explicit
     /// `pow_first_contact` when set, otherwise the base `pow`. Centralised so
     /// the event loop and tests agree on the fallback (spec §6 Phase 2).
@@ -880,6 +896,7 @@ impl Default for MostroSettings {
             transport: default_transport(),
             pow_first_contact: None,
             active_pubkeys_refresh_interval: default_active_pubkeys_refresh_interval(),
+            serbero_pubkey: None,
         }
     }
 }

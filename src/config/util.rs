@@ -88,6 +88,24 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             .is_some_and(|bond| bond.enabled),
     )?;
 
+    validate_serbero_pubkey(settings.mostro.serbero_pubkey.as_deref())?;
+
+    Ok(())
+}
+
+/// `serbero_pubkey`, when set, must be an npub or a hex public key. Checked at
+/// load so a typo stops the daemon instead of silently running without the
+/// assistant it was configured with. A blank value means none, like a blank
+/// `MOSTRO_NSEC_PRIVKEY`.
+fn validate_serbero_pubkey(serbero_pubkey: Option<&str>) -> Result<(), MostroError> {
+    let Some(key) = serbero_pubkey.filter(|key| !key.trim().is_empty()) else {
+        return Ok(());
+    };
+    nostr_sdk::prelude::PublicKey::parse(key.trim()).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(format!(
+            "serbero_pubkey ({key}) is not a valid npub or hex public key"
+        )))
+    })?;
     Ok(())
 }
 
@@ -279,6 +297,25 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+        }
+    }
+
+    #[test]
+    fn serbero_pubkey_accepts_npub_hex_or_nothing() {
+        let key = nostr_sdk::prelude::Keys::generate().public_key();
+        assert!(validate_serbero_pubkey(None).is_ok());
+        assert!(validate_serbero_pubkey(Some("  ")).is_ok());
+        assert!(validate_serbero_pubkey(Some(&key.to_hex())).is_ok());
+        assert!(validate_serbero_pubkey(Some(&key.to_bech32().unwrap())).is_ok());
+    }
+
+    #[test]
+    fn serbero_pubkey_rejects_a_malformed_key() {
+        for bad in ["npub1notakey", "not-a-key", "abc123"] {
+            assert!(
+                validate_serbero_pubkey(Some(bad)).is_err(),
+                "{bad:?} must not load"
+            );
         }
     }
 

@@ -24,6 +24,7 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
 use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
+use crate::app::serbero::{serbero_guard, SerberoDecision};
 use crate::app::{run, run_cashu};
 use crate::cli::settings_init;
 use crate::config::{
@@ -79,6 +80,45 @@ async fn main() -> Result<()> {
         tracing::error!("No connection to database - closing Mostro!");
         exit(1);
     };
+
+    // Serbero, the dispute assistant: the configured key must be a read-only
+    // solver. Registered here when it has no row yet; any other kind of row
+    // is left untouched and stops the boot (docs/SOLVER_PERMISSION_LEVELS.md).
+    if let Some(serbero) = Settings::get_mostro().serbero_pubkey() {
+        let node = util::get_keys()?.public_key();
+        let npub = serbero.to_bech32().unwrap_or_else(|_| serbero.to_hex());
+        let decision = serbero_guard(get_db_pool().as_ref(), &serbero, &node).await?;
+        match decision {
+            SerberoDecision::Registered => {
+                tracing::info!("Serbero {npub} configured: registered as a read-only solver");
+            }
+            SerberoDecision::ReadOnlySolver => {
+                tracing::info!("Serbero {npub} configured: read-only solver");
+            }
+            SerberoDecision::WriteSolver { category } => {
+                tracing::error!(
+                    "REFUSING TO START: serbero_pubkey {npub} is a solver with write permission \
+                     (category {category}). Serbero must be read-only: give it its own key, or \
+                     remove serbero_pubkey."
+                );
+            }
+            SerberoDecision::NotASolver => {
+                tracing::error!(
+                    "REFUSING TO START: serbero_pubkey {npub} belongs to a user that is not a \
+                     solver. Give Serbero its own key, or remove serbero_pubkey."
+                );
+            }
+            SerberoDecision::NodeKey => {
+                tracing::error!(
+                    "REFUSING TO START: serbero_pubkey {npub} is this node's own key. Give \
+                     Serbero its own key, or remove serbero_pubkey."
+                );
+            }
+        }
+        if !decision.allows_start() {
+            exit(1);
+        }
+    }
 
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {

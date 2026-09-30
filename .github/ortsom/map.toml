@@ -108,6 +108,11 @@ paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
 uncovered = "covered by cashu.yml, not by ortsom"
 
 [[rule]]
+name = "serbero boot registration"
+paths = ["src/app/serbero.rs"]
+uncovered = "runs only when serbero_pubkey is set, which the ortsom stack does not do; covered by unit tests in src/app/serbero.rs"
+
+[[rule]]
 name = "session restore and key bookkeeping"
 paths = ["src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs"]
 uncovered = "no ortsom scenario yet"

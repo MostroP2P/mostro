@@ -129,6 +129,12 @@ payout_max_retries           = 5
 # `payout_max_retries`, which only governs `send_payment` attempts
 # *once an invoice has been received*.
 payout_claim_window_days = 15
+
+# Seconds a maker has to pay the maker bond (apply_to = "make" | "both").
+# The bond hold invoice is created with this expiry; past it the order,
+# never published, is closed as `expired` and the maker gets `canceled`
+# (see §10.1).
+maker_bond_payment_timeout_seconds = 900
 ```
 
 Note: there is **no `slash_on_lost_dispute` flag**. Dispute slashes are
@@ -688,6 +694,11 @@ never has to lean on memo parsing in the wild.
     the order, transition `WaitingTakerBond` → `Pending` and
     republish. If other `Requested` bonds remain (a fresh concurrent
     taker is still in flight), leave the order in `WaitingTakerBond`.
+  - **Deadline to pay (#990).** The taker bond hold invoice is created
+    with `expiry = hold_invoice_expiration_window`, the time the info
+    event advertises for a taker to pay. LND cancels it unpaid when the
+    window closes, even with the daemon down, and `on_bond_invoice_canceled`
+    releases the bond as above. Before this, LND's 24 h default applied.
   - The trade hold invoice continues to ship as `Action::PayInvoice`
     — only the bond switches.
 - **Bump the `mostro-core` pin** in this repo's `Cargo.toml` from
@@ -1867,6 +1878,38 @@ so the lifecycle scope is described in maker/taker terms:
   `Locked`.
 - Once the bond subscriber reports `Accepted`, continue the existing
   `publish_order` work (compute tags, emit event, set `event_id`).
+- **Deadline to pay (#942).** The maker bond hold invoice is created with
+  `expiry = maker_bond_payment_timeout_seconds`, so LND stops accepting a
+  payment when the window closes, even with the daemon down. An unpaid
+  order ends the first of three ways, all through
+  `bond::close_unpublished_maker_order`:
+  - the scheduler (`job_expire_unpaid_maker_bonds`, every minute) finds the
+    order still `waiting-maker-bond` past the timeout, whatever its bond's
+    state (a bond already `released` by a close interrupted half-way
+    included);
+  - LND cancels the invoice and `on_bond_invoice_canceled` sees a maker
+    bond;
+  - the order reaches its own `expires_at` (`job_expire_pending_older_orders`).
+
+  The close moves `waiting-maker-bond → expired` **in the DB only** (the
+  order has no NIP-33 event to replace), releases the bond and sends the
+  maker `canceled`. It is a CAS that refuses while the maker bond is
+  `locked`, so a maker who pays at the last moment has their order
+  published, not refunded. A bond that could not be canceled in LND at
+  close time is released again on every scheduler pass until it is, but
+  only while its order is in one of the statuses the close writes
+  (`UNPUBLISHED_CLOSE_STATUSES`): those are exactly the ones the lock
+  refuses, so the retry can never refund a payment that won.
+- **Operator cancel.** `CancelOrder` (and `admin-cancel` with the daemon
+  key) also accepts a `waiting-maker-bond` order: same close, with
+  `canceled-by-admin` and `admin-canceled`.
+- **Maker cancel (#993).** The maker may `cancel` while the order is
+  `waiting-maker-bond`: same close, with `canceled`, answered on the
+  maker's request id. The order moves to `canceled` in the DB only (it was
+  never published, so no event is emitted) and the bond is released, which
+  cancels its hold invoice. If the bond has locked, the close refuses and
+  the cancel answers `NotAllowedByStatus`: the order is published, and the
+  maker then cancels it as a `pending` order.
 
 ### 10.2 Slash hooks (buyer/seller via the unified mechanism)
 

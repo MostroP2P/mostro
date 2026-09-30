@@ -62,8 +62,8 @@ use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message};
-use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::transport::unwrap_incoming;
+use mostro_core::transport::UnwrappedMessage;
 use mostro_core::user::User;
 use nostr_sdk::prelude::*;
 
@@ -337,22 +337,15 @@ async fn accept_event(
     // the victim's id. Verifying here (cheap Schnorr, pre-decrypt) is what
     // makes the spam gate's dedup safe: only ids that are provably the
     // author's own are ever recorded, so a forged copy cannot get the genuine
-    // event dropped as a replay.
-    //
-    // It is also the only outer-event check on the v1 path: `unwrap_incoming`
-    // re-verifies the event itself on v2 only (`unwrap_message_nip44` calls
-    // `event.verify()`), while v1's `nip59::unwrap_message` decrypts the wrap
-    // and verifies the *seal's* signature alone — never the outer gift wrap's
-    // id or signature. Do not delete this as redundant.
+    // event dropped as a replay. `unwrap_incoming` verifies the event again,
+    // but only after the gate has run, so this check is not redundant.
     if event.verify().is_err() {
         tracing::warn!("Dropping event {} with an invalid signature", event.id);
         return None;
     }
-    // Phase 2 anti-spam gate (protocol v2 / kind 14 only):
-    // cheap pre-validation BEFORE paying the NIP-44 decrypt
-    // cost. `None` means the gate does not apply: v1 gift wraps
-    // (throwaway outer key, no pre-validatable signal) or no
-    // gate installed (fail-open).
+    // Phase 2 anti-spam gate: cheap pre-validation BEFORE paying
+    // the NIP-44 decrypt cost. `None` means no gate is installed
+    // (fail-open).
     if let Some(gate) = gate {
         let now = chrono::Utc::now().timestamp();
         // Dedup: drop a re-sent identical event (defense in
@@ -386,12 +379,9 @@ async fn accept_event(
         }
     }
 
-    // Mostro-core dispatches on the event kind: the gift wrap
-    // path handles the dual-key layout (identity key signs
-    // seal, trade key authors rumor), the kind-14 path the
-    // 3-element tuple with its in-ciphertext identity proof.
-    // Both decode and verify signatures in one shot and yield
-    // the same transport-agnostic `UnwrappedMessage`.
+    // Mostro-core dispatches on the event kind and opens the
+    // kind-14 3-element tuple with its in-ciphertext identity
+    // proof, verifying every signature in one shot.
     let unwrapped = match unwrap_incoming(event, my_keys).await {
         Ok(Some(u)) => u,
         // NIP-44 decrypt failed: not addressed to this node.
@@ -459,16 +449,55 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
-/// Shared post-dispatch error handling (identical in both loops). A handler
-/// `Err` is downcast to a `MostroError` and turned into the right reply
-/// (`manage_errors`) or logged (`warning_msg`); `Ok` is a no-op. Factored out
-/// with [`accept_event`] so `run` and `run_cashu` share one error tail (CF-5).
+/// Actions that can tie the sender's trade key to an order (creator or taker)
+/// or to a dispute (solver). Only these are worth a recognition lookup after
+/// dispatch; every other action either needs no new key or already came from
+/// a recognized one.
+fn introduces_trade_key(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewOrder | Action::TakeSell | Action::TakeBuy | Action::AdminTakeDispute
+    )
+}
+
+/// Add the sender's trade key to the spam gate if the DB now ties it to an
+/// order or dispute (#857), so its follow-up needs only the base `pow`.
+///
+/// It asks the DB rather than trusting the handler result, for two reasons:
+/// a handler can commit and then fail on a later step (a new order is stored
+/// before its broadcast), and a handler can succeed without storing anything.
+/// Recognition then grants exactly the keys the next rebuild would, never one
+/// that a rejected request introduced.
+///
+/// A dispute take stores the solver's identity, so a solver is recognized when
+/// it sends from that identity (as the admin clients do); a solver sending
+/// from a separate key keeps paying `pow_first_contact`, as before.
+async fn recognize_sender(ctx: &AppContext, gate: &SpamGate, unwrapped: &UnwrappedMessage) {
+    let sender = unwrapped.sender.to_string();
+    match crate::db::is_active_trade_pubkey(ctx.pool(), &sender).await {
+        Ok(true) => gate.add_known(sender),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("spam_gate: recognition lookup failed: {e}"),
+    }
+}
+
+/// Shared post-dispatch tail (identical in both loops). An action that may
+/// introduce a trade key is first checked for recognition
+/// ([`recognize_sender`]); then a handler `Err` is downcast to a `MostroError`
+/// and turned into the right reply (`manage_errors`) or logged
+/// (`warning_msg`). Factored out with [`accept_event`] so `run` and
+/// `run_cashu` share one tail (CF-5).
 async fn finalize_dispatch(
+    ctx: &AppContext,
     result: Result<()>,
     message: Message,
     unwrapped: UnwrappedMessage,
     action: &Action,
+    gate: Option<&SpamGate>,
 ) {
+    if let Some(gate) = gate.filter(|_| introduces_trade_key(action)) {
+        recognize_sender(ctx, gate, &unwrapped).await;
+    }
     if let Err(e) = result {
         match e.downcast::<MostroError>() {
             Ok(err) => {
@@ -479,24 +508,6 @@ async fn finalize_dispatch(
                 warning_msg(action, ServiceError::UnexpectedError(e.to_string()));
             }
         }
-    }
-}
-
-/// Resolve the anti-spam gate for a transport, once per event loop.
-///
-/// The gate applies to the v2 (kind-14) transport only: there the visible
-/// author is the trade key, so the daemon can pre-validate before decrypting.
-/// `None` fail-opens — v1 gift wraps (throwaway outer key, no pre-validatable
-/// signal) or no gate installed. Shared by `run` and `run_cashu` so the single
-/// v2-only policy cannot drift between the two loops.
-///
-/// `install_spam_gate` (`main.rs`) runs before both loops, so the `OnceLock`
-/// load is loop-invariant and stays out of the per-event path.
-fn gate_for(is_v2: bool) -> Option<&'static SpamGate> {
-    if is_v2 {
-        SpamGate::global()
-    } else {
-        None
     }
 }
 
@@ -511,20 +522,17 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
-    // The node speaks exactly one transport (protocol v1 gift wrap or v2
-    // NIP-44 direct); events of any other kind are dropped before any
-    // decryption work. See docs/TRANSPORT_V2_SPEC.md.
-    // DEPRECATED(v0.19.0, #786): with the `transport` knob gone this becomes
-    // unconditionally kind 14 and the v1/v2 branching below collapses.
-    #[allow(deprecated)]
+    // The node speaks exactly one transport; events of any other kind are
+    // dropped before any decryption work. See docs/TRANSPORT_V2_SPEC.md.
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
-    // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): on the v2 (kind
-    // 14) transport the visible author is the trade key, so the daemon can
-    // pre-validate before decrypting. Unknown (first-contact) senders must
-    // clear `pow_first_contact`; known active-trade keys need only `pow`. The
-    // gate is meaningless for v1 (gift wraps are signed by throwaway keys).
+    // Phase 2 anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6): the visible
+    // author is the trade key, so the daemon can pre-validate before
+    // decrypting. Unknown (first-contact) senders must clear
+    // `pow_first_contact`; known active-trade keys need only `pow`.
+    // `install_spam_gate` (`main.rs`) runs before both loops, so the lookup
+    // stays out of the per-event path.
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+    let gate = SpamGate::global();
 
     loop {
         let mut notifications = client.notifications();
@@ -553,7 +561,7 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                     &ctx,
                 )
                 .await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }
     }
@@ -572,10 +580,9 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
     let pow = ctx.settings().mostro.pow;
-    #[allow(deprecated)]
     let accepted_kind = ctx.settings().mostro.transport.event_kind();
     let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
-    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+    let gate = SpamGate::global();
 
     loop {
         let mut notifications = client.notifications();
@@ -597,7 +604,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                 };
                 let result =
                     dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
-                finalize_dispatch(result, message, unwrapped, &action).await;
+                finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }
     }
@@ -655,7 +662,6 @@ mod tests {
     use mostro_core::message::Action;
 
     use nostr_sdk::prelude::{Keys, Kind as NostrKind, Timestamp};
-    use secp256k1::schnorr::Signature;
 
     // Helper function to create test keys
     fn create_test_keys() -> Keys {
@@ -777,8 +783,7 @@ mod tests {
     mod accept_event_ordering_tests {
         use super::*;
         use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
-        use mostro_core::nip59::{wrap_message, WrapOptions};
-        use mostro_core::transport::wrap_message_nip44;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A protocol-v2 (kind 14) event addressed to `mostro`, in full-privacy
         /// mode (trade key doubles as identity, so no identity proof is needed).
@@ -814,9 +819,8 @@ mod tests {
             mostro: &Keys,
             gate: &SpamGate,
         ) -> Option<(Action, Message, UnwrappedMessage)> {
-            // Same kind constant the event loops use to identify v2 before
-            // calling `gate_for`, so the test fails if it drifts from
-            // `Transport::Nip44Direct`'s kind.
+            // Same kind constant the event loops accept, so the test fails if
+            // it drifts from `Transport::Nip44Direct`'s kind.
             accept_event(
                 ctx,
                 event,
@@ -886,64 +890,245 @@ mod tests {
             .await;
             assert!(accepted.is_none());
         }
+    }
 
-        /// A protocol-v1 gift wrap addressed to `mostro`, in full-privacy mode
-        /// (trade key doubles as identity).
-        async fn v1_event(mostro: &Keys) -> Event {
-            let trade = create_test_keys();
-            let message = create_test_message(Action::FiatSent, None);
-            wrap_message(
-                &message,
-                &trade,
-                &trade,
+    /// Synchronous recognition (#857): after a create, take or dispute take,
+    /// the sender's trade key enters the spam gate as soon as the DB ties it
+    /// to an order or dispute, so the follow-up needs only the base `pow`
+    /// without waiting for the periodic rebuild. The handler result does not
+    /// decide it: committed state does.
+    mod sync_recognition_tests {
+        use super::*;
+        use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
+        use mostro_core::order::{Kind as OrderKind, SmallOrder};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        /// Far above anything an unmined test event reaches by chance
+        /// (2^-20), so "dropped at first contact" is deterministic.
+        const FIRST_CONTACT_POW: u8 = 20;
+
+        /// A fresh, unmined kind-14 event from `trade` (full-privacy mode).
+        fn follow_up_from(trade: &Keys, mostro: &Keys) -> Event {
+            wrap_message_nip44(
+                &create_test_message(Action::FiatSent, None),
+                trade,
+                trade,
                 mostro.public_key(),
                 WrapOptions::default(),
             )
+            .expect("wrap kind-14 event")
+        }
+
+        async fn accepted(ctx: &AppContext, event: &Event, mostro: &Keys, gate: &SpamGate) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                FIRST_CONTACT_POW,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                Some(gate),
+            )
             .await
-            .expect("wrap gift wrap event")
+            .is_some()
         }
 
-        /// The v1 path takes `gate = None` and `nip59::unwrap_message` never
-        /// checks the outer event, so `accept_event`'s own `verify()` is the
-        /// only thing standing between a malformed gift wrap and the decrypt.
-        /// The second assertion is the one that pins the behaviour change:
-        /// well-formed gift wraps still go through.
+        async fn dispatch(
+            ctx: &AppContext,
+            gate: &SpamGate,
+            trade: &Keys,
+            action: Action,
+            result: Result<()>,
+        ) {
+            let unwrapped = UnwrappedMessage {
+                message: create_test_message(action.clone(), None),
+                signature: None,
+                sender: trade.public_key(),
+                identity: trade.public_key(),
+                created_at: Timestamp::now(),
+            };
+            finalize_dispatch(
+                ctx,
+                result,
+                unwrapped.message.clone(),
+                unwrapped,
+                &action,
+                Some(gate),
+            )
+            .await;
+        }
+
+        /// Store a pending sell order made by `trade` the way the real
+        /// `new-order` handler does. The offline test client cannot broadcast,
+        /// so, like on a node whose relays are down, `publish_order` commits
+        /// the row and then returns an error.
+        async fn store_order_failing_at_broadcast(ctx: &AppContext, trade: &Keys) -> Result<()> {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let _ = crate::config::NOSTR_CLIENT.set(nostr_sdk::prelude::Client::default());
+            let order = SmallOrder {
+                kind: Some(OrderKind::Sell),
+                amount: 1_000,
+                fiat_code: "USD".to_string(),
+                fiat_amount: 100,
+                payment_method: "SEPA".to_string(),
+                ..Default::default()
+            };
+            let pk = trade.public_key();
+            let result = crate::util::publish_order(
+                ctx.pool(),
+                &create_test_keys(),
+                &order,
+                pk,
+                pk,
+                pk,
+                Some(1),
+                Some(1),
+            )
+            .await;
+            assert!(result.is_err(), "the broadcast must fail offline");
+            result.map_err(Into::into)
+        }
+
         #[tokio::test]
-        async fn v1_gift_wrap_with_invalid_signature_is_dropped() {
+        async fn follow_up_after_a_stored_order_needs_only_base_pow_even_if_publishing_failed() {
             let ctx = create_migrated_ctx().await;
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
             let mostro = create_test_keys();
-            let genuine = v1_event(&mostro).await;
-            let forged = with_tampered_signature(&genuine);
+            let trade = create_test_keys();
 
             assert!(
-                accept_event(&ctx, &forged, &mostro, 0, 0, NostrKind::GiftWrap, None)
-                    .await
-                    .is_none(),
-                "a gift wrap with an invalid signature must be dropped"
+                !accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "an unknown key below pow_first_contact is dropped"
             );
+
+            let result = store_order_failing_at_broadcast(&ctx, &trade).await;
+            dispatch(&ctx, &gate, &trade, Action::NewOrder, result).await;
+
             assert!(
-                accept_event(&ctx, &genuine, &mostro, 0, 0, NostrKind::GiftWrap, None)
-                    .await
-                    .is_some(),
-                "a well-formed gift wrap must still be accepted"
+                accepted(&ctx, &follow_up_from(&trade, &mostro), &mostro, &gate).await,
+                "the order is stored, so its follow-up must pass on base pow"
             );
         }
 
-        /// The v2-only policy lives in one place now; both event loops read it
-        /// from here, so this is where it gets covered.
-        #[test]
-        fn gate_applies_to_v2_only() {
-            assert!(gate_for(false).is_none(), "v1 must fail open");
-            // Force the installed state rather than reading it: asserting
-            // against `SpamGate::global()` compares `gate_for` with itself and
-            // passes vacuously while nothing has installed yet. Install wins
-            // here or another test's already did; either way a second one is
-            // refused, not a panic.
-            let _ = SpamGate::new(REPLAY_WINDOW_SECS).install_global();
-            assert!(
-                gate_for(true).is_some(),
-                "v2 must resolve the installed gate"
-            );
+        #[tokio::test]
+        async fn every_introducing_action_recognizes_a_stored_key() {
+            for action in [
+                Action::NewOrder,
+                Action::TakeSell,
+                Action::TakeBuy,
+                Action::AdminTakeDispute,
+            ] {
+                let ctx = create_migrated_ctx().await;
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+                let _ = store_order_failing_at_broadcast(&ctx, &trade).await;
+
+                dispatch(&ctx, &gate, &trade, action.clone(), Ok(())).await;
+
+                assert!(
+                    gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} must recognize a key the DB ties to an order"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn nothing_stored_grants_nothing_whatever_the_result() {
+            let ctx = create_migrated_ctx().await;
+            let cant_do: Result<()> =
+                Err(MostroError::MostroCantDo(CantDoReason::InvalidOrderStatus).into());
+            for result in [cant_do, Ok(())] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                let trade = create_test_keys();
+
+                dispatch(&ctx, &gate, &trade, Action::TakeSell, result).await;
+
+                assert!(
+                    !gate.is_known(&trade.public_key().to_string()),
+                    "a key tied to nothing must not open the known lane"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn other_actions_are_left_to_the_rebuild() {
+            // No lookup for actions that cannot introduce a key, even when the
+            // key is active: the periodic rebuild already covers them.
+            let ctx = create_migrated_ctx().await;
+            let trade = create_test_keys();
+            let _ = store_order_failing_at_broadcast(&ctx, &trade).await;
+            for action in [
+                Action::Orders,
+                Action::LastTradeIndex,
+                Action::RestoreSession,
+                Action::FiatSent,
+            ] {
+                let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+                dispatch(&ctx, &gate, &trade, action.clone(), Ok(())).await;
+                assert!(
+                    !gate.is_known(&trade.public_key().to_string()),
+                    "{action:?} must not trigger recognition"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn solver_is_recognized_by_the_identity_the_dispute_stores() {
+            // `admin-take-dispute` stores the solver's identity; the rebuild
+            // returns that key and nothing else, so recognition follows it: a
+            // solver sending from its identity is fast-pathed, a separate
+            // trade key is not (it would be dropped again at the next rebuild).
+            let ctx = create_migrated_ctx().await;
+            let solver = create_test_keys();
+            let other_key = create_test_keys();
+            sqlx::query(
+                "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, created_at) \
+                 VALUES (?1, ?2, 'in-progress', 'fiat-sent', ?3, 1700000000)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(uuid::Uuid::new_v4())
+            .bind(solver.public_key().to_string())
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            let from_other_key = UnwrappedMessage {
+                message: create_test_message(Action::AdminTakeDispute, None),
+                signature: None,
+                sender: other_key.public_key(),
+                identity: solver.public_key(),
+                created_at: Timestamp::now(),
+            };
+            finalize_dispatch(
+                &ctx,
+                Ok(()),
+                from_other_key.message.clone(),
+                from_other_key,
+                &Action::AdminTakeDispute,
+                Some(&gate),
+            )
+            .await;
+            assert!(!gate.is_known(&other_key.public_key().to_string()));
+
+            dispatch(&ctx, &gate, &solver, Action::AdminTakeDispute, Ok(())).await;
+            assert!(gate.is_known(&solver.public_key().to_string()));
+        }
+
+        #[tokio::test]
+        async fn no_gate_installed_is_a_no_op() {
+            let ctx = create_migrated_ctx().await;
+            let unwrapped = create_test_unwrapped_message();
+            finalize_dispatch(
+                &ctx,
+                Ok(()),
+                unwrapped.message.clone(),
+                unwrapped,
+                &Action::NewOrder,
+                None,
+            )
+            .await;
         }
     }
 
@@ -954,9 +1139,8 @@ mod tests {
         use super::*;
         use crate::config::MESSAGE_QUEUES;
         use crate::db::is_user_present;
-        use mostro_core::nip59::WrapOptions;
         use mostro_core::prelude::Payload;
-        use mostro_core::transport::wrap_message_nip44;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A kind-14 event in full-privacy mode (trade key doubles as
         /// identity) so no inner signature is needed.
@@ -1594,47 +1778,6 @@ mod tests {
 
             assert!(meets_pow);
             assert!(!fails_pow);
-        }
-    }
-
-    mod event_processing_tests {
-        use super::*;
-
-        #[test]
-        fn test_gift_wrap_processing_structure() {
-            // Test the structure of gift wrap event processing
-            let kind = NostrKind::GiftWrap;
-
-            match kind {
-                NostrKind::GiftWrap => {
-                    // This is the expected path for gift wrap events
-                    // No-op
-                }
-                _ => unreachable!("Only GiftWrap events are considered in this test scope"),
-            }
-        }
-
-        #[test]
-        fn test_message_parsing_structure() {
-            // Test message parsing logic structure
-            let test_content = r#"[{"order":{"version":1,"request_id":1,"trade_index":null,"id":"550e8400-e29b-41d4-a716-446655440000","action":"new-order","payload":null}}, null]"#;
-
-            let result = serde_json::from_str::<(Message, Option<Signature>)>(test_content);
-            match result {
-                Ok((message, signature)) => {
-                    // Test the structure of message parsing
-                    // Note: message.verify() may fail without proper payload setup
-                    // We're testing the parsing structure, not the validation logic
-                    assert!(signature.is_none());
-
-                    // Test that we got a message of some kind
-                    if let Message::Order(_) = message {}
-                }
-                Err(_) => {
-                    // Parsing error is handled gracefully
-                    // No-op
-                }
-            }
         }
     }
 }

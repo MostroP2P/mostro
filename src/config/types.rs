@@ -100,6 +100,16 @@ pub struct AntiAbuseBondSettings {
     /// Used by Phase 3.
     #[serde(default = "default_payout_claim_window_days")]
     pub payout_claim_window_days: u32,
+    /// How long (seconds) a maker has to pay the maker bond. The bond hold
+    /// invoice is created with this expiry, and past it the scheduler
+    /// cancels the bond, marks the unpublished order `expired` and tells the
+    /// maker (#942). Without it an unpaid maker bond lived as long as LND's
+    /// default invoice expiry (24 h) and its order until `expires_at`.
+    #[serde(
+        default = "default_maker_bond_payment_timeout_seconds",
+        deserialize_with = "deserialize_maker_bond_payment_timeout_seconds"
+    )]
+    pub maker_bond_payment_timeout_seconds: u64,
 }
 
 fn default_bond_amount_pct() -> f64 {
@@ -112,6 +122,10 @@ fn default_bond_base_amount() -> i64 {
 
 fn default_payout_invoice_window_seconds() -> u64 {
     300
+}
+
+fn default_maker_bond_payment_timeout_seconds() -> u64 {
+    900
 }
 
 fn default_payout_max_retries() -> u32 {
@@ -140,6 +154,25 @@ where
     Ok(v)
 }
 
+/// Validating deserializer for `maker_bond_payment_timeout_seconds`.
+/// Rejects 0: LND reads an invoice `expiry` of 0 as its 24 h default, the
+/// opposite of what was configured, and the deadline job would close a
+/// maker's order on its next pass. Any positive value is coherent: LND
+/// enforces the expiry itself, so short regtest windows stay possible.
+fn deserialize_maker_bond_payment_timeout_seconds<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = u64::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(D::Error::custom(
+            "maker_bond_payment_timeout_seconds must be greater than 0",
+        ));
+    }
+    Ok(v)
+}
+
 fn default_payout_claim_window_days() -> u32 {
     15
 }
@@ -156,6 +189,7 @@ impl Default for AntiAbuseBondSettings {
             payout_invoice_window_seconds: default_payout_invoice_window_seconds(),
             payout_max_retries: default_payout_max_retries(),
             payout_claim_window_days: default_payout_claim_window_days(),
+            maker_bond_payment_timeout_seconds: default_maker_bond_payment_timeout_seconds(),
         }
     }
 }
@@ -292,22 +326,8 @@ mod tests {
         assert_eq!(settings.get_expiration_for_kind(DM_EVENT_KIND), Some(30));
     }
 
-    #[test]
-    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
-    #[allow(deprecated)]
-    fn transport_defaults_to_nip44() {
-        // The daemon defaults to protocol v2; gift-wrap is opt-in only
-        // (docs/TRANSPORT_V2_SPEC.md §5).
-        assert_eq!(MostroSettings::default().transport, Transport::Nip44Direct);
-    }
-
-    #[test]
-    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
-    #[allow(deprecated)]
-    fn transport_omitted_in_toml_deserializes_to_nip44() {
-        // A settings.toml without a `transport` line must land on nip44 —
-        // not on mostro-core's `Transport::default()` (gift-wrap).
-        let toml = r#"
+    /// Minimal `[mostro]` section; tests append a `transport` line to it.
+    const MOSTRO_TOML_BASE: &str = r#"
             fee = 0.0
             max_routing_fee = 0.002
             max_order_amount = 1000000
@@ -324,35 +344,41 @@ mod tests {
             max_orders_per_response = 10
             dev_fee_percentage = 0.30
         "#;
-        let settings: MostroSettings = toml::from_str(toml).expect("valid mostro settings");
+
+    #[test]
+    fn transport_defaults_to_nip44() {
+        assert_eq!(MostroSettings::default().transport, Transport::Nip44Direct);
+        let settings: MostroSettings =
+            toml::from_str(MOSTRO_TOML_BASE).expect("valid mostro settings");
         assert_eq!(settings.transport, Transport::Nip44Direct);
     }
 
     #[test]
-    // DEPRECATED(v0.19.0, #786): delete along with the `transport` setting.
-    #[allow(deprecated)]
-    fn transport_gift_wrap_is_explicit_opt_in() {
-        // Operators can still pin protocol v1 by writing it out explicitly.
-        let toml = r#"
-            fee = 0.0
-            max_routing_fee = 0.002
-            max_order_amount = 1000000
-            min_payment_amount = 100
-            expiration_hours = 24
-            expiration_seconds = 900
-            user_rates_sent_interval_seconds = 3600
-            max_expiration_days = 15
-            publish_relays_interval = 60
-            pow = 0
-            publish_mostro_info_interval = 300
-            bitcoin_price_api_url = "https://api.yadio.io"
-            fiat_currencies_accepted = ["USD"]
-            max_orders_per_response = 10
-            dev_fee_percentage = 0.30
-            transport = "gift-wrap"
-        "#;
-        let settings: MostroSettings = toml::from_str(toml).expect("valid mostro settings");
-        assert_eq!(settings.transport, Transport::GiftWrap);
+    fn transport_nip44_line_is_accepted() {
+        // Obsolete but harmless: it describes exactly what the node does.
+        let toml = format!("{MOSTRO_TOML_BASE}\ntransport = \"nip44\"\n");
+        let settings: MostroSettings = toml::from_str(&toml).expect("valid mostro settings");
+        assert_eq!(settings.transport, Transport::Nip44Direct);
+    }
+
+    #[test]
+    fn transport_gift_wrap_refuses_to_start_with_a_clear_reason() {
+        // An operator who chose protocol v1 explicitly must not be moved to
+        // v2 behind their back: loading fails, and the error says why and
+        // what to do (docs/TRANSPORT_V2_SPEC.md §6 Phase 4).
+        let toml = format!("{MOSTRO_TOML_BASE}\ntransport = \"gift-wrap\"\n");
+        let err = toml::from_str::<MostroSettings>(&toml)
+            .expect_err("gift-wrap must not load")
+            .to_string();
+        assert!(err.contains("protocol v2 only"), "{err}");
+        assert!(err.contains("remove the `transport` line"), "{err}");
+        assert!(err.contains("0.18"), "{err}");
+    }
+
+    #[test]
+    fn transport_unknown_value_is_rejected() {
+        let toml = format!("{MOSTRO_TOML_BASE}\ntransport = \"bogus\"\n");
+        assert!(toml::from_str::<MostroSettings>(&toml).is_err());
     }
 
     #[test]
@@ -476,7 +502,9 @@ pub struct LightningSettings {
     pub invoice_expiration_window: u32,
     /// Hold invoice CLTV delta
     pub hold_invoice_cltv_delta: u32,
-    /// Hold invoice expiration window in seconds
+    /// Hold invoice expiration window in seconds. It is also the taker
+    /// bond invoice's `expiry` (#990), so it must be positive.
+    #[serde(deserialize_with = "deserialize_hold_invoice_expiration_window")]
     pub hold_invoice_expiration_window: u32,
     /// Number of payment attempts
     pub payment_attempts: u32,
@@ -590,6 +618,24 @@ fn default_max_inflight_payouts_per_destination() -> u32 {
 /// guardian job's tick.
 fn default_escrow_deadline_margin_blocks() -> u32 {
     24
+}
+
+/// Validating deserializer for `hold_invoice_expiration_window`.
+/// Rejects 0: the taker bond hold invoice is created with this window as
+/// its `expiry` (#990), and LND reads an `expiry` of 0 as its 24 h
+/// default, the opposite of what was configured.
+fn deserialize_hold_invoice_expiration_window<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = u32::deserialize(deserializer)?;
+    if v == 0 {
+        return Err(D::Error::custom(
+            "hold_invoice_expiration_window must be greater than 0",
+        ));
+    }
+    Ok(v)
 }
 
 // Hand-written so `max_final_cltv_expiry_delta` defaults to the real bound
@@ -718,23 +764,15 @@ pub struct MostroSettings {
     /// Exchange rates update interval in seconds (default: 300 = 5 minutes)
     #[serde(default = "default_exchange_rates_update_interval")]
     pub exchange_rates_update_interval_seconds: u64,
-    /// Wire transport for protocol messages: `"nip44"` (protocol v2,
-    /// kind-14 direct — the default) or `"gift-wrap"` (protocol v1, NIP-59,
-    /// deprecated opt-in). A node speaks exactly one. See
-    /// docs/TRANSPORT_V2_SPEC.md.
-    ///
-    /// The daemon defaults to `nip44`; `gift-wrap` is only used when the
-    /// operator explicitly sets it in `settings.toml`. This deliberately
-    /// overrides mostro-core's `Transport::default()` (still `gift-wrap`
-    /// for clients' sake) via [`default_transport`].
-    ///
-    /// DEPRECATED(v0.19.0, #786): transitional knob for the v1→v2 protocol
-    /// migration. v0.19.0 removes it and runs protocol v2 (`nip44`) only.
-    #[deprecated(
-        since = "0.18.0",
-        note = "transitional v1/v2 transport selection; removed in v0.19.0 (protocol v2 only) — see issue #786"
+    /// Wire transport for protocol messages. The only value is `"nip44"`
+    /// (protocol v2, kind-14 direct), which is also the default, so the line
+    /// can be left out; it is not in `settings.tpl.toml`. The field stays as
+    /// the per-node protocol selector (docs/TRANSPORT_V2_SPEC.md §8).
+    /// A leftover `"gift-wrap"` refuses to load (see [`deserialize_transport`]).
+    #[serde(
+        default = "default_transport",
+        deserialize_with = "deserialize_transport"
     )]
-    #[serde(default = "default_transport")]
     pub transport: Transport,
     /// Proof-of-work difficulty (leading-zero bits) demanded of a
     /// *first-contact* event on the protocol-v2 (`nip44`) transport — one
@@ -744,9 +782,8 @@ pub struct MostroSettings {
     /// `pow`, while brand-new orders/takes from unseen keys must grind this
     /// harder toll (see docs/TRANSPORT_V2_SPEC.md §6 Phase 2).
     ///
-    /// `None` ⇒ falls back to `pow`, so existing configs and the v1
-    /// transport are wire-identical to before. Has no effect on `gift-wrap`
-    /// (v1 senders are throwaway keys that can't be pre-validated).
+    /// `None` ⇒ falls back to `pow`, so existing configs are wire-identical
+    /// to before.
     #[serde(default)]
     pub pow_first_contact: Option<u8>,
     /// How often (seconds) to rebuild the active-trade-pubkey cache that the
@@ -783,20 +820,35 @@ fn default_active_pubkeys_refresh_interval() -> u64 {
     60 // 1 minute — keeps a just-taken order's keys fast-pathing promptly
 }
 
-/// Daemon-side default wire transport: protocol v2 (`nip44`). Operators
-/// must explicitly set `transport = "gift-wrap"` in `settings.toml` to keep
-/// running the deprecated protocol-v1 path. Intentionally *not*
-/// `Transport::default()` — mostro-core keeps `gift-wrap` as its own default
-/// for client-side migration needs.
-///
-/// DEPRECATED(v0.19.0, #786): goes away with the `transport` setting.
+/// Why a node configured with `transport = "gift-wrap"` does not start, and
+/// what the operator can do about it.
+const GIFT_WRAP_REMOVED: &str = "transport = \"gift-wrap\" (protocol v1) is no longer supported: \
+     this version of mostrod speaks protocol v2 only, and clients that speak protocol v1 \
+     cannot use this node. To run on protocol v2, remove the `transport` line from \
+     settings.toml. To keep serving protocol v1 clients, stay on mostrod 0.18.x. \
+     See https://github.com/MostroP2P/mostro/issues/786";
+
+/// Parse `[mostro] transport`, turning the removed `"gift-wrap"` value into
+/// an error that explains itself. mostro-core no longer knows the value, so
+/// without this the operator would only see serde's "unknown variant".
+fn deserialize_transport<'de, D>(deserializer: D) -> Result<Transport, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = String::deserialize(deserializer)?;
+    if value == "gift-wrap" {
+        return Err(D::Error::custom(GIFT_WRAP_REMOVED));
+    }
+    value.parse().map_err(D::Error::custom)
+}
+
+/// Daemon-side default wire transport: protocol v2 (`nip44`).
 pub(crate) fn default_transport() -> Transport {
     Transport::Nip44Direct
 }
 
 impl Default for MostroSettings {
-    // DEPRECATED(v0.19.0, #786): `transport` init goes away with the field.
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             fee: 0.0,
@@ -954,6 +1006,52 @@ payout_claim_window_days = 30"#,
             msg.contains("slash_node_share_pct") && msg.contains("[0.0, 1.0]"),
             "error message should name the field and the valid range, got: {msg}"
         );
+    }
+
+    #[test]
+    fn toml_zero_maker_bond_payment_timeout_rejected() {
+        // 0 would reach LND as `expiry: 0`, its 24 h default, and make the
+        // deadline job close a maker order on its next pass.
+        #[derive(Debug, serde::Deserialize)]
+        struct Stub {
+            #[allow(dead_code)]
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        let err =
+            toml::from_str::<Stub>("[anti_abuse_bond]\nmaker_bond_payment_timeout_seconds = 0")
+                .expect_err("a zero maker window must be rejected");
+        assert!(
+            err.to_string()
+                .contains("maker_bond_payment_timeout_seconds"),
+            "error message should name the field, got: {err}"
+        );
+        let short =
+            toml::from_str::<Stub>("[anti_abuse_bond]\nmaker_bond_payment_timeout_seconds = 30")
+                .expect("a short window is valid");
+        assert_eq!(short.anti_abuse_bond.maker_bond_payment_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn toml_zero_hold_invoice_expiration_window_rejected() {
+        // 0 would reach LND as the taker bond invoice's `expiry: 0`, its
+        // 24 h default, and the info event would advertise a 0 s window.
+        let lightning = |window: u32| {
+            format!(
+                "lnd_cert_file = \"\"\nlnd_macaroon_file = \"\"\nlnd_grpc_host = \"\"\n\
+                 invoice_expiration_window = 3600\nhold_invoice_cltv_delta = 144\n\
+                 hold_invoice_expiration_window = {window}\npayment_attempts = 3\n\
+                 payment_retries_interval = 60\n"
+            )
+        };
+        let err = toml::from_str::<LightningSettings>(&lightning(0))
+            .expect_err("a zero hold invoice window must be rejected");
+        assert!(
+            err.to_string().contains("hold_invoice_expiration_window"),
+            "error message should name the field, got: {err}"
+        );
+        let short =
+            toml::from_str::<LightningSettings>(&lightning(30)).expect("a short window is valid");
+        assert_eq!(short.hold_invoice_expiration_window, 30);
     }
 
     #[test]

@@ -113,27 +113,11 @@ user_rates_sent_interval_seconds = 3600
 publish_relays_interval = 60
 # Requested POW
 pow = 0
-# Wire transport for protocol messages. A node speaks exactly one:
-#   "nip44"     - protocol v2, signed kind-14 events with NIP-44 encrypted
-#                 content. Rate-limitable by relays. THIS IS THE DEFAULT:
-#                 a node with no `transport` line (or a fresh settings.toml)
-#                 starts in nip44.
-#   "gift-wrap" - protocol v1, NIP-59 gift wraps (kind 1059). DEPRECATED and
-#                 OPT-IN ONLY: it is never selected automatically — you must
-#                 explicitly write `transport = "gift-wrap"` here to keep
-#                 serving protocol-v1 clients during the transition. It will
-#                 be removed in v0.19.0 — mostrod will then run protocol v2
-#                 only and this setting disappears. See
-#                 https://github.com/MostroP2P/mostro/issues/786
-# See docs/TRANSPORT_V2_SPEC.md
-transport = "nip44"
-# Anti-spam gate for the "nip44" transport (docs/TRANSPORT_V2_SPEC.md §6
-# Phase 2). Proof-of-work (leading-zero bits) demanded of a *first-contact*
+# Anti-spam gate (docs/TRANSPORT_V2_SPEC.md §6 Phase 2). Proof-of-work (leading-zero bits) demanded of a *first-contact*
 # event — one whose visible sender (trade key) is not part of an active
 # order/dispute — checked BEFORE decryption. Ongoing trades (known keys) need
 # only `pow`; brand-new orders/takes from unseen keys must clear this stiffer
-# toll. Omit (or leave commented) to fall back to `pow`. No effect on
-# "gift-wrap". Example: keep pow = 0 for cheap ongoing trades but require work
+# toll. Omit (or leave commented) to fall back to `pow`. Example: keep pow = 0 for cheap ongoing trades but require work
 # from first-contact senders.
 # pow_first_contact = 16
 # How often (seconds) to rebuild the active-trade-pubkey cache the gate
@@ -285,6 +269,9 @@ port = 50051
 # # Days the winner has to claim their share by submitting a bolt11; after
 # # this the bond closes as `forfeited` and the node retains everything.
 # payout_claim_window_days = 15
+# # Seconds a maker has to pay the maker bond (apply_to = "make" | "both").
+# # Past it the unpublished order expires and the maker is told. Must be > 0.
+# maker_bond_payment_timeout_seconds = 900
 
 # Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
 # the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens

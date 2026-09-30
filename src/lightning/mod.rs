@@ -421,6 +421,18 @@ pub(crate) fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroE
     Ok(bytes)
 }
 
+/// Map a failed `lookup_invoice` call to a [`MostroError`], keeping the
+/// gRPC code in the same `code=… message=…` shape as
+/// `cancel_hold_invoice` so callers can tell `NotFound` from transport
+/// failures.
+pub(crate) fn lookup_invoice_error(status: fedimint_tonic_lnd::tonic::Status) -> MostroError {
+    MostroInternalErr(ServiceError::LnNodeError(format!(
+        "code={:?} message={}",
+        status.code(),
+        status.message()
+    )))
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -443,6 +455,19 @@ impl LndConnector {
         description: &str,
         amount: i64,
     ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
+        self.create_hold_invoice_with_expiry(description, amount, None)
+            .await
+    }
+
+    /// [`Self::create_hold_invoice`] with an explicit invoice expiry in
+    /// seconds. `None` leaves LND's default (86 400 s), which is what every
+    /// hold invoice got before #942.
+    pub async fn create_hold_invoice_with_expiry(
+        &mut self,
+        description: &str,
+        amount: i64,
+        expiry_secs: Option<i64>,
+    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
@@ -454,6 +479,7 @@ impl LndConnector {
             memo: description.to_string(),
             value: amount,
             cltv_expiry,
+            expiry: expiry_secs.unwrap_or_default(),
             ..Default::default()
         };
         let holdinvoice = self
@@ -577,7 +603,7 @@ impl LndConnector {
                 ..Default::default()
             })
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .map_err(lookup_invoice_error)?
             .into_inner();
 
         Ok(invoice

@@ -198,7 +198,8 @@ pub fn new_dispute_event(
 /// Builds the standard tag set for a kind-38386 dispute event.
 ///
 /// `created_at` is the dispute open time from SQLite (`disputes.created_at`),
-/// carried as a business tag so clients can show when the dispute was opened.
+/// carried as a `published_at` tag (named as in NIP-23) so clients can show
+/// when the dispute was opened.
 /// It is independent of the Nostr event's `created_at`, which stays "now"
 /// (bumped past the dispute's previous revision when they share a second, see
 /// [`new_dispute_event`]) so NIP-33 replacement keeps resolving to the latest
@@ -212,7 +213,7 @@ pub fn create_dispute_event_tags(
     Tags::from_list(vec![
         Tag::custom("s", vec![status.into()]),
         Tag::custom("initiator", vec![initiator.into()]),
-        Tag::custom("created_at", vec![created_at.to_string()]),
+        Tag::custom("published_at", vec![created_at.to_string()]),
         Tag::custom("y", create_platform_tag_values(platform_name)),
         Tag::custom("z", vec!["dispute".to_string()]),
     ])
@@ -291,27 +292,41 @@ fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     }
 }
 
-fn create_fiat_amt_array(order: &Order) -> Vec<String> {
-    // `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
-    // state (Phase 1.5). On the wire it publishes as `pending` (per
-    // `create_status_tags`), so range-order min/max advertising must
-    // mirror the `Pending` branch — otherwise the bond window would
-    // expose a single `fiat_amount` and clients would think the order
-    // had moved out of the range-takeable state.
-    if order.status == Status::Pending.to_string()
+/// `WaitingTakerBond` is the daemon-internal "matched, awaiting bond"
+/// state (Phase 1.5). On the wire it publishes as `pending` (per
+/// `create_status_tags`), so `fa` must treat it exactly like `Pending`.
+/// Otherwise the bond window would expose a single `fiat_amount` and
+/// clients would think a range order had left the takeable state.
+fn publishes_as_pending(order: &Order) -> bool {
+    order.status == Status::Pending.to_string()
         || order.status == Status::WaitingTakerBond.to_string()
-    {
-        match (order.min_amount, order.max_amount) {
-            (Some(min), Some(max)) => {
-                vec![min.to_string(), max.to_string()]
-            }
-            _ => {
-                vec![order.fiat_amount.to_string()]
-            }
+}
+
+fn create_fiat_amt_array(order: &Order) -> Vec<String> {
+    // While the order publishes as `pending`, a range order advertises
+    // its [min, max] — otherwise the bond window would expose a single
+    // `fiat_amount` and clients would think the order had moved out of
+    // the range-takeable state.
+    if publishes_as_pending(order) {
+        if let (Some(min), Some(max)) = (order.min_amount, order.max_amount) {
+            return vec![min.to_string(), max.to_string()];
         }
-    } else {
-        vec![order.fiat_amount.to_string()]
     }
+    vec![order.fiat_amount.to_string()]
+}
+
+/// Sats amount as advertised. A range order that still publishes as
+/// `pending` has no agreed sats amount — the in-memory `Order` may
+/// already carry the prospective taker's quote (`take_sell` /
+/// `take_buy` mutate `amount` before any republish), but that price is
+/// not binding until the taker's bond is locked. Keep `amt` byte-
+/// identical to the Pending event (`"0"`) so `fa` and `amt` cannot
+/// disagree (issue #927).
+fn create_amt_value(order: &Order) -> String {
+    if publishes_as_pending(order) && order.is_range_order() {
+        return "0".to_string();
+    }
+    order.amount.to_string()
 }
 
 pub(crate) fn create_platform_tag_values(instance_name: Option<&str>) -> Vec<String> {
@@ -505,17 +520,18 @@ pub fn order_to_tags(
             Tag::custom("k", vec![order.kind.to_string()]),
             Tag::custom("f", vec![order.fiat_code.to_string()]),
             Tag::custom("s", vec![status.to_string()]),
-            Tag::custom("amt", vec![order.amount.to_string()]),
+            Tag::custom("amt", vec![create_amt_value(order)]),
             Tag::custom("fa", create_fiat_amt_array(order)),
             Tag::custom("pm", payment_method),
             Tag::custom("premium", vec![order.premium.to_string()]),
             Tag::custom("network", vec![ln_network]),
             Tag::custom("layer", vec!["lightning".to_string()]),
-            // When the order was created (NIP-69). The event's own
-            // `created_at` moves on every revision of this addressable event;
-            // this one does not, so clients can show the order's real age.
+            // When the order was created (NIP-69), named `published_at` as in
+            // NIP-23. The event's own `created_at` moves on every revision of
+            // this addressable event; this one does not, so clients can show
+            // the order's real age.
             // Kept after the positional `rating` / `source` inserts below.
-            Tag::custom("created_at", vec![order.created_at.to_string()]),
+            Tag::custom("published_at", vec![order.created_at.to_string()]),
             Tag::custom("expires_at", vec![order.expires_at.to_string()]),
             Tag::custom(
                 "expiration",
@@ -549,32 +565,15 @@ pub fn order_to_tags(
 /// clear on this node — the value published in the `pow_first_contact` tag of
 /// the kind-38385 info event.
 ///
-/// Transport-dependent because the Phase 2 gate is v2-only: on `nip44` an
-/// unknown sender must clear `pow_first_contact` before the daemon decrypts,
-/// while on `gift-wrap` that gate is skipped entirely (the throwaway outer key
-/// carries no pre-validatable signal), so a first event only has to clear the
-/// base `pow`. Advertising the v2 number on a v1 node would make clients grind
-/// work nobody checks.
-///
-/// The v2 arm takes the **maximum** of the two knobs because the event loop
-/// applies them in sequence — the base `pow` check runs first, then the
-/// first-contact one — so a config with `pow_first_contact` *below* `pow` still
-/// enforces `pow`. Publishing the lower number would tell clients to mine less
-/// work than the node accepts, and their first event would be dropped silently.
-///
-/// DEPRECATED(v0.19.0, #786): with the v1 path gone this collapses to
-/// `max(pow, effective_pow_first_contact())`.
-#[allow(deprecated)]
+/// It is the **maximum** of the two knobs because the event loop applies
+/// them in sequence — the base `pow` check runs first, then the first-contact
+/// one — so a config with `pow_first_contact` *below* `pow` still enforces
+/// `pow`. Publishing the lower number would tell clients to mine less work
+/// than the node accepts, and their first event would be dropped silently.
 fn advertised_first_contact_pow(mostro_settings: &MostroSettings) -> u8 {
-    match mostro_settings.transport {
-        Transport::Nip44Direct => mostro_settings
-            .pow
-            .max(mostro_settings.effective_pow_first_contact()),
-        // Matched explicitly rather than with a catch-all: a future transport
-        // variant must fail the build here instead of silently advertising the
-        // base `pow` for a gate whose behaviour nobody has considered yet.
-        Transport::GiftWrap => mostro_settings.pow,
-    }
+    mostro_settings
+        .pow
+        .max(mostro_settings.effective_pow_first_contact())
 }
 
 /// The two invoice windows the info event advertises, each under its own name.
@@ -614,9 +613,6 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
     let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
     let bond_settings = Settings::get_bond();
-    // DEPRECATED(v0.19.0, #786): once the `transport` knob is gone the
-    // `protocol_version` tag is hardcoded to the crate-wide `PROTOCOL_VER`.
-    #[allow(deprecated)]
     let protocol_version = mostro_settings.transport.protocol_version();
 
     let mut tags_vec: Vec<Tag> = vec![
@@ -658,19 +654,19 @@ pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
         // fallback rules. Under-powered events are dropped before decryption
         // with no reply, so discovery has to come from here.
         //
-        // This is a per-*event* requirement, not a one-off toll on the first
-        // one: the cache is rebuilt periodically, so a trade key stays
-        // unrecognized for up to one `active_pubkeys_refresh_interval` after
-        // its first accepted event and its follow-ups must carry the same
-        // work. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
+        // The protocol rule is that only the event introducing a trade key
+        // pays it. Today the daemon keeps charging it until the next cache
+        // rebuild recognizes the key, so a follow-up sent before then must
+        // clear it too or is dropped. That gap is known and its fix is
+        // pending. See docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
         Tag::custom(
             "pow_first_contact",
             vec![advertised_first_contact_pow(mostro_settings).to_string()],
         ),
         // Capability advertisement: which Mostro protocol version this node
-        // speaks ("1" = gift wrap, "2" = NIP-44 direct), derived from the
-        // `transport` setting so clients pick the right wire format before
-        // sending anything. See docs/TRANSPORT_V2_SPEC.md.
+        // speaks, derived from the `transport` setting so clients pick the
+        // right wire format (or refuse the node) before sending anything.
+        // See docs/TRANSPORT_V2_SPEC.md §3.1.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
             "hold_invoice_cltv_delta",
@@ -957,12 +953,12 @@ mod tests {
         );
     }
 
-    // ── order_to_tags: created_at tag (NIP-69) ───────────────────────────────────
+    // ── order_to_tags: published_at tag (NIP-69) ─────────────────────────────────
 
     /// The tag carries the order's own creation time, not the revision's,
     /// and is the same on a later revision with another status.
     #[test]
-    fn order_to_tags_created_at_is_the_orders_and_stable_across_revisions() {
+    fn order_to_tags_published_at_is_the_orders_and_stable_across_revisions() {
         init_test_settings();
         let pending = Order {
             created_at: 1_702_548_701,
@@ -980,11 +976,14 @@ mod tests {
                 .expect("order_to_tags must not error")
                 .expect("order must produce Some(tags)");
             assert_eq!(
-                get_tag_value(&tags, "created_at").as_deref(),
+                get_tag_value(&tags, "published_at").as_deref(),
                 Some("1702548701"),
                 "status {}",
                 order.status
             );
+            // Nostr names this tag `published_at` (NIP-23); the old name
+            // must not be published alongside it.
+            assert_eq!(get_tag_value(&tags, "created_at"), None);
         }
     }
 
@@ -992,7 +991,7 @@ mod tests {
     /// after them so their indices, and so the tags other clients read by
     /// position, are unchanged.
     #[test]
-    fn order_to_tags_created_at_precedes_expires_at_and_leaves_the_positional_tags_alone() {
+    fn order_to_tags_published_at_precedes_expires_at_and_leaves_the_positional_tags_alone() {
         init_test_settings();
         let order = make_pending_order();
 
@@ -1010,11 +1009,11 @@ mod tests {
 
         assert_eq!(names[7], "rating");
         assert_eq!(names[8], "source");
-        let created = names
+        let published = names
             .iter()
-            .position(|n| n == "created_at")
-            .expect("created_at");
-        assert_eq!(names[created + 1], "expires_at");
+            .position(|n| n == "published_at")
+            .expect("published_at");
+        assert_eq!(names[published + 1], "expires_at");
     }
 
     // ── order_to_tags: source tag with Mostro pubkey (kind 38383) ───────────────
@@ -1199,7 +1198,7 @@ mod tests {
         // Both values compared below are plain config data, not something the
         // code under test derives — the resolution rules, including what the
         // shipped defaults advertise, are pinned against literals in
-        // `advertised_first_contact_pow_is_transport_dependent`.
+        // `advertised_first_contact_pow_resolution`.
         let live = &MOSTRO_CONFIG
             .get()
             .expect("init_test_settings installs a config")
@@ -1217,9 +1216,8 @@ mod tests {
         // `>= live.pow`: this assertion is about *wiring* — that the resolved
         // difficulty is what reaches the `pow_first_contact` tag, and not, say,
         // the base `pow`, which a bound would happily accept. What the resolver
-        // must itself return per transport, shipped defaults included, is
-        // pinned against literals in
-        // `advertised_first_contact_pow_is_transport_dependent`.
+        // must itself return, shipped defaults included, is pinned against
+        // literals in `advertised_first_contact_pow_resolution`.
         let expected = super::advertised_first_contact_pow(live);
         assert_eq!(
             first_contact, expected,
@@ -1230,54 +1228,40 @@ mod tests {
         );
     }
 
-    /// Per-transport branches of the advertised first-contact difficulty.
+    /// Resolution rules of the advertised first-contact difficulty.
     /// Exercised through the pure helper because `info_to_tags` reads settings
     /// from the process-wide `MOSTRO_CONFIG` OnceLock, which cannot be mutated
     /// mid-run (same reason as `bond_tags` below).
     #[test]
-    #[allow(deprecated)]
-    fn advertised_first_contact_pow_is_transport_dependent() {
+    fn advertised_first_contact_pow_resolution() {
         use crate::config::types::MostroSettings;
 
-        // v2: the gate runs, so the stiffer explicit value is what a
+        // The stiffer explicit value is what a
         // first-contact sender must actually clear.
-        let v2 = MostroSettings {
+        let explicit = MostroSettings {
             pow: 4,
             pow_first_contact: Some(16),
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2), 16);
+        assert_eq!(super::advertised_first_contact_pow(&explicit), 16);
 
-        // v2 without an explicit override falls back to the base `pow`.
-        let v2_default = MostroSettings {
+        // Without an explicit override falls back to the base `pow`.
+        let fallback = MostroSettings {
             pow: 4,
             pow_first_contact: None,
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2_default), 4);
+        assert_eq!(super::advertised_first_contact_pow(&fallback), 4);
 
-        // v2 with an override BELOW the base `pow`: the base check runs first
+        // An override BELOW the base `pow`: the base check runs first
         // and still rejects, so the enforced difficulty is `pow`. Advertising
         // the lower number would make clients under-mine and be dropped.
-        let v2_below = MostroSettings {
+        let below = MostroSettings {
             pow: 8,
             pow_first_contact: Some(2),
-            transport: Transport::Nip44Direct,
             ..Default::default()
         };
-        assert_eq!(super::advertised_first_contact_pow(&v2_below), 8);
-
-        // v1: the gate is skipped, so a configured `pow_first_contact` is not
-        // enforced and must NOT be advertised — only the base `pow` is real.
-        let v1 = MostroSettings {
-            pow: 4,
-            pow_first_contact: Some(16),
-            transport: Transport::GiftWrap,
-            ..Default::default()
-        };
-        assert_eq!(super::advertised_first_contact_pow(&v1), 4);
+        assert_eq!(super::advertised_first_contact_pow(&below), 8);
 
         // The shipped defaults (`pow = 0`, `pow_first_contact` unset) must
         // advertise "0" — identical in meaning to the pre-tag behaviour, so a
@@ -1363,6 +1347,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 5,
             payout_claim_window_days: 30,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let tags = bond_tags(Some(&bond));
@@ -1401,7 +1386,7 @@ mod tests {
     // ── Dispute event tag list: end-to-end y-tag emission (kind 38386) ──────────
 
     /// Verifies that [`create_dispute_event_tags`] emits status, initiator,
-    /// stable open-time `created_at`, platform `y`, and `z=dispute`.
+    /// stable open-time `published_at`, platform `y`, and `z=dispute`.
     #[test]
     fn dispute_event_tags_emit_y_tag_matching_platform_helper() {
         init_test_settings();
@@ -1435,10 +1420,13 @@ mod tests {
             "initiator tag must match"
         );
         assert_eq!(
-            get_tag_value(&tags, "created_at").as_deref(),
+            get_tag_value(&tags, "published_at").as_deref(),
             Some("1700000100"),
-            "created_at tag must carry the SQLite dispute open time"
+            "published_at tag must carry the SQLite dispute open time"
         );
+        // Nostr names this tag `published_at` (NIP-23); the old name must
+        // not be published alongside it.
+        assert_eq!(get_tag_value(&tags, "created_at"), None);
         assert_eq!(
             get_tag_value(&tags, "z").as_deref(),
             Some("dispute"),
@@ -1447,7 +1435,7 @@ mod tests {
     }
 
     /// Kind-38386 `event.created_at` stays "signed now"; the business open
-    /// time lives only on the `created_at` tag so NIP-33 replace still works.
+    /// time lives only on the `published_at` tag so NIP-33 replace still works.
     ///
     /// Uses a `d` tag unique to this test: `created_at` is now stamped
     /// monotonically per dispute, so a first revision only equals wall-clock
@@ -1469,7 +1457,7 @@ mod tests {
             "event.created_at must be wall-clock now, not the open-time tag"
         );
         assert_eq!(
-            get_tag_value(&event.tags, "created_at").as_deref(),
+            get_tag_value(&event.tags, "published_at").as_deref(),
             Some("1600000000")
         );
         assert_ne!(event.created_at.as_secs() as i64, opened_at);
@@ -1732,10 +1720,87 @@ mod tests {
             vec!["42".to_string()]
         );
 
+        // Bond window still publishes as pending, so the range stays.
+        order.status = Status::WaitingTakerBond.to_string();
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["10".to_string(), "100".to_string()]
+        );
+
         // Taken (active) order → exact amount even if min/max present.
         order.status = Status::Active.to_string();
         order.fiat_amount = 55;
         assert_eq!(super::create_fiat_amt_array(&order), vec!["55".to_string()]);
+    }
+
+    /// Issue #927: any publish of a range order in `WaitingTakerBond`
+    /// must match the `Pending` event: `s: pending`, `amt: 0`,
+    /// `fa: [min, max]` — even when the in-memory struct already holds
+    /// the taker's sats quote (the mutation `take_sell` / `take_buy`
+    /// apply before a republish).
+    #[test]
+    fn waiting_taker_bond_range_order_publishes_unpriced_range() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::WaitingTakerBond.to_string();
+        // Mutated take-time quote — must not leak into `amt`.
+        order.amount = 199_399;
+        order.fiat_amount = 800_000;
+        order.min_amount = Some(500_000);
+        order.max_amount = Some(2_000_000);
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("WaitingTakerBond must produce a publishable event");
+
+        let fa: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .find(|v| v[0] == "fa")
+            .expect("fa tag present")[1..]
+            .to_vec();
+        assert_eq!(get_tag_value(&tags, "s").as_deref(), Some("pending"));
+        assert_eq!(get_tag_value(&tags, "amt").as_deref(), Some("0"));
+        assert_eq!(fa, vec!["500000".to_string(), "2000000".to_string()]);
+    }
+
+    /// Fixed-price (non-range) order in `WaitingTakerBond` keeps its
+    /// real `amt`; only range orders force `"0"` while publishing as
+    /// pending.
+    #[test]
+    fn waiting_taker_bond_single_amount_publishes_real_amt() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::WaitingTakerBond.to_string();
+        order.amount = 50_000;
+        order.fiat_amount = 100;
+        order.min_amount = None;
+        order.max_amount = None;
+
+        assert_eq!(super::create_amt_value(&order), "50000");
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["100".to_string()]
+        );
+    }
+
+    /// Once Active, a range order's quote is real — `amt` and `fa` both
+    /// advertise the agreed take.
+    #[test]
+    fn active_range_order_publishes_agreed_amt_and_fa() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::Active.to_string();
+        order.amount = 199_399;
+        order.fiat_amount = 800_000;
+        order.min_amount = Some(500_000);
+        order.max_amount = Some(2_000_000);
+
+        assert_eq!(super::create_amt_value(&order), "199399");
+        assert_eq!(
+            super::create_fiat_amt_array(&order),
+            vec!["800000".to_string()]
+        );
     }
 
     // ── create_status_tags remaining arms ────────────────────────────────
@@ -1863,6 +1928,7 @@ mod tests {
             payout_invoice_window_seconds: 300,
             payout_max_retries: 3,
             payout_claim_window_days: 14,
+            maker_bond_payment_timeout_seconds: 900,
         };
 
         let take_tags = bond_tags(Some(&base));

@@ -107,7 +107,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `lnd_grpc_host` (String): LND gRPC endpoint URL
 - `invoice_expiration_window` (u32): Required invoice validity window in seconds (default: 3600)
 - `hold_invoice_cltv_delta` (u32): Hold invoice CLTV delta in blocks (default: 144)
-- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300)
+- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300). Also the taker bond invoice expiry, so it must be greater than 0; mostrod refuses to start with 0.
 - `payment_attempts` (u32): Max payment retry attempts (default: 3)
 - `payment_retries_interval` (u32): Retry interval in seconds (default: 60)
 - `max_final_cltv_expiry_delta` (u32): Upper bound, in blocks, on the `min_final_cltv_expiry_delta` of a user-supplied payout invoice (buyer payout, bond payout, dev fee). It bounds how long that payee can hold the outgoing HTLC without settling — the node cannot cancel a locked-in HTLC. 144 (~1 day) is the top of the range real wallets ask for; raise it only if a legitimate wallet is rejected, and never set it to 0 (the check is `delta > bound`, and BOLT11 substitutes 18 when the field is absent, so 0 rejects every invoice) (default: 144)
@@ -140,7 +140,8 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Network/API:*
 - `pow` (u8): Proof-of-work difficulty (leading-zero bits, NIP-13) required of every incoming event, checked on the outer event before anything else (default: 0, i.e. no requirement)
-- `pow_first_contact` (Option\<u8\>): Stiffer PoW demanded of a *first-contact* event — one whose visible sender is not in the active-trade cache — checked before the NIP-44 decrypt. Only enforced on the `nip44` transport; `None` falls back to `pow` (default: None). Setting it *below* `pow` has no effect, since the base check runs first. See [TRANSPORT_V2_SPEC.md](TRANSPORT_V2_SPEC.md) §6 Phase 2
+- `pow_first_contact` (Option\<u8\>): Stiffer PoW demanded of a *first-contact* event — one whose visible sender is not in the active-trade cache — checked before the NIP-44 decrypt. `None` falls back to `pow` (default: None). Setting it *below* `pow` has no effect, since the base check runs first. See [TRANSPORT_V2_SPEC.md](TRANSPORT_V2_SPEC.md) §6 Phase 2
+- `transport` (String, optional): Wire protocol. The only value is `"nip44"` (protocol v2), which is also the default, so the line is not needed and is not in the template. A leftover `"gift-wrap"` (protocol v1, removed in v0.19.0) makes mostrod refuse to start with an error that explains why
 - `active_pubkeys_refresh_interval` (u64): How often, in seconds, to rebuild the active-trade-pubkey cache that the first-contact gate consults (default: 60)
 - `bitcoin_price_api_url` (String): Bitcoin price API base URL (default: [`https://api.yadio.io`](https://api.yadio.io))
 

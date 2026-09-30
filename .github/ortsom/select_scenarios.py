@@ -105,6 +105,8 @@ def validate_map(gate_map):
         raise SelectionError("rule must be an array of [[rule]] tables")
     if not isinstance(settings.get("ortsom_ref"), str) or not settings["ortsom_ref"]:
         raise SelectionError("[settings] needs a non-empty ortsom_ref")
+    if not isinstance(settings.get("stack_with_bonds", False), bool):
+        raise SelectionError("[settings] stack_with_bonds must be true or false")
     if not isinstance(settings.get("always_tags", []), list):
         raise SelectionError("[settings] always_tags must be a list")
     seen = set()

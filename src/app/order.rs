@@ -100,6 +100,16 @@ pub async fn order_action(
             return Err(MostroCantDo(cause));
         }
 
+        // A half-specified range is not a thing: reject it explicitly.
+        // Otherwise it slips past both `check_fiat_amount` (skipped below
+        // when either bound is set) and `check_range_order_limits` (which
+        // only enforces the amount == 0 rule when both bounds are set),
+        // and gets persisted with a fixed sats price and no fiat amount
+        // (issue #927, part 3).
+        if order.min_amount.is_some() != order.max_amount.is_some() {
+            return Err(MostroCantDo(CantDoReason::InvalidAmount));
+        }
+
         // `check_fiat_amount` in mostro-core requires fiat_amount > 0. Range orders set
         // min/max and use fiat_amount == 0, so only run it for single-amount orders.
         if order.min_amount.is_none() && order.max_amount.is_none() {
@@ -306,6 +316,56 @@ mod tests {
             "expected InvalidAmount, got: {:?}",
             err
         );
+    }
+
+    /// Issue #927 part 3: a half-specified range (only one of
+    /// `min_amount` / `max_amount`) used to slip past every validation —
+    /// `check_fiat_amount` is skipped when either bound is set, while
+    /// `check_range_order_limits` only enforces its rules when both are —
+    /// so an order with a fixed sats price and no fiat amount got
+    /// persisted. It must be rejected outright.
+    #[tokio::test]
+    async fn test_order_action_rejects_partial_range() {
+        let pool = create_test_pool().await;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        let ctx = TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let keys = create_test_keys();
+        let event = create_test_unwrapped_message();
+
+        for (min, max) in [(Some(100), None), (None, Some(500))] {
+            let order = mostro_core::order::SmallOrder::new(
+                Some(uuid::Uuid::new_v4()),
+                Some(mostro_core::order::Kind::Sell),
+                Some(mostro_core::order::Status::Pending),
+                1_000, // fixed sats price
+                "USD".to_string(),
+                min,
+                max,
+                0, // no fiat amount
+                "BANK".to_string(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let msg = Message::new_order(
+                Some(uuid::Uuid::new_v4()),
+                Some(1),
+                None,
+                Action::NewOrder,
+                Some(Payload::Order(order)),
+            );
+            let err = order_action(&ctx, msg, &event, &keys).await.unwrap_err();
+            assert!(
+                matches!(err, MostroCantDo(CantDoReason::InvalidAmount)),
+                "partial range (min={min:?}, max={max:?}) must be InvalidAmount, got: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

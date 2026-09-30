@@ -45,6 +45,8 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_reconcile_stranded_taker_bonds(ctx.clone()).await;
+        job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -61,18 +63,22 @@ pub async fn start_scheduler(ctx: AppContext) {
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
 /// cache from the DB (spec §6 Phase 2). Status mutations are scattered across
 /// many handlers with no single choke-point, so a periodic full reload is the
-/// robust, low-coupling refresh strategy: a just-taken order's keys begin
-/// fast-pathing within one `active_pubkeys_refresh_interval`. Inert on the v1
-/// transport (the event loop only consults the gate for kind-14 events).
+/// robust, low-coupling refresh strategy. The event loop also adds a key the
+/// moment it accepts a create or take (#857); this rebuild is what prunes keys
+/// whose orders have gone terminal.
 async fn job_refresh_active_pubkeys(ctx: AppContext) {
     let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
     tokio::spawn(async move {
         loop {
+            let gate = crate::spam_gate::SpamGate::global();
+            // Before the DB read, so keys the event loop adds while it runs
+            // survive this snapshot (#857).
+            let mark = gate.map(|gate| gate.begin_rebuild());
             match find_active_trade_pubkeys(ctx.pool()).await {
                 Ok(keys) => {
-                    if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                    if let (Some(gate), Some(mark)) = (gate, mark) {
                         let n = keys.len();
-                        gate.set_known(keys);
+                        gate.finish_rebuild(mark, keys);
                         tracing::debug!(
                             "spam_gate: refreshed active-trade-pubkey cache ({n} keys)"
                         );
@@ -257,7 +263,7 @@ async fn job_retry_failed_payments(ctx: AppContext) {
     tokio::spawn(async move {
         loop {
             info!(
-                "I run async every {} minutes - checking for failed lighting payment",
+                "I run async every {} seconds - checking for failed lightning payment",
                 interval
             );
 
@@ -1239,35 +1245,24 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                     // Going through `update_order_event` would publish a
                     // brand-new Expired/Canceled event for an order that
                     // never appeared in the book — a ghost entry the
-                    // §10.4 acceptance forbids. Mark it Expired directly
-                    // in the DB and release any bond row instead.
+                    // §10.4 acceptance forbids. The shared close marks it
+                    // Expired in the DB only, releases the bond and tells
+                    // the maker (#942). Bonds are Lightning-only (CF-1), and
+                    // the close skips the release on a cashu node.
                     if order.status == Status::WaitingMakerBond.to_string() {
-                        let order_id = order.id;
-                        let mut expired = order.clone();
-                        expired.status = Status::Expired.to_string();
-                        match expired.update(pool).await {
-                            Ok(_) => {
-                                // Bonds are Lightning-only and mutually exclusive
-                                // with Cashu mode (CF-1), which has no LND — the
-                                // release helpers open `LndConnector::new()`, so
-                                // skip them here. A cashu node should carry no
-                                // bond rows; any left over (e.g. a reused DB) are
-                                // a misconfiguration, not this job's concern.
-                                if !Settings::is_cashu_enabled() {
-                                    bond::release_bonds_for_order_or_warn(
-                                        pool,
-                                        order_id,
-                                        "maker_bond_expiry",
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "maker_bond_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
-                                    order_id, e
-                                );
-                            }
+                        if let Err(e) = bond::close_unpublished_maker_order(
+                            pool,
+                            order.id,
+                            Status::Expired,
+                            Action::Canceled,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "maker_bond_expiry: close failed for order {} ({}); will retry next tick",
+                                order.id, e
+                            );
                         }
                         continue;
                     }
@@ -1368,6 +1363,46 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
     });
 }
 
+/// Bound the taker-bond window (issue #927 part 2). LND cancels the bond
+/// hold invoice at `hold_invoice_expiration_window` (#990 / #999); this
+/// job is the belt-and-braces path when that cancel signal is missed. It
+/// releases stale `Requested` taker bonds after the window plus grace and
+/// drops the order back to `Pending`.
+///
+/// Sleeps one interval before the first tick so startup
+/// `resubscribe_active_bonds` can deliver replayed `Accepted` events and
+/// lock paid bonds before the sweep runs (otherwise a still-`Requested`
+/// row with an accepted HTLC is cancelled — grunch on #986).
+async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            bond::reconcile_stranded_taker_bonds(pool).await;
+        }
+    });
+}
+
+/// #942: give the maker a deadline to pay the maker bond. Every minute,
+/// orders whose maker bond is still unpaid past
+/// `maker_bond_payment_timeout_seconds` are closed as `expired` (DB only,
+/// they were never published) and the maker is told. Before this, nothing
+/// but LND's 24 h default invoice expiry and the order's own `expires_at`
+/// ended them.
+async fn job_expire_unpaid_maker_bonds(ctx: AppContext) {
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            if let Err(e) = bond::expire_unpaid_maker_bonds(pool, Utc::now().timestamp()).await {
+                warn!("expire_unpaid_maker_bonds: {e}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
 async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
         let Some(manager) = PriceManager::global() else {
@@ -1423,10 +1458,10 @@ async fn job_update_bitcoin_prices() {
                 // covered. A summary at warn is enough; per-provider info
                 // is already in the manager's per-provider logs.
                 warn!(
-                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    "price: {}/{} providers failed this tick ({} currencies still servable)",
                     report.failures.len(),
                     report.failures.len() + report.successes.len(),
-                    report.fresh_currencies
+                    report.servable_currencies
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;

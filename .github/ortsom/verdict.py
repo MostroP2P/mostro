@@ -271,11 +271,12 @@ def load_baseline(get, download, repo, run):
     return read_baseline_zip(download(artifacts[0]["archive_download_url"]))
 
 
-def find_baselines(walk, runs, load, pinned_ref, window):
+def find_baselines(walk, runs, load, pinned_ref, window, with_bonds=False):
     """The history of § 7.1, newest first, at most `window` long: baselines
-    of commits on the walk, measured with the pinned Ortsom, whose stack came
-    up and whose suite finished. The first is the reference baseline. Each
-    entry is {distance, run, meta, summary}."""
+    of commits on the walk, measured with the pinned Ortsom and the same
+    `stack_with_bonds` (a baseline from before that setting ran without
+    bonds), whose stack came up and whose suite finished. The first is the
+    reference baseline. Each entry is {distance, run, meta, summary}."""
     by_sha = {}
     for run in sorted(runs, key=lambda r: r["created_at"], reverse=True):
         by_sha.setdefault(run["head_sha"], []).append(run)
@@ -287,6 +288,7 @@ def find_baselines(walk, runs, load, pinned_ref, window):
                 continue
             meta, summary = loaded
             if (meta.get("sha") != sha or meta.get("ortsom_ref") != pinned_ref
+                    or meta.get("stack_with_bonds", False) != with_bonds
                     or meta.get("stack") != "ok" or not complete(summary)):
                 continue
             history.append({"distance": distance, "run": run, "meta": meta, "summary": summary})
@@ -339,10 +341,11 @@ def sentence(outcome, meta, settings):
     verdict, c = outcome["verdict"], outcome["counts"]
     if verdict == "inconclusive":
         if outcome["reason"] == "no-baseline":
-            return (f"No baseline of `main` measured with Ortsom `{settings['ortsom_ref']}` exists within "
-                    f"{settings['baseline_max_distance']} commits of the merge-base. After `ortsom_ref` is "
-                    "bumped on `main` this lasts until the pull request merges or rebases onto a `main` "
-                    "whose new-harness baseline has finished.")
+            bonds = "on" if settings.get("stack_with_bonds", False) else "off"
+            return (f"No baseline of `main` measured with Ortsom `{settings['ortsom_ref']}` and bonds {bonds} "
+                    f"exists within {settings['baseline_max_distance']} commits of the merge-base. After "
+                    "`ortsom_ref` or `stack_with_bonds` changes on `main` this lasts until the pull request "
+                    "merges or rebases onto a `main` whose new baseline has finished.")
         return INCONCLUSIVE.get(outcome["reason"], INCONCLUSIVE["unknown-stack"])
     if verdict == "not-applicable":
         return "No scenario applies: the map ignores every changed file."
@@ -574,7 +577,8 @@ def history_finder(get, fetch, repo, settings):
         compare = get(f"/repos/{repo}/compare/main...{meta['head_sha']}", "?per_page=1")
         walk = first_parent_walk(get, repo, compare["merge_base_commit"]["sha"], settings["baseline_max_distance"])
         return find_baselines(walk, baseline_runs(get, repo), lambda r: load_baseline(get, fetch, repo, r),
-                              settings["ortsom_ref"], settings["stability_window"])
+                              settings["ortsom_ref"], settings["stability_window"],
+                              settings.get("stack_with_bonds", False))
     return find
 
 

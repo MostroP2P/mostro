@@ -287,6 +287,21 @@ class FindBaselinesTest(unittest.TestCase):
         history = vd.find_baselines(w, runs, load, "v0.3.1", 3)
         self.assertEqual([h["run"]["id"] for h in history], [3])
 
+    def test_a_baseline_run_with_other_bond_settings_is_passed_over(self):
+        # The stack runs with or without bonds by `stack_with_bonds`; a
+        # baseline measured the other way is a different daemon config, and
+        # one from before the setting existed ran without bonds.
+        w = self.WALK
+        runs, load = self.runs_and_loader([
+            (w[0], "2026-09-25T02:00:00Z", self.ok_meta(w[0]), passing("s1")),
+            (w[0], "2026-09-25T01:00:00Z", self.ok_meta(w[0], stack_with_bonds=False), passing("s1")),
+            (w[1], "2026-09-25T00:00:00Z", self.ok_meta(w[1], stack_with_bonds=True), passing("s1")),
+        ])
+        with_bonds = vd.find_baselines(w, runs, load, "v0.3.1", 3, with_bonds=True)
+        self.assertEqual([h["run"]["id"] for h in with_bonds], [2])
+        without = vd.find_baselines(w, runs, load, "v0.3.1", 3)
+        self.assertEqual([h["run"]["id"] for h in without], [0, 1])
+
     def test_the_window_bounds_the_history(self):
         w = self.WALK
         runs, load = self.runs_and_loader([
@@ -456,7 +471,9 @@ class CommentTest(unittest.TestCase):
 
     def test_no_baseline_explains_the_harness_bump(self):
         body = self.render(self.outcome("inconclusive", "no-baseline", history=[]))
-        self.assertIn("rebases onto a `main` whose new-harness baseline has finished", body)
+        self.assertIn("`ortsom_ref` or `stack_with_bonds` changes on `main`", body)
+        self.assertIn("rebases onto a `main` whose new baseline has finished", body)
+        self.assertIn("and bonds off", body)
 
     def test_a_blind_spot_is_a_warning_before_the_details(self):
         out = self.outcome("pass", "ok")

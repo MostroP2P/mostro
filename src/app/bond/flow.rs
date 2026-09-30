@@ -38,6 +38,8 @@
 //! losing the lock race), if no other active bond remains on the
 //! order, the status flips back to `Pending`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -53,6 +55,7 @@ use tokio::sync::mpsc::channel;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::app::cancel::CancelLightning;
 use crate::config::settings::Settings;
 use crate::lightning::{InvoiceMessage, LndConnector};
 use crate::util::{
@@ -136,6 +139,17 @@ pub struct TakerContext {
     pub dev_fee: i64,
 }
 
+/// Invoice expiry, in seconds, of a taker bond's hold invoice (#990).
+///
+/// It is `hold_invoice_expiration_window`, the time the info event tells
+/// a taker they have to pay. Without it LND keeps the invoice payable for
+/// its 24 h default, and the order sits at `WaitingTakerBond` that long.
+/// With it LND cancels the unpaid invoice when the window closes, even
+/// while the daemon is down, and `on_bond_invoice_canceled` ends the take.
+fn taker_bond_invoice_expiry(ln: &crate::config::types::LightningSettings) -> Option<i64> {
+    Some(i64::from(ln.hold_invoice_expiration_window))
+}
+
 /// Create a hold invoice for the taker's bond, persist a `Bond` row in
 /// `Requested`, ship the bolt11 to the taker, and start the LND
 /// subscriber that flips the row to `Locked` once the taker pays.
@@ -167,9 +181,10 @@ pub async fn request_taker_bond(
     let amount = compute_bond_amount(taker_ctx.amount, cfg);
     let memo = format!("mostro bond order_id={}", order.id);
 
+    let expiry = taker_bond_invoice_expiry(Settings::get_ln());
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice(&memo, amount)
+        .create_hold_invoice_with_expiry(&memo, amount, expiry)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -264,10 +279,9 @@ pub async fn request_taker_bond(
     //
     // Atomically claim the `Pending → WaitingTakerBond` transition with
     // a compare-and-swap UPDATE. If `rows_affected == 0`, another path
-    // already owns the order's status; we skip the Nostr republish and
-    // exit cleanly. If we win, we then republish the NIP-33 event and
-    // patch the persisted `event_id` only (not the full row) so we
-    // never clobber concurrent field updates.
+    // already owns the order's status. No NIP-33 republish on a win:
+    // `WaitingTakerBond` publishes as `pending`, so the relays already
+    // hold the right event until the next real transition.
     let cas = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status = ?")
         .bind(Status::WaitingTakerBond.to_string())
         .bind(order.id)
@@ -284,30 +298,7 @@ pub async fn request_taker_bond(
             false
         }
     };
-    if claimed {
-        let my_keys = get_keys()?;
-        match crate::util::update_order_event(my_keys, Status::WaitingTakerBond, order).await {
-            Ok(updated) => {
-                if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
-                    .bind(&updated.event_id)
-                    .bind(order.id)
-                    .execute(pool)
-                    .await
-                {
-                    warn!(
-                        order_id = %order.id,
-                        "request_taker_bond: failed to persist event_id after WaitingTakerBond republish: {}", e
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    order_id = %order.id,
-                    "request_taker_bond: WaitingTakerBond republish failed: {}", e
-                );
-            }
-        }
-    } else {
+    if !claimed {
         // Lost the CAS. If it was to a cancel/expiry rather than to a
         // sibling take or a fast lock, this bond will never be promoted:
         // release it now instead of stranding the hold invoice (and the
@@ -356,9 +347,13 @@ pub async fn request_maker_bond(
     let amount = compute_bond_amount(notional_sats, cfg);
     let memo = format!("mostro bond order_id={}", order.id);
 
+    // The invoice stops being payable when the maker's window closes, so LND
+    // enforces the deadline even while the daemon is down (#942);
+    // `expire_unpaid_maker_bonds` enforces it on the order side.
+    let expiry = i64::try_from(cfg.maker_bond_payment_timeout_seconds).unwrap_or(i64::MAX);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice(&memo, amount)
+        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry))
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -506,7 +501,110 @@ pub(crate) fn classify_cancel_error(err: &MostroError) -> CancelOutcome {
 /// - Operators see a structured `warn` event with `bond_id`, `order_id`,
 ///   and the classified outcome so they can spot and intervene if a
 ///   bond stays stuck.
+///
+/// **The state write is a compare-and-swap** from the caller's observed
+/// `state`. Exit paths ([`release_bond`]) re-read and retry on a miss so a
+/// bond that locked meanwhile is still cancelled — matching pre-CAS
+/// behaviour when the order is leaving the book. The stranded-taker
+/// sweep uses [`release_bond_if_state`], which leaves a concurrent
+/// `Locked` winner alone. A transient cancel failure rolls the claim
+/// back so the bond stays active for retry.
 pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), MostroError> {
+    release_bond_with(pool, bond, &mut LazyLndCancel::default()).await
+}
+
+/// [`release_bond`] with an injectable LND canceller, so tests can run the
+/// release path without a live node.
+pub(crate) async fn release_bond_with<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    ln: &mut L,
+) -> Result<(), MostroError> {
+    // Exit paths mean "this bond must go". A stale `Requested` snapshot
+    // that races a lock must still cancel the HTLC once we see `Locked`
+    // — otherwise an expiry/cancel job can strand a Locked bond on a
+    // terminal or republished order (grunch on #986). Cap retries: one
+    // re-read covers Requested→Locked; further misses mean another
+    // writer already finished or the row vanished.
+    const MAX_ATTEMPTS: usize = 3;
+    let mut snapshot = bond.clone();
+    for attempt in 0..MAX_ATTEMPTS {
+        match release_bond_if_state_with(pool, &snapshot, ln).await? {
+            ReleaseBondOutcome::Released | ReleaseBondOutcome::AlreadyTerminal => return Ok(()),
+            ReleaseBondOutcome::StateMoved => {
+                let Some(fresh) = Bond::by_id(pool, bond.id)
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+                else {
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "release_bond: bond row gone after CAS miss; done"
+                    );
+                    return Ok(());
+                };
+                let fresh_state = BondState::from_str(&fresh.state).map_err(|e| {
+                    MostroInternalErr(ServiceError::UnexpectedError(format!(
+                        "Bond {} has unparseable state {:?}: {}",
+                        fresh.id, fresh.state, e
+                    )))
+                })?;
+                if !fresh_state.is_active() {
+                    return Ok(());
+                }
+                info!(
+                    bond_id = %bond.id,
+                    order_id = %bond.order_id,
+                    attempt,
+                    from = %snapshot.state,
+                    to = %fresh.state,
+                    "release_bond: state moved; retrying release from fresh row"
+                );
+                snapshot = fresh;
+            }
+        }
+    }
+    warn!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        "release_bond: exhausted retries after concurrent state moves; leaving for the next exit path"
+    );
+    Ok(())
+}
+
+/// Outcome of a single compare-and-swap release attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseBondOutcome {
+    /// Row claimed `Released` and the hold invoice was cancelled (or
+    /// had no hash / was already gone).
+    Released,
+    /// Caller's snapshot was already terminal or otherwise not
+    /// releaseable (`PendingPayout`) — no-op.
+    AlreadyTerminal,
+    /// Row left the observed state before the claim; invoice was **not**
+    /// cancelled. The stranded-taker sweep treats this as success (leave
+    /// a concurrent `Locked` alone). Exit paths re-read and retry via
+    /// [`release_bond`].
+    StateMoved,
+}
+
+/// Release only if the bond is still in `bond.state`. Used by the
+/// stranded-taker sweep: a `Requested` snapshot that lost to a lock
+/// must not cancel the winner's HTLC.
+#[cfg(test)]
+pub(crate) async fn release_bond_if_state(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+) -> Result<ReleaseBondOutcome, MostroError> {
+    release_bond_if_state_with(pool, bond, &mut LazyLndCancel::default()).await
+}
+
+/// [`release_bond_if_state`] with an injectable LND canceller.
+pub(crate) async fn release_bond_if_state_with<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    ln: &mut L,
+) -> Result<ReleaseBondOutcome, MostroError> {
     // Parse `state` once into the enum so callers don't depend on the
     // `Display` form for control flow (and a malformed value short-
     // circuits to "no-op" instead of falsely transitioning).
@@ -516,70 +614,119 @@ pub async fn release_bond(pool: &Pool<Sqlite>, bond: &Bond) -> Result<(), Mostro
             bond.id, bond.state, e
         )))
     })?;
-    if state.is_terminal() {
-        return Ok(());
+    if !state.is_active() {
+        return Ok(ReleaseBondOutcome::AlreadyTerminal);
+    }
+
+    // Claim the transition before touching LND. `Bond::update` writes
+    // every column `WHERE id = ?`, so a stale `Requested` snapshot would
+    // overwrite a concurrent `Locked` row — including `locked_at` — after
+    // cancelling the winner's HTLC. A miss means that row already moved;
+    // leave it, and do not cancel.
+    let released_at = Utc::now().timestamp();
+    let claimed =
+        sqlx::query("UPDATE bonds SET state = ?, released_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::Released.to_string())
+            .bind(released_at)
+            .bind(bond.id)
+            .bind(&bond.state)
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if claimed.rows_affected() == 0 {
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "release_bond_if_state: bond left state {}; not cancelling the hold invoice",
+            bond.state
+        );
+        return Ok(ReleaseBondOutcome::StateMoved);
     }
 
     if let Some(hash) = bond.hash.as_ref() {
-        match LndConnector::new().await {
-            Ok(mut ln) => {
-                if let Err(e) = ln.cancel_hold_invoice(hash).await {
-                    match classify_cancel_error(&e) {
-                        CancelOutcome::AlreadyDone => {
-                            // Common race with the subscriber, or the
-                            // invoice was never created in the first place
-                            // (request_taker_bond bailed before the row got
-                            // a hash). HTLC is verifiably gone — fall
-                            // through to mark Released.
-                            info!(
-                                bond_id = %bond.id,
-                                order_id = %bond.order_id,
-                                "cancel_hold_invoice reports already-done ({}); marking Released",
-                                e
-                            );
-                        }
-                        CancelOutcome::Transient => {
-                            warn!(
-                                bond_id = %bond.id,
-                                order_id = %bond.order_id,
-                                outcome = "transient",
-                                "cancel_hold_invoice failed transiently ({}); leaving bond {} for retry",
-                                e, bond.state
-                            );
-                            return Err(e);
-                        }
-                    }
+        // An unreachable LND surfaces here as the connect error, which
+        // classifies as transient: don't pretend the HTLC is gone.
+        let cancel_err = match ln.cancel_hold_invoice(hash).await {
+            Ok(()) => None,
+            Err(e) => match classify_cancel_error(&e) {
+                CancelOutcome::AlreadyDone => {
+                    // Common race with the subscriber, or the
+                    // invoice was never created in the first place
+                    // (request_taker_bond bailed before the row got
+                    // a hash). HTLC is verifiably gone.
+                    info!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "cancel_hold_invoice reports already-done ({}); marking Released",
+                        e
+                    );
+                    None
                 }
-            }
-            Err(e) => {
-                // LND unreachable: definitionally transient. Don't pretend
-                // the HTLC is gone.
+                CancelOutcome::Transient => Some(e),
+            },
+        };
+        if let Some(e) = cancel_err {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                outcome = "transient",
+                "cancel_hold_invoice failed transiently ({}); restoring bond {} for retry",
+                e, bond.state
+            );
+            if let Err(revert_err) = revert_bond_release_claim(pool, bond.id, &bond.state).await {
                 warn!(
                     bond_id = %bond.id,
                     order_id = %bond.order_id,
-                    outcome = "transient",
-                    "could not connect to LND for cancel ({}); leaving bond {} for retry",
-                    e, bond.state
+                    "release_bond: failed to restore bond after transient cancel: {revert_err}"
                 );
-                return Err(e);
             }
+            return Err(e);
         }
     }
 
-    let mut updated = bond.clone();
-    updated.state = BondState::Released.to_string();
-    updated.released_at = Some(Utc::now().timestamp());
-    let id = updated.id;
-    let order_id = updated.order_id;
-    updated
-        .update(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
     info!(
         "Bond {} released for order {} (was state={})",
-        id, order_id, bond.state
+        bond.id, bond.order_id, bond.state
     );
+    Ok(ReleaseBondOutcome::Released)
+}
+
+/// [`CancelLightning`] that opens the LND connection on first use, so
+/// callers only connect when a hold invoice actually needs cancelling
+/// (hashless bonds and CAS misses never touch LND).
+#[derive(Default)]
+pub(crate) struct LazyLndCancel(Option<LndConnector>);
+
+impl CancelLightning for LazyLndCancel {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move {
+            let ln = match &mut self.0 {
+                Some(ln) => ln,
+                slot => slot.insert(LndConnector::new().await?),
+            };
+            ln.cancel_hold_invoice(hash).await.map(|_| ())
+        })
+    }
+}
+
+/// Undo [`release_bond_if_state`]'s compare-and-swap after a transient LND
+/// failure. Only the row we just marked `Released` is restored, so a
+/// concurrent writer that moved it on is left alone.
+async fn revert_bond_release_claim(
+    pool: &Pool<Sqlite>,
+    bond_id: Uuid,
+    previous_state: &str,
+) -> Result<(), MostroError> {
+    sqlx::query("UPDATE bonds SET state = ?, released_at = NULL WHERE id = ? AND state = ?")
+        .bind(previous_state)
+        .bind(bond_id)
+        .bind(BondState::Released.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     Ok(())
 }
 
@@ -855,14 +1002,7 @@ async fn on_bond_invoice_accepted(
             "Bond {} lost concurrent-bonds race (current state={}) — releasing and notifying taker",
             current.id, current.state
         );
-        if !current_state.is_terminal() {
-            if let Err(e) = release_bond(pool, &current).await {
-                warn!(
-                    bond_id = %current.id,
-                    "release_bond on race-loser failed: {}", e
-                );
-            }
-        }
+        release_race_loser(pool, &current, current_state, &mut LazyLndCancel::default()).await;
         notify_loser(&current).await;
         return Ok(());
     }
@@ -924,26 +1064,30 @@ async fn on_bond_invoice_accepted(
     if order.status != Status::Pending.to_string()
         && order.status != Status::WaitingTakerBond.to_string()
     {
-        // A canceled order means this taker's bond locked against a trade
-        // that will never start — the maker's cancel beat the promotion,
-        // or the cancel-side release hit a transient LND failure. Release
-        // the bond here (idempotent: the cancel path may already have
-        // done it) and tell the taker, so their sats are not stranded
-        // until the bond invoice's CLTV expiry. Any other non-pre-trade
-        // status is a live trade the bond still backs — leave it alone.
+        // A closed order means this taker's bond locked against a trade
+        // that will never start — the maker's cancel / admin cancel /
+        // pending-expiry beat the promotion, or the cancel-side release
+        // hit a transient LND failure. Release the bond here (idempotent:
+        // the cancel path may already have done it) and tell the taker,
+        // so their sats are not stranded until the bond invoice's CLTV
+        // expiry. Any other non-pre-trade status is a live trade the bond
+        // still backs — leave it alone.
         if matches!(
             order.get_order_status(),
-            Ok(Status::Canceled | Status::CooperativelyCanceled | Status::CanceledByAdmin)
+            Ok(Status::Canceled
+                | Status::CooperativelyCanceled
+                | Status::CanceledByAdmin
+                | Status::Expired)
         ) && !current_state.is_terminal()
         {
             info!(
-                "Bond {} locked on canceled order {} — releasing and notifying taker",
-                current.id, order.id
+                "Bond {} locked on closed order {} ({}) — releasing and notifying taker",
+                current.id, order.id, order.status
             );
             if let Err(e) = release_bond(pool, &current).await {
                 warn!(
                     bond_id = %current.id,
-                    "release_bond on canceled order failed ({}); the next exit path retries", e
+                    "release_bond on closed order failed ({}); the next exit path retries", e
                 );
             }
             notify_loser(&current).await;
@@ -965,6 +1109,45 @@ async fn on_bond_invoice_accepted(
     resume_take_after_bond(pool, order, my_keys, request_id).await
 }
 
+/// Tear down a taker bond whose `Accepted` lost the lock `UPDATE` in
+/// [`on_bond_invoice_accepted`]: another bond on the order locked first,
+/// or another path claimed this row meanwhile.
+///
+/// A row already `Released` is not left alone: the claimer may have run
+/// its LND cancel before this HTLC was accepted, so the hold invoice is
+/// cancelled again best-effort. Other terminal states need nothing — a
+/// `Slashed` HTLC was settled and `Failed` / `Forfeited` hold no funds.
+async fn release_race_loser<L: CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    current: &Bond,
+    current_state: BondState,
+    ln: &mut L,
+) {
+    if !current_state.is_terminal() {
+        if let Err(e) = release_bond_with(pool, current, ln).await {
+            warn!(
+                bond_id = %current.id,
+                "release_bond on race-loser failed: {}", e
+            );
+        }
+        return;
+    }
+    if current_state != BondState::Released {
+        return;
+    }
+    let Some(hash) = current.hash.as_deref() else {
+        return;
+    };
+    if let Err(e) = ln.cancel_hold_invoice(hash).await {
+        if classify_cancel_error(&e) == CancelOutcome::Transient {
+            warn!(
+                bond_id = %current.id,
+                "cancel_hold_invoice on Released race-loser failed: {}", e
+            );
+        }
+    }
+}
+
 /// Subscriber callback path for a **maker** bond reaching `Accepted`.
 ///
 /// The maker bond is a singleton, so there is no first-to-lock-wins race
@@ -983,15 +1166,27 @@ async fn on_maker_bond_accepted(
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
     let now = Utc::now().timestamp();
-    let result =
-        sqlx::query("UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ?")
-            .bind(BondState::Locked.to_string())
-            .bind(now)
-            .bind(bond.id)
-            .bind(BondState::Requested.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // The lock and `close_unpublished_maker_order` exclude each other: the
+    // bond does not lock once the close has ended its order, and the close
+    // refuses while the bond is locked. Each is one statement, so whichever
+    // commits first wins (#942). A payment racing a close that already won
+    // leaves the bond `Requested`; the close's release (or the next
+    // `expire_unpaid_maker_bonds` pass) cancels the HTLC and refunds it.
+    let result = sqlx::query(
+        "UPDATE bonds SET state = ?, locked_at = ? WHERE id = ? AND state = ? \
+         AND NOT EXISTS (SELECT 1 FROM orders WHERE id = bonds.order_id \
+                         AND status IN (?, ?, ?))",
+    )
+    .bind(BondState::Locked.to_string())
+    .bind(now)
+    .bind(bond.id)
+    .bind(BondState::Requested.to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[0].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[1].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[2].to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // Re-read so a concurrent release (e.g. the order expired and its
     // bond was cancelled) is visible before we try to publish.
@@ -1174,6 +1369,160 @@ async fn promote_taker_context_to_order(
     Ok(order)
 }
 
+/// The statuses [`close_unpublished_maker_order`] writes. The maker bond
+/// lock (`on_maker_bond_accepted`) refuses an order in any of them, and the
+/// stranded-bond retry in [`expire_unpaid_maker_bonds`] releases only under
+/// them: one list, so the two cannot drift apart.
+pub(crate) const UNPUBLISHED_CLOSE_STATUSES: [Status; 3] =
+    [Status::Expired, Status::CanceledByAdmin, Status::Canceled];
+
+/// Close an order that is still waiting for its maker bond (#942).
+///
+/// Such an order was never published, so there is no NIP-33 event to
+/// replace: publishing one would put a ghost entry in the book. The order
+/// moves to `status` in the DB only, its bonds are released and the maker is
+/// sent `notice` (on `request_id` when the maker asked for the close), so
+/// their client can end the bond screen instead of counting down to nothing.
+///
+/// The transition is a compare-and-set on `waiting-maker-bond` that also
+/// refuses while the maker bond is `locked`, and `on_maker_bond_accepted`
+/// does not lock the bond of an order this function has closed (the statuses
+/// it writes: `expired`, `canceled-by-admin`, `canceled`). The two exclude
+/// each other, so a payment and a deadline cannot both win:
+/// a bond that locked first gets its order published, and once the close has
+/// committed the bond can no longer lock, so a payment arriving at that
+/// instant is refunded together with the closed order.
+///
+/// Returns whether this call closed the order; `false` means another path
+/// already owns its status.
+pub async fn close_unpublished_maker_order(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    status: Status,
+    notice: Action,
+    request_id: Option<u64>,
+) -> Result<bool, MostroError> {
+    if !UNPUBLISHED_CLOSE_STATUSES.contains(&status) {
+        return Err(MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "close_unpublished_maker_order: {status} is not a status the maker bond lock refuses"
+        ))));
+    }
+    let closed = sqlx::query(
+        "UPDATE orders SET status = ? WHERE id = ? AND status = ? \
+         AND NOT EXISTS (SELECT 1 FROM bonds WHERE order_id = ? AND role = ? AND state = ?)",
+    )
+    .bind(status.to_string())
+    .bind(order_id)
+    .bind(Status::WaitingMakerBond.to_string())
+    .bind(order_id)
+    .bind(BondRole::Maker.to_string())
+    .bind(BondState::Locked.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if closed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    info!("Unpublished maker-bond order {order_id} closed as {status}");
+
+    // Bonds are Lightning-only and mutually exclusive with Cashu mode
+    // (CF-1), whose node has no LND for the release helpers to open.
+    if !Settings::is_cashu_enabled() {
+        release_bonds_for_order_or_warn(pool, order_id, "close_unpublished_maker_order").await;
+    }
+
+    // The notice is best effort: the order is closed either way, and a
+    // client that misses it still ends the window at the invoice's expiry.
+    match Order::by_id(pool, order_id).await {
+        Ok(Some(order)) => match order.get_creator_pubkey() {
+            Ok(maker) => {
+                enqueue_order_msg(request_id, Some(order_id), notice, None, maker, None).await;
+            }
+            Err(e) => warn!(%order_id, "close_unpublished_maker_order: no maker pubkey: {e}"),
+        },
+        Ok(None) => warn!(%order_id, "close_unpublished_maker_order: order vanished"),
+        Err(e) => warn!(%order_id, "close_unpublished_maker_order: reload failed: {e}"),
+    }
+    Ok(true)
+}
+
+/// Enforce `maker_bond_payment_timeout_seconds` (#942), in two steps that
+/// both read the current rows, never a snapshot.
+///
+/// 1. **Close** every order still `waiting-maker-bond` past the deadline,
+///    whatever its bond's state: `requested` (unpaid), `released` (a crash
+///    or failed close between `on_bond_invoice_canceled`'s two writes), or
+///    no bond row at all. [`close_unpublished_maker_order`] refuses one
+///    whose bond is `locked`.
+/// 2. **Release** every maker bond still `requested` whose order that close
+///    has already ended (LND could not cancel the invoice at close time).
+///    Only orders in [`UNPUBLISHED_CLOSE_STATUSES`] qualify: the bond lock
+///    refuses exactly those, so such a bond can never lock again and
+///    releasing it cannot refund a payment that won. Retried every pass
+///    until LND cancels it, so a late payment cannot strand an HTLC.
+///
+/// Returns how many orders this pass closed.
+pub async fn expire_unpaid_maker_bonds(
+    pool: &Pool<Sqlite>,
+    now: i64,
+) -> Result<usize, MostroError> {
+    let timeout = Settings::get_bond()
+        .map(|cfg| cfg.maker_bond_payment_timeout_seconds)
+        .unwrap_or_else(|| {
+            crate::config::types::AntiAbuseBondSettings::default()
+                .maker_bond_payment_timeout_seconds
+        });
+    let cutoff = now.saturating_sub(i64::try_from(timeout).unwrap_or(i64::MAX));
+
+    let overdue = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM orders WHERE status = ? AND created_at <= ? ORDER BY created_at ASC",
+    )
+    .bind(Status::WaitingMakerBond.to_string())
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let mut closed = 0;
+    for (order_id,) in overdue {
+        match close_unpublished_maker_order(pool, order_id, Status::Expired, Action::Canceled, None)
+            .await
+        {
+            Ok(true) => {
+                info!(%order_id, "maker bond unpaid past the deadline; order expired");
+                closed += 1;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(%order_id, "expire_unpaid_maker_bonds: close failed, retrying next pass: {e}")
+            }
+        }
+    }
+
+    let stranded = sqlx::query_as::<_, Bond>(
+        "SELECT b.* FROM bonds b JOIN orders o ON o.id = b.order_id \
+         WHERE b.role = ? AND b.state = ? AND b.parent_bond_id IS NULL \
+         AND o.status IN (?, ?, ?)",
+    )
+    .bind(BondRole::Maker.to_string())
+    .bind(BondState::Requested.to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[0].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[1].to_string())
+    .bind(UNPUBLISHED_CLOSE_STATUSES[2].to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    for bond in stranded.iter() {
+        if let Err(e) = release_bond(pool, bond).await {
+            warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "expire_unpaid_maker_bonds: stranded bond release failed, retrying next pass: {e}"
+            );
+        }
+    }
+    Ok(closed)
+}
+
 /// Subscriber callback for `InvoiceState::Canceled`: bond never locked
 /// (taker abandoned the invoice, LND auto-canceled on expiration, or
 /// the bond was cancelled by `release_bond` because another concurrent
@@ -1224,6 +1573,26 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
             order_id = %bond.order_id,
             "on_bond_invoice_canceled: failed to flip status back to Pending: {}", e
         );
+    }
+
+    // #942: the maker-side twin. An unpaid maker bond invoice that LND
+    // canceled (its expiry passed) ends the unpublished order with it;
+    // otherwise the order sat in `WaitingMakerBond` until its own expiry.
+    if bond.role == BondRole::Maker.to_string() {
+        if let Err(e) = close_unpublished_maker_order(
+            pool,
+            bond.order_id,
+            Status::Expired,
+            Action::Canceled,
+            None,
+        )
+        .await
+        {
+            warn!(
+                order_id = %bond.order_id,
+                "on_bond_invoice_canceled: failed to close the unpublished order: {}", e
+            );
+        }
     }
     Ok(())
 }
@@ -1346,6 +1715,270 @@ pub(crate) async fn maybe_drop_waiting_taker_bond(
     Ok(())
 }
 
+/// Whether an LND lookup that found an accepted hold-invoice HTLC must
+/// block the stranded-taker sweep from releasing a still-`Requested`
+/// bond row. `Some(expiry_height)` means LND already accepted an HTLC
+/// ([`LndConnector::get_hold_invoice_expiry_height`]); cancelling then
+/// would refund the payer before the subscriber can promote the row to
+/// `Locked`.
+pub(crate) fn accepted_htlc_blocks_stale_release(accepted_expiry_height: Option<u32>) -> bool {
+    accepted_expiry_height.is_some()
+}
+
+/// LND lookup the stranded-taker sweep needs before cancelling a still-
+/// `Requested` bond: whether an accepted HTLC already backs the hold
+/// invoice. Mirrors [`crate::app::cancel::CancelLightning`] so tests can
+/// pass a stub instead of a live [`LndConnector`].
+pub trait HoldInvoiceProbe {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>>;
+
+    /// Attach a fresh LND subscriber to the bond hold invoice `hash`
+    /// (hex). `SubscribeSingleInvoice` replays the current state, so an
+    /// already-accepted HTLC reaches [`on_bond_invoice_accepted`].
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>>;
+}
+
+impl HoldInvoiceProbe for LndConnector {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { LndConnector::get_hold_invoice_expiry_height(self, hash).await })
+    }
+
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = Vec::<u8>::from_hex(hash).map_err(|e| {
+                MostroInternalErr(ServiceError::UnexpectedError(format!(
+                    "malformed bond hash {hash}: {e}"
+                )))
+            })?;
+            bond_invoice_subscribe(bytes, None).await
+        })
+    }
+}
+
+/// Probe that always reports no accepted HTLC. Unit tests that exercise
+/// the hashless bail-early release path never open LND; this keeps the
+/// sweep callable without a connector.
+#[cfg(test)]
+pub(crate) struct NoAcceptedHtlc;
+
+#[cfg(test)]
+impl HoldInvoiceProbe for NoAcceptedHtlc {
+    fn get_hold_invoice_expiry_height<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn rearm_subscriber<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+impl CancelLightning for NoAcceptedHtlc {
+    fn cancel_hold_invoice<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Scheduler sweep (issue #927 part 2): bound the taker-bond window
+/// independently of the LND cancel callback.
+///
+/// Ideal path: LND cancels the bond hold invoice at
+/// `hold_invoice_expiration_window` (#990 / #999) and drives
+/// `on_bond_invoice_canceled` → [`maybe_drop_waiting_taker_bond`]. This
+/// sweep is the belt-and-braces path when that signal is missed: it
+/// releases `Requested` taker bonds older than the window plus a grace
+/// margin and drops the order back to `Pending`. Safe to run
+/// redundantly with the LND path: every step no-ops when the order or
+/// bond has already moved on.
+///
+/// Before cancelling, the sweep asks LND whether the invoice already has
+/// an accepted HTLC. `Some(_)` means payment landed but
+/// [`on_bond_invoice_accepted`] has not locked the row yet (common at
+/// startup after `resubscribe_active_bonds`); the release is skipped so
+/// the subscriber can promote the bond. Cancel only when the lookup
+/// returns `None`.
+pub async fn reconcile_stranded_taker_bonds(pool: &Pool<Sqlite>) {
+    // Margin past `hold_invoice_expiration_window` before a `Requested`
+    // bond counts as stale. Invoice expiry and the scheduler clock are
+    // not synchronized; the LND accepted-HTLC probe (and the state CAS
+    // once the lock has committed) keep a concurrent payment from being
+    // cancelled.
+    const STALE_GRACE_SECONDS: i64 = 60;
+    let window = Settings::get_ln().hold_invoice_expiration_window as i64;
+    let stale_cutoff = Utc::now().timestamp() - window - STALE_GRACE_SECONDS;
+
+    // Cheap pre-check so an idle node never opens LND just to find nothing.
+    match super::db::find_stale_waiting_taker_bond_orders(pool, stale_cutoff).await {
+        Ok(orders) if orders.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("reconcile_taker_bonds: scan for stranded WaitingTakerBond orders failed: {e}");
+            return;
+        }
+    }
+    let mut ln = match LndConnector::new().await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("reconcile_taker_bonds: cannot connect to LND to probe/cancel stale bonds: {e}");
+            return;
+        }
+    };
+    reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut ln).await;
+}
+
+/// Testable core of [`reconcile_stranded_taker_bonds`]: the cutoff is
+/// injected so tests don't depend on global LN settings. Uses
+/// [`NoAcceptedHtlc`] — call [`reconcile_stranded_taker_bonds_at_with`]
+/// when the probe outcome matters.
+#[cfg(test)]
+pub(crate) async fn reconcile_stranded_taker_bonds_at(pool: &Pool<Sqlite>, stale_cutoff: i64) {
+    reconcile_stranded_taker_bonds_at_with(pool, stale_cutoff, &mut NoAcceptedHtlc).await;
+}
+
+/// Like [`reconcile_stranded_taker_bonds_at`], with an injectable LND
+/// seam: [`HoldInvoiceProbe`] for the accepted-HTLC guard and
+/// [`CancelLightning`] for the release.
+pub(crate) async fn reconcile_stranded_taker_bonds_at_with<
+    P: HoldInvoiceProbe + CancelLightning + Send,
+>(
+    pool: &Pool<Sqlite>,
+    stale_cutoff: i64,
+    probe: &mut P,
+) {
+    let stale = match super::db::find_stale_waiting_taker_bond_orders(pool, stale_cutoff).await {
+        Ok(orders) => orders,
+        Err(e) => {
+            warn!("reconcile_taker_bonds: scan for stranded WaitingTakerBond orders failed: {e}");
+            return;
+        }
+    };
+    for order in stale {
+        sweep_stranded_taker_bond_order(pool, order.id, stale_cutoff, probe).await;
+    }
+}
+
+/// Per-order sweep step of [`reconcile_stranded_taker_bonds_at`].
+///
+/// Re-checks each bond's state and age at action time. The finder's
+/// exclusions only hold at SELECT time, and a `WaitingTakerBond` order
+/// is still takeable — so between the scan and this point a concurrent
+/// take can add a fresh `Requested` bond, or one can lock. Releasing
+/// either would cancel a live hold invoice (in the locked case: refund
+/// the winner's bond mid-promotion). Only bonds matching the finder's
+/// own stale predicate — `Requested`, taker role, created before the
+/// cutoff — are released; anything fresher is skipped here and makes
+/// `maybe_drop_waiting_taker_bond`'s CAS no-op below.
+///
+/// A stale `Requested` row can still back an **accepted** HTLC that the
+/// daemon has not locked yet (payment while mostrod was down, or a
+/// delayed `Accepted` callback after resubscribe). The CAS in
+/// [`release_bond_if_state`] only helps once the lock `UPDATE` has
+/// committed; before that the sweep probes LND and skips cancel when an
+/// accepted HTLC is present. It also re-arms the bond subscriber: the
+/// one attached at startup returns on its first stream error, and
+/// without a live subscriber nothing would ever lock the row.
+/// `SubscribeSingleInvoice` replays the current state, and a duplicate
+/// `Accepted` is absorbed by the lock and promotion CAS guards. A lookup
+/// that fails because LND does not know the invoice falls through to the
+/// release; any other lookup failure skips the bond until the next tick.
+/// When the row is already `Locked`, the CAS miss skips cancel so the
+/// winner is not refunded. Exit paths use [`release_bond`], which
+/// retries from the fresh state. A transient LND failure during the
+/// cancel rolls the claim back and the next tick retries.
+async fn sweep_stranded_taker_bond_order<P: HoldInvoiceProbe + CancelLightning + Send>(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    stale_cutoff: i64,
+    probe: &mut P,
+) {
+    match find_active_bonds_for_order(pool, order_id).await {
+        Ok(bonds) => {
+            let taker_role = BondRole::Taker.to_string();
+            let requested = BondState::Requested.to_string();
+            for bond in bonds.iter().filter(|b| {
+                b.role == taker_role && b.state == requested && b.created_at < stale_cutoff
+            }) {
+                if let Some(hash) = bond.hash.as_deref() {
+                    match probe.get_hold_invoice_expiry_height(hash).await {
+                        Ok(height) if accepted_htlc_blocks_stale_release(height) => {
+                            info!(
+                                bond_id = %bond.id,
+                                order_id = %order_id,
+                                "reconcile_taker_bonds: stale Requested bond has an accepted HTLC; re-arming subscriber"
+                            );
+                            if let Err(e) = probe.rearm_subscriber(hash).await {
+                                warn!(
+                                    bond_id = %bond.id,
+                                    order_id = %order_id,
+                                    "reconcile_taker_bonds: re-arming bond subscriber failed: {e}"
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(_) => {}
+                        // LND has no such invoice: nothing to protect.
+                        Err(e) if classify_cancel_error(&e) == CancelOutcome::AlreadyDone => {}
+                        Err(e) => {
+                            // Fail closed: do not cancel if we cannot tell
+                            // whether an accepted HTLC is still held.
+                            warn!(
+                                bond_id = %bond.id,
+                                order_id = %order_id,
+                                "reconcile_taker_bonds: hold-invoice probe failed; skipping release: {e}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                if let Err(e) = release_bond_if_state_with(pool, bond, probe).await {
+                    warn!(
+                        bond_id = %bond.id,
+                        order_id = %order_id,
+                        "reconcile_taker_bonds: could not release stale taker bond: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                order_id = %order_id,
+                "reconcile_taker_bonds: bond lookup failed: {e}"
+            );
+            return;
+        }
+    }
+    // Republishes from a fresh DB read, so the orderbook gets correct
+    // tags — not the taker-mutated in-memory struct the
+    // `WaitingTakerBond` event was built from at take-time.
+    if let Err(e) = maybe_drop_waiting_taker_bond(pool, order_id).await {
+        warn!(
+            order_id = %order_id,
+            "reconcile_taker_bonds: drop back to Pending failed: {e}"
+        );
+    }
+}
+
 /// Resume the take flow after the winning bond locks.
 ///
 /// The take handler deferred the trade hold-invoice step under
@@ -1432,7 +2065,28 @@ async fn resume_take_after_bond(
 mod tests {
     use super::*;
     use crate::app::bond::types::BondRole;
+    use crate::lightning::lookup_invoice_error;
+    use fedimint_tonic_lnd::tonic::Status as Status_;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    /// #990: the taker's bond invoice must stop being payable when the
+    /// window the info event advertises closes, not after LND's 24 h
+    /// default. LND then cancels it and `on_bond_invoice_canceled` ends the
+    /// take, as the bond code expects.
+    #[test]
+    fn taker_bond_invoice_expires_with_the_advertised_window() {
+        // Arrange
+        let ln = crate::config::types::LightningSettings {
+            hold_invoice_expiration_window: 300,
+            ..Default::default()
+        };
+
+        // Act
+        let expiry = taker_bond_invoice_expiry(&ln);
+
+        // Assert
+        assert_eq!(expiry, Some(300));
+    }
 
     async fn setup_pool() -> Pool<Sqlite> {
         let pool = SqlitePoolOptions::new()
@@ -1967,6 +2621,452 @@ mod tests {
         assert_eq!(order.status, Status::Pending.to_string());
     }
 
+    async fn insert_waiting_taker_bond_order(pool: &Pool<Sqlite>) -> Uuid {
+        let id = Uuid::new_v4();
+        insert_order(pool, id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Issue #927 part 2: the stale-order finder must select exactly the
+    /// orders whose taker-bond window has demonstrably closed — and
+    /// nothing else.
+    #[tokio::test]
+    async fn find_stale_waiting_taker_bond_orders_scopes_to_closed_windows() {
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+        let stale_cutoff = now - 360;
+
+        // (a) Stale Requested taker bond → returned.
+        let stale_requested = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(stale_requested, BondState::Requested);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        // (b) Fresh Requested taker bond (window still open) → not returned.
+        let fresh_requested = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(fresh_requested, BondState::Requested);
+        b.created_at = now;
+        create_bond(&pool, b).await.unwrap();
+
+        // (c) Locked taker bond, however old → not returned. The winner's
+        // sats are held; `on_bond_invoice_accepted` owns that transition.
+        let locked = insert_waiting_taker_bond_order(&pool).await;
+        let mut b = make_bond(locked, BondState::Locked);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        // (d) No bond rows at all → returned (pure stranded status).
+        let bondless = insert_waiting_taker_bond_order(&pool).await;
+
+        // (e) Stale Requested taker bond + Locked MAKER bond (apply_to =
+        // both) → returned: the role filter must ignore the maker bond.
+        let with_maker = insert_waiting_taker_bond_order(&pool).await;
+        let mut t = make_bond(with_maker, BondState::Requested);
+        t.created_at = stale_cutoff - 100;
+        create_bond(&pool, t).await.unwrap();
+        let mut m = Bond::new_requested(with_maker, "m".repeat(64), BondRole::Maker, 1_000);
+        m.state = BondState::Locked.to_string();
+        m.created_at = now;
+        create_bond(&pool, m).await.unwrap();
+
+        // (f) Pending order with a stale Requested bond → not returned
+        // (status filter).
+        let pending = Uuid::new_v4();
+        insert_order(&pool, pending).await;
+        let mut b = make_bond(pending, BondState::Requested);
+        b.created_at = stale_cutoff - 100;
+        create_bond(&pool, b).await.unwrap();
+
+        let found = super::super::db::find_stale_waiting_taker_bond_orders(&pool, stale_cutoff)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<Uuid> = found.iter().map(|o| o.id).collect();
+        assert!(ids.contains(&stale_requested), "stale Requested must match");
+        assert!(
+            ids.contains(&bondless),
+            "bondless stranded order must match"
+        );
+        assert!(
+            ids.contains(&with_maker),
+            "maker bond must not pin the order"
+        );
+        assert!(
+            !ids.contains(&fresh_requested),
+            "open window must not match"
+        );
+        assert!(!ids.contains(&locked), "Locked taker bond must not match");
+        assert!(
+            !ids.contains(&pending),
+            "non-WaitingTakerBond must not match"
+        );
+    }
+
+    /// Recording stub for [`HoldInvoiceProbe`] + [`CancelLightning`]:
+    /// returns a fixed lookup result (height or error) and counts
+    /// lookups, subscriber re-arms and cancels.
+    struct StubHoldProbe {
+        height: Option<u32>,
+        lookup_err: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        rearms: std::sync::atomic::AtomicUsize,
+        cancels: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubHoldProbe {
+        fn with_height(height: Option<u32>) -> Self {
+            Self {
+                height,
+                lookup_err: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                rearms: std::sync::atomic::AtomicUsize::new(0),
+                cancels: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with_lookup_err(msg: &str) -> Self {
+            Self {
+                lookup_err: Some(msg.to_string()),
+                ..Self::with_height(None)
+            }
+        }
+
+        fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl HoldInvoiceProbe for StubHoldProbe {
+        fn get_hold_invoice_expiry_height<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u32>, MostroError>> + Send + 'a>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = match &self.lookup_err {
+                Some(msg) => Err(MostroInternalErr(ServiceError::LnNodeError(msg.clone()))),
+                None => Ok(self.height),
+            };
+            Box::pin(async move { result })
+        }
+
+        fn rearm_subscriber<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            self.rearms
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    impl CancelLightning for StubHoldProbe {
+        fn cancel_hold_invoice<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
+            self.cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    async fn bond_state(pool: &Pool<Sqlite>, bond_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// grunch on #986: an accepted HTLC seen by the sweep must re-arm the
+    /// bond subscriber — the startup one may have died on a stream error
+    /// and would never deliver the `Accepted` that locks the bond.
+    #[tokio::test]
+    async fn sweep_rearms_subscriber_for_accepted_htlc() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe = StubHoldProbe::with_height(Some(800_000));
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(
+            StubHoldProbe::count(&probe.rearms),
+            1,
+            "accepted HTLC must re-arm the subscriber"
+        );
+        assert_eq!(StubHoldProbe::count(&probe.cancels), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Requested.to_string()
+        );
+    }
+
+    /// grunch on #986: a `NotFound` lookup means LND has no invoice to
+    /// protect, so the sweep must release instead of pinning the order.
+    #[tokio::test]
+    async fn sweep_releases_bond_when_invoice_gone_at_lnd() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe =
+            StubHoldProbe::with_lookup_err("code=NotFound message=there are no existing invoices");
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(StubHoldProbe::count(&probe.rearms), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Released.to_string(),
+            "invoice unknown to LND must not block the release"
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// A transient lookup failure keeps failing closed: the HTLC state is
+    /// unknown, so the bond stays `Requested` for the next tick.
+    #[tokio::test]
+    async fn sweep_skips_bond_when_probe_unavailable() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe =
+            StubHoldProbe::with_lookup_err("code=Unavailable message=connection refused");
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(StubHoldProbe::count(&probe.cancels), 0);
+        assert_eq!(
+            bond_state(&pool, bond_id).await,
+            BondState::Requested.to_string()
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    /// LND reports a missing invoice on lookup as `NotFound`; the mapped
+    /// error must carry the gRPC code so `classify_cancel_error` sees it.
+    #[test]
+    fn lookup_invoice_error_keeps_grpc_code() {
+        let err = lookup_invoice_error(Status_::not_found("there are no existing invoices"));
+        assert_eq!(classify_cancel_error(&err), CancelOutcome::AlreadyDone);
+
+        let err = lookup_invoice_error(Status_::unavailable("connection refused"));
+        assert_eq!(classify_cancel_error(&err), CancelOutcome::Transient);
+    }
+
+    /// CodeRabbit on #986: a race loser that finds the row already
+    /// `Released` (a claim whose LND cancel may not have landed) must
+    /// still cancel the hold invoice best-effort.
+    #[tokio::test]
+    async fn race_loser_cancels_htlc_behind_released_claim() {
+        init_test_settings();
+        let pool = setup_pool().await;
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let bond = make_bond(order_id, BondState::Released);
+        assert!(bond.hash.is_some());
+
+        let mut ln = StubHoldProbe::with_height(None);
+        release_race_loser(&pool, &bond, BondState::Released, &mut ln).await;
+        assert_eq!(
+            StubHoldProbe::count(&ln.cancels),
+            1,
+            "Released race loser must cancel the HTLC"
+        );
+
+        let slashed = make_bond(order_id, BondState::Slashed);
+        let mut ln = StubHoldProbe::with_height(None);
+        release_race_loser(&pool, &slashed, BondState::Slashed, &mut ln).await;
+        assert_eq!(
+            StubHoldProbe::count(&ln.cancels),
+            0,
+            "Slashed bond's HTLC was settled; nothing to cancel"
+        );
+    }
+
+    /// A stale `Requested` bond whose invoice lookup returns an accepted
+    /// HTLC must not be released — the subscriber still needs to lock it
+    /// (grunch on #986: Accepted-but-not-Locked at startup).
+    #[tokio::test]
+    async fn sweep_skips_requested_bond_with_accepted_htlc() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        let mut probe = StubHoldProbe::with_height(Some(800_000));
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut probe).await;
+
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "sweep must probe LND before cancelling a hashed bond"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            BondState::Requested.to_string(),
+            "accepted HTLC must block the sweep release"
+        );
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    /// Issue #927 part 2: the sweep releases the stale `Requested` taker
+    /// bond and drops the order back to `Pending` with no LND callback
+    /// involved. Uses a bond without a hash (the `request_taker_bond`
+    /// bailed-early shape) so `release_bond` skips the LND connection;
+    /// the NIP-33 republish inside `maybe_drop_waiting_taker_bond` may
+    /// fail without Nostr globals, but the status CAS commits before it
+    /// and the sweep swallows that error.
+    #[tokio::test]
+    async fn reconcile_stranded_taker_bonds_releases_stale_and_drops_order() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        bond.created_at = now - 1_000;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        reconcile_stranded_taker_bonds_at(&pool, now - 360).await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, BondState::Released.to_string());
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::Pending.to_string());
+    }
+
+    /// Race regression (issue #927 part 2 review): the finder's
+    /// exclusions only hold at SELECT time, and a `WaitingTakerBond`
+    /// order is still takeable — a concurrent take can add a fresh
+    /// `Requested` bond (or a bond can lock) between the scan and the
+    /// release loop. The per-order sweep step must re-check state and
+    /// age at action time, or it would cancel a live hold invoice — in
+    /// the locked case refunding the winner's bond mid-promotion.
+    /// Simulates the post-scan state by invoking the step directly.
+    #[tokio::test]
+    async fn sweep_step_rechecks_bond_state_and_age_at_action_time() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+
+        // Fresh `Requested` taker bond: a concurrent take that landed
+        // after the scan. Must NOT be released.
+        let mut fresh = make_bond(order_id, BondState::Requested);
+        fresh.hash = None;
+        fresh.created_at = now;
+        let fresh_id = fresh.id;
+        create_bond(&pool, fresh).await.unwrap();
+
+        // Taker bond that locked after the scan (winner mid-promotion,
+        // stale by age). Must NOT be released either — state, not just
+        // age, gates the release. `hash = None` so a broken filter would
+        // actually mark it Released (with a hash, `release_bond` merely
+        // errors on the absent LND and the assert passes vacuously).
+        let mut locked = make_bond(order_id, BondState::Locked);
+        locked.hash = None;
+        locked.pubkey = "w".repeat(64);
+        locked.created_at = now - 1_000;
+        let locked_id = locked.id;
+        create_bond(&pool, locked).await.unwrap();
+
+        sweep_stranded_taker_bond_order(&pool, order_id, now - 360, &mut NoAcceptedHtlc).await;
+
+        let fresh_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(fresh_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh_state,
+            BondState::Requested.to_string(),
+            "a fresh Requested bond must survive the sweep"
+        );
+        let locked_state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(locked_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            locked_state,
+            BondState::Locked.to_string(),
+            "a Locked bond must survive the sweep regardless of age"
+        );
+        // And the drop CAS must no-op: the surviving bonds pin the order.
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
+    /// A fresh `Requested` bond keeps its order out of the sweep — the
+    /// racing taker still has time to pay the bond invoice.
+    #[tokio::test]
+    async fn reconcile_stranded_taker_bonds_leaves_open_windows_alone() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let now = Utc::now().timestamp();
+
+        let order_id = insert_waiting_taker_bond_order(&pool).await;
+        let mut bond = make_bond(order_id, BondState::Requested);
+        bond.hash = None;
+        bond.created_at = now;
+        let bond_id = bond.id;
+        create_bond(&pool, bond).await.unwrap();
+
+        reconcile_stranded_taker_bonds_at(&pool, now - 360).await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM bonds WHERE id = ?")
+            .bind(bond_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, BondState::Requested.to_string());
+        let order = Order::by_id(&pool, order_id).await.unwrap().unwrap();
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+    }
+
     /// Phase 1.5 P2 regression: `maybe_drop_waiting_taker_bond` must
     /// not flip a `WaitingTakerBond` order back to `Pending` if a
     /// concurrent bond has just become `Locked`. The single conditional
@@ -2270,6 +3370,115 @@ mod tests {
             BondState::Requested.to_string(),
             "bond must stay active for a later retry"
         );
+    }
+
+    /// Sweep path: a `Requested` snapshot must not cancel or overwrite a
+    /// bond that locked after the snapshot was taken. `hash = None` so a
+    /// missing state predicate would mark the row `Released` instead of
+    /// failing on LND and hiding the overwrite. (ermeme P1 / Matobi98 /
+    /// grunch on #928/#986)
+    #[tokio::test]
+    async fn release_bond_if_state_leaves_a_concurrent_lock_untouched() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        let mut stale = created.clone();
+        stale.state = BondState::Requested.to_string();
+        stale.locked_at = None;
+        let outcome = release_bond_if_state(&pool, &stale).await.unwrap();
+        assert_eq!(outcome, ReleaseBondOutcome::StateMoved);
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
+        assert!(after.locked_at.is_some());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
+    /// Exit path: a `Locked` snapshot released after a concurrent slash
+    /// moved the row to `PendingPayout` must not claim `Released` — the
+    /// HTLC is already settled and Phase 3 owns the payout
+    /// (CodeRabbit on #986). Fails while the retry only bails on
+    /// `is_terminal()` (PendingPayout is neither terminal nor active).
+    #[tokio::test]
+    async fn release_bond_leaves_pending_payout_alone() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut locked = make_bond(order_id, BondState::Locked);
+        locked.hash = None;
+        locked.locked_at = Some(Utc::now().timestamp());
+        let created = create_bond(&pool, locked).await.unwrap();
+
+        // Concurrent slash: HTLC settled, payout job owns the row.
+        sqlx::query("UPDATE bonds SET state = ? WHERE id = ?")
+            .bind(BondState::PendingPayout.to_string())
+            .bind(created.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut stale = created.clone();
+        stale.state = BondState::Locked.to_string();
+        release_bond(&pool, &stale).await.unwrap();
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            BondState::PendingPayout.to_string(),
+            "release must not overwrite PendingPayout"
+        );
+        assert!(after.released_at.is_none());
+    }
+
+    /// Exit path: a `Requested` snapshot released after the row locked
+    /// must still cancel — re-read and retry from `Locked` so expiry /
+    /// cancel jobs do not strand the HTLC (grunch on #986).
+    #[tokio::test]
+    async fn release_bond_retries_and_releases_a_concurrent_lock() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        let mut stale = created.clone();
+        stale.state = BondState::Requested.to_string();
+        stale.locked_at = None;
+        release_bond(&pool, &stale).await.unwrap();
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert!(after.released_at.is_some());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    /// Same exit-path contract through the order-level helper the pending
+    /// expiry job uses.
+    #[tokio::test]
+    async fn release_taker_bonds_releases_after_concurrent_lock() {
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut requested = make_bond(order_id, BondState::Requested);
+        requested.hash = None;
+        let created = create_bond(&pool, requested).await.unwrap();
+        assert_eq!(try_lock(&pool, &created).await, 1);
+
+        release_taker_bonds_for_order_or_warn(&pool, order_id, "unit_test").await;
+
+        let after = Bond::by_id(&pool, created.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        let active = find_active_bonds_for_order(&pool, order_id).await.unwrap();
+        assert!(active.is_empty());
     }
 
     #[tokio::test]
@@ -2706,6 +3915,292 @@ mod tests {
             .unwrap();
         assert_eq!(after.state, BondState::Slashed.to_string());
         assert_eq!(after.released_at, created.released_at);
+    }
+
+    #[tokio::test]
+    async fn canceled_callback_expires_unpublished_maker_order() {
+        // #942: LND cancels the unpaid maker bond invoice. The order was
+        // never published, so it must end with the bond instead of sitting
+        // in WaitingMakerBond until its own expiry.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingMakerBond.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.hash = Some("a".repeat(64));
+        create_bond(&pool, maker).await.unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("cancel path returns Ok");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::Expired.to_string());
+    }
+
+    /// The deadline `expire_unpaid_maker_bonds` enforces under the settings
+    /// this test process happened to install.
+    fn maker_timeout() -> i64 {
+        let secs = Settings::get_bond()
+            .map(|cfg| cfg.maker_bond_payment_timeout_seconds)
+            .unwrap_or_else(|| {
+                crate::config::types::AntiAbuseBondSettings::default()
+                    .maker_bond_payment_timeout_seconds
+            });
+        i64::try_from(secs).unwrap()
+    }
+
+    async fn waiting_maker_bond_order(pool: &Pool<Sqlite>, bond_state: BondState) -> (Uuid, Bond) {
+        let order_id = Uuid::new_v4();
+        insert_order(pool, order_id).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::WaitingMakerBond.to_string())
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        // No hash: the release marks the row without an LND round-trip.
+        let mut maker = Bond::new_requested(order_id, "m".repeat(64), BondRole::Maker, 1_000);
+        maker.state = bond_state.to_string();
+        let bond = create_bond(pool, maker).await.unwrap();
+        // The deadline runs from the order's creation, which the fixture
+        // leaves at 0: align it with the bond's.
+        sqlx::query("UPDATE orders SET created_at = ? WHERE id = ?")
+            .bind(bond.created_at)
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        (order_id, bond)
+    }
+
+    async fn set_order_status(pool: &Pool<Sqlite>, order_id: Uuid, status: Status) {
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(order_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn maker_bond_state(pool: &Pool<Sqlite>, order_id: Uuid) -> String {
+        super::super::db::find_bond_by_order_and_role(pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    #[tokio::test]
+    async fn a_requested_bond_whose_order_left_the_window_is_not_released() {
+        // The payment won: by the time the pass looks, the order is no longer
+        // waiting for the bond (the lock committed and the order was
+        // published). A close that loses must never be followed by a
+        // release, or the winner's bond is refunded under a live order.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        set_order_status(&pool, order_id, Status::Pending).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        assert_eq!(
+            maker_bond_state(&pool, order_id).await,
+            BondState::Requested.to_string()
+        );
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bond_locked_past_the_deadline_keeps_its_order() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Locked).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        assert_eq!(
+            maker_bond_state(&pool, order_id).await,
+            BondState::Locked.to_string()
+        );
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_released_bond_never_closed_it_expires() {
+        // A crash (or a failed close) between on_bond_invoice_canceled's two
+        // writes leaves the bond Released and the order still waiting. The
+        // next pass must close it rather than leave it to its expires_at.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Released).await;
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 1);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpaid_maker_bond_past_the_deadline_expires_its_order() {
+        // Arrange
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+
+        // Act
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(closed, 1);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
+        let after = super::super::db::find_bond_by_order_and_role(&pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+    }
+
+    #[tokio::test]
+    async fn unpaid_maker_bond_within_the_deadline_is_left_alone() {
+        // Arrange
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+
+        // Act
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout() - 1)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(closed, 0);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_maker_bond_on_a_closed_order_is_released() {
+        // An earlier close could not cancel the invoice (LND down): the order
+        // is already expired, the bond still requested. The next pass must
+        // retry the release, and must not count or touch the order again.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, bond) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::Expired.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let closed = expire_unpaid_maker_bonds(&pool, bond.created_at + maker_timeout())
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 0);
+        let after = super::super::db::find_bond_by_order_and_role(&pool, order_id, BondRole::Maker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Released.to_string());
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_maker_bond_wins_over_the_close() {
+        // The maker paid at the last moment: the bond is Locked and the
+        // publication is resuming. The close must refuse, so the order is
+        // published and the payment is not refunded behind the maker's back.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, _) = waiting_maker_bond_order(&pool, BondState::Locked).await;
+
+        let closed =
+            close_unpublished_maker_order(&pool, order_id, Status::Expired, Action::Canceled, None)
+                .await
+                .unwrap();
+
+        assert!(!closed);
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payment_after_the_close_cannot_lock_the_bond() {
+        // The close committed first; LND reports the maker's payment a
+        // moment later. The bond must not lock (the close's release refunds
+        // it), and the closed order must stay closed.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let (order_id, _) = waiting_maker_bond_order(&pool, BondState::Requested).await;
+        sqlx::query("UPDATE bonds SET hash = ? WHERE order_id = ?")
+            .bind("c".repeat(64))
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+            .bind(Status::Expired.to_string())
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        on_bond_invoice_accepted(&"c".repeat(64), &pool, None)
+            .await
+            .expect("a lock that loses to the close is not an error");
+
+        let after = find_bond_by_hash(&pool, &"c".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::Requested.to_string());
+        assert_eq!(
+            load_order(&pool, order_id).await.status,
+            Status::Expired.to_string()
+        );
     }
 
     #[tokio::test]

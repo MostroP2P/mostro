@@ -4190,6 +4190,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_bond_invoice_accepts_share_below_min_payment_amount() {
+        // Issue #1011: `min_payment_amount` is a floor on order sizes. The
+        // counterparty share is computed by the node, so a share below that
+        // floor must still be claimable with an invoice for exactly the share.
+        init_test_settings();
+        let min = Settings::get_mostro().min_payment_amount as i64;
+        assert!(min > 1, "test needs a non-trivial min_payment_amount");
+        let share = min / 2;
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            share * 2,
+            share,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let invoice = signed_test_invoice(share as u64);
+        let msg = add_invoice_msg(Some(order_id), Some(&invoice));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        add_bond_invoice_action(&ctx, msg, &event, &keys)
+            .await
+            .expect("a share below min_payment_amount must be claimable");
+
+        let row: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.payout_invoice.as_deref(), Some(invoice.as_str()));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_amount_other_than_share() {
+        // Skipping the order minimum must not relax the exact-amount rule.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            100,
+            50,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, bond).await.unwrap();
+
+        let msg = add_invoice_msg(Some(order_id), Some(&signed_test_invoice(60)));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::InvalidInvoice))
+        ));
+    }
+
+    #[tokio::test]
     async fn add_bond_invoice_resurrects_failed_bond_within_window() {
         // The `InvoiceApplyOutcome::Resurrected` arm: a `Failed` row, still
         // inside the claim window, receiving a fresh valid bolt11 from the

@@ -491,7 +491,7 @@ This starts:
 
 `make docker-build` installs the LND admin macaroon into `docker/config/lnd/` with mode `0600`, since it grants full control of your node, and sets `docker/config/lnd` to mode `0700` on every run. It sets `docker/config` to `0700` only when it has to create the directory — that one holds `settings.toml` and `mostro.db` as well, so a mode you chose for it deliberately is left as it is.
 
-`make docker-up` then runs the container as the owner of `docker/config`, so it can read those files whatever your uid is; `export MOSTRO_CONTAINER_USER=uid:gid` to override that. It refuses to start the container as root, which is what a root-owned `docker/config` would otherwise mean. Under `sudo`, `make docker-build` installs the credentials as the owner of `docker/config` rather than as root, so a directory already handed over to uid 1000 stays readable by the container across rebuilds.
+`make docker-up` then runs the container as the owner of `docker/config`, so it can read those files whatever your uid is; `export MOSTRO_CONTAINER_USER=uid:gid` to override that only when the selected non-root UID owns `docker/config` and its files and can write `mostro.db` (`docker-up` does not change ownership for an override). It refuses to start the container as root, which is what a root-owned `docker/config` would otherwise mean. Under `sudo`, `make docker-build` installs the credentials as the owner of `docker/config` rather than as root, so a directory already handed over to uid 1000 stays readable by the container across rebuilds.
 
 **Stop**: `make docker-down`
 

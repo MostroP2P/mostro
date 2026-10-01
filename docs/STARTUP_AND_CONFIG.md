@@ -109,7 +109,8 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `lnd_macaroon_file` (String): Path to LND macaroon auth file
   - The admin macaroon is spend-capable: any account that can read it controls
     the node, including the funds escrowed in Mostro's hold invoices. Keep it
-    readable only by the user running `mostrod` (`chmod 600`).
+    unreadable by other accounts (`chmod o=`; `chmod 600` only when the user
+    running `mostrod` owns the file).
   - At startup (Lightning mode only, right before the LND connection is opened)
     `src/config/permissions.rs`, `fn warn_if_other_accessible` logs a warning when the
     file's `other` permission bits are set, and suggests `chmod o=`. The check

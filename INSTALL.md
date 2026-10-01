@@ -92,10 +92,11 @@ adduser --disabled-login mostro  # keep pressing enter until it ends
 cd /opt/mostro
 ```
 
-Create a new settings file from `/opt/mostro/mostro/settings.tpl.toml` and save it to `/opt/mostro`:
+Create a new settings file from `/opt/mostro/mostro/settings.tpl.toml` and save it to `/opt/mostro`. `/opt/mostro` holds `settings.toml`, whose `nsec_privkey` is the daemon's identity, and the `mostro.db` created later, so both the directory and the file are restricted to the service account — `install -m` rather than `cp`, which keeps whatever mode the template happens to have:
 
 ```bash
-cp /opt/mostro/mostro/settings.tpl.toml /opt/mostro/settings.toml
+install -d -m 700 -o mostro -g mostro /opt/mostro
+install -m 600 -o mostro -g mostro /opt/mostro/mostro/settings.tpl.toml /opt/mostro/settings.toml
 ```
 
 Update the file `/opt/mostro/settings.toml` with your favourite editor.
@@ -108,29 +109,54 @@ Here some parameters you might want to change:
 - **nsec_privkey** : Your mostro private key
 - **relays** : List of relays you want to connect to
 
+### Protect the admin macaroon
+
+The admin macaroon is a spend-capable credential: any user who can read it has full control of the LND node, including the funds escrowed in Mostro's hold invoices. Access should reach no further than the `mostro` service account created above and the LND account the node already runs as.
+
+If LND runs on this same VPS, grant access through the node's group instead of loosening the file (LND creates `admin.macaroon` with mode `0640`):
+
+```bash
+usermod -aG lnd mostro
+```
+
+If you copy the macaroon into `/opt/mostro` instead, install it owner-readable only and hand it to the service account — do not use plain `cp`, which keeps whatever mode the source file or an existing destination happens to have:
+
+```bash
+install -d -m 700 -o mostro -g mostro /opt/mostro/lnd
+install -m 600 -o mostro -g mostro /path/to/lnd/admin.macaroon /opt/mostro/lnd/admin.macaroon
+```
+
+Then point `lnd_macaroon_file` at `/opt/mostro/lnd/admin.macaroon`.
+
 ## Database
 
 The data is saved in a sqlite db file named by default `mostro.db`, this file is saved on the root directory of the project and can be change just editing the `url` var on the `[database]` section in `settings.toml` file.
 
-Before start building you can initialize the database manually with `sqlx-cli` (optional — `mostrod` creates the file and runs migrations on first connect):
+Before start building you can initialize the database manually with `sqlx-cli` (optional — `mostrod` creates the file and runs migrations on first connect).
+
+These commands run as root, so the database ends up owned by root. Hand it to the service account right away: SQLite writes the `-shm`/`-wal` sidecars next to the database, so `mostrod` needs to own the files *and* be able to create new ones in the directory.
 
 ```bash
 cargo install sqlx-cli --version 0.9.0 --no-default-features --features sqlite
+cd /opt/mostro
 export DATABASE_URL=sqlite://mostro.db
 sqlx database create
 sqlx migrate run
+chown mostro:mostro /opt/mostro/mostro.db*
 ```
 
-Check the DB files are there
+Check the DB files are there, and that they belong to `mostro`:
 
 ```bash
 ls -al /opt/mostro
-drwxrwxr-x root root 4.0 KB Fri Jun 14 15:52:07 2024 .
-drwxr-x--- root root 4.0 KB Sat Jun 15 15:50:32 2024 ..
-.rw-r--r-- root root  52 KB Fri May 31 16:35:34 2024 mostro.db
-.rw-r--r-- root root  32 KB Sat Jun 15 15:28:23 2024 mostro.db-shm
-.rw-r--r-- root root  16 KB Fri Jun 14 15:57:24 2024 mostro.db-wal
+drwx------ mostro mostro 4.0 KB Fri Jun 14 15:52:07 2024 .
+drwxr-x--- root   root   4.0 KB Sat Jun 15 15:50:32 2024 ..
+.rw-r--r-- mostro mostro  52 KB Fri May 31 16:35:34 2024 mostro.db
+.rw-r--r-- mostro mostro  32 KB Sat Jun 15 15:28:23 2024 mostro.db-shm
+.rw-r--r-- mostro mostro  16 KB Fri Jun 14 15:57:24 2024 mostro.db-wal
 ```
+
+If you skip this step, `mostrod` creates the database itself on first connect — as root during the foreground test below. Either way, the `chown -R mostro:mostro /opt/mostro` further down is the backstop that puts the ownership right before the service starts.
 
 ## Clean compilation artifacts
 

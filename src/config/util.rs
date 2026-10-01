@@ -166,7 +166,13 @@ fn validate_cashu_settings(
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
-pub fn init_configuration_file(config_path: Option<String>) -> Result<(), MostroError> {
+///
+/// Returns the settings directory that was used. The caller needs it because
+/// the files in there — `settings.toml` and the optional `.env`, both carrying
+/// `nsec_privkey` in plaintext — are checked for over-broad permissions at
+/// startup, and the path is otherwise not recoverable from the loaded
+/// `Settings`.
+pub fn init_configuration_file(config_path: Option<String>) -> Result<PathBuf, MostroError> {
     let settings_dir = if let Some(user_path) = config_path {
         PathBuf::from(user_path)
     } else {
@@ -208,7 +214,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         validate_mostro_settings(&settings)?;
         init_mostro_settings(settings)?;
         log_settings_loaded();
-        return Ok(());
+        return Ok(settings_dir);
     }
 
     // Read the file content into a zeroizing buffer so TOML plaintext is wiped
@@ -237,7 +243,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
 
     log_settings_loaded();
 
-    Ok(())
+    Ok(settings_dir)
 }
 
 #[cfg(test)]

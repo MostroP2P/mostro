@@ -697,18 +697,34 @@ pub(crate) async fn release_bond_if_state_with<L: CancelLightning + Send>(
 #[derive(Default)]
 pub(crate) struct LazyLndCancel(Option<LndConnector>);
 
+impl LazyLndCancel {
+    async fn connector(&mut self) -> Result<&mut LndConnector, MostroError> {
+        Ok(match &mut self.0 {
+            Some(ln) => ln,
+            slot => slot.insert(LndConnector::new().await?),
+        })
+    }
+}
+
 impl CancelLightning for LazyLndCancel {
     fn cancel_hold_invoice<'a>(
         &'a mut self,
         hash: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
         Box::pin(async move {
-            let ln = match &mut self.0 {
-                Some(ln) => ln,
-                slot => slot.insert(LndConnector::new().await?),
-            };
-            ln.cancel_hold_invoice(hash).await.map(|_| ())
+            self.connector()
+                .await?
+                .cancel_hold_invoice(hash)
+                .await
+                .map(|_| ())
         })
+    }
+
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { self.connector().await?.lookup_invoice_state(hash).await })
     }
 }
 
@@ -1798,6 +1814,13 @@ impl CancelLightning for NoAcceptedHtlc {
     ) -> Pin<Box<dyn Future<Output = Result<(), MostroError>> + Send + 'a>> {
         Box::pin(async move { Ok(()) })
     }
+
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        _hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { Ok(None) })
+    }
 }
 
 /// Scheduler sweep (issue #927 part 2): bound the taker-bond window
@@ -2772,6 +2795,14 @@ mod tests {
             self.cancels
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
+        }
+
+        fn lookup_invoice_state<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(None) })
         }
     }
 

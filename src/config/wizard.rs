@@ -9,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use super::constants::{ENV_FILENAME, NSEC_ENV_VAR};
+use super::permissions::write_owner_only_atomic;
 use super::settings::Settings;
 use super::types::{
     DatabaseSettings, LightningSettings, MostroSettings, NostrSettings, RpcSettings,
@@ -259,43 +260,21 @@ fn prompt_nsec_storage(
     Ok(nsec_in_toml)
 }
 
-/// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path with 0o600 permissions on Unix.
+/// Write `MOSTRO_NSEC_PRIVKEY=<nsec>` to the given path, owner-only (`0600` on
+/// Unix), replacing whatever is already there.
 ///
-/// `OpenOptionsExt::mode(0o600)` only applies when the file is created, so for
-/// preexisting files we must explicitly tighten permissions after opening to
-/// avoid leaving a previously-broader mode in place.
+/// Goes through `write_owner_only_atomic` rather than opening the path
+/// directly. `.env` holds the same `nsec_privkey` as `settings.toml` and, in
+/// the wizard flow, is written first — so opening it with
+/// `create(true).truncate(true)` would follow a symlink another local account
+/// planted in the settings directory, truncating its target and resetting it
+/// to `0600`.
+///
+/// The line goes through a `Zeroizing` buffer so the plaintext nsec is wiped
+/// once handed off.
 fn write_env_file(path: &Path, nsec: &str) -> Result<(), MostroError> {
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let file = {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-    };
-    let mut file = file.map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        file.set_permissions(permissions)
-            .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    }
-
-    writeln!(file, "{}={}", NSEC_ENV_VAR, nsec)
-        .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
-    Ok(())
+    let line = Zeroizing::new(format!("{}={}\n", NSEC_ENV_VAR, nsec));
+    write_owner_only_atomic(path, line.as_bytes())
 }
 
 fn prompt_mostro_settings() -> Result<MostroSettings, MostroError> {

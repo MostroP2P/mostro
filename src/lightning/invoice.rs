@@ -152,6 +152,8 @@ async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroE
 /// * `payment_request` - The BOLT11 invoice string to validate
 /// * `amount` - Optional expected amount in satoshis (before fees)
 /// * `fee` - Optional fee amount in satoshis to subtract from expected amount
+/// * `min_amount_sats` - Smallest non-zero invoice amount accepted; `0`
+///   disables the floor
 ///
 /// # Returns
 ///
@@ -163,21 +165,21 @@ async fn validate_lightning_address(payment_request: &str) -> Result<(), MostroE
 /// - Invoice currency must match the chain the node runs on, when known
 /// - `min_final_cltv_expiry_delta` must not exceed `max_final_cltv_expiry_delta`
 /// - If `amount` is provided, the invoice amount must match `amount - fee`
-/// - Invoice amount must meet minimum payment threshold (if non-zero)
+/// - Invoice amount must meet `min_amount_sats` (if non-zero)
 /// - Invoice must not be expired
 /// - Invoice expiration must be within acceptable time window
 ///
 /// # Notes
 ///
 /// Zero-amount invoices are allowed but still subject to expiration checks.
-/// The function uses configuration settings for minimum amounts and time windows.
+/// The expiration window comes from the Lightning settings.
 async fn validate_bolt11_invoice(
     payment_request: &str,
     amount: Option<u64>,
     fee: Option<u64>,
+    min_amount_sats: u64,
 ) -> Result<(), MostroError> {
     let invoice = decode_invoice(payment_request)?;
-    let mostro_settings = Settings::get_mostro();
     let ln_settings = Settings::get_ln();
 
     let amount_sat = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
@@ -200,7 +202,7 @@ async fn validate_bolt11_invoice(
     }
 
     // Check minimum payment amount
-    if amount_sat > 0 && amount_sat < mostro_settings.min_payment_amount as u64 {
+    if amount_sat > 0 && amount_sat < min_amount_sats {
         return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
     }
 
@@ -255,22 +257,47 @@ async fn validate_bolt11_invoice(
 ///
 /// This function is typically used to validate buyer invoices in trading contexts
 /// where the exact payment format may vary depending on user preference.
-/// Lightning Address / LNURL existence checks use the shared LNURL host policy
-/// in `src/lnurl.rs` (SSRF bounds, DNS pin, timeouts).
+/// BOLT11 invoices must meet `min_payment_amount`, the node's floor on order
+/// sizes. Lightning Address / LNURL existence checks use the shared LNURL host
+/// policy in `src/lnurl.rs` (SSRF bounds, DNS pin, timeouts).
 pub async fn is_valid_invoice(
     payment_request: String,
     amount: Option<u64>,
     fee: Option<u64>,
 ) -> Result<(), MostroError> {
+    let min_amount_sats = Settings::get_mostro().min_payment_amount as u64;
+    validate_payment_request(&payment_request, amount, fee, min_amount_sats).await
+}
+
+/// Validates the payment request a bond winner submits to claim their share
+/// of a slashed bond.
+///
+/// Same rules as [`is_valid_invoice`] except `min_payment_amount`: that
+/// setting bounds the order sizes users pick, while `amount` here is computed
+/// by the node and can fall below it (e.g. 500 sats from the default bond
+/// settings). The invoice must still be for exactly `amount`, or amountless.
+pub async fn is_valid_bond_payout_invoice(
+    payment_request: String,
+    amount: u64,
+) -> Result<(), MostroError> {
+    validate_payment_request(&payment_request, Some(amount), None, 0).await
+}
+
+async fn validate_payment_request(
+    payment_request: &str,
+    amount: Option<u64>,
+    fee: Option<u64>,
+    min_amount_sats: u64,
+) -> Result<(), MostroError> {
     // Try Lightning address or LNURL first
-    if LightningAddress::from_str(&payment_request).is_ok()
-        || LnUrl::from_str(&payment_request).is_ok()
+    if LightningAddress::from_str(payment_request).is_ok()
+        || LnUrl::from_str(payment_request).is_ok()
     {
-        return validate_lightning_address(&payment_request).await;
+        return validate_lightning_address(payment_request).await;
     }
 
     // Fall back to BOLT11 invoice
-    validate_bolt11_invoice(&payment_request, amount, fee).await
+    validate_bolt11_invoice(payment_request, amount, fee, min_amount_sats).await
 }
 
 #[cfg(test)]
@@ -762,6 +789,31 @@ mod tests {
         assert_eq!(
             Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
             min_amount_err.await
+        );
+    }
+
+    /// `min_payment_amount` guards order invoices only: the bond payout path
+    /// accepts the same below-floor invoice, but still checks the amount.
+    #[tokio::test]
+    async fn bond_payout_invoice_skips_only_the_order_minimum() {
+        init_settings_test();
+        let min = Settings::get_mostro().min_payment_amount as u64;
+        assert!(min > 1, "test needs a non-trivial min_payment_amount");
+        let below_min = min - 1;
+        let invoice = build_test_invoice(Some(below_min * 1_000), 86_400);
+
+        assert_eq!(
+            is_valid_invoice(invoice.clone(), Some(below_min), None).await,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "order path keeps enforcing the floor"
+        );
+        assert!(is_valid_bond_payout_invoice(invoice.clone(), below_min)
+            .await
+            .is_ok());
+        assert_eq!(
+            is_valid_bond_payout_invoice(invoice, below_min + 1).await,
+            Err(MostroInternalErr(ServiceError::InvoiceInvalidError)),
+            "amount must still match the share"
         );
     }
 

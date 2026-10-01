@@ -77,7 +77,7 @@ use uuid::Uuid;
 
 use crate::app::context::AppContext;
 use crate::config::settings::Settings;
-use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
+use crate::lightning::invoice::{decode_invoice, is_valid_bond_payout_invoice};
 use crate::lightning::{
     claim_payout_slot, routing_fee_cap_sats, LndConnector, PayoutCaps, PayoutGateReason,
     SlotVerdict,
@@ -545,7 +545,7 @@ async fn pay_counterparty(
     let counterparty_share = counterparty_share_sats(bond)?;
 
     // Decode the invoice so we can derive the BOLT11 `payment_hash`.
-    // `add_bond_invoice_action::is_valid_invoice` already accepted this
+    // `add_bond_invoice_action::is_valid_bond_payout_invoice` already accepted this
     // bolt11; a decode failure here is an invariant violation, so we
     // route it through `on_send_payment_failure` rather than panic.
     let decoded = match decode_invoice(invoice) {
@@ -1447,17 +1447,14 @@ pub async fn add_bond_invoice_action(
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
-    // Validate the bolt11 amount matches the counterparty share. Fee
-    // 0 because the counterparty share is what arrives at the
-    // recipient; routing fees come out of Mostro's own wallet, not
-    // the invoice principal.
-    if is_valid_invoice(
-        payment_request.clone(),
-        Some(counterparty_share as u64),
-        Some(0),
-    )
-    .await
-    .is_err()
+    // Validate the bolt11 amount matches the counterparty share. No fee
+    // is subtracted because the counterparty share is what arrives at
+    // the recipient; routing fees come out of Mostro's own wallet, not
+    // the invoice principal. `min_payment_amount` is not applied: the
+    // share is computed by the node and may be below the order floor.
+    if is_valid_bond_payout_invoice(payment_request.clone(), counterparty_share as u64)
+        .await
+        .is_err()
     {
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }

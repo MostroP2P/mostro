@@ -517,4 +517,33 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode_of(&env_path), 0o600);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_env_file_does_not_write_the_nsec_through_a_planted_symlink() {
+        let dir = temp_dir("env-symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "victim contents").expect("seed victim");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
+                .expect("set victim mode");
+        }
+
+        // The wizard writes `.env` before `settings.toml`, so on a settings
+        // directory another local account can write to this is the first shot
+        // it gets at the nsec.
+        let env_path = dir.join(ENV_FILENAME);
+        std::os::unix::fs::symlink(&victim, &env_path).expect("plant symlink");
+
+        write_env_file(&env_path, "nsec1secret").expect("write env file");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "victim contents",
+            "the nsec must not be written through the link"
+        );
+        assert_eq!(mode_of(&victim), 0o644);
+        assert_eq!(mode_of(&env_path), 0o600);
+    }
 }

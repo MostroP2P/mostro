@@ -20,6 +20,7 @@ use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
+use mostro_core::user::day_truncate;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
@@ -2260,6 +2261,35 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     Ok(payment_request)
 }
 
+/// The `since` Mostro publishes for a user whose record was created at
+/// `created_at`: the date of their first trade, truncated to its UTC day by
+/// core so it cannot link the user's trade pubkeys together.
+///
+/// `None` when there is no real date (`created_at` unset or corrupt), so the
+/// field is omitted instead of reading as 1 January 1970.
+pub fn first_trade_since(created_at: i64) -> Option<u64> {
+    (created_at > 0).then(|| day_truncate(created_at))
+}
+
+/// Reputation sent to the counterparty in the `Peer` payload; zeroed for a
+/// user Mostro does not know. `operating_days` stays next to `since` for the
+/// deprecation window.
+fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
+    match user {
+        Some(user) => UserInfo {
+            rating: user.total_rating,
+            reviews: user.total_reviews,
+            // Same rule as `days` on the published events: no date, no age.
+            operating_days: match user.created_at {
+                created_at if created_at > 0 => now.saturating_sub(created_at as u64) / 86400,
+                _ => 0,
+            },
+            since: first_trade_since(user.created_at),
+        },
+        None => UserInfo::default(),
+    }
+}
+
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
     order: &Order,
@@ -2277,24 +2307,8 @@ pub async fn notify_taker_reputation(
         None => return Err(MostroCantDo(CantDoReason::InvalidPubkey)),
     };
 
-    let reputation_data = match is_user_present(pool, master_key).await {
-        Ok(user) => {
-            let now = Timestamp::now().as_secs();
-            UserInfo {
-                rating: user.total_rating,
-                reviews: user.total_reviews,
-                operating_days: (now - user.created_at as u64) / 86400,
-                // Filled by the `since` rollout (REPUTATION_PORTABILITY.md, PR 1.2).
-                since: None,
-            }
-        }
-        Err(_) => UserInfo {
-            rating: 0.0,
-            reviews: 0,
-            operating_days: 0,
-            since: None,
-        },
-    };
+    let user = is_user_present(pool, master_key).await.ok();
+    let reputation_data = peer_reputation(user.as_ref(), Timestamp::now().as_secs());
 
     // Get order status
     let order_status = order.get_order_status().map_err(MostroInternalErr)?;
@@ -2360,6 +2374,59 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    // ───────────────── first-trade date (`since`) ─────────────────
+
+    #[test]
+    fn first_trade_since_truncates_to_the_utc_day() {
+        // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+        assert_eq!(first_trade_since(1_700_000_000), Some(1_699_920_000));
+        assert_eq!(first_trade_since(1_699_920_000), Some(1_699_920_000));
+    }
+
+    #[test]
+    fn first_trade_since_is_none_without_a_real_date() {
+        assert_eq!(first_trade_since(0), None);
+        assert_eq!(first_trade_since(-1), None);
+    }
+
+    #[test]
+    fn peer_reputation_fills_since_next_to_operating_days() {
+        let user = User {
+            total_rating: 4.5,
+            total_reviews: 7,
+            created_at: 1_700_000_000,
+            ..Default::default()
+        };
+        let now = 1_700_000_000 + 10 * 86_400;
+        let info = peer_reputation(Some(&user), now);
+        assert_eq!(info.rating, 4.5);
+        assert_eq!(info.reviews, 7);
+        assert_eq!(info.operating_days, 10);
+        assert_eq!(info.since, Some(1_699_920_000));
+    }
+
+    #[test]
+    fn peer_reputation_of_unknown_user_has_no_since() {
+        let info = peer_reputation(None, 1_700_000_000);
+        assert_eq!(info.reviews, 0);
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
+    }
+
+    #[test]
+    fn peer_reputation_without_a_first_trade_date_has_no_age() {
+        let user = User {
+            total_reviews: 2,
+            created_at: 0,
+            ..Default::default()
+        };
+        let info = peer_reputation(Some(&user), 1_700_000_000);
+        assert_eq!(info.reviews, 2);
+        // Not ~19,675 days since the epoch.
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
     }
 
     /// Regression: the CAS-miss repair timestamp must be strictly newer than

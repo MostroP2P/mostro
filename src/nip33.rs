@@ -3,8 +3,8 @@ use crate::config::settings::Settings;
 use crate::config::types::{AntiAbuseBondSettings, BondApplyTo, LightningSettings, MostroSettings};
 use crate::lightning::LnStatus;
 use crate::util::{
-    get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp,
-    monotonic_info_event_timestamp,
+    first_trade_since, get_expiration_timestamp_for_kind, get_keys,
+    monotonic_dispute_event_timestamp, monotonic_info_event_timestamp,
 };
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
@@ -273,20 +273,23 @@ pub fn new_exchange_rates_event(
 fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     if let Some(data) = reputation_data {
         const SECONDS_IN_DAY: u64 = 86400;
-        // If operating day is 0, it means the user is new and we don't have a valid reputation data
-        let days = if data.2 != 0 {
-            let now = Timestamp::now();
-            (now.as_secs() - data.2 as u64) / SECONDS_IN_DAY
-        } else {
-            0
-        };
+        // No real creation date (0, or a corrupt negative value) means no age;
+        // a negative `as u64` cast would underflow the subtraction.
+        let days = u64::try_from(data.2)
+            .ok()
+            .filter(|ts| *ts > 0)
+            .map(|ts| Timestamp::now().as_secs().saturating_sub(ts) / SECONDS_IN_DAY)
+            .unwrap_or(0);
+
+        // `days` stays next to `since` for the deprecation window; `since` is
+        // omitted when the user has no first-trade date.
+        let mut rating = json!({"total_reviews": data.1, "total_rating": data.0, "days": days});
+        if let Some(since) = first_trade_since(data.2) {
+            rating["since"] = json!(since);
+        }
 
         // Create the json string
-        let json_data = json!([
-        "rating",
-            {"total_reviews": data.1, "total_rating": data.0, "days": days}
-        ]);
-        json_data.to_string()
+        json!(["rating", rating]).to_string()
     } else {
         "{}".to_string()
     }
@@ -1781,6 +1784,35 @@ mod tests {
 
         // No reputation data at all → placeholder object.
         assert_eq!(super::create_rating_tag(None), "{}");
+    }
+
+    #[test]
+    fn create_rating_tag_publishes_day_truncated_since_next_to_days() {
+        // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+        let json = super::create_rating_tag(Some((4.5, 12, 1_700_000_000)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value[0], "rating");
+        assert_eq!(value[1]["since"], 1_699_920_000u64);
+        // `days` stays for the deprecation window.
+        assert!(value[1]["days"].as_u64().is_some());
+    }
+
+    #[test]
+    fn create_rating_tag_omits_since_without_a_first_trade_date() {
+        // created_at == 0: publishing `since: 0` would read as 1 January 1970.
+        let json = super::create_rating_tag(Some((0.0, 0, 0)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value[1].get("since").is_none());
+        assert_eq!(value[1]["days"], 0);
+    }
+
+    #[test]
+    fn create_rating_tag_gives_no_age_for_a_negative_creation_date() {
+        // A corrupt negative created_at must not underflow into a huge `days`.
+        let json = super::create_rating_tag(Some((4.0, 3, -1)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value[1].get("since").is_none());
+        assert_eq!(value[1]["days"], 0);
     }
 
     // ── create_fiat_amt_array ────────────────────────────────────────────

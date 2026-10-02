@@ -273,13 +273,13 @@ pub fn new_exchange_rates_event(
 fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     if let Some(data) = reputation_data {
         const SECONDS_IN_DAY: u64 = 86400;
-        // If operating day is 0, it means the user is new and we don't have a valid reputation data
-        let days = if data.2 != 0 {
-            let now = Timestamp::now();
-            (now.as_secs() - data.2 as u64) / SECONDS_IN_DAY
-        } else {
-            0
-        };
+        // No real creation date (0, or a corrupt negative value) means no age;
+        // a negative `as u64` cast would underflow the subtraction.
+        let days = u64::try_from(data.2)
+            .ok()
+            .filter(|ts| *ts > 0)
+            .map(|ts| Timestamp::now().as_secs().saturating_sub(ts) / SECONDS_IN_DAY)
+            .unwrap_or(0);
 
         // `days` stays next to `since` for the deprecation window; `since` is
         // omitted when the user has no first-trade date.
@@ -1801,6 +1801,15 @@ mod tests {
     fn create_rating_tag_omits_since_without_a_first_trade_date() {
         // created_at == 0: publishing `since: 0` would read as 1 January 1970.
         let json = super::create_rating_tag(Some((0.0, 0, 0)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value[1].get("since").is_none());
+        assert_eq!(value[1]["days"], 0);
+    }
+
+    #[test]
+    fn create_rating_tag_gives_no_age_for_a_negative_creation_date() {
+        // A corrupt negative created_at must not underflow into a huge `days`.
+        let json = super::create_rating_tag(Some((4.0, 3, -1)));
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value[1].get("since").is_none());
         assert_eq!(value[1]["days"], 0);

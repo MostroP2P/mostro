@@ -83,11 +83,14 @@ on a Mostro issuer that date is `native_created_at`, never the backdated
 | Dimension (cell-id key) | Bands (*open decision*) | Cell-id labels | Floor | Seeds on the destination |
 |---|---|---|---|---|
 | Ratings received (`reviews`) | `[1,10)`, `[10,50)`, `[50,200)`, `[200,∞)` | `1-10`, `10-50`, `50-200`, `200+` | 1 / 10 / 50 / 200 | `total_reviews` += floor |
-| Average rating (`rating`) | `[0,4.0)`, `[4.0,4.5)`, `[4.5,5.0]` | `0-4.0`, `4.0-4.5`, `4.5+` | 0.0 / 4.0 / 4.5 | `total_rating` weighted with floor |
+| Average rating (`rating`) | `[1.0,4.0)`, `[4.0,4.5)`, `[4.5,5.0]` | `1.0-4.0`, `4.0-4.5`, `4.5+` | 1.0 / 4.0 / 4.5 | `total_rating` weighted with floor |
 | Account age (`age`) | `[0,6m)`, `[6m,24m)`, `[24m,∞)` | `0-6m`, `6m-24m`, `24m+` | 0d / 180d / 720d | `created_at` moved back by floor |
 
 The top rating band is closed at 5.0 because that is the maximum a rating can
-take; every other band is half-open. The cell-id labels are the exact strings
+take; every other band is half-open. The rating dimension starts at 1.0, not
+0: ratings are 1–5 and eligibility requires at least one, so an eligible
+average is never below 1, and a 0.0 floor would seed an average no set of
+valid reviews can produce. The cell-id labels are the exact strings
 used in keyset events and token `cell` fields (section 5.1); a label always
 names the band's low bound and, except for the open-ended top band, its high
 bound.
@@ -103,14 +106,20 @@ Rules:
 - Seeds always use the **floor** of the band. Nobody receives more than they
   earned; the destination shows a conservative lower bound.
 - Cells are the leaves of the issuer keyset (section 5). An issuer must merge
-  any cell holding fewer than `K` users (*open decision*, default 50) into an
-  adjacent lower cell before publishing, so every cell is a real crowd. The
-  merge is **deterministic and published**: a sparse cell steps down one band,
-  trying dimensions in the fixed order `reviews`, `age`, `rating`, and repeats until
-  the absorbing cell holds at least `K` or no lower band exists in any
-  dimension, in which case it merges into the nearest non-empty lower cell.
-  The resulting raw→effective map ships in the keyset, so a client can apply
-  the same map and check the issuer followed it.
+  any cell holding fewer than `K` users (*open decision*, default 50) into a
+  lower cell before publishing, so every cell is a real crowd. A cell's
+  population counts only **eligible** users: they are the only ones who can
+  ever hold a token, so they are the crowd a token hides in. The merge is
+  **deterministic and published**: the issuer repeatedly takes the smallest
+  sparse cell in cell order (band indices compared as `(reviews, age,
+  rating)`) and folds it into the cell that currently absorbs its
+  `step_down` — one band lower in the first of `reviews`, `age`, `rating`
+  that has a lower band. The lowest cell in all three dimensions has nowhere
+  to go and keeps its key whatever it holds, so the loop always completes and
+  a young issuer can still issue. The exact loop is normative in the
+  protocol's reputation-bands page. The resulting raw→effective map ships in
+  the keyset, so a client can apply the same map and check the issuer
+  followed it.
 - Eligibility (*open decision*): at least 10 completed trades **and** at least
   1 rating received, not banned, and disputes lost below 10% of completed
   trades. Below eligibility the issuer refuses and there is nothing to
@@ -194,7 +203,7 @@ kind: 30xxx (open decision)
 tags: ["d", "reputation-keyset:2026"], ["epoch", "2026"]
 content: {
   "cells":  {"reviews:200+|rating:4.5+|age:24m+": "<hex compressed P>", ...},
-  "merges": {"reviews:200+|rating:0-4.0|age:24m+": "reviews:50-200|rating:0-4.0|age:24m+", ...}
+  "merges": {"reviews:200+|rating:1.0-4.0|age:24m+": "reviews:50-200|rating:1.0-4.0|age:24m+", ...}
 }
 ```
 

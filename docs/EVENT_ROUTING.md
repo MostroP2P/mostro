@@ -32,7 +32,7 @@ sequenceDiagram
   participant DB as DB
   participant LND as LND
 
-  Relay-->>Loop: GiftWrap Event
+  Relay-->>Loop: kind-14 Event
   Loop->>Loop: POW + verify + freshness
   Loop->>Loop: unwrap + parse Message
   Loop->>DB: check_trade_index

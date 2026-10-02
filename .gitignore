@@ -27,3 +27,6 @@ CLAUDE.md
 # Mutation testing output
 mutants.out/
 mutants.out.old/
+
+# Python bytecode from the .github/ scripts
+__pycache__/

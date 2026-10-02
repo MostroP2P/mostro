@@ -124,7 +124,7 @@ File references are to this repository unless marked `$CORE`
 
 | Fact | Where |
 |---|---|
-| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/nip59.rs` (`UnwrappedMessage`), `handle_message_action_no_ln` in `src/app.rs` |
+| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/transport.rs` (`UnwrappedMessage`), `handle_message_action_no_ln` in `src/app.rs` |
 | `users.pubkey` (PRIMARY KEY) is the master key. A `users` row is created **only** when `identity != sender`. | `migrations/20231005195154_users.sql`, `handle_message_action_no_ln` in `src/app.rs` |
 | `orders.master_buyer_pubkey` / `master_seller_pubkey` hold the identity keys; `buyer_pubkey` / `seller_pubkey` the trade keys. | `migrations/20221222153301_orders.sql`, `Order` buyer/seller pubkey helpers in `src/util.rs` |
 | **Full Privacy Mode is structural, not a flag**: the client never sends the identity key, so `identity == sender` and `master_*_pubkey == *_pubkey`. No `users` row, no trade-index continuity, reputation reads as zero, rating a full-privacy counterpart is a silent no-op. | `Order` identity-key documentation in `$CORE/src/order.rs` (doc comment), `Order::is_full_privacy_order` usage in `src/util.rs`, `rate_user_action` in `src/app/rate_user.rs`, `Order::is_full_privacy_order` in `$CORE/src/order.rs` (`is_full_privacy_order`) |

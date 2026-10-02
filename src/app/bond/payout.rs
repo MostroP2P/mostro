@@ -66,8 +66,8 @@ use mostro_core::error::{
     ServiceError,
 };
 use mostro_core::message::{Action, BondPayoutRequest, Message, Payload};
-use mostro_core::nip59::UnwrappedMessage;
 use mostro_core::order::{Order, SmallOrder};
+use mostro_core::transport::UnwrappedMessage;
 use nostr_sdk::prelude::*;
 use sqlx::{Pool, Sqlite};
 use tokio::sync::mpsc::channel;
@@ -77,7 +77,7 @@ use uuid::Uuid;
 
 use crate::app::context::AppContext;
 use crate::config::settings::Settings;
-use crate::lightning::invoice::{decode_invoice, is_valid_invoice};
+use crate::lightning::invoice::{decode_invoice, is_valid_bond_payout_invoice};
 use crate::lightning::{
     claim_payout_slot, routing_fee_cap_sats, LndConnector, PayoutCaps, PayoutGateReason,
     SlotVerdict,
@@ -545,7 +545,7 @@ async fn pay_counterparty(
     let counterparty_share = counterparty_share_sats(bond)?;
 
     // Decode the invoice so we can derive the BOLT11 `payment_hash`.
-    // `add_bond_invoice_action::is_valid_invoice` already accepted this
+    // `add_bond_invoice_action::is_valid_bond_payout_invoice` already accepted this
     // bolt11; a decode failure here is an invariant violation, so we
     // route it through `on_send_payment_failure` rather than panic.
     let decoded = match decode_invoice(invoice) {
@@ -1447,17 +1447,14 @@ pub async fn add_bond_invoice_action(
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
-    // Validate the bolt11 amount matches the counterparty share. Fee
-    // 0 because the counterparty share is what arrives at the
-    // recipient; routing fees come out of Mostro's own wallet, not
-    // the invoice principal.
-    if is_valid_invoice(
-        payment_request.clone(),
-        Some(counterparty_share as u64),
-        Some(0),
-    )
-    .await
-    .is_err()
+    // Validate the bolt11 amount matches the counterparty share. No fee
+    // is subtracted because the counterparty share is what arrives at
+    // the recipient; routing fees come out of Mostro's own wallet, not
+    // the invoice principal. `min_payment_amount` is not applied: the
+    // share is computed by the node and may be below the order floor.
+    if is_valid_bond_payout_invoice(payment_request.clone(), counterparty_share as u64)
+        .await
+        .is_err()
     {
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
@@ -4187,6 +4184,74 @@ mod tests {
             .unwrap();
         assert_eq!(row.payout_invoice.as_deref(), Some(invoice.as_str()));
         assert_eq!(row.state, BondState::PendingPayout.to_string());
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_accepts_share_below_min_payment_amount() {
+        // Issue #1011: `min_payment_amount` is a floor on order sizes. The
+        // counterparty share is computed by the node, so a share below that
+        // floor must still be claimable with an invoice for exactly the share.
+        init_test_settings();
+        let min = Settings::get_mostro().min_payment_amount as i64;
+        assert!(min > 1, "test needs a non-trivial min_payment_amount");
+        let share = min / 2;
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            share * 2,
+            share,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+
+        let invoice = signed_test_invoice(share as u64);
+        let msg = add_invoice_msg(Some(order_id), Some(&invoice));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        add_bond_invoice_action(&ctx, msg, &event, &keys)
+            .await
+            .expect("a share below min_payment_amount must be claimable");
+
+        let row: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.payout_invoice.as_deref(), Some(invoice.as_str()));
+    }
+
+    #[tokio::test]
+    async fn add_bond_invoice_rejects_amount_other_than_share() {
+        // Skipping the order minimum must not relax the exact-amount rule.
+        init_test_settings();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(&pool);
+        let keys = Keys::generate();
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            100,
+            50,
+            Utc::now().timestamp(),
+            None,
+            None,
+        );
+        create_bond(&pool, bond).await.unwrap();
+
+        let msg = add_invoice_msg(Some(order_id), Some(&signed_test_invoice(60)));
+        let event = unwrapped_from(PublicKey::from_str(maker_pk()).unwrap(), &msg);
+        assert!(matches!(
+            add_bond_invoice_action(&ctx, msg, &event, &keys).await,
+            Err(MostroCantDo(CantDoReason::InvalidInvoice))
+        ));
     }
 
     #[tokio::test]

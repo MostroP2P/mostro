@@ -1,7 +1,8 @@
 # Transport v2 — NIP-44 Direct Messaging (Protocol v2)
 
-**Status:** Phases 1–2 implemented · Phases 3–4 pending
+**Status:** Phases 0–3 done · Phase 4 (v0.19.0 cutover: remove protocol v1) in progress
 **Issue:** [#626 — Messaging Transport Abstraction Layer](https://github.com/MostroP2P/mostro/issues/626)
+**Cutover issue:** [#786 — run protocol v2 only in v0.19.0](https://github.com/MostroP2P/mostro/issues/786)
 **Full proposal:** [issue comment](https://github.com/MostroP2P/mostro/issues/626#issuecomment-4694164653)
 **Core implementation:** [mostro-core#152](https://github.com/MostroP2P/mostro-core/pull/152), released in mostro-core **0.13.0** (`transport` module)
 
@@ -111,16 +112,56 @@ once per message — the same custody model as v1, where it signs every seal.
 
 ## 3. Versioning
 
-- `Message.version` is **2** (mostro-core `PROTOCOL_VER`, since 0.13.0).
+- mostro-core's `PROTOCOL_VER` is **2** (since 0.13.0).
 - **v1** = gift wrap + 2-tuple, frozen. **v2** = kind-14 direct + 3-tuple.
 - Which parser applies is keyed off the **event kind** (`1059` vs `14`),
   not the version field. mostro-core's `unwrap_incoming()` dispatches and
   returns the same `UnwrappedMessage` for both, which is why daemon
   handlers needed no changes.
+- **Transitional (0.18.x only):** the inner `version` of the messages
+  mostrod sends follows the configured transport — `1` on `gift-wrap`,
+  `2` on `nip44` (`stamp_protocol_version` in `src/util.rs`, #785). From
+  v0.19.0 there is no transport to follow, the stamping is removed and
+  every message carries `PROTOCOL_VER` (2).
 
-## 4. Operator configuration — one transport per node
+### 3.1 Compatibility — v1 and v2 are incompatible
+
+Protocol v1 and protocol v2 **cannot talk to each other**. They differ in
+the event kind, in who signs the outer event and in the shape of the
+decrypted content, so:
+
+- a v1 node subscribes to kind `1059` only and never sees a kind-`14`
+  event; a v2 node subscribes to kind `14` only and never sees a gift wrap;
+- there is no negotiation, fallback or translation between them — neither
+  in the daemon nor on the wire;
+- a mismatch is **silent**: the node does not answer and sends no
+  `cant-do`, because the event never reaches a handler.
+
+The only bridge is on the client side: the node advertises which protocol
+it speaks in the `protocol_version` tag of its kind-`38385` instance-info
+event (`"1"` or `"2"`), and a client reads it **before** it sends anything
+to that node. A kind-`38385` event with no `protocol_version` tag comes
+from a daemon older than v0.18.0, which speaks v1.
+
+What each client does with that tag:
+
+| client | reads `protocol_version` | v1 node | v2 node |
+|---|---|---|---|
+| Mostro Mobile (app v1, `MostroP2P/mobile`) ≥ v1.3.0 | yes, then picks the transport per node | works (gift wrap) | works (kind 14) |
+| Mostro app v2 (`MostroP2P/app`) | yes, as a gate | **not supported** — the app tells the user the node speaks a protocol it does not | works (kind 14) |
+| mostro-cli, mostrix | yes, then picks the transport per node | works | works |
+
+So app v1 is the client that carries users across the transition: it keeps
+both wrap paths and follows whatever the node announces. App v2 is
+v2-native and never implements v1. Once every node runs v0.19.0 the v1
+path in dual clients becomes dead code they can remove at their own pace.
+
+## 4. Operator configuration — one transport per node (0.18.x)
 
 There is **no dual mode**: a node speaks exactly one protocol version.
+This section describes the 0.18.x settings. v0.19.0 removes the
+`"gift-wrap"` value and takes the field out of the template. The field
+itself stays, as part of the migration path (§5, §6 Phase 4, §8).
 
 ```toml
 [mostro]
@@ -135,8 +176,8 @@ dm_days = 30
 
 | `transport` | event kind | who can trade on this node |
 |---|---|---|
-| `nip44` *(default)* | 14 (v2) | v2-capable clients only — the only mode from v0.19.0 |
-| `gift-wrap` *(deprecated, explicit opt-in only)* | 1059 (v1) | every current client — wire behavior identical to pre-v2 daemons |
+| `nip44` *(default)* | 14 (v2) | app v1 ≥ v1.3.0, app v2, mostro-cli, mostrix — the only mode from v0.19.0 |
+| `gift-wrap` *(deprecated, explicit opt-in only)* | 1059 (v1) | app v1 and older v1-only clients; **not app v2** — wire behavior identical to pre-v2 daemons |
 
 A node with no `transport` line starts in `nip44`. Operators who still need
 to serve protocol-v1 clients must write `transport = "gift-wrap"` explicitly
@@ -144,10 +185,8 @@ in `settings.toml`; it is never selected automatically.
 
 **Capability discovery:** the node advertises its protocol in the kind
 `38385` instance-info event with a `protocol_version` tag (`"1"` or
-`"2"`, derived from `transport`). Old clients ignore the unknown tag;
-v2-capable clients check it and use the matching wire format — a client
-implementation should keep both wrap paths (mostro-core ships both) to
-talk to v1 and v2 nodes during the transition.
+`"2"`, derived from `transport`). Clients that predate the tag ignore it
+and speak v1; every current client reads it before sending (§3.1).
 
 Switching a community to v2 is a deliberate operator decision, coordinated
 with the clients that community uses.
@@ -163,10 +202,20 @@ with the clients that community uses.
   `settings.toml` (the code path is untouched; removal is deferred to
   v0.19.0). The mostro-core `Transport::default()` remains `gift-wrap`
   for clients; mostrod overrides it with its own `default_transport()`.
-- **v0.19.0** — protocol v2 becomes the default and only protocol.
-  Everything v1-related is removed from mostrod (gift-wrap path,
-  `"gift-wrap"` setting value, v1 acceptance). mostro-core keeps its
-  gift-wrap helpers for clients' own migration needs.
+- **v0.19.0** — protocol v2 is the **only** protocol mostrod speaks
+  (#786). Every trace of v1 is removed from the daemon: the gift-wrap
+  send and receive paths, the `"gift-wrap"` setting value, its tests and
+  its docs. The **versioning mechanism stays**: the `transport` setting
+  (out of the template, `nip44` its only valid value), the per-node
+  protocol that drives kind, wrap, inner `version` and the
+  `protocol_version` tag, so that any future protocol change can be
+  rolled out the same way v2 was (§8). The info event keeps publishing
+  `["protocol_version", "2"]`: it is what app v1 and the other dual
+  clients read to choose kind 14, and what app v2 checks before it talks
+  to the node. mostrod v0.19.0 is built on **mostro-core 0.16**, which
+  removes gift wrap first (mostro-core#174); mostro-cli, mostrix and the
+  v2 app then bump to 0.16 too, and the two dual Rust clients drop v1
+  with that bump.
 
 ## 6. Implementation phases
 
@@ -185,7 +234,7 @@ The bulk of the work, all additive, in mostro-core's `transport` module:
 - Identity proof bound to the trade key via the domain-tagged payload
   (§2.3), with a grafting regression test.
 
-### Phase 1 — mostrod wiring (DONE — this change)
+### Phase 1 — mostrod wiring (DONE — #776)
 
 Minimal daemon integration; **zero handler changes** by design:
 
@@ -204,7 +253,7 @@ Minimal daemon integration; **zero handler changes** by design:
   when the caller didn't pass one.
 - `src/nip33.rs` — `protocol_version` tag in the kind-38385 info event.
 
-### Phase 2 — anti-spam gates (DONE — this change; daemon-only, the payoff)
+### Phase 2 — anti-spam gates (DONE — #780; daemon-only, the payoff)
 
 The reason v2 exists: reject junk *before* paying decrypt/parse costs. All of
 the following are **v2-only** — the gate is skipped on the `gift-wrap`
@@ -219,7 +268,10 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   `active_pubkeys_refresh_interval` seconds (default 60) by
   `scheduler::job_refresh_active_pubkeys` — a periodic full reload, chosen
   because status mutations are scattered across handlers with no single
-  choke-point. Global-singleton (`OnceLock`), mirroring `PriceManager`.
+  choke-point. Keys are also added one at a time when the daemon accepts the
+  event that introduces them (see "Recognition at acceptance" below); the
+  rebuild stays the only way a key leaves the set. Global-singleton
+  (`OnceLock`), mirroring `PriceManager`.
 - **Cheap pre-validation in the event loop** (`src/app.rs`), for kind 14,
   **before** `unwrap_incoming` decrypts: check `event.pubkey` against the
   cache.
@@ -254,54 +306,159 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
   `pow_first_contact` tag next to `pow`. A dropped event gets no `cant-do`
   reply — it never reaches a handler — so the info event is the only way a
   client can learn what the first-contact lane costs. The published value is
-  the *enforced* difficulty (`advertised_first_contact_pow`): on `nip44`
+  the *enforced* difficulty (`advertised_first_contact_pow`):
   `max(pow, effective_pow_first_contact())` — a max because the two checks run
-  in sequence, so a `pow_first_contact` below `pow` still enforces `pow` — and
-  on `gift-wrap` just `pow`, since the gate never runs there and advertising the
-  stiffer number would make clients grind work nobody checks.
-- **Recognition is eventually consistent — the lane is not "the first event
-  only".** Accepting a create or take does *not* insert that trade key into the
-  cache synchronously; `job_refresh_active_pubkeys` is the only writer after
-  startup and rebuilds the whole set on its interval. A trade key whose event
-  was just accepted therefore keeps being classified as first contact until the
-  next rebuild lands — up to one full `active_pubkeys_refresh_interval`
-  (default 60 s), and longer if a reload fails and the previous snapshot is
-  retained. A client that mined `pow_first_contact` once and then dropped back
-  to `pow` for an immediate follow-up (the `take-sell` right after a
-  `new-order`, or the invoice message that follows a take) would have that
-  follow-up silently discarded.
+  in sequence, so a `pow_first_contact` below `pow` still enforces `pow`.
+- **Recognition at acceptance (#857).** The protocol rule is the simple one:
+  **only the event that introduces a trade key pays `pow_first_contact`**;
+  everything after it pays `pow`. That is what app v2 and mostrix implement
+  (on new-order and take). For the daemon to honor it, a key must be in the
+  cache before its follow-up arrives, and the periodic rebuild alone could
+  lag by up to one `active_pubkeys_refresh_interval`, silently dropping the
+  invoice right after a take.
 
-  The client-side rule is therefore: **mine `pow_first_contact` for every event
-  sent from a trade key, not just for its first one.** Recognition is not
-  observable from the client side — the daemon publishes no per-key signal and
-  does not advertise the refresh interval — so there is no bound a client can
-  safely wait out; it must keep using the higher difficulty for the lifetime of
-  the trade key. On nodes where `pow_first_contact` resolves to `pow` (the
-  default) the rule costs nothing; on nodes that set it higher it is the
-  difference between working and failing silently. Making recognition
-  synchronous at accept time, so the rule can be relaxed to a bounded window,
-  is follow-up work — the advertised value is correct either way, because it
-  always reports the difficulty the gate enforces on an unrecognized sender.
+  So `finalize_dispatch` (`src/app.rs`), the tail both event loops share,
+  checks the sender after every `new-order`, `take-sell`, `take-buy` or
+  `admin-take-dispute`: if `db::is_active_trade_pubkey` says the DB now ties
+  that trade key to an order or dispute, the key goes into the cache
+  (`SpamGate::add_known`). The answer comes from committed state, not from
+  the handler result, because a handler can store the order and then fail a
+  later step (the broadcast), and a `cant-do` stores nothing. The lookup
+  applies the same three arms as `find_active_trade_pubkeys`, pinned by a
+  test, so recognition grants exactly the keys the next rebuild would: a
+  rejected request buys nothing, and no other action triggers a lookup.
+
+  `find_active_trade_pubkeys` also returns the key of a bond in `requested`
+  or `locked` on a non-terminal order, because a bonded take writes the
+  taker onto the order only once the bond locks.
+
+  A rebuild reads the DB before it replaces the set, so a create committed
+  in between would be dropped by its stale snapshot. The scheduler takes a
+  mark (`begin_rebuild`) before the read, and `finish_rebuild` keeps every
+  key added after the mark; the following rebuild judges those on its own
+  snapshot, so pruning is late by one interval at most.
+
+  A dispute take stores the solver's **identity**, and that is the key the
+  rebuild returns. Solvers are therefore recognized when they send from
+  their identity, which is what the admin clients do; a solver that sends
+  from a separate trade key keeps paying `pow_first_contact`.
+
+  app v1 and mostro-cli do not read `pow_first_contact` at all: they mine
+  every event at `pow`. On a node that sets `pow_first_contact` above `pow`,
+  their new orders and takes are dropped without a reply. Until they read the
+  tag, a node that serves those clients must keep `pow_first_contact` equal
+  to `pow`.
 
 New config (`[mostro]`): `pow_first_contact` (`Option<u8>`, default = `pow`)
 and `active_pubkeys_refresh_interval` (default 60). Both `#[serde(default)]`,
 so pre-Phase-2 `settings.toml` files are wire-identical. Zero handler changes;
 the gate sits entirely in the event-loop preamble.
 
-### Phase 3 — protocol docs + client migration (PENDING)
+### Phase 3 — protocol docs + client migration (DONE)
 
-- Update the protocol repo (`MostroP2P/protocol`): `overview.md` ("The
-  Message": both transports, the v2 tuple, `version: 2`),
-  `key_management.md` (v2 examples mirroring the existing unencrypted
-  gift-wrap walkthroughs), migration guide for client developers.
-- mostro-cli / client support via the same mostro-core 0.13.0 APIs:
-  clients keep both wrap paths and pick per node from `protocol_version`.
+- Protocol repo (`MostroP2P/protocol`): `overview.md` (both content
+  tuples), `key_management.md` (the v2 wire format next to the gift-wrap
+  walkthroughs) and `transport_migration.md` (the client developer guide:
+  capability discovery, PoW and the first-contact gate, timeline).
+- Clients: Mostro Mobile (app v1) since v1.3.0, mostro-cli and mostrix read
+  `protocol_version` and speak whichever protocol the node announces; the
+  v2 app (`MostroP2P/app`) speaks v2 only and refuses v1 nodes (§3.1).
+- mostrod's default became `nip44` in v0.18.5 (#880).
 
-### Phase 4 — the v0.19.0 cutover (PENDING)
+### Phase 4 — the v0.19.0 cutover (IN PROGRESS — #786)
 
-- Default `transport = "nip44"`; remove the v1 path from mostrod entirely
-  (per §5). Metrics: `messages_received_total`, decrypt failures as a spam
-  indicator.
+Remove every trace of protocol v1 from mostrod. The order is load-bearing:
+the specs first, so that the code PRs have something to be checked against.
+
+1. **Specs.** This document and the protocol repo's
+   `transport_migration.md`: v1 and v2 are incompatible, how each client
+   chooses (§3.1), and what v0.19.0 removes.
+2. **mostro-core 0.16 first** (mostro-core#174): gift wrap removed,
+   `Transport` left with `Nip44Direct` only. mostrod bumps to it, and
+   the steps below are done against it: without `GiftWrap` in core, the
+   compiler points at every v1 branch left in mostrod. The same order as
+   the v1 → v2 rollout, where Phase 0 was mostro-core. After mostrod,
+   mostro-cli, mostrix and the v2 app bump to 0.16. The two Rust clients
+   ship their unknown-version fix (mostro-cli#200, mostrix#198) in that
+   same bump, because from then on `"1"` is a version they no longer
+   speak. Mostro Mobile does not depend on mostro-core.
+3. **Take `transport` out of the template, keep it in the code.** The
+   knob leaves `settings.tpl.toml` (a new install has no reason to see it)
+   and the gift-wrap deprecation warning leaves `src/main.rs`, but the
+   optional `[mostro] transport` field stays, defaulting to `nip44`: it is
+   the per-node protocol selector a future migration needs back (§8), and keeping
+   it avoids deleting it now only to reintroduce it. Its only valid value
+   in v0.19.0 is `nip44`; any other value is a startup error. A
+   `settings.toml` that still carries the line is handled on purpose:
+   - `transport = "gift-wrap"` → mostrod **refuses to start** with an
+     error that says v0.19.0 speaks protocol v2 only. That operator chose
+     v1 explicitly; switching their community to another protocol behind
+     their back is the silent mismatch §3.1 describes. mostro-core 0.16
+     no longer parses `"gift-wrap"`, so mostrod has to check the raw
+     `[mostro].transport` value while loading `settings.toml`, before or
+     instead of handing it to serde, and turn it into this error. The
+     generic "unknown variant" error that serde would raise does not say
+     what to do.
+   - `transport = "nip44"` → start normally and say nothing about it. The
+     line is no longer needed, but it describes exactly what the node does,
+     so there is nothing to warn about.
+
+   The error for `gift-wrap` says why, and what to do: this version speaks
+   protocol v2 only, clients on protocol v1 cannot use this node, remove the
+   `transport` line to start on v2 or stay on 0.18.x to keep serving v1.
+   Whatever the settings say, mostrod logs the protocol it speaks at startup
+   (`protocol v2, event kind 14`), as it does today with the transport.
+4. **Remove the v1 receive and send paths, keep the seam.** Subscription
+   (`src/main.rs`), event loop (`src/app.rs`) and `send_dm`
+   (`src/util.rs`) keep going through the configured transport
+   (`transport.event_kind()`, `unwrap_incoming`, `wrap_message_with`)
+   instead of calling the NIP-44 functions directly. With a single variant
+   those calls cost nothing, and they are where a new transport would plug in.
+   What goes is every `GiftWrap` branch and the gift-wrap-only checks.
+   `send_dm` always sets the NIP-40 expiration.
+5. **Keep the version stamping, drop its v1 test** (#785). The inner
+   `version` keeps coming from the active transport
+   (`stamp_protocol_version`), so the kind, the envelope, the inner
+   version and the advertised tag have one source of truth. Only its
+   `DEPRECATED(v0.19.0, #786)` markers and the gift-wrap assertions go.
+   This replaces #786's "revert #785": the revert would hardcode
+   `PROTOCOL_VER`, which a future migration would have to undo.
+6. **Simplify the anti-spam gate.** Without v1 there is no transport
+   the gate skips, so it always runs. `advertised_first_contact_pow` in `src/nip33.rs` loses
+   its gift-wrap arm, and tests that pin the "v2 only" behavior (for
+   example `gate_applies_to_v2_only`) are rewritten or deleted.
+7. **Keep the capability tag.** The info event publishes
+   `["protocol_version", "2"]`, still derived from the transport. Removing it would make every
+   node look like a pre-0.18.0 v1 daemon to the clients (§3.1).
+8. **Tests and docs.** Every `DEPRECATED(v0.19.0, #786)` marker goes. Tests
+   that only exist for v1 are deleted; tests of the kept seam (stamping,
+   transport parsing) lose their gift-wrap cases and keep the rest. The v1
+   fixtures in mostrod go (mostro-core keeps its own). Update
+   `README.md`, `docs/STARTUP_AND_CONFIG.md`, and the sequence diagrams in
+   `docs/ARCHITECTURE.md`, `docs/EVENT_ROUTING.md` and
+   `docs/ORDERS_AND_ACTIONS.md`, which still say "GiftWrap".
+9. **Release notes** for v0.19.0 say, in this order: v1 is gone; nodes that
+   still run `transport = "gift-wrap"` will not start until the line is
+   removed; users on that node need app v1 ≥ v1.3.0, app v2, mostro-cli or
+   mostrix, all of which speak v2.
+
+**Upgrading a v1 node.** Orders, trade keys and trade indexes are stored
+without any notion of transport, so a trade that started on v1 continues
+on v2 after the upgrade: the node answers on kind 14 and app v1 follows the
+new `protocol_version` tag. Messages the node already sent as gift wraps
+stay on the relays, and v0.19.0 no longer reads kind 1059, so a client that
+restores a trade from relays needs its own v1 reader for the part that
+happened before the upgrade. Operators should upgrade when few trades are
+open and announce the change to their community first.
+
+**Relay retention.** v2 messages carry a NIP-40 expiration (`dm_days`,
+30 days by default) while v1 gift wraps from mostrod never did. Clients
+that rebuild trades and disputes from relay history lose anything older
+than `dm_days`. Operators whose disputes can last longer should raise
+`dm_days` accordingly.
+
+Out of scope for the cutover: transport metrics (message counts, decrypt
+failures as a spam signal).
 
 ## 7. Security notes
 
@@ -320,3 +477,67 @@ the gate sits entirely in the event-loop preamble.
   index, `identity != sender && signature.is_none()` bail-out) apply
   unchanged to both transports because both yield the same
   `UnwrappedMessage`.
+
+## 8. Keeping the migration path
+
+Removing v1 must not remove the machinery that made the v1 → v2 move
+orderly. No new protocol is planned; the point is that if one ever comes,
+it can follow the same playbook without trauma, and v0.19.0 keeps every
+piece that playbook uses.
+
+### 8.1 The playbook (what v1 → v2 did)
+
+1. **mostro-core, additive.** The new wrap/unwrap pair next to the old
+   one, a `Transport` variant, dispatch by event kind, test vectors. No
+   behavior change for anyone.
+2. **mostrod behind the setting.** The node speaks one protocol, picked by
+   `[mostro] transport`, default the old one. It advertises it in
+   `protocol_version`. Handlers do not change: every transport yields the
+   same `UnwrappedMessage`.
+3. **Protocol docs and clients.** The new wire format in the protocol
+   repo, and a migration guide. Clients learn the new version and choose
+   per node from `protocol_version`.
+4. **Deprecation.** Release notes, `#[deprecated]`, greppable
+   `DEPRECATED(vX, #issue)` markers that double as the removal checklist.
+5. **Default flip.** The new protocol becomes the default; the old one is
+   an explicit opt-in.
+6. **Removal.** The old variant goes; a leftover setting for it refuses
+   to start with a clear reason; the tag stays.
+
+### 8.2 What v0.19.0 keeps for that
+
+| piece | where | what it did in the v1 → v2 migration |
+|---|---|---|
+| `protocol_version` tag | kind 38385, `src/nip33.rs` | told each client which protocol a node speaks (§3.1) |
+| `[mostro] transport` setting | `src/config/types.rs`, out of the template | let each operator choose when to switch (steps 2 and 5) |
+| transport-driven wrap, unwrap and subscription | `src/main.rs`, `src/app.rs`, `src/util.rs` | added v2 next to v1 with zero handler changes |
+| version stamping from the transport | `stamp_protocol_version` | kept the inner `version` consistent with the wire format |
+| startup refusal for a removed protocol | config validation | stops a node from switching protocol behind its operator's back |
+| startup log of the active protocol | `src/main.rs` | shows operators what their node speaks |
+
+### 8.3 What the clients must do now
+
+A client that meets a `protocol_version` it does not know must treat the
+node as **unsupported** and say so. It must not guess. A guess is a
+silent failure: the node never answers a message in the wrong format
+(§3.1). The v2 app already does this. The others do not yet, and should
+fix it before they drop their v1 code (mobile#737, mostro-cli#200,
+mostrix#198):
+
+| client | unknown `protocol_version` today |
+|---|---|
+| app v2 | refused, user told why — correct |
+| Mostro Mobile (app v1) | assumes v2 (`resolveTransport`) |
+| mostro-cli | falls back to gift wrap (only `"2"` selects NIP-44) |
+| mostrix | falls back to gift wrap |
+
+A missing tag is a different case. It means a daemon older than v0.18.0,
+which speaks v1.
+
+### 8.4 mostro-core
+
+mostro-core 0.16 removes everything related to gift wrap, before
+mostrod v0.19.0 (mostro-core#174). It keeps the same pieces for the same
+reason: the `Transport` enum (`event_kind()`, `protocol_version()`), the
+`wrap_message_with` / `unwrap_incoming` dispatchers, and `UnwrappedMessage`
+as the single result every transport returns.

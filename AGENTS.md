@@ -38,6 +38,25 @@
 - PRs: link the motivating issue, include `cargo test` output, and call out schema or config changes to ease verification.
 - **Protocol/tag changes:** prefer single-kind (single event domain) PRs. Cross-kind changes require a scope declaration and compatibility statement in the PR body (see `CONTRIBUTING.md § Protocol / Tag Changes`).
 
+## Before opening a pull request
+
+If you are an AI agent preparing a pull request, follow
+`CONTRIBUTING.md § Contribution quality bar`. In short:
+
+- Link an issue labelled `status: accepted` (`Closes #N`). If there is no
+  accepted issue, do not open the pull request; comment on the issue instead.
+- Fill in every section of `.github/pull_request_template.md`, including
+  Manual testing: steps a person ran by hand against a mostrod, with
+  mostro-cli or Mostro Mobile. Do not present steps nobody ran as results.
+  Ortsom is an internal tool of the Mostro developers; do not use or cite it.
+- For a fix, the first commit is `test:` and adds a regression test that
+  fails on `main`.
+- If you could not build or run mostrod, say so in the pull request instead
+  of claiming results.
+
+A pull request that only changes Markdown files is exempt from the first
+three points (see the exemptions in that section); commits are still signed.
+
 ## Documentation Guidelines
 - Do not hardcode source code line numbers in documentation (e.g., `src/app/take_buy.rs:11`). Line numbers drift as the codebase evolves, misleading developers. Reference file paths (`src/app/take_buy.rs`) or function names (`fn take_buy_action`) instead, which are far more stable and easily searchable.
 - Add a language specifier to every fenced code block. Static analysis (markdownlint MD040) flags blocks without a language identifier. Example: ` ```flutter test ` instead of bare ` ``` `.

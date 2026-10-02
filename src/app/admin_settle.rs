@@ -21,6 +21,27 @@ pub async fn admin_settle_action(
     my_keys: &Keys,
     ln_client: &mut LndConnector,
 ) -> Result<(), MostroError> {
+    admin_settle_action_with_settle(
+        ctx,
+        msg,
+        event,
+        my_keys,
+        ln_client,
+        async |event, ln_client, order| {
+            settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, order).await
+        },
+    )
+    .await
+}
+
+async fn admin_settle_action_with_settle(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+    ln_client: &mut LndConnector,
+    settle: impl AsyncFnOnce(&UnwrappedMessage, &mut LndConnector, &Order) -> Result<(), MostroError>,
+) -> Result<(), MostroError> {
     let pool = ctx.pool();
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
@@ -120,7 +141,7 @@ pub async fn admin_settle_action(
     // guarantee: an RPC timeout on a settle LND did apply returns `Err` with the
     // escrow already gone, and the retry then meets "invoice already settled",
     // which this path does not tolerate. Out of scope here, noted in the PR.
-    settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)
+    settle(event, ln_client, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
 
@@ -591,8 +612,8 @@ mod handler_tests {
 
     /// A genuine dispute settle reaches `settle_seller_hold_invoice`, which
     /// short-circuits on the missing preimage before any LND call and is
-    /// mapped to `LnNodeError`. The LND settle + `do_payment` tail beyond
-    /// this seam requires a live node and is covered by integration tests.
+    /// mapped to `LnNodeError`. Successful LND settlement itself requires
+    /// a live node; the post-settle progression is tested separately below.
     #[tokio::test]
     async fn dispute_order_reaches_settle_seam() {
         let pool = setup_pool().await;
@@ -621,6 +642,69 @@ mod handler_tests {
             result,
             Err(MostroInternalErr(ServiceError::LnNodeError(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn post_settle_failures_do_not_skip_payout_bookkeeping() {
+        for (fail_dispute_update, invalid_seller, invalid_buyer) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let pool = setup_pool().await;
+            let ctx = build_ctx(pool.clone());
+            let mut ln = dead_lnd().await;
+            let admin = Keys::generate();
+            let seller = Keys::generate().public_key();
+            let buyer = Keys::generate().public_key();
+            let mut order = dispute_order(seller, buyer);
+            order.seller_dispute = true;
+            if invalid_seller {
+                order.seller_pubkey = Some("invalid-seller".to_string());
+            }
+            if invalid_buyer {
+                order.buyer_pubkey = Some("invalid-buyer".to_string());
+            }
+            let order = order.create(ctx.pool()).await.unwrap();
+            assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+            if fail_dispute_update {
+                sqlx::query(
+                    "CREATE TRIGGER fail_dispute_close BEFORE UPDATE ON disputes \
+                     BEGIN SELECT RAISE(ABORT, 'injected dispute close failure'); END",
+                )
+                .execute(ctx.pool())
+                .await
+                .unwrap();
+            }
+            let event = admin_event(admin.public_key());
+            let result = admin_settle_action_with_settle(
+                &ctx,
+                settle_msg(order.id),
+                &event,
+                &admin,
+                &mut ln,
+                async |_, _, _| Ok(()),
+            )
+            .await;
+
+            assert!(result.is_ok(), "post-settle failure aborted: {result:?}");
+            let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+            assert_eq!(stored.status, Status::SettledHoldInvoice.to_string());
+            assert!(stored.failed_payment, "payout bookkeeping must be reached");
+            assert_eq!(stored.payment_attempts, 1);
+            assert!(queued_actions_for(event.sender)
+                .await
+                .contains(&Action::AdminSettled));
+            let dispute = crate::db::find_dispute_by_order_id(ctx.pool(), order.id)
+                .await
+                .unwrap();
+            let expected_status = if fail_dispute_update {
+                DisputeStatus::InProgress
+            } else {
+                DisputeStatus::Settled
+            };
+            assert_eq!(dispute.status, expected_status.to_string());
+        }
     }
 }
 

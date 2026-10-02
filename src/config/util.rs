@@ -5,9 +5,10 @@
 use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
-use crate::config::{init_mostro_settings, Settings};
+use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use nostr_sdk::prelude::ToBech32;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -35,6 +36,20 @@ fn load_env_file(settings_dir: &std::path::Path) {
             e
         );
     }
+}
+
+/// Log the node's pubkey, then that the settings loaded. Nothing is logged
+/// before the settings on a normal start, so the node's identity is the first
+/// line: an operator can match the logs to the pubkey clients connect to.
+fn log_settings_loaded() {
+    if let Some(keys) = get_mostro_keys() {
+        let pubkey = keys.public_key();
+        match pubkey.to_bech32() {
+            Ok(npub) => tracing::info!("Mostro pubkey: {npub} (hex {})", pubkey.to_hex()),
+            Err(_) => tracing::info!("Mostro pubkey: {}", pubkey.to_hex()),
+        }
+    }
+    tracing::info!("Settings correctly loaded!");
 }
 
 /// If the `MOSTRO_NSEC_PRIVKEY` environment variable is set to a non-empty
@@ -73,6 +88,24 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             .is_some_and(|bond| bond.enabled),
     )?;
 
+    validate_serbero_pubkey(settings.mostro.serbero_pubkey.as_deref())?;
+
+    Ok(())
+}
+
+/// `serbero_pubkey`, when set, must be an npub or a hex public key. Checked at
+/// load so a typo stops the daemon instead of silently running without the
+/// assistant it was configured with. A blank value means none, like a blank
+/// `MOSTRO_NSEC_PRIVKEY`.
+fn validate_serbero_pubkey(serbero_pubkey: Option<&str>) -> Result<(), MostroError> {
+    let Some(key) = serbero_pubkey.filter(|key| !key.trim().is_empty()) else {
+        return Ok(());
+    };
+    nostr_sdk::prelude::PublicKey::parse(key.trim()).map_err(|_| {
+        MostroInternalErr(ServiceError::IOError(format!(
+            "serbero_pubkey ({key}) is not a valid npub or hex public key"
+        )))
+    })?;
     Ok(())
 }
 
@@ -175,7 +208,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
         apply_nsec_env_override(&mut settings);
         validate_mostro_settings(&settings)?;
         init_mostro_settings(settings)?;
-        tracing::info!("Settings correctly loaded!");
+        log_settings_loaded();
         return Ok(());
     }
 
@@ -203,7 +236,7 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     // Initialize the global settings variable
     init_mostro_settings(settings)?;
 
-    tracing::info!("Settings correctly loaded!");
+    log_settings_loaded();
 
     Ok(())
 }
@@ -264,6 +297,25 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+        }
+    }
+
+    #[test]
+    fn serbero_pubkey_accepts_npub_hex_or_nothing() {
+        let key = nostr_sdk::prelude::Keys::generate().public_key();
+        assert!(validate_serbero_pubkey(None).is_ok());
+        assert!(validate_serbero_pubkey(Some("  ")).is_ok());
+        assert!(validate_serbero_pubkey(Some(&key.to_hex())).is_ok());
+        assert!(validate_serbero_pubkey(Some(&key.to_bech32().unwrap())).is_ok());
+    }
+
+    #[test]
+    fn serbero_pubkey_rejects_a_malformed_key() {
+        for bad in ["npub1notakey", "not-a-key", "abc123"] {
+            assert!(
+                validate_serbero_pubkey(Some(bad)).is_err(),
+                "{bad:?} must not load"
+            );
         }
     }
 

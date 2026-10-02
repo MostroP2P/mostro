@@ -386,10 +386,14 @@ The day count is exposed in **three** places today, and all three change:
 | kind 38384 rating event | `days` tag pushed by `rate_user` next to `Rating::to_tags()` | mostro; `Rating` itself has no date field |
 | `Peer` payload sent to the counterparty | `UserInfo.operating_days`, filled in `util.rs` | mostro-core type, mostro fills it |
 
-The daemon publishes both `days` and `since` for one deprecation window at
-all three sites, then drops `days`. `Rating::from_tags` ignores unknown keys
-and `UserInfo` gains the field as `Option` with a serde default, so old and
-new peers interoperate during the window.
+The daemon publishes both `days` and `since` at all three sites, and drops
+`days` only as the very last step of the rollout (section 9, phase 7). The
+window is not counted in releases: an operator decides when a daemon updates,
+but nobody decides when users update their apps, and a client that predates
+`since` loses the age the moment `days` goes away. Keeping it costs a few bytes
+per event. `Rating::from_tags` ignores unknown keys and `UserInfo` gains the
+field as `Option` with a serde default, so old and new peers interoperate for
+as long as both fields are published.
 
 ## 7. Mostro-to-Mostro specifics
 
@@ -527,7 +531,7 @@ Independent of the migration and worth shipping first.
 | 1.2 | mostro | In progress (mostro#1016). Bump core. One helper `first_trade_since(created_at)` over core's `day_truncate`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
 | 1.3 | mobile | `data/models/rating.dart` parses `since` and falls back to `days`; `data/models/user_info.dart` parses `since` and falls back to `operating_days`; age is computed at display time. Tests for both shapes. | Old and new daemons render the same age. |
 | 1.3b | app | Rust core: `nostr/order_events.rs::parse_rating_tag` reads `since` and falls back to `days`; `mostro/status.rs` maps `UserInfo.since` with fallback to `operating_days`. Bridge exposes `since` and the Dart side (`peer_reputation_card.dart`, trade detail) computes the age at display time. Tests for both shapes. | Old and new daemons render the same age. |
-| 1.4 | mostro | Remove `days` and `operating_days` emission after the deprecation window (open decision 4). `UserInfo.operating_days` removal in core is a **minor** bump and goes with PR 2.2. | Removed with a changelog entry. |
+| 1.4 | mostro | **Deferred to the last step of the rollout (phase 7), not part of this phase.** Remove `days` and `operating_days` emission. `UserInfo.operating_days` is removed from core in the same step, as a **minor** bump, never earlier: a core that drops it makes every daemon built on it stop sending it. | Removed with a changelog entry. |
 
 ### Phase 2: shared types in mostro-core
 
@@ -586,23 +590,25 @@ Runs in parallel with phase 5; shares the UI copy and the localized strings.
 
 ### Phase 7: rollout
 
-1. Deploy 1.2, then ship 1.3 and 1.3b; wait one release before 1.4.
+1. Deploy 1.2, then ship 1.3 and 1.3b.
 2. Deploy phase 3 on the reference instance with an empty issuer list.
 3. Deploy phase 6 on the bot and phase 4 on the reference instance; add both keys to the trust list.
 4. Ship the 1.x app with phases 5.1-5.4 and the 2.x app with phases 5b.1-5b.3.
 5. Document the operator side (`docs/REPUTATION_PORTABILITY.md`, settings template) and the user side (mobile in-app help).
+6. Last of all, PR 1.4: stop publishing `days` and `operating_days`, and drop `UserInfo.operating_days` from core. Nothing earlier in the plan depends on it, and it never moves ahead of another step (section 6.1).
 
 ## 10. Open decisions
 
 1. Attestation kind number (default `38388`, to be reserved in protocol PR 0.2).
 2. Attestation lifetime (default 7 days, and the destination's cap on it).
 3. lnp2pBot `subject`: internal user id or Telegram id (default internal id).
-4. Length of the `days` deprecation window before PR 1.4 (default one minor
-   release plus one app release cycle).
-5. Refreshing an earlier import with newer figures: in v1 or later (default later).
+4. Refreshing an earlier import with newer figures: in v1 or later (default later).
 
 Closed during review:
 
+- **`days` deprecation window.** `days` and `operating_days` stay published
+  until the last step of the rollout, not for a fixed number of releases:
+  app updates are outside anyone's control (section 6.1).
 - **Real figures, not bands.** Reputation travels as the user's real figures;
   unlinkability is not a goal, because importing is opt-in (section 3). This
   drops the band grid, K-anonymity, the per-cell keysets and blind Schnorr

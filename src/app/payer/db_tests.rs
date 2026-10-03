@@ -241,16 +241,26 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
     let frozen = insert(&pool, frozen).await;
     let buyer_key = PublicKey::from_hex(&buyer).unwrap();
 
-    assert!(
-        upsert_open_declaration(&pool, active, &buyer_key, &hash('a'), 1)
-            .await
-            .unwrap()
-    );
-    assert!(
-        upsert_open_declaration(&pool, active, &buyer_key, &hash('b'), 2)
-            .await
-            .unwrap()
-    );
+    assert!(upsert_open_declaration(
+        &pool,
+        active,
+        &buyer_key,
+        Some(seller.as_str()),
+        &hash('a'),
+        1
+    )
+    .await
+    .unwrap());
+    assert!(upsert_open_declaration(
+        &pool,
+        active,
+        &buyer_key,
+        Some(seller.as_str()),
+        &hash('b'),
+        2
+    )
+    .await
+    .unwrap());
     assert_eq!(
         find_declaration(&pool, active)
             .await
@@ -259,17 +269,22 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         Some(hash('b'))
     );
 
-    assert!(
-        !upsert_open_declaration(&pool, frozen, &buyer_key, &hash('a'), 1)
-            .await
-            .unwrap()
-    );
+    assert!(!upsert_open_declaration(
+        &pool,
+        frozen,
+        &buyer_key,
+        Some(seller.as_str()),
+        &hash('a'),
+        1
+    )
+    .await
+    .unwrap());
     assert!(find_declaration(&pool, frozen).await.unwrap().is_none());
     // Not the order's buyer (a request that raced a rollback and a new
     // take): refused, and the stored declaration is untouched.
     let other = Keys::generate().public_key();
     assert!(
-        !upsert_open_declaration(&pool, active, &other, &hash('c'), 3)
+        !upsert_open_declaration(&pool, active, &other, Some(seller.as_str()), &hash('c'), 3)
             .await
             .unwrap()
     );
@@ -280,12 +295,29 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
             .map(|d| d.payment_hash),
         Some(hash('b'))
     );
+    // Same buyer, another seller (a maker-buyer order retaken meanwhile).
+    let new_seller = key();
+    assert!(!upsert_open_declaration(
+        &pool,
+        active,
+        &buyer_key,
+        Some(new_seller.as_str()),
+        &hash('d'),
+        4
+    )
+    .await
+    .unwrap());
     // Unknown order: nothing to attach the declaration to.
-    assert!(
-        !upsert_open_declaration(&pool, Uuid::new_v4(), &buyer_key, &hash('a'), 1)
-            .await
-            .unwrap()
-    );
+    assert!(!upsert_open_declaration(
+        &pool,
+        Uuid::new_v4(),
+        &buyer_key,
+        Some(seller.as_str()),
+        &hash('a'),
+        1
+    )
+    .await
+    .unwrap());
 }
 
 #[tokio::test]

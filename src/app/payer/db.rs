@@ -64,14 +64,17 @@ pub const DECLARATION_OPEN_STATUSES: &str = "'waiting-payment','waiting-buyer-in
 /// Upsert the declaration for `order_id` only while the order is still in
 /// [`DECLARATION_OPEN_STATUSES`]. Status check and write are one statement,
 /// so a declaration racing a concurrent `fiat-sent` cannot land after the
-/// order froze, and only while `buyer_pubkey` is still the order's buyer, so
-/// a request that raced a rollback or a new take cannot attach to it. It
+/// order froze, and only while `buyer_pubkey` and `seller_pubkey` (the
+/// parties the handler read, `None` for no seller yet) are still the order's,
+/// so a request that raced a rollback or a new take cannot attach to it, and
+/// the caller forwards to a seller the write confirmed. It
 /// records that buyer trade key on the row. Returns `false` when nothing was
 /// written.
 pub async fn upsert_open_declaration(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
     buyer_pubkey: &PublicKey,
+    seller_pubkey: Option<&str>,
     payment_hash: &str,
     now: i64,
 ) -> Result<bool, MostroError> {
@@ -80,7 +83,7 @@ pub async fn upsert_open_declaration(
            (order_id, payment_hash, declared_at, buyer_pubkey) \
          SELECT ?1, ?2, ?3, o.buyer_pubkey FROM orders o \
           WHERE o.id = ?1 AND o.status IN ({DECLARATION_OPEN_STATUSES}) \
-            AND o.buyer_pubkey = ?4 \
+            AND o.buyer_pubkey = ?4 AND o.seller_pubkey IS ?5 \
          ON CONFLICT(order_id) DO UPDATE SET payment_hash = excluded.payment_hash, \
                                              declared_at = excluded.declared_at, \
                                              buyer_pubkey = excluded.buyer_pubkey"
@@ -90,6 +93,7 @@ pub async fn upsert_open_declaration(
         .bind(payment_hash)
         .bind(now)
         .bind(buyer_pubkey.to_hex())
+        .bind(seller_pubkey)
         .execute(pool)
         .await
         .map_err(db_err)?;

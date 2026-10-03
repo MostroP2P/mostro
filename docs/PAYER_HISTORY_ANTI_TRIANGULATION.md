@@ -211,6 +211,13 @@ counters and **does not** write history rows (they could never be matched
 again and would only link a hash to a trade key in the DB). Clients must render
 this as *"history is unavailable for this buyer"*, not as *"new account"*.
 Hash-only (user-agnostic) history is explicitly deferred to §18.
+A full-privacy buyer's client declares the **order-bound** hash
+(`sha256("mostro-payer-order-v1|" + order_id + "|" + canonical)`,
+`mostro_core::payer::order_bound_payment_hash`), never the reusable one: the
+same account would otherwise give the same hash on every order and let the
+node link trade keys the mode keeps apart. The daemon cannot tell the two
+constructions apart and needs no change; the seller's client recomputes the
+order-bound form when the push reports `buyer_mode = "full_privacy"`.
 
 **D-5 · History increments in exactly one place: the `Success` CAS in
 `payment_success`.** The increment runs only when `rows_affected()==1`, inside
@@ -1547,6 +1554,7 @@ MVP (the Cashu release path does not exist yet); see §13.
 |---|---|---|
 | Seller (via Mostro) | buyer's committed `payment_hash` for **this order**; aggregate counters for **this** (buyer, hash) pair — including how many of the buyer's past counterparties met the node's experience policy (D-7), as a bare count; whether the buyer is in full-privacy mode (already visible today through `Peer.reputation == None`) | buyer identity key, other trade keys, other order ids, which sellers were the counterparties, any single counterparty's qualification status, any hash other than the one the buyer chose to commit to this order |
 | Buyer | nothing new about the seller | — |
+| Solver, in a dispute | the plaintext payer details, when a party discloses the chat's conversation key: they travel over the peer chat, which is the dispute transcript | the hash's history, unless shown the `payment-history` message |
 | Mostro node | `(master_buyer_pubkey, payment_hash)` association + counters; keyed counterparty hashes; per-counterparty qualification snapshots (derived from `orders`, which the node already holds) | plaintext payer details (D-2) |
 | Public relays | nothing | everything in this feature |
 
@@ -1592,9 +1600,14 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
 **Buyer side**
 1. When the order is taken and `payer_history_enabled` is true, show a
    "payment sender" form for the method in use, explaining why (gist §21).
-2. Canonicalise, hash (§7), send `declare-payer`. Keep the plaintext locally.
-3. Send the plaintext to the seller over the peer channel (chat or DM).
-4. Before `fiat-sent`, confirm: *"Did you send the payment from the account
+2. Canonicalise, hash (§7; order-bound in full-privacy mode, D-4), send
+   `declare-payer`. Keep the plaintext locally. Wait for the `payer-declared`
+   ack with the request's `request_id` and re-send if it does not arrive: on a
+   node that does not require declarations, a `fiat-sent` that overtakes the
+   declaration closes the window and the late declaration is refused.
+3. Send the plaintext to the seller over the peer channel (chat or DM),
+   telling the buyer that a solver reads it if the trade goes to dispute.
+4. Send `fiat-sent` only after the ack of step 2. Before it, confirm: *"Did you send the payment from the account
    declared for this trade?"*
 5. If `fiat-sent` answers `payer_not_declared`, go back to step 1.
 

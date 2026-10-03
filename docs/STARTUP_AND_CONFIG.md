@@ -165,6 +165,11 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `max_lifetime_seconds` (u64): Longest an attestation may live, `expiration - created_at`; caps a faulty or compromised issuer. Must be > 0 and at most 2592000, 30 days (default: 604800, 7 days)
 - `issuers` (list of `[[reputation_import.issuers]]`): The trust list. Each entry has a `name`, the stable key imports are deduplicated on (never rename one once an import is recorded under it; see Additional Boot Steps), and `keys`, the issuer's signing keys as npub or hex. To follow a key rotation, add the new key to the same entry and remove the old one once its attestations have expired. Names must be unique and without leading or trailing spaces, and a key belongs to one entry only; a violation, an empty entry or a key that does not parse stops the load, even while the section is disabled
 
+**Reputation export** (`[reputation_export]`, optional; absent ≡ disabled). Lets users carry the reputation they earned on this node to another Mostro, as an attestation of their native figures (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md)):
+- `enabled` (bool): Master switch. While enabled, the info event carries a `reputation_issuer` tag with the issuer's public key (default: false)
+- `issuer_key_env` (String): Environment variable holding the issuer's secret key, nsec or hex; read at startup like `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`. The boot stops when export is enabled and the variable is unset, empty or invalid, when it holds the node's own key, or when the key is also in `[reputation_import]` (default: `MOSTRO_REPUTATION_ISSUER_SK`)
+- `lifetime_seconds` (u64): Lifetime of an attestation; destinations cap it, 7 days by default. Must be > 0 (default: 604800)
+
 **Health** (`[health]`, optional; absent ≡ the defaults below; `HealthSettings` in `src/config/types.rs`). The health event, and how mostrod reacts when its Lightning node stops being synced to chain (see [HEALTH.md](HEALTH.md)):
 - `enabled` (bool): Publish the health event, kind 38389 (default: true)
 - `interval` (u64): Seconds between publications, 30 to 3600; a value outside the range is clamped with an error logged. The event's NIP-40 expiration is three intervals (default: 60)

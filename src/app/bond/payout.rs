@@ -3404,6 +3404,7 @@ mod tests {
             reputation_import: None,
             payer_history: None,
             health: Default::default(),
+            reputation_export: None,
         });
         let _ = &MOSTRO_CONFIG;
     }

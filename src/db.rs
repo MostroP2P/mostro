@@ -1973,6 +1973,26 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// An identity's completed trades on this node: how many `success` orders it
+/// was the master buyer or seller of, and when the first of them started —
+/// `taken_at`, or `created_at` for an order that never recorded it. Orders
+/// placed in full privacy mode carry no master key and are not counted, and
+/// nothing an import brought is either: this is native history only.
+pub async fn completed_trades_for_identity(
+    pool: &SqlitePool,
+    identity: &str,
+) -> Result<(i64, Option<i64>), MostroError> {
+    sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT COUNT(*), MIN(CASE WHEN taken_at > 0 THEN taken_at ELSE created_at END) \
+         FROM orders WHERE status = 'success' \
+         AND (master_buyer_pubkey = ?1 OR master_seller_pubkey = ?1)",
+    )
+    .bind(identity)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// The trust-list names that hold `issuer_key`: the names its imports were
 /// recorded under, and the name it is bound to while an import is recorded
 /// under that name. A name no import uses has nothing to deduplicate, so it

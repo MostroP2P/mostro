@@ -8,7 +8,10 @@ use nostr_sdk::prelude::Keys;
 use sqlx::{Pool, Sqlite};
 
 /// Re-evaluate every stored `experienced` snapshot when the configured
-/// thresholds differ from the ones they were evaluated under (§10.7).
+/// thresholds differ from the ones they were evaluated under (§10.7), or
+/// when the node key differs from the one their counterparty ids were
+/// resolved with: ids are keyed by the node secret, and only the recompute
+/// moves rows a new key cannot resolve out of the counted generation.
 ///
 /// Returns `None` when there was nothing to do: the feature is off (the
 /// recompute never runs then, whatever the config says, D-10) or the stored
@@ -24,14 +27,17 @@ pub async fn sync_experience_policy(
         return Ok(None);
     }
     let (min_trades, min_days) = PayerHistorySettings::experience_thresholds(cfg);
+    let node_pubkey = node_keys.public_key().to_hex();
     if let Some(policy) = db::load_experience_policy(pool).await? {
-        if (policy.min_trades, policy.min_days) == (min_trades, min_days) {
+        if (policy.min_trades, policy.min_days) == (min_trades, min_days)
+            && policy.node_pubkey.as_deref() == Some(node_pubkey.as_str())
+        {
             return Ok(None);
         }
     }
     let outcome = db::recompute_experienced(pool, node_keys, min_trades, min_days, now).await?;
     tracing::info!(
-        "payer_history: experience thresholds now {min_trades}/{min_days}; \
+        "payer_history: experience policy {min_trades}/{min_days} under the current node key; \
          recomputed snapshots, {} row(s) changed",
         outcome.changed
     );

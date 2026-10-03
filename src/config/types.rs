@@ -810,7 +810,7 @@ pub struct RpcSettings {
     pub rate_limiter_stale_duration: u64,
     /// Optional shared secret for the mutating admin RPCs (`CancelOrder`,
     /// `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`,
-    /// `RevokeReputationImports`).
+    /// `RevokeReputationImports`, `RebindReputationExport`).
     /// When set, those calls must carry `authorization: Bearer <token>`
     /// metadata. Unset (default) keeps the historical bind-address-only
     /// model. Never serialized back to disk.

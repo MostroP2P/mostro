@@ -3285,6 +3285,7 @@ mod tests {
             cashu: None,
             price: None,
             reputation_import: None,
+            reputation_export: None,
         });
         let _ = &MOSTRO_CONFIG;
     }

@@ -32,6 +32,28 @@ pub fn read_nsec_env_var() -> Option<SecretString> {
     Some(secret)
 }
 
+/// Read the reputation issuer's secret key (nsec or hex) from the environment
+/// variable `name`, trimmed, and zeroize the buffer. Unset, blank or
+/// unparseable is an error: export is enabled and cannot run without it.
+pub fn load_reputation_issuer_keys(name: &str) -> Result<Keys, MostroError> {
+    let fail = |reason: String| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_export] {reason}"
+        ))))
+    };
+    let Ok(mut raw) = std::env::var(name) else {
+        return fail(format!("export is enabled but {name} is not set"));
+    };
+    let blank = raw.trim().is_empty();
+    let parsed = Keys::parse(raw.trim());
+    raw.zeroize();
+    match parsed {
+        _ if blank => fail(format!("export is enabled but {name} is empty")),
+        Ok(keys) => Ok(keys),
+        Err(_) => fail(format!("{name} is not a valid secret key")),
+    }
+}
+
 /// Parse a bech32 nsec into [`Keys`], exposing the secret only in this scope.
 pub fn parse_mostro_keys(secret: &SecretString) -> Result<Keys, MostroError> {
     let nsec = secret.expose_secret();

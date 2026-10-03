@@ -2,7 +2,8 @@ use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
-    LightningSettings, MostroSettings, NostrSettings, ReputationImportSettings, RpcSettings,
+    LightningSettings, MostroSettings, NostrSettings, ReputationExportSettings,
+    ReputationImportSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
@@ -44,11 +45,16 @@ pub struct Settings {
     /// section ≡ disabled.
     #[serde(default)]
     pub reputation_import: Option<ReputationImportSettings>,
+    /// Reputation export (docs/REPUTATION_PORTABILITY.md, phase 4). Absent
+    /// section ≡ disabled.
+    #[serde(default)]
+    pub reputation_export: Option<ReputationExportSettings>,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
 pub fn init_mostro_settings(mut s: Settings) -> Result<(), MostroError> {
     let keys = take_nsec_for_init(&mut s.nostr)?;
+    attach_reputation_issuer_keys(&mut s, &keys)?;
     NOSTR_KEYS.set(keys).map_err(|_| {
         MostroInternalErr(ServiceError::IOError(
             "Mostro nostr keys already initialized".to_string(),
@@ -59,6 +65,41 @@ pub fn init_mostro_settings(mut s: Settings) -> Result<(), MostroError> {
             "Mostro settings already initialized".to_string(),
         ))
     })?;
+    Ok(())
+}
+
+/// Load the reputation issuer key when export is enabled: from the
+/// environment variable the section names, a dedicated key that is neither
+/// the node's own key nor one the node imports from (it would let a user
+/// import their own reputation here and double it). Any of these stops the
+/// boot.
+pub(crate) fn attach_reputation_issuer_keys(
+    s: &mut Settings,
+    node: &Keys,
+) -> Result<(), MostroError> {
+    let trusted = s
+        .reputation_import
+        .as_ref()
+        .map(ReputationImportSettings::trusted_keys)
+        .unwrap_or_default();
+    let Some(export) = s.reputation_export.as_mut().filter(|e| e.enabled) else {
+        return Ok(());
+    };
+    let issuer = crate::config::secret::load_reputation_issuer_keys(&export.issuer_key_env)?;
+    let fail = |reason: &str| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_export] {reason}"
+        ))))
+    };
+    if issuer.public_key() == node.public_key() {
+        return fail("the issuer key must be a dedicated key, not the node's own key");
+    }
+    if trusted.contains(&issuer.public_key()) {
+        return fail(
+            "the issuer key is also in [reputation_import]: a node never imports its own attestations",
+        );
+    }
+    export.issuer_keys = Some(issuer);
     Ok(())
 }
 
@@ -127,9 +168,18 @@ impl Settings {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
     }
 
-    /// The reputation import settings, only when import is enabled. Like
-    /// [`Settings::get_bond`], never panics before the configuration is
-    /// initialised.
+    /// The reputation export settings, only when export is enabled; its
+    /// `issuer_keys` were loaded at startup. Like [`Settings::get_bond`],
+    /// never panics before the configuration is initialised.
+    pub fn get_reputation_export() -> Option<&'static ReputationExportSettings> {
+        MOSTRO_CONFIG
+            .get()?
+            .reputation_export
+            .as_ref()
+            .filter(|export| export.enabled)
+    }
+
+    /// The reputation import settings, only when import is enabled.
     pub fn get_reputation_import() -> Option<&'static ReputationImportSettings> {
         MOSTRO_CONFIG
             .get()?
@@ -206,6 +256,102 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+
+    mod reputation_issuer_keys {
+        use super::super::*;
+        use crate::app::context::test_utils::test_settings;
+        use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+        use nostr_sdk::prelude::{Keys, ToBech32};
+
+        /// Each test sets its own variable, so parallel tests never race.
+        fn settings_with(env: &str, value: Option<&str>) -> Settings {
+            match value {
+                Some(value) => std::env::set_var(env, value),
+                None => std::env::remove_var(env),
+            }
+            let mut settings = test_settings();
+            settings.reputation_export = Some(ReputationExportSettings {
+                enabled: true,
+                issuer_key_env: env.to_string(),
+                ..Default::default()
+            });
+            settings
+        }
+
+        fn refusal(result: Result<(), MostroError>) -> String {
+            match result {
+                Err(MostroInternalErr(ServiceError::IOError(reason))) => reason,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn loads_a_dedicated_key_from_the_named_variable() {
+            let issuer = Keys::generate();
+            let nsec = issuer.secret_key().to_bech32().unwrap();
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_OK", Some(&nsec));
+            attach_reputation_issuer_keys(&mut settings, &Keys::generate()).unwrap();
+            let export = settings.reputation_export.unwrap();
+            assert_eq!(export.issuer_key(), Some(issuer.public_key()));
+        }
+
+        #[test]
+        fn a_disabled_section_needs_no_key() {
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_OFF", None);
+            settings.reputation_export.as_mut().unwrap().enabled = false;
+            attach_reputation_issuer_keys(&mut settings, &Keys::generate()).unwrap();
+            assert!(settings.reputation_export.unwrap().issuer_keys.is_none());
+        }
+
+        #[test]
+        fn an_unset_empty_or_invalid_key_stops_the_boot() {
+            let mut unset = settings_with("MOSTRO_TEST_ISSUER_SK_UNSET", None);
+            assert!(
+                refusal(attach_reputation_issuer_keys(&mut unset, &Keys::generate()))
+                    .contains("is not set")
+            );
+            let mut empty = settings_with("MOSTRO_TEST_ISSUER_SK_EMPTY", Some("  "));
+            assert!(
+                refusal(attach_reputation_issuer_keys(&mut empty, &Keys::generate()))
+                    .contains("is empty")
+            );
+            let mut bad = settings_with("MOSTRO_TEST_ISSUER_SK_BAD", Some("nsec1nope"));
+            assert!(
+                refusal(attach_reputation_issuer_keys(&mut bad, &Keys::generate()))
+                    .contains("not a valid secret key")
+            );
+        }
+
+        #[test]
+        fn the_node_key_is_never_the_issuer_key() {
+            let node = Keys::generate();
+            let hex = node.secret_key().to_secret_hex();
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_NODE", Some(&hex));
+            assert!(refusal(attach_reputation_issuer_keys(&mut settings, &node))
+                .contains("not the node's own key"));
+        }
+
+        #[test]
+        fn a_key_the_node_imports_from_is_never_its_issuer_key() {
+            let issuer = Keys::generate();
+            let hex = issuer.secret_key().to_secret_hex();
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_SELF", Some(&hex));
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled: true,
+                issuers: vec![ReputationIssuer {
+                    name: "self".to_string(),
+                    keys: vec![issuer.public_key().to_hex()],
+                }],
+                ..Default::default()
+            });
+            assert!(refusal(attach_reputation_issuer_keys(
+                &mut settings,
+                &Keys::generate()
+            ))
+            .contains("[reputation_import]"));
+        }
+    }
+
     use super::*;
     use crate::app::context::test_utils::test_settings;
 

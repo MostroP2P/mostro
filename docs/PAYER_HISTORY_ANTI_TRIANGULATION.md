@@ -627,9 +627,10 @@ Summary of the contract:
      (IBAN, CBU/CVU, account number, tax id);
    - collapse runs of whitespace to one space in *name* fields, trim;
    - "whitespace" is exactly the Unicode `White_Space` set, and after these
-     steps every code point must lie in U+0020–U+007E or U+00A0–U+017F
-     (stable NFKC and case mappings across Unicode versions); anything else
-     has no canonical form;
+     steps every code point must lie in U+0020–U+007E, U+00A0–U+017F or
+     U+0218–U+021B (stable NFKC and case mappings across Unicode versions);
+     anything else has no canonical form, so on a node requiring
+     declarations the buyer's client checks this before taking the order;
    - country codes ISO-3166 alpha-2, currency ISO-4217.
 2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`), so
    identical account numbers under different rails never collide.

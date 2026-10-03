@@ -2180,7 +2180,8 @@ mod tests {
                 order_id char(36) PRIMARY KEY NOT NULL,
                 payment_hash char(64) NOT NULL,
                 declared_at integer NOT NULL,
-                buyer_pubkey char(64)
+                buyer_pubkey char(64),
+                history_snapshot text
             )
             "#,
         )

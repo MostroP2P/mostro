@@ -115,7 +115,7 @@ uncovered = "runs only when serbero_pubkey is set, which the ortsom stack does n
 [[rule]]
 name = "payer history"
 paths = ["src/app/payer/**"]
-uncovered = "opt-in [payer_history] is off in the ortsom stack and no ortsom scenario declares a payer; covered by unit tests in src/app/payer and the fiat_sent / release tests"
+uncovered = "opt-in [payer_history] is off in the ortsom stack and no ortsom scenario declares a payer; covered by unit tests in src/app/payer"
 
 [[rule]]
 name = "settings template"

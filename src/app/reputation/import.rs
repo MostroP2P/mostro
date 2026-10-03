@@ -44,7 +44,18 @@ pub async fn import_reputation_action(
     let (attestation, _) =
         ReputationAttestation::parse_json(json, Timestamp::now(), import.max_lifetime_seconds)
             .map_err(|e| MostroCantDo(e.cant_do_reason()))?;
-    // Step 3: a trusted key, which from here on stands for its entry's name.
+    // Step 3: a trusted key, which from here on stands for its entry's name,
+    // and never this node's own issuer key: importing its own attestations
+    // would let a user double their reputation here.
+    let own_key = ctx
+        .settings()
+        .reputation_export
+        .as_ref()
+        .filter(|export| export.enabled)
+        .and_then(|export| export.issuer_key());
+    if own_key == Some(attestation.issuer) {
+        return Err(MostroCantDo(CantDoReason::UntrustedReputationIssuer));
+    }
     let issuer = import
         .issuer_for(&attestation.issuer)
         .ok_or(MostroCantDo(CantDoReason::UntrustedReputationIssuer))?;
@@ -464,6 +475,32 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Step 3: even with its own issuer key in the trust list (settings
+    /// loading refuses that, but the check stands on its own), a node never
+    /// imports its own attestations.
+    #[tokio::test]
+    async fn the_nodes_own_attestations_are_never_imported() {
+        let own = Keys::generate();
+        let mut f =
+            fixture_with(vec![("self", vec![own.public_key().to_hex()])], own.clone()).await;
+        let mut settings = test_settings();
+        settings.reputation_import = f.ctx.settings().reputation_import.clone();
+        settings.reputation_export = Some(crate::config::types::ReputationExportSettings {
+            enabled: true,
+            issuer_keys: Some(own.clone()),
+            ..Default::default()
+        });
+        f.ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(f.ctx.pool().clone()))
+            .with_settings(settings)
+            .build();
+        let identity = Keys::generate().public_key();
+        assert_eq!(
+            refused(import(&f, &identity, &attestation(&own, &identity, "acct-1")).await),
+            CantDoReason::UntrustedReputationIssuer
         );
     }
 

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{Keys, PublicKey};
 use sqlx::{AssertSqlSafe, Pool, Row, Sqlite, SqliteConnection};
 use uuid::Uuid;
 
@@ -28,10 +28,13 @@ pub struct PayerDeclarationRow {
     pub declared_at: i64,
 }
 
-/// Insert or overwrite the declaration for `order_id` (last write wins).
+/// Insert or overwrite the declaration for `order_id` (last write wins),
+/// with no status or buyer condition: a test fixture. Production writes go
+/// through [`upsert_open_declaration`].
 /// The row records the order's buyer trade key at that moment: a take that
 /// rolls back to `pending` gives the order a new buyer later, and every read
 /// below ignores a declaration made by a previous one.
+#[cfg(test)]
 pub async fn upsert_declaration(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
@@ -53,6 +56,59 @@ pub async fn upsert_declaration(
     .await
     .map_err(db_err)?;
     Ok(())
+}
+
+/// Order statuses in which a buyer may (re)declare its payer (§5.1).
+pub const DECLARATION_OPEN_STATUSES: &str = "'waiting-payment','waiting-buyer-invoice','active'";
+
+/// Upsert the declaration for `order_id` only while the order is still in
+/// [`DECLARATION_OPEN_STATUSES`]. Status check and write are one statement,
+/// so a declaration racing a concurrent `fiat-sent` cannot land after the
+/// order froze, and only while `buyer_pubkey` and `seller_pubkey` (the
+/// parties the handler read, `None` for no seller yet) are still the order's,
+/// and while `taken_at` is still the value the handler read: a rollback
+/// resets it and every take stamps a new one, so a request that raced a
+/// rollback or a new take, even by the same two keys, cannot attach to it,
+/// and the caller forwards to a seller the write confirmed. (`taken_at` is
+/// also re-anchored when the hold invoice is paid; a request crossing that
+/// is refused and the client re-sends it.) `taken_at` has second precision:
+/// a cancel and a retake by the same two keys within one second, with this
+/// buyer's own request in flight across both, would still match. That is the
+/// same buyer declaring on its new take of the same order, and closing it
+/// would need a take-generation column on `orders`, which §9 keeps to the
+/// single `success_at` change. It
+/// records that buyer trade key on the row. Returns `false` when nothing was
+/// written.
+pub async fn upsert_open_declaration(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: Option<&str>,
+    taken_at: i64,
+    payment_hash: &str,
+    now: i64,
+) -> Result<bool, MostroError> {
+    let sql = format!(
+        "INSERT INTO order_payer_declarations \
+           (order_id, payment_hash, declared_at, buyer_pubkey) \
+         SELECT ?1, ?2, ?3, o.buyer_pubkey FROM orders o \
+          WHERE o.id = ?1 AND o.status IN ({DECLARATION_OPEN_STATUSES}) \
+            AND o.buyer_pubkey = ?4 AND o.seller_pubkey IS ?5 AND o.taken_at = ?6 \
+         ON CONFLICT(order_id) DO UPDATE SET payment_hash = excluded.payment_hash, \
+                                             declared_at = excluded.declared_at, \
+                                             buyer_pubkey = excluded.buyer_pubkey"
+    );
+    let done = sqlx::query(AssertSqlSafe(sql))
+        .bind(order_id)
+        .bind(payment_hash)
+        .bind(now)
+        .bind(buyer_pubkey.to_hex())
+        .bind(seller_pubkey)
+        .bind(taken_at)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// The current declaration for `order_id`, if any: one made by the order's

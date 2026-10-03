@@ -45,6 +45,7 @@ use crate::app::fiat_sent::fiat_sent_action;
 use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
 use crate::app::orders::orders_action;
+use crate::app::payer::declare::declare_payer_action;
 use crate::app::rate_user::update_user_reputation_action;
 use crate::app::release::release_action;
 use crate::app::restore_session::restore_session_action;
@@ -247,6 +248,12 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::RateUser => update_user_reputation_action(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
+
+        // Payer history (anti-triangulation); answers invalid_action when the
+        // feature is off (D-10). Not routed in Cashu mode yet (§10.8).
+        Action::DeclarePayer => declare_payer_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 

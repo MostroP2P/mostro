@@ -1553,8 +1553,8 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(
         "
-            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at, native_rating_sum, native_created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?13)
         ",
     )
     .bind(new_user.pubkey.clone())
@@ -1570,6 +1570,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .bind(new_user.max_rating)
     .bind(new_user.min_rating)
     .bind(created_at.as_secs() as i64)
+    .bind(new_user.native_rating_sum)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1705,6 +1706,7 @@ pub async fn claim_order_rating_flag(
 /// flag claim and this write commit or roll back together.
 ///
 /// Returns `Ok(true)` when a matching `users` row was updated.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_user_rating<'e, E>(
     executor: E,
     public_key: String,
@@ -1713,6 +1715,7 @@ pub async fn update_user_rating<'e, E>(
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
+    native_rating_sum: f64,
 ) -> Result<bool, MostroError>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -1740,9 +1743,12 @@ where
     if !(min_rating <= last_rating && last_rating <= max_rating) {
         return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
+    if !native_rating_sum.is_finite() || native_rating_sum < 0.0 {
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
+    }
     let result = sqlx::query(
         r#"
-            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
+            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5, native_rating_sum = ?6 WHERE pubkey = ?7
         "#,
     )
     .bind(last_rating)
@@ -1750,6 +1756,7 @@ where
     .bind(max_rating)
     .bind(total_reviews)
     .bind(total_rating)
+    .bind(native_rating_sum)
     .bind(public_key)
     .execute(executor)
     .await
@@ -1757,6 +1764,169 @@ where
     let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+/// One row of `reputation_imports`: an attestation a user imported
+/// (docs/REPUTATION_PORTABILITY.md §5.3, §6). `issuer` is the trust-list
+/// entry's name, which deduplication is on; `issuer_key` is the key that
+/// signed. The figures are what reversing the import subtracts.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ReputationImportRow {
+    pub attestation_id: String,
+    pub issuer: String,
+    pub issuer_key: String,
+    pub subject: String,
+    pub identity_pubkey: String,
+    pub reviews: i64,
+    pub rating_hundredths: i64,
+    pub since: i64,
+    pub imported_at: i64,
+}
+
+impl ReputationImportRow {
+    /// The figures the import merged, as core's merge and reversal take them.
+    pub fn figures(&self) -> ReputationImport {
+        ReputationImport {
+            reviews: u32::try_from(self.reviews).unwrap_or(0),
+            rating_hundredths: u16::try_from(self.rating_hundredths).unwrap_or(0),
+            since: u64::try_from(self.since).unwrap_or(0),
+        }
+    }
+}
+
+const REPUTATION_IMPORT_COLUMNS: &str = "attestation_id, issuer, issuer_key, subject, \
+    identity_pubkey, reviews, rating_hundredths, since, imported_at";
+
+/// Record an import. The unique indexes on `(issuer, subject)` and
+/// `(issuer, identity_pubkey)` make a second import of the same source, or a
+/// second account from one issuer for the same identity, fail here even when
+/// two requests race: that failure is `ReputationAlreadyImported`.
+pub async fn insert_reputation_import<'e, E>(
+    executor: E,
+    row: &ReputationImportRow,
+) -> Result<(), MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO reputation_imports ({REPUTATION_IMPORT_COLUMNS}) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+    )))
+    .bind(&row.attestation_id)
+    .bind(&row.issuer)
+    .bind(&row.issuer_key)
+    .bind(&row.subject)
+    .bind(&row.identity_pubkey)
+    .bind(row.reviews)
+    .bind(row.rating_hundredths)
+    .bind(row.since)
+    .bind(row.imported_at)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        let unique = e
+            .as_database_error()
+            .is_some_and(|db| db.is_unique_violation());
+        if unique {
+            MostroCantDo(CantDoReason::ReputationAlreadyImported)
+        } else {
+            MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+        }
+    })?;
+    Ok(())
+}
+
+/// Write the reputation columns an import or its reversal changes.
+pub async fn update_user_reputation<'e, E>(executor: E, user: &User) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(
+        "UPDATE users SET total_reviews = ?1, total_rating = ?2, created_at = ?3, \
+         native_created_at = ?4, min_rating = ?5, max_rating = ?6, last_rating = ?7, \
+         seeded_reviews = ?8, seeded_rating_sum = ?9 WHERE pubkey = ?10",
+    )
+    .bind(user.total_reviews)
+    .bind(user.total_rating)
+    .bind(user.created_at)
+    .bind(user.native_created_at)
+    .bind(user.min_rating)
+    .bind(user.max_rating)
+    .bind(user.last_rating)
+    .bind(user.seeded_reviews)
+    .bind(user.seeded_rating_sum)
+    .bind(&user.pubkey)
+    .execute(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The imports made with `issuer_key`, oldest first; with `imported_after`,
+/// only those this node recorded at or after that time. This is what
+/// revoking a compromised key selects: by the key and the node's own clock.
+pub async fn reputation_imports_by_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+    imported_after: Option<i64>,
+) -> Result<Vec<ReputationImportRow>, MostroError> {
+    sqlx::query_as::<_, ReputationImportRow>(AssertSqlSafe(format!(
+        "SELECT {REPUTATION_IMPORT_COLUMNS} FROM reputation_imports \
+         WHERE issuer_key = ?1 AND imported_at >= ?2 ORDER BY imported_at, attestation_id"
+    )))
+    .bind(issuer_key)
+    .bind(imported_after.unwrap_or(i64::MIN))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Every import recorded for an identity.
+pub async fn reputation_imports_for_identity<'e, E>(
+    executor: E,
+    identity: &str,
+) -> Result<Vec<ReputationImportRow>, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_as::<_, ReputationImportRow>(AssertSqlSafe(format!(
+        "SELECT {REPUTATION_IMPORT_COLUMNS} FROM reputation_imports \
+         WHERE identity_pubkey = ?1 ORDER BY imported_at, attestation_id"
+    )))
+    .bind(identity)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Delete an import's row once it is reversed, so its user can import again.
+pub async fn delete_reputation_import<'e, E>(
+    executor: E,
+    attestation_id: &str,
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query("DELETE FROM reputation_imports WHERE attestation_id = ?1")
+        .bind(attestation_id)
+        .execute(executor)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The trust-list names imports were recorded under for `issuer_key`.
+pub async fn reputation_issuer_names_for_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+) -> Result<Vec<String>, MostroError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT issuer FROM reputation_imports WHERE issuer_key = ?1 ORDER BY issuer",
+    )
+    .bind(issuer_key)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// Returns true only when the given `solver_pubkey` is assigned to the dispute
@@ -4818,7 +4988,8 @@ mod tests {
                 last_rating integer not null default 0,
                 max_rating integer not null default 0,
                 min_rating integer not null default 0,
-                created_at integer not null
+                created_at integer not null,
+                native_rating_sum real not null default 0.0
             )"#,
         )
         .execute(&pool)
@@ -5069,7 +5240,8 @@ mod tests {
         insert_test_user(&pool, VALID_PUBKEY).await;
 
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_ok());
         assert!(result.unwrap(), "Should update existing user rating");
 
@@ -5092,7 +5264,8 @@ mod tests {
     async fn test_update_user_rating_invalid_pubkey() {
         let pool = setup_users_db().await.unwrap();
 
-        let result = super::update_user_rating(&pool, "short".to_string(), 4, 3, 5, 10, 40.0).await;
+        let result =
+            super::update_user_rating(&pool, "short".to_string(), 4, 3, 5, 10, 40.0, 0.0).await;
         assert!(result.is_err(), "Should reject invalid pubkey");
     }
 
@@ -5103,12 +5276,14 @@ mod tests {
 
         // Rating > 5
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 6, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 6, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject rating > 5");
 
         // Rating < 0
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), -1, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), -1, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject negative rating");
     }
 
@@ -5118,7 +5293,8 @@ mod tests {
         insert_test_user(&pool, VALID_PUBKEY).await;
 
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, -1, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, -1, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject negative total_reviews");
     }
 
@@ -5129,7 +5305,7 @@ mod tests {
 
         // total_rating > total_reviews * 5
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 2, 11.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 2, 11.0, 0.0).await;
         assert!(result.is_err(), "Should reject total_rating > reviews * 5");
     }
 
@@ -5140,7 +5316,8 @@ mod tests {
 
         // min_rating > last_rating
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 2, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 2, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject min_rating > last_rating");
     }
 
@@ -5151,7 +5328,8 @@ mod tests {
 
         // last_rating > max_rating
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 5, 3, 4, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 5, 3, 4, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject last_rating > max_rating");
     }
 
@@ -5497,7 +5675,7 @@ mod tests {
         insert_sentinel_user(&pool, DAEMON_PUBKEY).await;
 
         assert!(
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0)
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, 0.0)
                 .await
                 .unwrap()
         );
@@ -6437,17 +6615,17 @@ mod migration_and_query_tests {
         let pool = migrated_pool().await;
         // min_rating outside 0..=5
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 6, 5, 1, 5.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 6, 5, 1, 5.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
         // max_rating outside 0..=5
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 0, 9, 1, 5.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 0, 9, 1, 5.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
         // last_rating below the MIN_RATING floor (0 < 1)
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 0, 0, 5, 1, 0.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 0, 0, 5, 1, 0.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
     }

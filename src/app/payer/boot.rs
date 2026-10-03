@@ -144,6 +144,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_node_key_change_recomputes_even_with_unchanged_thresholds() {
+        // Counterparty ids are keyed by the node secret: under a new key the
+        // stored ones resolve to no seller, and only the recompute moves
+        // them out of the counted generation.
+        let pool = create_test_pool().await;
+        let cfg = with_thresholds(5, 30);
+        sync_experience_policy(&pool, &Keys::generate(), Some(&cfg), 10)
+            .await
+            .unwrap();
+
+        let new_key = Keys::generate();
+        let out = sync_experience_policy(&pool, &new_key, Some(&cfg), 20)
+            .await
+            .unwrap();
+
+        assert!(out.is_some(), "recomputed");
+        let policy = load_experience_policy(&pool).await.unwrap().unwrap();
+        assert_eq!(policy.generation, 2);
+        assert_eq!(policy.node_pubkey, Some(new_key.public_key().to_hex()));
+        assert_eq!(
+            sync_experience_policy(&pool, &new_key, Some(&cfg), 30)
+                .await
+                .unwrap(),
+            None,
+            "same key and thresholds: nothing to do"
+        );
+    }
+
     #[test]
     fn cashu_warning_only_when_both_are_enabled() {
         assert!(cashu_conflict_warning(true, true).is_some());

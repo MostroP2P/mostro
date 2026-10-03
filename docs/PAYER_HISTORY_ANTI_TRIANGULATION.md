@@ -1244,13 +1244,18 @@ produces an externally visible `Success`** — not on the relays, not in the
 message queue.
 
 ```rust
+// `conn` is the Success CAS transaction (`&mut *tx`). `thresholds` comes from
+// the context's `[payer_history]` section, and `now` is the instant the CAS
+// stamped into `orders.success_at`, so both writes record the same moment.
 pub async fn record_payer_success(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conn: &mut SqliteConnection,
     node_keys: &Keys,
     order: &Order,
+    thresholds: (u32, u32),
+    now: i64,
 ) -> Result<(), MostroError> {
     // Idempotency token: the declaration row can be consumed exactly once.
-    let Some(decl) = db::take_declaration(&mut **tx, order.id).await? else {
+    let Some(decl) = db::take_declaration(conn, order.id).await? else {
         return Ok(());                                           // nothing to do / already done
     };
     if order.buyer_dispute || order.seller_dispute {                   // D-6
@@ -1268,17 +1273,14 @@ pub async fn record_payer_success(
     // explicitly: it never counts toward its own counterparty's qualification.
     // Only history that predates this trade — and only trades with OTHER
     // buyers — qualifies.
-    let exp = db::seller_experience(&mut **tx, &seller_master, &user, order.id, None).await?;
-    let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
-    let experienced = exp.qualifying_trades >= min_trades
-        && exp.first_qualifying_at
-               .is_some_and(|t| now() - t >= i64::from(min_days) * 86_400);
+    let exp = db::seller_experience(conn, &seller_master, &user, Some(order.id), None).await?;
+    // N trades AND first one at least D days before `now`.
+    let experienced = is_experienced(&exp, thresholds.0, thresholds.1, now);
     // The generation stamps WHICH policy this snapshot was taken under, so a
     // later threshold change can tell it apart from rows it could not
-    // re-evaluate (§9, §10.7).
-    let gen = db::current_policy_generation(&mut **tx).await?;
-    db::bump_history(&mut **tx, &user, &decl.payment_hash, &cp, experienced, gen, now()).await?;
-    Ok(())
+    // re-evaluate (§9, §10.7). Seeded from `thresholds` on first use.
+    let gen = db::current_policy_generation(conn, thresholds, now).await?;
+    db::bump_history(conn, &user, &decl.payment_hash, &cp, experienced, gen, now).await
 }
 
 pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
@@ -1376,11 +1378,14 @@ if Settings::is_payer_history_enabled() {
     match db::load_experience_policy(&pool).await? {
         Some(p) if (p.min_trades, p.min_days) == (min_trades, min_days) => {}   // unchanged: nothing to do
         Some(_) | None => {
-            let changed = db::recompute_experienced(&pool, &my_keys, min_trades, min_days).await?;
+            let outcome =
+                db::recompute_experienced(&pool, &my_keys, min_trades, min_days, now).await?;
             tracing::info!(
                 "payer_history: experience thresholds now {min_trades}/{min_days}; \
-                 recomputed snapshots, {changed} row(s) changed"
+                 recomputed snapshots, {} row(s) changed",
+                outcome.changed
             );
+            // outcome.unresolved is logged at warn (count only), step 4 below.
         }
     }
 }

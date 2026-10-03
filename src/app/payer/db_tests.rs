@@ -683,13 +683,32 @@ async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
     );
     assert_eq!(
         stored_flag(&pool, &buyer).await,
-        (1, old),
-        "value and generation kept"
+        (1, -1),
+        "value kept, marked unresolved"
     );
 
     let got = load_history(&pool, &buyer, &h).await.unwrap();
+    assert_eq!(got.successful_trades, 1, "the trade itself still happened");
+    assert_eq!(
+        (got.distinct_counterparties, got.experienced_counterparties),
+        (0, 0)
+    );
+
+    // The same seller trading again under the new key gets a new id; it must
+    // count once, not next to its unresolvable old row.
+    let current = load_experience_policy(&pool).await.unwrap().unwrap();
+    bump(
+        &pool,
+        &buyer,
+        &h,
+        &hash('8'),
+        false,
+        current.generation,
+        NOW + 1,
+    )
+    .await;
+    let got = load_history(&pool, &buyer, &h).await.unwrap();
     assert_eq!(got.distinct_counterparties, 1);
-    assert_eq!(got.experienced_counterparties, 0);
 }
 
 #[tokio::test]

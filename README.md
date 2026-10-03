@@ -1,6 +1,6 @@
 # Mostro 🧌
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
 [![Coverage](https://img.shields.io/endpoint?url=https://mostro.network/mostro/coverage/badge.json)](https://mostro.network/mostro/coverage/)
@@ -1241,7 +1241,17 @@ Join the operator community:
 
 ## License
 
-Mostro is licensed under the [GNU General Public License v3.0](LICENSE).
+Copyright (C) 2022-2026 Francisco Calderón and Mostro contributors.
+
+Mostro is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License](LICENSE) as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version (SPDX: `GPL-3.0-or-later`).
+
+Mostro was previously released under the MIT License. Code contributed before
+the switch to GPL keeps its original copyright and permission notice, which is
+preserved in [LICENSE-MIT](LICENSE-MIT). Releases already published under the
+MIT License remain available under those terms.
 
 ## Credits & Acknowledgments
 

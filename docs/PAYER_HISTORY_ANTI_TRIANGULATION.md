@@ -1395,7 +1395,13 @@ declarations; nothing special.
 
 `experienced` is a snapshot, so a change to `N` or `D` invalidates every stored
 snapshot at once. `mostrod` detects that at boot and rebuilds the column rather
-than leaving old-policy and new-policy rows side by side.
+than leaving old-policy and new-policy rows side by side. A change of node key
+does the same: `counterparty_id` is keyed by the node secret, so under a new
+key the stored ids resolve to no seller, and only the recompute moves them out
+of the counted generation. The policy row records `node_key_id`, a
+domain-separated hash of the node secret the last recompute ran under, for that
+reason; the public key would not do, since `s` and `n - s` share it while
+`counterparty_id` hashes the secret bytes.
 
 Called once from startup (`src/main.rs`, right after `run_migrations`), only
 when the feature is enabled:
@@ -1403,13 +1409,15 @@ when the feature is enabled:
 ```rust
 if Settings::is_payer_history_enabled() {
     let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
+    let node_key_id = payer::node_key_id(&my_keys);   // hash of the secret, not its pubkey
     match db::load_experience_policy(&pool).await? {
-        Some(p) if (p.min_trades, p.min_days) == (min_trades, min_days) => {}   // unchanged: nothing to do
+        Some(p) if (p.min_trades, p.min_days) == (min_trades, min_days)
+            && p.node_key_id.as_deref() == Some(node_key_id.as_str()) => {}   // unchanged: nothing to do
         Some(_) | None => {
             let outcome =
                 db::recompute_experienced(&pool, &my_keys, min_trades, min_days, now).await?;
             tracing::info!(
-                "payer_history: experience thresholds now {min_trades}/{min_days}; \
+                "payer_history: experience policy {min_trades}/{min_days} under the current node key; \
                  recomputed snapshots, {} row(s) changed",
                 outcome.changed
             );

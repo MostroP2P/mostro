@@ -57,7 +57,9 @@ pub async fn payment_history_action(
 ///
 /// Frozen at the first build, which is the `fiat-sent` push (§10.3): every
 /// later query returns the same snapshot, so a seller polling the order
-/// cannot watch the buyer's other trades with the same account land.
+/// cannot watch the buyer's other trades with the same account land. When
+/// the push could not be built, or a policy recompute discarded the
+/// snapshot, the next query takes it.
 pub async fn build_for_order(
     pool: &Pool<Sqlite>,
     order: &Order,

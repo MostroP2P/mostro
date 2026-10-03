@@ -113,6 +113,11 @@ paths = ["src/app/serbero.rs"]
 uncovered = "runs only when serbero_pubkey is set, which the ortsom stack does not do; covered by unit tests in src/app/serbero.rs"
 
 [[rule]]
+name = "payer history"
+paths = ["src/app/payer/**"]
+uncovered = "opt-in [payer_history] is off in the ortsom stack and no ortsom scenario declares a payer; covered by unit tests in src/app/payer and the fiat_sent / release tests"
+
+[[rule]]
 name = "settings template"
 paths = ["settings.tpl.toml"]
 uncovered = "the ortsom stack runs its own template (ci/regtest/mostro-settings.tpl.toml in Ortsom); mostrod embeds this one only to write a first-run settings.toml and for the wizard, covered by unit tests in src/config"

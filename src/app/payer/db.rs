@@ -71,7 +71,12 @@ pub const DECLARATION_OPEN_STATUSES: &str = "'waiting-payment','waiting-buyer-in
 /// rollback or a new take, even by the same two keys, cannot attach to it,
 /// and the caller forwards to a seller the write confirmed. (`taken_at` is
 /// also re-anchored when the hold invoice is paid; a request crossing that
-/// is refused and the client re-sends it.) It
+/// is refused and the client re-sends it.) `taken_at` has second precision:
+/// a cancel and a retake by the same two keys within one second, with this
+/// buyer's own request in flight across both, would still match. That is the
+/// same buyer declaring on its new take of the same order, and closing it
+/// would need a take-generation column on `orders`, which §9 keeps to the
+/// single `success_at` change. It
 /// records that buyer trade key on the row. Returns `false` when nothing was
 /// written.
 pub async fn upsert_open_declaration(

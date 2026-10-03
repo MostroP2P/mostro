@@ -418,7 +418,7 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
         1
     );
     assert_eq!(
-        current_policy_generation(&mut conn, (9, 9), NOW)
+        current_policy_generation(&mut conn, (5, 30), NOW + 1)
             .await
             .unwrap(),
         1,
@@ -442,6 +442,41 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
             min_trades: 3,
             min_days: 7
         })
+    );
+}
+
+#[tokio::test]
+async fn snapshots_under_unrecomputed_thresholds_are_never_counted() {
+    // Thresholds changed but the recompute has not run yet: a snapshot taken
+    // now must not join the stored generation, whose rows were evaluated
+    // under the old thresholds.
+    let pool = pool().await;
+    let old = seed_policy(&pool, 5, 30).await;
+    let (user, h) = (key(), hash('3'));
+    bump(&pool, &user, &h, "cp-a", true, old, 100).await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let stale = current_policy_generation(&mut conn, (3, 7), NOW)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_ne!(stale, old, "never the stored generation");
+    bump(&pool, &user, &h, "cp-b", true, stale, 200).await;
+
+    let got = load_history(&pool, &user, &h).await.unwrap();
+    assert_eq!(got.distinct_counterparties, 2);
+    assert_eq!(
+        got.experienced_counterparties, 1,
+        "only the snapshot evaluated under the stored thresholds"
+    );
+    assert_eq!(
+        load_experience_policy(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        old,
+        "the policy row is left to the recompute"
     );
 }
 

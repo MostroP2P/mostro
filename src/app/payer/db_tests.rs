@@ -386,6 +386,39 @@ async fn seller_experience_as_of_excludes_a_success_at_the_same_instant() {
 }
 
 #[tokio::test]
+async fn seller_age_counts_from_success_not_from_order_creation() {
+    // An offer that waited 39 days and succeeded yesterday is one day old
+    // as evidence, not 40.
+    let pool = pool().await;
+    let (seller, buyer) = (key(), key());
+    insert(
+        &pool,
+        Trade {
+            success_at: Some(NOW - ONE_DAY),
+            ..Trade::success(&seller, &key(), NOW - 40 * ONE_DAY)
+        },
+    )
+    .await;
+    let exp = experience(&pool, &seller, &buyer, None, None).await;
+    assert_eq!(exp.first_qualifying_at, Some(NOW - ONE_DAY));
+
+    // A legacy row with no success stamp falls back to its creation time.
+    insert(
+        &pool,
+        Trade {
+            success_at: None,
+            ..Trade::success(&seller, &key(), NOW - 50 * ONE_DAY)
+        },
+    )
+    .await;
+    let exp = experience(&pool, &seller, &buyer, None, None).await;
+    assert_eq!(
+        (exp.qualifying_trades, exp.first_qualifying_at),
+        (2, Some(NOW - 50 * ONE_DAY))
+    );
+}
+
+#[tokio::test]
 async fn seller_experience_ignores_trades_with_an_unknown_buyer() {
     let pool = pool().await;
     let (seller, buyer, other) = (key(), key(), key());

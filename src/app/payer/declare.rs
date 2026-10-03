@@ -40,12 +40,13 @@ pub async fn declare_payer_action(
         _ => return Err(MostroCantDo(CantDoReason::InvalidPayload)),
     };
     validate_payment_hash(&declaration.payment_hash)?;
-    // Conditional on the status again, inside the write: the check above
-    // gives the precise refusal, this one closes the race with a
-    // concurrent `fiat-sent`.
+    // Conditional on the status and the buyer again, inside the write: the
+    // checks above give the precise refusal, this one closes the race with a
+    // concurrent `fiat-sent` or a take rolled back meanwhile.
     let stored = db::upsert_open_declaration(
         pool,
         order.id,
+        &event.sender,
         &declaration.payment_hash,
         Timestamp::now().as_secs() as i64,
     )

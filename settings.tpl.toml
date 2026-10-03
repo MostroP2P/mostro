@@ -311,3 +311,20 @@ port = 50051
 # [[reputation_import.issuers]]
 # name = "lnp2pbot"
 # keys = ["<lnp2pBot's reputation issuer pubkey>"]
+
+# Reputation export (docs/REPUTATION_PORTABILITY.md). Opt-in, disabled by
+# default. Lets users carry the reputation they earned on this node to
+# another Mostro: the node signs an attestation of their native figures
+# (ratings received here, their average, the day of their first trade here)
+# for an identity they confirm. Eligibility: not banned, 10 completed trades
+# and 5 ratings received here. The signing key is a dedicated one, never the
+# node's key, read from the environment variable named below (also from
+# <settings dir>/.env); the node announces its public key in its info event,
+# and operators who trust this node add it to their [reputation_import].
+#
+# [reputation_export]
+# enabled = false
+# issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
+# # Lifetime of an attestation, in seconds. Destinations cap it (7 days by
+# # default), so keep it at or below that.
+# lifetime_seconds = 604800

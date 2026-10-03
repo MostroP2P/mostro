@@ -326,6 +326,7 @@ pub mod test_utils {
             cashu: None,
             price: None,
             reputation_import: None,
+            reputation_export: None,
         }
     }
 }

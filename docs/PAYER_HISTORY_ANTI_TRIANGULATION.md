@@ -929,9 +929,10 @@ pub async fn bump_history(conn: &mut SqliteConnection, user_pubkey, hash, counte
 /// documented anti-Sybil choice, D-7).
 pub struct SellerExperience { pub qualifying_trades: u32,
                               pub first_qualifying_at: Option<i64> }
-/// `as_of`: `None` on the live success path (§10.5); `Some(instant)` when
-/// re-evaluating a stored snapshot (§10.7), which must see only the trades
-/// that had already reached Success at that instant.
+/// `as_of`: the snapshot instant, which must see only the trades that had
+/// already reached Success at that instant: the success being recorded on the
+/// live path (§10.5), the stored `last_success_at` on the recompute path
+/// (§10.7). `None` drops the bound and is not used by either path.
 pub async fn seller_experience(conn: &mut SqliteConnection,
     seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Option<Uuid>,
     as_of: Option<i64>)

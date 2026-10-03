@@ -168,7 +168,8 @@ mod tests {
         let seller = parties.seller;
         let order = order_in(&pool, Status::Active, parties).await;
 
-        for intruder in [seller, Keys::generate().public_key()] {
+        // The buyer's identity key is not its trade key either.
+        for intruder in [seller, parties.buyer_master, Keys::generate().public_key()] {
             let res = run(
                 &ctx,
                 intruder,

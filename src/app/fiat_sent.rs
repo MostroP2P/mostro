@@ -530,6 +530,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn history_lookup_failure_never_fails_fiat_sent() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+            // Break the history read that builds the push.
+            sqlx::query("DROP TABLE payer_history")
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(db_order.status, Status::FiatSent.to_string());
+            let actions: Vec<Action> = queued_for(order.id)
+                .await
+                .into_iter()
+                .map(|q| q.action)
+                .collect();
+            assert_eq!(
+                actions,
+                vec![Action::FiatSentOk, Action::FiatSentOk],
+                "no push, no failure"
+            );
+        }
+
+        #[tokio::test]
         async fn feature_off_ignores_a_stored_declaration() {
             // A declaration left over from before the operator turned the
             // feature off must not produce a push (D-10).

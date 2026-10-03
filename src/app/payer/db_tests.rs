@@ -129,7 +129,10 @@ async fn stored_flag(pool: &SqlitePool, user: &str) -> (i64, i64) {
 #[tokio::test]
 async fn declaration_upsert_overwrites_and_take_consumes_once() {
     let pool = pool().await;
-    let order_id = Uuid::new_v4();
+    let (seller, buyer) = (key(), key());
+    let mut open = Trade::success(&seller, &buyer, NOW);
+    open.status = Status::Active;
+    let order_id = insert(&pool, open).await;
 
     upsert_declaration(&pool, order_id, &hash('a'), 10)
         .await
@@ -150,6 +153,47 @@ async fn declaration_upsert_overwrites_and_take_consumes_once() {
         .unwrap()
         .is_none());
     assert!(find_declaration(&pool, order_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_declaration_belongs_to_the_buyer_who_made_it() {
+    // A take that rolls back to pending (taker timeout) gives the order a new
+    // buyer later; the previous buyer's declaration must not carry over.
+    let pool = pool().await;
+    let (seller, buyer) = (key(), key());
+    let mut open = Trade::success(&seller, &buyer, NOW);
+    open.status = Status::Active;
+    let order_id = insert(&pool, open).await;
+    upsert_declaration(&pool, order_id, &hash('a'), NOW)
+        .await
+        .unwrap();
+    assert!(find_declaration(&pool, order_id).await.unwrap().is_some());
+
+    sqlx::query("UPDATE orders SET buyer_pubkey = ?1 WHERE id = ?2")
+        .bind(key())
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        find_declaration(&pool, order_id).await.unwrap().is_none(),
+        "not the current buyer's declaration"
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        take_declaration(&mut conn, order_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "never recorded for the new buyer"
+    );
+    drop(conn);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_payer_declarations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the stale row is consumed");
 }
 
 #[tokio::test]

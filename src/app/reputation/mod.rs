@@ -2,6 +2,7 @@
 //! attestation another issuer signed, and issuing one.
 
 pub mod import;
+pub mod revoke;
 
 use crate::config::types::ReputationImportSettings;
 use crate::db::{record_reputation_issuer_key, reputation_issuer_names_for_key};

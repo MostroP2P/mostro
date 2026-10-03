@@ -34,6 +34,7 @@ Summary of order lifecycle and key handlers.
 | `dispute` | https://github.com/MostroP2P/mostro/blob/main/src/app/dispute.rs#L141 | Open dispute and notify admin/solver |
 | `rate-user` | https://github.com/MostroP2P/mostro/blob/main/src/app/rate_user.rs | Record post-trade reputation update |
 | `orders` | https://github.com/MostroP2P/mostro/blob/main/src/app/orders.rs | Return order lists/history to requester |
+| `export-reputation` | https://github.com/MostroP2P/mostro/blob/main/src/app/reputation/export.rs | Check eligibility, bind the account to the destination identity (compare-and-set), sign and return a reputation attestation of the native figures |
 | `import-reputation` | https://github.com/MostroP2P/mostro/blob/main/src/app/reputation/import.rs | Verify an issuer's reputation attestation, record the import and merge it into the identity's reputation (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md)) |
 | `trade-pubkey` | https://github.com/MostroP2P/mostro/blob/main/src/app/trade_pubkey.rs | Exchange or update per-trade pubkeys |
 | `restore-session` | https://github.com/MostroP2P/mostro/blob/main/src/app/restore_session.rs | Rehydrate client session and state |

@@ -264,6 +264,9 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
+        Action::ExportReputation => reputation::export::export_reputation_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into()),
         Action::ImportReputation => {
             reputation::import::import_reputation_action(ctx, msg, event, my_keys)
                 .await
@@ -644,8 +647,8 @@ async fn dispatch_cashu(
         Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
-        // Reputation import touches no escrow either.
-        Action::ImportReputation => {
+        // Reputation import and export touch no escrow either.
+        Action::ImportReputation | Action::ExportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -1743,14 +1746,14 @@ mod tests {
             );
         }
 
-        /// `import-reputation` reaches its handler on both routers. With import
-        /// enabled and no payload the handler answers `InvalidPayload`, which
-        /// neither the default arm (`Ok`) nor the Cashu block
-        /// (`InvalidAction`) produces.
+        /// `import-reputation` and `export-reputation` reach their handlers on
+        /// both routers. With both enabled and no payload each answers
+        /// `InvalidPayload`, which neither the default arm (`Ok`) nor the
+        /// Cashu block (`InvalidAction`) produces.
         #[tokio::test]
-        async fn routes_import_reputation_to_its_handler_in_both_modes() {
+        async fn routes_reputation_actions_to_their_handlers_in_both_modes() {
             use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-            use crate::config::types::ReputationImportSettings;
+            use crate::config::types::{ReputationExportSettings, ReputationImportSettings};
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
@@ -1762,14 +1765,17 @@ mod tests {
                 enabled: true,
                 ..Default::default()
             });
+            settings.reputation_export = Some(ReputationExportSettings {
+                enabled: true,
+                issuer_keys: Some(create_test_keys()),
+                ..Default::default()
+            });
             let ctx = TestContextBuilder::new()
                 .with_pool(std::sync::Arc::new(pool))
                 .with_settings(settings)
                 .build();
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
-            let action = Action::ImportReputation;
-            let msg = create_test_message(action.clone(), None);
             let invalid_payload = |result: Result<()>| {
                 matches!(
                     result,
@@ -1777,12 +1783,20 @@ mod tests {
                         == Some(&MostroError::MostroCantDo(CantDoReason::InvalidPayload))
                 )
             };
-            assert!(invalid_payload(
-                handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx).await
-            ));
-            assert!(invalid_payload(
-                dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await
-            ));
+            for action in [Action::ImportReputation, Action::ExportReputation] {
+                let msg = create_test_message(action.clone(), None);
+                assert!(
+                    invalid_payload(
+                        handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx)
+                            .await
+                    ),
+                    "{action:?} on the Lightning router"
+                );
+                assert!(
+                    invalid_payload(dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await),
+                    "{action:?} on the Cashu router"
+                );
+            }
         }
     }
 

@@ -929,9 +929,10 @@ pub async fn bump_history(conn: &mut SqliteConnection, user_pubkey, hash, counte
 /// documented anti-Sybil choice, D-7).
 pub struct SellerExperience { pub qualifying_trades: u32,
                               pub first_qualifying_at: Option<i64> }
-/// `as_of`: `None` on the live success path (§10.5); `Some(instant)` when
-/// re-evaluating a stored snapshot (§10.7), which must see only the trades
-/// that had already reached Success at that instant.
+/// `as_of`: the snapshot instant, which must see only the trades that had
+/// already reached Success at that instant: the success being recorded on the
+/// live path (§10.5), the stored `last_success_at` on the recompute path
+/// (§10.7). `None` drops the bound and is not used by either path.
 pub async fn seller_experience(conn: &mut SqliteConnection,
     seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Option<Uuid>,
     as_of: Option<i64>)
@@ -998,8 +999,10 @@ SELECT COUNT(*) AS n, MIN(COALESCE(success_at, created_at)) AS first_at
    AND buyer_dispute = 0 AND seller_dispute = 0   -- "successful" means undisputed, as in D-6
    AND id <> ?2                        -- the trade being recorded never counts (D-7)
    AND master_buyer_pubkey <> ?3       -- trades with THIS buyer do not qualify (D-7)
-   -- `as_of` is NULL on the live path (§10.5: "everything that has succeeded
-   -- by now") and bound to the snapshot instant on the recompute path (§10.7).
+   -- `as_of` is the snapshot instant on both paths: the success being
+   -- recorded (§10.5) and the stored `last_success_at` (§10.7). On the live
+   -- path it keeps a success stamped later but committed first out of the
+   -- count, so live and recomputed snapshots agree.
    AND (?4 IS NULL OR success_at IS NULL OR success_at < ?4)
 ```
 
@@ -1311,7 +1314,7 @@ pub async fn record_payer_success(
     // explicitly: it never counts toward its own counterparty's qualification.
     // Only history that predates this trade — and only trades with OTHER
     // buyers — qualifies.
-    let exp = db::seller_experience(conn, &seller_master, &user, Some(order.id), None).await?;
+    let exp = db::seller_experience(conn, &seller_master, &user, Some(order.id), Some(now)).await?;
     // N trades AND first one at least D days before `now`.
     let experienced = is_experienced(&exp, thresholds.0, thresholds.1, now);
     // The generation stamps WHICH policy this snapshot was taken under, so a

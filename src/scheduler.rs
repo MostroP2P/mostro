@@ -30,6 +30,10 @@ pub async fn start_scheduler(ctx: AppContext) {
     // Mode-agnostic jobs run in both Lightning and Cashu mode.
     job_expire_pending_older_orders(ctx.clone()).await;
     job_update_rate_events(ctx.clone()).await;
+    // Spawned whether or not `[payer_history]` is enabled: it only deletes,
+    // and it is what removes declarations stranded when an operator turns
+    // the feature off mid-trade (payer history D-10, item 3).
+    job_prune_payer_declarations(ctx.clone()).await;
 
     // Lightning-only jobs: they settle/cancel hold invoices, retry LN
     // payments, pay the dev fee over LN, and service anti-abuse bonds — all of
@@ -1496,6 +1500,34 @@ async fn job_update_bitcoin_prices() {
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
+        }
+    });
+}
+
+/// Cadence of [`job_prune_payer_declarations`], in seconds.
+const PAYER_DECLARATION_PRUNE_INTERVAL_SECS: u64 = 60;
+
+/// Delete the payer declarations of orders that reached a terminal status
+/// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md` §10.6). With the feature on,
+/// successful trades consume their declaration in the success hook, so this
+/// removes the canceled / expired ones; with it off, it also removes the
+/// declarations of trades that succeeded after the operator turned it off.
+/// The query is driven by the (usually empty) declarations table and never
+/// scans `orders`, so a node that never enabled the feature pays nothing.
+#[mutants::skip]
+async fn job_prune_payer_declarations(ctx: AppContext) {
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            match crate::app::payer::db::prune_declarations_for_terminal_orders(pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!("pruned {n} payer declaration(s) of finished orders"),
+                Err(e) => tracing::warn!("payer declaration prune failed: {e}"),
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                PAYER_DECLARATION_PRUNE_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 }

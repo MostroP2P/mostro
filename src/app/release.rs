@@ -1,6 +1,8 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::app::payer;
+use crate::config::payer_history::PayerHistorySettings;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
@@ -10,8 +12,9 @@ use crate::lightning::{
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
 use crate::util::{
-    bytes_to_string, enqueue_order_msg, get_order, mark_orderbook_publish_failed,
-    monotonic_order_event_timestamp, settle_seller_hold_invoice, update_order_event,
+    build_order_event, bytes_to_string, enqueue_order_msg, get_order,
+    mark_orderbook_publish_failed, monotonic_order_event_timestamp, publish_order_event,
+    requeue_orderbook_publish_failure, settle_seller_hold_invoice, update_order_event,
 };
 use crate::Result;
 use bitcoin::hashes::hex::FromHex;
@@ -1249,6 +1252,15 @@ async fn payment_success(
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<bool> {
+    // Payer history (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md §10.5) needs
+    // the history write inside the Success transaction and the publish after
+    // its commit. With the feature off the publish-then-update path below is
+    // kept as it was: commit-then-publish would expose a disabled node to a
+    // restart window it does not have today (D-10).
+    if PayerHistorySettings::enabled(ctx.settings().payer_history.as_ref()) {
+        return payment_success_with_payer_history(ctx, order, buyer_pubkey, my_keys, request_id)
+            .await;
+    }
     let pool = ctx.pool();
 
     let order_updated = match update_order_event(my_keys, Status::Success, order).await {
@@ -1259,34 +1271,125 @@ async fn payment_success(
         Err(_) => return Ok(false),
     };
 
-    // Only update status and event_id to avoid overwriting fields modified by
-    // concurrent processes (dev_fee_paid, dev_fee_payment_hash, etc.)
-    // The WHERE guard prevents double success transitions from concurrent tasks.
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
-            .bind(&order_updated.status)
-            .bind(&order_updated.event_id)
-            .bind(order_updated.id)
-            .bind(Status::SettledHoldInvoice.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    // Only update status, event_id and the immutable success stamp to avoid
+    // overwriting fields modified by concurrent processes (dev_fee_paid,
+    // dev_fee_payment_hash, etc.). The WHERE guard prevents double success
+    // transitions from concurrent tasks. `success_at` is stamped whether or
+    // not payer history is enabled (D-10, item 2).
+    let result = success_cas(&order_updated, Timestamp::now().as_secs() as i64)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
-        // Another task already finalized this order: it is terminal, so the
-        // caller may release the marker, but the notifications were already
-        // sent by that task — do not duplicate them.
-        tracing::warn!(
-            "Order {} not transitioned to success: already processed by another task",
-            order_updated.id
-        );
+        warn_already_finalized(&order_updated);
         return Ok(true);
     }
 
-    // Committed by us — notify the buyer now.
+    notify_buyer_of_success(order_updated.id, buyer_pubkey, request_id).await;
+    Ok(true)
+}
+
+/// The guarded `SettledHoldInvoice → Success` CAS, shared by both
+/// finalization paths. Column-scoped on purpose: it writes only `status`,
+/// `event_id` and `success_at`, never the whole row.
+fn success_cas(
+    order_updated: &Order,
+    success_at: i64,
+) -> sqlx::query::Query<'_, Sqlite, sqlx::sqlite::SqliteArguments> {
+    sqlx::query(
+        "UPDATE orders SET status = ?, event_id = ?, success_at = ? WHERE id = ? AND status = ?",
+    )
+    .bind(&order_updated.status)
+    .bind(&order_updated.event_id)
+    .bind(success_at)
+    .bind(order_updated.id)
+    .bind(Status::SettledHoldInvoice.to_string())
+}
+
+fn warn_already_finalized(order_updated: &Order) {
+    // Another task already finalized this order: it is terminal, so the
+    // caller may release the marker, but the notifications were already
+    // sent by that task — do not duplicate them.
+    tracing::warn!(
+        "Order {} not transitioned to success: already processed by another task",
+        order_updated.id
+    );
+}
+
+/// [`payment_success`] with `[payer_history]` enabled: build the Success
+/// revision, run the CAS and the payer-history write in one transaction, and
+/// only after the commit publish the revision and notify the buyer. No
+/// failure before the commit produces an externally visible Success.
+async fn payment_success_with_payer_history(
+    ctx: &AppContext,
+    order: &mut Order,
+    buyer_pubkey: PublicKey,
+    my_keys: &Keys,
+    request_id: Option<u64>,
+) -> Result<bool> {
+    let pool = ctx.pool();
+    let (order_updated, success_event) =
+        match build_order_event(my_keys, Status::Success, order).await {
+            Ok(built) => built,
+            Err(_) => return Ok(false), // keep the marker for reconciliation
+        };
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+
+    // One instant for the whole transition: the CAS stamps it into
+    // `orders.success_at` and the history records the same value.
+    let now = Timestamp::now().as_secs() as i64;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let result = success_cas(&order_updated, now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        warn_already_finalized(&order_updated);
+        return Ok(true);
+    }
+    let thresholds =
+        PayerHistorySettings::experience_thresholds(ctx.settings().payer_history.as_ref());
+    // A failure drops `tx`, rolling the transition back: the order stays
+    // settled-hold-invoice and the declaration stays retryable. Logged at
+    // `error`: while it lasts the paid order cannot finalize.
+    if let Err(e) =
+        payer::success::record_payer_success(&mut tx, my_keys, &order_updated, thresholds, now)
+            .await
+    {
+        tracing::error!(
+            "Order {}: payer history write failed, Success rolled back and left for retry: {e}",
+            order_updated.id
+        );
+        return Err(e.into());
+    }
+
+    // From the commit on the DB is the truth and the relays are behind, so
+    // queue the order for the orderbook reconciler BEFORE committing: it then
+    // converges even if the publish below never runs. Arming consumes no
+    // retry attempt; a successful publish clears the entry.
+    if let Some(event) = &success_event {
+        requeue_orderbook_publish_failure(order_updated.id, event.generation(), 0);
+    }
+    tx.commit().await.map_err(db_err)?;
+
+    if let Some(event) = success_event {
+        publish_order_event(event).await;
+    }
+    notify_buyer_of_success(order_updated.id, buyer_pubkey, request_id).await;
+    Ok(true)
+}
+
+/// Tell the buyer its purchase completed and invite it to rate.
+async fn notify_buyer_of_success(
+    order_id: uuid::Uuid,
+    buyer_pubkey: PublicKey,
+    request_id: Option<u64>,
+) {
     enqueue_order_msg(
         None,
-        Some(order_updated.id),
+        Some(order_id),
         Action::PurchaseCompleted,
         None,
         buyer_pubkey,
@@ -1295,14 +1398,13 @@ async fn payment_success(
     .await;
     enqueue_order_msg(
         request_id,
-        Some(order_updated.id),
+        Some(order_id),
         Action::Rate,
         None,
         buyer_pubkey,
         None,
     )
     .await;
-    Ok(true)
 }
 
 /// The one LND capability `reconcile_inflight_payout` needs: query a payment's
@@ -3146,3 +3248,7 @@ mod tests {
         assert!(db_order.failed_payment, "malformed marker re-arms retry");
     }
 }
+
+#[cfg(test)]
+#[path = "release_payer_tests.rs"]
+mod payer_tests;

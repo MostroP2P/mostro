@@ -353,9 +353,10 @@ pub struct SellerExperience {
 ///
 /// * `current_order`: the trade being recorded, which never counts toward
 ///   its own qualification. `None` on the recompute path (§10.7).
-/// * `as_of`: `None` on the live success path; `Some(instant)` when
-///   re-evaluating a stored snapshot, which must see only trades that had
-///   already reached Success at that instant (`success_at < as_of`; a NULL
+/// * `as_of`: the snapshot instant, which must see only trades that had
+///   already reached Success at that instant: the success being recorded on
+///   the live path (§10.5), the stored `last_success_at` on the recompute
+///   path (§10.7) (`success_at < as_of`; a NULL
 ///   `success_at` predates every snapshot and counts). Strictly before on
 ///   purpose: stamps have second resolution, so a success in the snapshot's
 ///   own second cannot be ordered against it and is left out. A recompute

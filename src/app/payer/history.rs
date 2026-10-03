@@ -54,6 +54,10 @@ pub async fn payment_history_action(
 /// never declared a payer for it. History is keyed by the buyer's identity
 /// key (D-1); a buyer in Full Privacy Mode has none, and gets an honest
 /// "unavailable" answer instead of zero counters that read as "new" (D-4).
+///
+/// Frozen at the first build, which is the `fiat-sent` push (§10.3): every
+/// later query returns the same snapshot, so a seller polling the order
+/// cannot watch the buyer's other trades with the same account land.
 pub async fn build_for_order(
     pool: &Pool<Sqlite>,
     order: &Order,
@@ -61,20 +65,35 @@ pub async fn build_for_order(
     let Some(declaration) = db::find_declaration(pool, order.id).await? else {
         return Ok(None);
     };
+    if let Some(frozen) = db::history_snapshot(pool, order.id).await? {
+        return Ok(Some(frozen));
+    }
+    let live = live_history(pool, order, declaration.payment_hash).await?;
+    Ok(Some(
+        db::freeze_history_snapshot(pool, order.id, &live).await?,
+    ))
+}
+
+/// The aggregate as it stands now, for the snapshot.
+async fn live_history(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+    payment_hash: String,
+) -> Result<PaymentHistory, MostroError> {
     let (normal_buyer_idkey, _) = order.is_full_privacy_order().map_err(MostroInternalErr)?;
     let Some(user) = normal_buyer_idkey else {
-        return Ok(Some(PaymentHistory::unavailable(declaration.payment_hash)));
+        return Ok(PaymentHistory::unavailable(payment_hash));
     };
-    let h = db::load_history(pool, &user, &declaration.payment_hash).await?;
-    Ok(Some(PaymentHistory {
-        payment_hash: declaration.payment_hash,
+    let h = db::load_history(pool, &user, &payment_hash).await?;
+    Ok(PaymentHistory {
+        payment_hash,
         buyer_mode: BuyerMode::Reputation,
         successful_trades: h.successful_trades,
         distinct_counterparties: h.distinct_counterparties,
         experienced_counterparties: h.experienced_counterparties,
         first_success_at: h.first_success_at,
         last_success_at: h.last_success_at,
-    }))
+    })
 }
 
 #[cfg(test)]

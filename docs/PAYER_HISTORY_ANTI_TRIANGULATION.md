@@ -1155,6 +1155,14 @@ pub async fn build_for_order(pool, node_keys: &Keys, order: &Order)
 }
 ```
 
+`build_for_order` freezes its first result, which is the `fiat-sent` push,
+in `order_payer_declarations.history_snapshot`, and every later query returns
+that snapshot. A live aggregate would change while the order waits in
+`fiat-sent`, `dispute` or `settled-hold-invoice` whenever the buyer finished
+another trade with the same account, so a polling seller could watch the
+buyer's other activity land; the snapshot also keeps the answer stable across
+a restart that changes the experience thresholds.
+
 A seller restoring a session might re-query in `Status::Success`, but the
 declaration row is consumed on success (§10.5), so the handler answers
 `not_found` — the seller already received the push at `fiat-sent` time and

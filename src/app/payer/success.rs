@@ -39,9 +39,11 @@ pub async fn record_payer_success(
     let cp = counterparty_id(node_keys, &seller_master);
     // D-7 snapshot. The CAS has already flipped this order to Success inside
     // the transaction, so it is excluded explicitly: the recorded trade never
-    // counts toward its own counterparty's qualification.
+    // counts toward its own counterparty's qualification. Bounded to `now`,
+    // the instant stamped on this order, like the recompute: a success
+    // stamped later but committed first must not count toward this one.
     let experience =
-        db::seller_experience(conn, &seller_master, &user, Some(order.id), None).await?;
+        db::seller_experience(conn, &seller_master, &user, Some(order.id), Some(now)).await?;
     let experienced = is_experienced(&experience, thresholds.0, thresholds.1, now);
     let generation = db::current_policy_generation(conn, thresholds, now).await?;
     db::bump_history(

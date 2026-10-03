@@ -569,7 +569,7 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
             generation: 1,
             min_trades: 5,
             min_days: 30,
-            node_pubkey: None,
+            node_key_id: None,
         }),
         "the success path seeds no node key"
     );
@@ -581,7 +581,7 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
             generation: 2,
             min_trades: 3,
             min_days: 7,
-            node_pubkey: Some(SEED_NODE.to_string()),
+            node_key_id: Some(SEED_NODE.to_string()),
         })
     );
 }
@@ -666,8 +666,8 @@ async fn recompute_on_empty_database_seeds_the_policy() {
     let policy = load_experience_policy(&pool).await.unwrap().unwrap();
     assert_eq!(policy.generation, 1);
     assert_eq!(
-        policy.node_pubkey,
-        Some(node.public_key().to_hex()),
+        policy.node_key_id,
+        Some(crate::app::payer::node_key_id(&node)),
         "the recompute records the key it resolved ids with"
     );
 }
@@ -833,7 +833,7 @@ async fn recompute_rolls_back_with_the_policy_row() {
             generation,
             min_trades: 5,
             min_days: 30,
-            node_pubkey: Some(SEED_NODE.to_string()),
+            node_key_id: Some(SEED_NODE.to_string()),
         })
     );
 }

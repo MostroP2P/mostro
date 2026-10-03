@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   experienced_min_trades integer NOT NULL,
   experienced_min_days   integer NOT NULL,
   evaluated_at           integer NOT NULL,  -- unix secs of the last (re)evaluation
-  node_pubkey            text               -- node key the counterparty ids were checked under; NULL until the first recompute
+  node_key_id            text               -- node_key_id() of the secret the counterparty ids were checked under; NULL until the first recompute
 );
 
 -- D-7 qualification reads every undisputed success of one seller

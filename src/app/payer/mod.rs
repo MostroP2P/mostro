@@ -37,6 +37,20 @@ pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
     sha256::Hash::from_engine(eng).to_string()
 }
 
+const NODE_KEY_ID_DOMAIN: &[u8] = b"mostro-payer-history-node-v1";
+
+/// Fingerprint of the node secret the counterparty ids are keyed with,
+/// `sha256("mostro-payer-history-node-v1" ‖ node_secret)` as lowercase hex.
+/// The policy row stores it so boot can tell that the secret changed (§10.7).
+/// It is the secret, not the public key, that `counterparty_id` hashes, and
+/// the x-only public key cannot tell `s` from `n - s`.
+pub fn node_key_id(node_keys: &Keys) -> String {
+    let mut eng = sha256::Hash::engine();
+    eng.input(NODE_KEY_ID_DOMAIN);
+    eng.input(node_keys.secret_key().as_secret_bytes());
+    sha256::Hash::from_engine(eng).to_string()
+}
+
 /// Reject a `payment_hash` that is not 64 lowercase hex characters with
 /// `cant-do invalid_payment_hash`. Used by the `declare-payer` handler and
 /// as a last line of defence by [`db::bump_history`].
@@ -68,6 +82,22 @@ mod tests {
     use super::*;
 
     const ONE_DAY: i64 = 86_400;
+
+    #[test]
+    fn node_key_id_tells_apart_secrets_with_the_same_pubkey() {
+        // `s` and `n - s` share the x-only public key but not the secret
+        // bytes `counterparty_id` hashes.
+        let keys = Keys::generate();
+        let negated =
+            bitcoin::secp256k1::SecretKey::from_slice(keys.secret_key().as_secret_bytes())
+                .unwrap()
+                .negate();
+        let twin =
+            Keys::new(nostr_sdk::prelude::SecretKey::from_slice(&negated.secret_bytes()).unwrap());
+        assert_eq!(keys.public_key(), twin.public_key());
+        assert_ne!(node_key_id(&keys), node_key_id(&twin));
+        assert_eq!(node_key_id(&keys), node_key_id(&keys));
+    }
 
     #[test]
     fn counterparty_id_is_deterministic_per_node_key() {

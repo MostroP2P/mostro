@@ -300,10 +300,10 @@ pub struct ExperiencePolicy {
     pub generation: i64,
     pub min_trades: u32,
     pub min_days: u32,
-    /// Hex public key of the node key the last recompute resolved the
-    /// counterparty ids with; `None` until a recompute ran. A different key
-    /// means the stored ids no longer match the node (§10.7).
-    pub node_pubkey: Option<String>,
+    /// [`super::node_key_id`] of the node secret the last recompute resolved
+    /// the counterparty ids with; `None` until a recompute ran. A different
+    /// value means the stored ids no longer match the node (§10.7).
+    pub node_key_id: Option<String>,
 }
 
 /// The stored policy, or `None` when the feature never ran on this database.
@@ -311,7 +311,7 @@ pub async fn load_experience_policy(
     pool: &Pool<Sqlite>,
 ) -> Result<Option<ExperiencePolicy>, MostroError> {
     let row = sqlx::query(
-        "SELECT generation, experienced_min_trades, experienced_min_days, node_pubkey \
+        "SELECT generation, experienced_min_trades, experienced_min_days, node_key_id \
            FROM payer_history_policy WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -321,16 +321,16 @@ pub async fn load_experience_policy(
         generation: r.get("generation"),
         min_trades: to_u32(r.get("experienced_min_trades")),
         min_days: to_u32(r.get("experienced_min_days")),
-        node_pubkey: r.get("node_pubkey"),
+        node_key_id: r.get("node_key_id"),
     }))
 }
 
-/// Record `(min_trades, min_days)`, evaluated under the node key
-/// `node_pubkey` (hex), as the current policy, bumping the generation (1 on
+/// Record `(min_trades, min_days)`, evaluated under the node secret whose
+/// [`super::node_key_id`] is `node_key_id`, as the current policy, bumping the generation (1 on
 /// first use). Returns the new generation.
 pub async fn store_experience_policy(
     conn: &mut SqliteConnection,
-    node_pubkey: &str,
+    node_key_id: &str,
     min_trades: u32,
     min_days: u32,
     now: i64,
@@ -338,19 +338,19 @@ pub async fn store_experience_policy(
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO payer_history_policy \
            (id, generation, experienced_min_trades, experienced_min_days, evaluated_at, \
-            node_pubkey) \
+            node_key_id) \
          VALUES (1, 1, ?1, ?2, ?3, ?4) \
          ON CONFLICT(id) DO UPDATE SET generation = generation + 1, \
                                        experienced_min_trades = excluded.experienced_min_trades, \
                                        experienced_min_days = excluded.experienced_min_days, \
                                        evaluated_at = excluded.evaluated_at, \
-                                       node_pubkey = excluded.node_pubkey \
+                                       node_key_id = excluded.node_key_id \
          RETURNING generation",
     )
     .bind(i64::from(min_trades))
     .bind(i64::from(min_days))
     .bind(now)
-    .bind(node_pubkey)
+    .bind(node_key_id)
     .fetch_one(conn)
     .await
     .map_err(db_err)
@@ -433,9 +433,9 @@ pub async fn recompute_experienced(
     now: i64,
 ) -> Result<RecomputeOutcome, MostroError> {
     let mut tx = pool.begin().await.map_err(db_err)?;
-    let node_pubkey = node_keys.public_key().to_hex();
+    let node_key_id = super::node_key_id(node_keys);
     let generation =
-        store_experience_policy(&mut tx, &node_pubkey, min_trades, min_days, now).await?;
+        store_experience_policy(&mut tx, &node_key_id, min_trades, min_days, now).await?;
 
     // counterparty_id -> seller key. The ids are keyed hashes and cannot be
     // inverted, so the map is built forward from every seller key the node

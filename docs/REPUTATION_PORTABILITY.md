@@ -1,8 +1,8 @@
 # Reputation Portability
 
 Design proposal for letting a user carry reputation earned in one trading venue
-(lnp2pBot, or another Mostro instance) into a Mostro instance, without giving
-any operator, or anyone who reads relays, a way to link the two identities.
+(lnp2pBot, or another Mostro instance) into a Mostro instance, as the
+figures they earned there.
 
 Status: **proposal**. Values marked *open decision* are defaults to be
 confirmed before implementation.
@@ -11,12 +11,9 @@ confirmed before implementation.
 
 1. A user with reputation on lnp2pBot can claim it on a Mostro instance.
 2. The same mechanism lets a user copy reputation from one Mostro to another.
-3. No party can link the source identity (Telegram user, or identity pubkey on
-   the source Mostro) with the destination identity pubkey **from the protocol
-   data itself** — not even when the source and destination operators are the
-   same person, or when the source database leaks. The guarantee is
-   cryptographic on the data; it is only probabilistic against traffic
-   analysis, and section 3 states the residual explicitly.
+3. What travels is the **real** reputation — ratings received, average rating
+   (rounded to two decimals), and the date of the first completed trade — not
+   a band or bucket standing in for it.
 4. Imported reputation is merged into the destination's ordinary reputation
    fields, so a counterparty sees one rating, one review count and one age, and
    never needs to know where it came from.
@@ -26,365 +23,394 @@ confirmed before implementation.
 ## 2. Non-goals
 
 - Moving reputation. Portability is a **copy**: the source keeps it.
-- Exact numbers. Reputation travels as coarse bands (section 4).
+- Unlinkability. Importing tells the destination which source account the
+  reputation came from, and tells the source which destination identity it was
+  issued to (section 3).
 - Users in `full_privacy` mode. They have no identity-bound reputation by
   design, so there is nothing to import into.
 
 ## 3. Threat model
 
-| Adversary | Must not learn |
+Importing is **opt-in**, and a user who asks for it accepts that the two
+identities become linkable:
+
+- the issuer learns the destination identity pubkey it signs for;
+- the destination operator learns the source account the attestation names
+  (for a Mostro issuer, the user's identity pubkey there);
+- anyone who knows the user's figures on the source can recognise them, merged,
+  on the destination;
+- with the lnp2pBot transport, Telegram sees the whole attestation: the
+  destination identity, the source account id and the figures.
+
+The figures are not secret on the source: a Mostro publishes a user's
+`total_reviews` and `total_rating` in the `rating` tag of every order they
+make. They are published under trade pubkeys, though, not under the identity,
+and the triple of review count, average and first-trade day is close to
+unique. The import is what joins that triple to an identity on a second
+venue, and a visible jump in the user's rating events right after an import
+says so too. A user who does not want the two identities linked simply does
+not import.
+
+Two consequences of the design are accepted rather than solved:
+
+- **Figures are a snapshot.** An attestation reflects the source at issuance.
+  A ban or a run of bad ratings on the source after that is not reflected on
+  the destination, and an attestation stays valid until it expires
+  (section 5.1).
+- **Imported history dilutes local history.** A large imported record
+  outweighs a few bad local ratings, exactly as a long native record would.
+  The destination operator bounds this only by choosing whom to trust.
+
+An earlier version of this proposal kept the identities unlinkable by
+carrying reputation as coarse bands under blind signatures. It is dropped:
+the bands cost the user most of what they earned (a 4.9 average imported as
+4.5, 214 ratings as 200), they needed a K-anonymity merge, per-cell keysets and
+a two-round blind-signing protocol to work at all, and the unlinkability they
+bought was only probabilistic against timing analysis.
+
+What the design must still guarantee:
+
+| Property | How |
 |---|---|
-| Source operator (bot or Mostro) | The destination identity pubkey, or which token was redeemed where |
-| Destination operator | The source identity (`tg_id` or source pubkey), or exact source stats |
-| Source + destination colluding, or a leaked source database | Any join key between the two identities |
-| Relay observer / counterparty | Anything beyond the merged public rating |
+| Only a trusted issuer can mint reputation | Attestation signed by the issuer key; destination keeps a trust list (section 5.3) |
+| Only the account holder can export | A Mostro issuer exports only for the identity the transport proved; lnp2pBot only for the Telegram account that asks (section 5.2) |
+| An attestation serves one destination identity | It names that identity; redemption requires the transport's identity proof to match (section 5.3) |
+| One source account is bound to one destination identity at a time | The issuer binds the source account to one destination identity, atomically, after the user confirms it (section 5.2). A rebind moves the binding but revokes nothing already issued, so across instances an account can end up seeding the old identity on some and the new one on others; on any one instance it seeds only one (next row) |
+| A mistaken binding can be undone by its owner | Rebinding needs a signature from the currently bound identity, or an audited admin action (section 5.2) |
+| A source account is counted once per destination | The destination records `(issuer, subject)` and refuses a second import (section 5.3) |
+| A seed never travels twice | A Mostro issuer exports native reputation only, and never imports its own attestations (sections 5.3, 7) |
+| Stale figures cannot be imported later | Attestations expire, and the destination caps their lifetime (section 5.3) |
 
-Two attacks decide the design:
+## 4. What travels
 
-- **Fingerprinting by exact values.** "347 trades, 4.87 rating, 12.3 BTC" is
-  unique in the source database. Any design that publishes exact values on the
-  destination lets the source operator, or a past counterparty who saw those
-  numbers in the bot, identify the destination pubkey. Hence bands.
-- **Issuer sees what it signs.** If the issuer signs a plaintext containing the
-  destination pubkey, or even a hash of it, it can recognise the same value
-  when it is redeemed. Hence blind signatures.
+Three figures, all of them the user's own native reputation on the source:
 
-**Residual risk: timing correlation.** The cryptography makes the token
-itself unlinkable, but it cannot hide *when* things happen. With few
-migrations per day, a colluding pair can match "issued at 14:02" with
-"redeemed at 14:05" and defeat goal 3 statistically. This is accepted, not
-solved, and it is bounded rather than eliminated:
-
-- The client waits a random delay before redeeming, drawn from a window wide
-  enough that many issuances fall inside it (*open decision* 7, default 24h).
-  The effective anonymity set is the number of migrations from the same
-  issuer within that window, which is small on day one and grows with
-  adoption.
-- Issuers store no issuance timestamp finer than the day-truncated per-user
-  flag in section 5.3, so the correlation must be done live; it cannot be
-  reconstructed later from the database alone.
-- Nothing here helps the very first migrant. Anyone for whom this matters
-  should wait until the issuer has processed a meaningful number of exports.
-
-## 4. Reputation bands
-
-Reputation is quantised into a cell of a three-dimensional grid. The grid is a
-**protocol constant**: every issuer uses the same cuts, so a token means the
-same thing wherever it is redeemed. Operators choose whom to trust, not what a
-band means.
-
-All intervals are **half-open**, `[low, high)`, so every value falls in
-exactly one band and two implementations cannot disagree on a boundary. A
-"month" is exactly 30 days of 86400 seconds; ages are computed from the
-day-truncated creation date (section 6.1) so the band does not flip mid-day —
-on a Mostro issuer that date is `native_created_at`, never the backdated
-`created_at` (section 7).
-
-| Dimension (cell-id key) | Bands (*open decision*) | Cell-id labels | Floor | Seeds on the destination |
-|---|---|---|---|---|
-| Ratings received (`reviews`) | `[1,10)`, `[10,50)`, `[50,200)`, `[200,∞)` | `1-10`, `10-50`, `50-200`, `200+` | 1 / 10 / 50 / 200 | `total_reviews` += floor |
-| Average rating (`rating`) | `[0,4.0)`, `[4.0,4.5)`, `[4.5,5.0]` | `0-4.0`, `4.0-4.5`, `4.5+` | 0.0 / 4.0 / 4.5 | `total_rating` weighted with floor |
-| Account age (`age`) | `[0,6m)`, `[6m,24m)`, `[24m,∞)` | `0-6m`, `6m-24m`, `24m+` | 0d / 180d / 720d | `created_at` moved back by floor |
-
-The top rating band is closed at 5.0 because that is the maximum a rating can
-take; every other band is half-open. The cell-id labels are the exact strings
-used in keyset events and token `cell` fields (section 5.1); a label always
-names the band's low bound and, except for the open-ended top band, its high
-bound.
-
-Rules:
-
-- **The first dimension counts ratings received, not completed trades.** On
-  Mostro `total_reviews` only increments when a counterparty actually submits
-  a rating, and it is also the weight of the running average. Seeding it from
-  a trade count would publish a review count the user never earned and give a
-  single rating the weight of hundreds. On lnp2pBot the matching field is
-  `total_reviews`; completed trades are used for eligibility only.
-- Seeds always use the **floor** of the band. Nobody receives more than they
-  earned; the destination shows a conservative lower bound.
-- Cells are the leaves of the issuer keyset (section 5). An issuer must merge
-  any cell holding fewer than `K` users (*open decision*, default 50) into an
-  adjacent lower cell before publishing, so every cell is a real crowd. The
-  merge is **deterministic and published**: a sparse cell steps down one band,
-  trying dimensions in the fixed order `reviews`, `age`, `rating`, and repeats until
-  the absorbing cell holds at least `K` or no lower band exists in any
-  dimension, in which case it merges into the nearest non-empty lower cell.
-  The resulting raw→effective map ships in the keyset, so a client can apply
-  the same map and check the issuer followed it.
-- Eligibility (*open decision*): at least 10 completed trades **and** at least
-  1 rating received, not banned, and disputes lost below 10% of completed
-  trades. Below eligibility the issuer refuses and there is nothing to
-  migrate.
-
-## 5. Cryptography: blind Schnorr signatures per cell
-
-The token must be verified by the **destination**, which is not the party that
-issued it. That rules out Cashu's BDHKE: there the mint verifies its own
-tokens with the private key `k`, and given only `K = k·G` deciding whether
-`C = k·Y` is the Decisional Diffie-Hellman problem, assumed hard on
-secp256k1. A third party simply cannot check a BDHKE token.
-
-The scheme is therefore **blind Schnorr on secp256k1**, which is blind at
-issuance and *publicly* verifiable at redemption: anyone holding the issuer's
-public key can check the signature. Each grid cell has its own keypair, so the
-key that verifies a token is what states its band.
-
-Concurrent blind Schnorr sessions are subject to the ROS attack, so issuers
-use the **clause variant** (Fuchsbauer–Kiltz–Loss): the issuer opens two
-nonce clauses, the client prepares a challenge for each, and the issuer
-answers only one, chosen at random. Issuers additionally allow one open
-session per user at a time.
-
-Implementations need scalar and point arithmetic on secp256k1, not a Cashu
-library: `k256` in mostro and in the 2.x app's Rust core, `@noble/curves` in
-the bot, and a small Dart implementation in the 1.x app.
-
-### 5.1 Canonical encoding
-
-Everything hashed or transmitted has exactly one byte encoding, so the Rust,
-JavaScript and Dart implementations cannot derive different challenges for the
-same token. Every field is fixed length, which makes concatenation unambiguous
-without extra framing.
-
-| Element | Encoding |
-|---|---|
-| Curve points | 33-byte compressed SEC1 (`0x02`/`0x03` prefix) |
-| Scalars | 32-byte big-endian integer in `1..n-1`; a parser rejects `0` and any value `≥ n` instead of reducing it, so each scalar has exactly one encoding. Reduction mod `n` happens only inside arithmetic (challenge, blinding, unblinding) |
-| Tagged hash | `H_tag(x) = SHA256(SHA256(tag) ‖ SHA256(tag) ‖ x)`, as in BIP-340 |
-| Challenge | `c = int(H_"mostro/reputation/challenge/v1"(R ‖ m)) mod n`, `R` compressed |
-| `m` | `"repv1:"` (6 ASCII bytes) ‖ 32-byte x-only destination identity pubkey ‖ 32-byte random nonce — 70 bytes exactly |
-| Token id | `H_"mostro/reputation/token/v1"(m)`, the primary key in `redeemed_reputation_tokens` |
-| Cell id | UTF-8 `reviews:<label>\|rating:<label>\|age:<label>`, no spaces, labels from the section 4 table |
-
-The token travels as the `ReputationToken` payload of `import-reputation`
-(PR 0.4 owns the normative schema; this is the byte contract it must state).
-Binary fields are lowercase hex, and a parser rejects the token before any
-curve arithmetic when a field is missing, duplicated, of the wrong length,
-not lowercase hex, or when a point does not decode onto the curve or a scalar
-is zero or `≥ n` (never reduced):
-
-| Field | Type | Bytes | Meaning |
+| Field | Meaning | Mostro issuer | lnp2pBot issuer |
 |---|---|---|---|
-| `issuer` | hex | 32 | x-only pubkey of the issuer's identity key, the one that signed the keyset |
-| `epoch` | string | – | epoch label, must match the keyset's `epoch` tag |
-| `cell` | string | – | effective cell id, must be a key of the keyset's `cells` |
-| `m` | hex | 70 | the message above, prefix checked before use |
-| `r_point` | hex | 33 | compressed `R_b` |
-| `s` | hex | 32 | the unblinded scalar |
+| `reviews` | Ratings received | `total_reviews - seeded_reviews` | `total_reviews` |
+| `rating` | Average of those ratings, rounded to two decimals | `native_rating_sum / native_reviews` | `total_rating` |
+| `since` | Day-truncated date of the first completed trade | earliest `success` order with the identity as master buyer or seller | earliest completed order of the user |
 
-Field order in JSON is not significant and nothing is hashed over the JSON;
-the token id and the challenge are computed from the decoded bytes only, so
-the same token serialised by Rust, JavaScript or Dart verifies identically.
-The 0.5 vectors include one complete serialised token together with its
-decoded bytes and its token id.
+- **Ratings received, not completed trades.** On Mostro `total_reviews` only
+  increments when a counterparty actually submits a rating, and it is also the
+  weight of the running average. Seeding it from a trade count would publish a
+  review count the user never earned and give a single rating the weight of
+  hundreds. Completed trades are not carried.
+- **`since` is the first completed trade, not account creation.** An account
+  that registered years ago and never traded has no trading history to carry;
+  measuring from creation would let a dormant account import "three years
+  trading". It is day-truncated with the same rule as the public `rating` tag
+  (section 6.1), so the attestation carries no more precision than is already
+  public. Order history is local to each venue, so this date is native by
+  construction: an import never changes it.
+- **Eligibility**: not banned, at least **10 completed trades** and at least
+  **5 ratings received**, both counted on the source's native history only.
+  Below that the issuer refuses. The floor makes a reputation expensive to
+  fabricate with a handful of throwaway trades.
 
-Points are compressed rather than x-only, and the challenge is a plain tagged
-hash rather than BIP-340's: BIP-340 normalises `R` to even Y, and the client's
-blinded `R_i = R'_i + α_i·G + β_i·P_cell` has unpredictable parity that the
-signer cannot compensate for, so x-only encoding would break the blinding.
+## 5. The attestation
 
-### 5.2 Issuer keyset
+### 5.1 Format
 
-An issuer holds one secret scalar `x_cell` per grid cell and publishes the
-public points `P_cell = x_cell·G` as a parameterised replaceable Nostr event
-signed with the issuer's own key:
+An attestation is a **Nostr event signed by the issuer** and never published
+to relays: it travels inside the `reputation-exported` reply and the
+`import-reputation` request. Using a Nostr event means every implementation
+already has the canonical serialisation, the event id and BIP-340
+verification, and nothing new has to be specified byte by byte.
 
-```text
-kind: 30xxx (open decision)
-tags: ["d", "reputation-keyset:2026"], ["epoch", "2026"]
-content: {
-  "cells":  {"reviews:200+|rating:4.5+|age:24m+": "<hex compressed P>", ...},
-  "merges": {"reviews:200+|rating:0-4.0|age:24m+": "reviews:50-200|rating:0-4.0|age:24m+", ...}
+```json
+{
+  "id": "<event id>",
+  "pubkey": "<issuer key>",
+  "created_at": 1790899200,
+  "kind": 38388,
+  "tags": [
+    ["p", "<destination identity pubkey>"],
+    ["subject", "<source account id>"],
+    ["reviews", "214"],
+    ["rating", "4.87"],
+    ["since", "1696204800"],
+    ["expiration", "1791504000"],
+    ["z", "reputation-attestation"]
+  ],
+  "content": "",
+  "sig": "<issuer signature>"
 }
 ```
 
-A consumer verifies the event before reading anything from it: the Nostr
-signature must be valid, `pubkey` must equal the trusted issuer key (the same
-32-byte x-only key that fills the token's `issuer` field), `kind` must be the
-reserved one, `d` must be `reputation-keyset:<epoch>` with the `epoch` tag
-equal to that `<epoch>`, and `content` must parse into `cells` and `merges`
-with every key a valid cell id and every value a valid compressed point. An
-event failing any of these is discarded and never cached, so a relay or a
-third party cannot substitute a `P_cell`.
+| Tag | Rule |
+|---|---|
+| `p` | 32-byte x-only destination identity pubkey, lowercase hex |
+| `subject` | Stable, opaque id of the source account **within this issuer**. A Mostro issuer uses the user's identity pubkey (hex). lnp2pBot uses its internal user id, not the Telegram id (*open decision*): the destination needs a dedup key, not the Telegram account |
+| `reviews` | Decimal integer, `≥ 5` (the eligibility floor) |
+| `rating` | Decimal string with exactly two fractional digits, in `[1.00, 5.00]` |
+| `since` | Unix seconds, a multiple of 86400, `≥ 1577836800` (2020-01-01, before any issuer existed) and `≤ created_at` |
+| `expiration` | [NIP-40](https://github.com/nostr-protocol/nips/blob/master/40.md) Unix seconds; `created_at` + the attestation lifetime (*open decision*, default 7 days) |
+| `z` | `reputation-attestation` |
 
-`cells` holds only the **effective** cells, the ones that actually have a key.
-`merges` is the published map from every raw cell that was folded away to the
-cell that absorbed it, so the client can reproduce the issuer's choice instead
-of having to trust it (section 5.3, step 3).
+Each tag appears exactly once. The issuer computes `rating` from its internal
+average as `clamp(round(avg × 100), 100, 500) / 100`, in IEEE 754 double
+precision, with `round` rounding half away from zero, and formats it with
+exactly two decimals. Fixing the arithmetic makes Rust, JavaScript and Dart
+agree even where the decimal value is not representable (`4.895 × 100` is
+`489.49999999999994`, so it gives `4.89`, not `4.90`). The clamp matters for legacy Mostro rows,
+whose damped average can sit below 1 (section 7). Two decimals is what every client displays, so the
+rounding never shows; it is not bit-exact, and the merge in section 6 works
+on the rounded value.
 
-The epoch is part of the `d` tag, not only a separate tag. Addressable events
-replace on `(kind, pubkey, d)`, so a fixed `d` would make each rotation
-**delete the previous keyset** from relays and leave the destination unable to
-verify tokens from the epoch it still accepts.
+The kind (*open decision*, default `38388`) gives the signature its own
+domain: an issuer key that also signs other events can never have one of
+those accepted as an attestation. An issuer never signs any other event of
+this kind, and the rebind authorisation of section 5.2, which reuses it, is
+signed by a user identity that is never on a trust list.
 
-The issuer's identity is **one key**: it signs the keyset event, it is what a
-destination lists as a trusted issuer, and it is the `issuer` field of every
-token. For lnp2pBot that key is `REPUTATION_ISSUER_SK`, kept separate from the
-bot's existing `NOSTR_SK` so reputation issuance can be rotated or revoked
-without disturbing the bot's other Nostr activity. A Mostro uses its daemon
-key. How an issuer derives or stores its `x_cell` scalars is its own business
-and not part of the protocol; only the `P_cell` points are.
+The issuer key is **dedicated** to issuance on every issuer. For lnp2pBot it
+is `REPUTATION_ISSUER_SK`, kept apart from the bot's `NOSTR_SK`; for a Mostro it
+is a separate key in `[reputation_export]`, not the daemon key, so either can
+be rotated without touching the other, and the daemon key never signs
+attestations next to its ordinary public events.
 
-A keyset is **immutable within its epoch**. The merge depends on cell
-populations, and populations move, so an issuer that recomputed the merge on
-every restart would replace the epoch's event with one whose `cells` no longer
-carries the `P_cell` of a cell folded away since — and every token minted
-against that cell would become unverifiable while its epoch is still
-accepted. The issuer therefore computes the merge once, when the epoch opens,
-persists the raw→effective map, and republishes exactly the same content on
-every later startup; population changes only shape the next epoch's keyset.
-A client compares a freshly fetched keyset with its cached one and treats a
-changed `cells` or `merges` under the same `d` as an issuer fault.
+### 5.2 Issuance (export)
 
-Keysets are rotated by **epoch**. The epoch label is a protocol constant, not
-an issuer choice — the UTC calendar year by default (*open decision* 4) — so
-that "current and previous epoch" means the same thing to every destination
-regardless of which issuer minted the token. A destination accepts the current
-and previous epoch only, so stale reputation cannot be imported years later
-and an issuer can retire keys.
+One request and one reply; there is no session.
 
-### 5.3 Issuance (export)
+1. **The issuer authenticates the source account.** The request is only ever
+   answered for the account that sends it:
+   - a Mostro issuer requires `UnwrappedMessage.identity` (on protocol v2,
+     proved by `identity_sig`) and sets `subject` to that proved identity. It
+     never reads the source account from the payload, and it refuses a
+     request without an identity proof — a `full_privacy` user or a bare
+     trade key has no identity-bound reputation to export;
+   - lnp2pBot takes the source account from the Telegram user who sent the
+     command, never from the link.
+2. The issuer looks up the user and checks eligibility (section 4).
+3. **Confirmation, on a first binding.** If the account is not bound yet, the
+   issuer shows the destination identity as an `npub` and asks the user to
+   confirm it before anything is recorded. A link opened by mistake, or one
+   crafted by someone else, binds nothing without that confirmation. On a
+   Mostro issuer the request is itself signed by the source identity, so the
+   app asks for the confirmation before sending it.
+4. **Binding.** The confirmed destination identity is recorded in
+   `reputation_exported_to` with an atomic compare-and-set: it succeeds only
+   if the field is empty or already holds that identity (`UPDATE … WHERE
+   reputation_exported_to IS NULL OR reputation_exported_to = ?` in the
+   daemon, `findOneAndUpdate` with the same condition in the bot). Two
+   concurrent requests for different identities therefore cannot both bind.
+   A later export to the bound identity is how a user re-obtains a lost
+   attestation or a fresher one; an export to any other identity is refused
+   unless the request carries a rebind authorisation.
+5. The issuer signs the attestation with its issuer key and returns it.
+6. The client verifies the signature and shows the user the figures before
+   importing.
 
-The blinding runs on the user's device; the issuer never sees the message it
-signs. Writing `m` for that message and `H` for the challenge hash:
+**Rebinding.** A binding is undone only by its owner or by an operator:
 
-1. Client builds `m = "repv1:" ‖ destination_identity_pubkey ‖ nonce` (section 5.1).
-2. Issuer looks up the user, checks eligibility and the once-only flag, picks
-   the effective cell (raw cell folded through its own published `merges`),
-   and opens the session by sending that cell id and two nonce points
-   `R'_0 = k_0·G`, `R'_1 = k_1·G`.
-3. **Client validates the cell against its own statistics.** The user knows
-   their own review count, rating and account age, so the client computes the
-   raw cell, applies the keyset's published `merges` map transitively, and
-   aborts if the result differs from the cell the issuer named. Applying the
-   map is what makes this compatible with K-anonymity merging: a user whose
-   raw cell was folded away still validates, because the client folds it the
-   same way. Without this check an adversarial issuer could tag a user by
-   assigning a deliberately rare cell and recognise it at redemption; no
-   proof about the signature itself would catch that, because the signature
-   would be perfectly valid.
-4. Client picks random `α_i`, `β_i` for each clause, computes
-   `R_i = R'_i + α_i·G + β_i·P_cell` and `c'_i = H(R_i ‖ m) + β_i`, and sends
-   both `c'_i`.
-5. Issuer picks `b ∈ {0,1}` at random and returns `s'_b = k_b + c'_b·x_cell`
-   with `b`. Answering only one clause is what defeats ROS.
-6. Client unblinds `s = s'_b + α_b` and stores the token
-   `{issuer, epoch, cell, m, R_b, s}`.
-7. Client verifies `s·G == R_b + H(R_b ‖ m)·P_cell` against the published
-   keyset **before** storing. This is the same check the destination will run,
-   so a token that would be rejected later is caught immediately, and an
-   issuer that signed with an off-keyset key is detected at once.
+- **Rebind authorisation.** The user signs, with the *currently bound*
+  identity, an event of the attestation kind with the tags `["p", "<new
+  identity>"]`, `["issuer", "<issuer pubkey>"]`, `["z", "reputation-rebind"]`
+  and an `expiration` at most one hour after its `created_at`, and sends it
+  with the export request. The issuer checks the signature, that `pubkey`
+  equals `reputation_exported_to`, that `issuer` names itself and that it has
+  not expired, then moves the binding to the new identity with the same
+  compare-and-set (conditioned on the old value) and exports to it. The
+  `issuer` tag keeps an authorisation from being replayed at another issuer;
+  the compare-and-set makes a replay at the same one a no-op.
+- **Admin rebind.** A user who lost the bound identity cannot sign, so the
+  operator can rebind by hand. Every admin rebind is logged with the old and
+  new identity and the reason.
+
+Rebinding does not let one source account seed two identities on the same
+instance: the destination refuses a second import of the same
+`(issuer, subject)` regardless of the identity (section 5.3, step 7).
+
+A rebind does not revoke anything already issued. Imports the old identity
+made stay where they are, and an attestation issued to it stays redeemable
+until it expires, at most the destination's lifetime cap. An issuer cannot
+withdraw what it never sees redeemed, and destinations do not ask the issuer
+about the current binding, so after a rebind the same source account can seed
+the old identity on some instances and the new one on others. This is
+accepted: reputation is per instance, and the per-instance check above is what
+stops one account from backing several identities where it matters.
 
 Transport differs per issuer:
 
-- **lnp2pBot**: two round trips over the Telegram deep link
-  (`t.me/lnp2pbot?start=migrate_...`), the bot answering into the app's deep
-  link scheme. The bot sets `reputation_exported_at` on the user and stores
-  nothing else.
-- **Mostro**: `export-reputation` messages over the daemon's ordinary
+- **lnp2pBot**: a Telegram deep link `t.me/lnp2pbot?start=rep_<pubkey>`,
+  where `<pubkey>` is the destination identity as 43 characters of unpadded
+  base64url — Telegram caps the start parameter at 64 characters, which a hex
+  key with a prefix would exceed. The bot shows the `npub` with a confirm
+  button (step 3), then replies with a button opening the app's deep link with
+  the attestation; on desktop and web the user pastes it. A rebind
+  authorisation does not fit in the start parameter, so the app shows it for
+  the user to paste into the bot chat, which answers with the same confirm
+  step.
+- **Mostro**: an `export-reputation` message over the daemon's ordinary
   protocol transport (v2: NIP-44 `kind: 14`, authored by a trade key with the
-  identity proof inside the ciphertext), one per round trip. The daemon sets
-  `reputation_exported_at` in `users`.
+  identity proof inside the ciphertext), with the destination identity and
+  an optional rebind authorisation in the payload; the daemon replies
+  `reputation-exported` with the attestation.
 
-The session is stateful across the two round trips, so both the issuer and the
-client persist it; an abandoned session expires and does not consume the
-once-only flag.
+A node advertises what it supports in its kind 38385 info event, as it already
+does for Serbero: `["reputation_import_issuers", "<hex>", …]` lists its trust
+list (absent when import is disabled), and `["reputation_issuer", "<hex>"]`
+names its issuer key (absent when export is disabled). Clients read these to
+offer the import and export screens, and never send the new actions to a node
+that does not advertise them.
 
-`reputation_exported_at` is stored **day-truncated**, with the same
-`day_truncate` helper as `since` (section 6.1). It exists only to enforce the
-once-only rule, and a second-precision value would hand a leaked source
-database exactly the timestamp needed to correlate an export with a redemption
-— the correlation section 3 tries to bound. Session state, which is
-necessarily fine-grained, is deleted when the session completes or expires.
+### 5.3 Redemption (import)
 
-### 5.4 Redemption (import)
+A new action `import-reputation` carrying the attestation, sent over the
+daemon's ordinary protocol transport. The destination daemon:
 
-A new action `import-reputation` carrying the token, sent over the daemon's
-ordinary protocol transport. The destination daemon:
-
-1. Checks the issuer is in its trusted list and the epoch is accepted.
-2. Verifies `s·G == R + H(R ‖ m)·P_cell` with the `P_cell` published for the
-   token's cell and epoch. This needs only public data, which is the whole
-   reason for blind Schnorr; the cell whose key verifies is the band.
-3. Checks the pubkey embedded in `m` equals `UnwrappedMessage.identity` —
-   the identity the transport *proved*, not one the sender claims. On
-   protocol v2 that proof is `identity_sig`, a domain-tagged signature bound
-   to the trade pubkey authoring the event, so it cannot be grafted from
-   another sender. This binds the token to one identity; selling it means
-   handing over the key, which is the same risk as selling the account today.
-4. Checks the token id `H_"mostro/reputation/token/v1"(m)` (section 5.1) is
-   not in `redeemed_reputation_tokens`, and that this `(issuer, identity)`
-   pair has not been redeemed before.
-5. Inserts the redemption and seeds the user row (section 6) in the same
+1. Parses the event and verifies its id and signature.
+2. Checks the kind, the `z` tag, and every tag rule in section 5.1.
+3. Checks `pubkey` is one of the keys of an entry in its trust list, and is
+   **not** its own issuer key. A Mostro trusting itself would otherwise let a
+   user import their own reputation on the same instance and double it. The
+   entry's name, not the key, is the issuer from here on (see *Issuer keys
+   and rotation* below).
+4. Checks the times, allowing a clock skew of 300 seconds: `created_at` is not
+   in the future, `expiration` has not passed, and `expiration - created_at`
+   does not exceed the destination's own maximum lifetime (default 7 days).
+   The cap keeps a buggy or compromised issuer from minting attestations that
+   live for years.
+5. Requires `UnwrappedMessage.identity` and checks the `p` tag equals it — the
+   identity the transport *proved*, not one the sender claims. On protocol v2
+   that proof is `identity_sig`, a domain-tagged signature bound to the trade
+   pubkey authoring the event, so it cannot be grafted from another sender. A
+   message without an identity proof is refused; there is no fallback to the
+   trade key.
+6. Loads the user row keyed by that proved identity; the import is applied to
+   that row and no other.
+7. Checks that neither `(issuer, subject)` nor `(issuer, identity)` has been
+   imported before on this instance. The first stops a source account from
+   seeding two identities here, even after a rebind or if an issuer broke its
+   own binding; the second stops an identity from importing two accounts from
+   one issuer. `issuer` is the trust-list entry name, so both checks hold
+   across a rotation of the issuer's key. Both are unique indexes, so two
+   concurrent imports cannot both pass.
+8. Records the import and applies it to the user row (section 6) in the same
    transaction.
 
 Replies: `reputation-imported` on success; `cant-do` with one of the new
-`CantDoReason` variants on failure (section 9, PR 2.3). `CantDoReason` is the
+`CantDoReason` variants on failure (section 9, PR 2.2). `CantDoReason` is the
 one enum in core carrying `#[serde(other)]`, so an old client degrades a new
 reason to `Unknown` instead of failing. `Action` and `Payload` have no such
 fallback — see section 9 for why that is still safe.
 
+**Issuer keys and rotation.** An issuer signs with one key at a time, but a
+destination does not identify it by that key. Each trust-list entry has a
+local, stable `name` and one or more `keys` (section 7); the name is what
+`reputation_imports.issuer` stores and what step 7 deduplicates on, and the
+signing key is stored next to it as `issuer_key`. If the dedup key were the
+pubkey, an issuer rotating its key would look like a new issuer, and every
+account already imported under the old key could import again under the new
+one. Rotation is therefore done by adding the new key to the existing entry:
+
+- **Planned rotation.** Add the new key to the entry; once every attestation
+  signed by the old key has expired (the destination's maximum lifetime),
+  remove the old key.
+- **Compromise.** Remove the old key from the entry at once, then revoke as
+  below.
+
+A key belongs to one entry only, and the daemon refuses to start if a
+configured key already has imports recorded under a different name, so
+renaming an entry or moving a key cannot reset the deduplication. The issuer
+announces its current key in its own info event (`reputation_issuer`,
+section 5.2); operators learn of a rotation through it, and through the
+issuer's own channels.
+
+**Revoking an issuer key.** Removing a key from the trust list stops new
+imports but does not unwind earlier ones. Because every import is kept as a
+row of `reputation_imports` with its figures (section 6), an operator who
+learns that an issuer key was compromised can reverse the imports made with
+that key. The selection is by `issuer_key` and by `imported_at`, the
+destination's own clock, from the earliest moment the key may have leaked;
+without a known date it is every import made with that key. It is never by
+the attestation's `created_at`: whoever holds the key chooses that value, and
+could backdate a forged attestation to just before the cutoff while keeping
+it valid for the whole lifetime. Legitimate imports made with the key after
+the cutoff are reversed too; the reversal deletes their rows, so those users
+request a new attestation, signed with the new key, and import again. Imports
+signed by the entry's other keys are untouched.
+
+The reversal: subtract its `reviews` from `total_reviews` and
+`seeded_reviews`, take `rating × reviews` back out of the weighted average and
+of `seeded_rating_sum`, and recompute `created_at` as the minimum of
+`native_created_at` and the `since` of the imports that remain. Native ratings
+received in between are unaffected, because the running average is linear in
+each contribution. `min_rating`, `max_rating` and `last_rating` are reset to
+`0` when no rating remains at all; otherwise they are left as they are. An
+import sets them only on a row with no rating (section 6), so reverting it
+right away restores them exactly, but once native ratings have arrived in
+between, a revoked import's value can survive in `max_rating` or `min_rating`.
+That is accepted: those fields are informational tags of the kind 38384 event,
+no decision reads them, and recomputing them would need a per-review history
+the daemon does not keep.
+
 ## 6. Merging on the destination
 
-Each dimension has its own merge rule, because they measure different things:
+Each figure has its own merge rule, because they measure different things:
 
 - **Ratings received add up.** A rating on A and a rating on B are distinct
-  reviews by distinct counterparties, so the seed is added to the local count.
+  reviews by distinct counterparties.
 - **Rating is a weighted average**, weighted by review count per origin. It is
-  never summed and never maxed.
-- **Account age is a maximum, never a sum.** "Days operating" answers "since
-  when does this person trade?", and that is a single date, the oldest one that
-  can be proven. Time passes in parallel on every venue, so adding day counts
-  would count the same month twice. A user who opened orders on A and B on the
-  same 10 August has 30 days on both a month later; importing A into B leaves
-  B at `max(30, 30) = 30`, not 60. With the default bands the import does not
-  even move the date: 30 days falls in `[0,6m)`, whose floor is 0. Only a user who
-  proves 6+ months elsewhere moves `created_at`, and only when the local date
-  is more recent than that floor.
+  never summed and never maxed. Because the imported average is the real one,
+  importing never drags a user's rating towards an arbitrary floor.
+- **Account age is a minimum date, never a sum.** "Since when does this person
+  trade?" is a single date, the oldest one that can be proven. Time passes in
+  parallel on every venue, so adding day counts would count the same month
+  twice: a user who opened orders on A and B on the same 10 August has 30 days
+  on both a month later, and importing A into B leaves B at 30, not 60.
 
-Seeds are applied to the user's existing values; nothing is overwritten.
+Imports are applied to the user's existing values; nothing is overwritten.
 The math lives next to `User::update_rating` in mostro-core, which already
 owns the running-average formula (first vote weighted 1/2, then incremental
-mean). A seeded user has `total_reviews > 1` from the start, so the
-first-vote damping no longer applies to them; that is the intended anchor
-effect.
+mean). A user with imported reputation has `total_reviews > 1` from the start,
+so the first-vote damping no longer applies to them; that is the intended
+anchor effect.
 
 | `users` column | Effect |
 |---|---|
-| `total_reviews` | `+= reviews_floor` |
-| `total_rating` | recomputed as the weighted average of the existing average and the seed floor |
-| `created_at` | `= min(created_at, now - age_floor)` — the displayed age |
-| `native_created_at` (new) | **unchanged**; the account's own creation date, never backdated |
-| `min_rating`, `max_rating`, `last_rating` | unchanged if non-zero, otherwise set to `round(rating_floor)` |
-| `seeded_reviews` (new) | `+= reviews_floor`, internal only |
-| `seeded_rating_sum` (new) | `+= reviews_floor * rating_floor`, internal only |
+| `total_reviews` | `+= reviews` |
+| `total_rating` | `= (total_rating × total_reviews + rating × reviews) / (total_reviews + reviews)`, using the values before the import |
+| `created_at` | `= min(created_at, since)` — the displayed age |
+| `native_created_at` (new) | **unchanged**; the account's own creation date, which revoking an import restores `created_at` from (section 5.3) |
+| `min_rating`, `max_rating`, `last_rating` | unchanged if non-zero, otherwise set to `round(rating)` |
+| `seeded_reviews` (new) | `+= reviews`, internal only |
+| `seeded_rating_sum` (new) | `+= rating × reviews`, internal only |
 | `native_rating_sum` (new) | **unchanged**; incremented by `update_rating` on native reviews only, internal only |
 
+Each import is also kept as a row of `reputation_imports` (issuer entry
+name, issuer key, subject, identity, the three figures, the attestation id and
+the import date): it is what step 7 of section 5.3 checks, it keeps every seed
+attributable, and it is what revoking an issuer key selects, by key and import
+date (section 5.3).
+
 `native_created_at` is set once, when the row is created, and no import ever
-moves it. Without it the age dimension would leak across hops: A→B backdates
-B's `created_at`, and B exporting to C would then present A's age as its own
-native age, so a seed would travel twice. Reviews and rating are protected the
-same way by `seeded_reviews` and `seeded_rating_sum`; age needs its own field
-because the merge is a minimum rather than a subtraction.
+moves it. Because the merge for age is a minimum, `created_at` alone cannot be
+undone; `native_created_at` is what an operator recomputes it from when
+reversing an import. It is the row's creation date on purpose, not the first
+completed trade: the daemon already publishes its native `since` from
+`created_at` (mostro#1016), and a reversal must give back exactly the date the
+user showed before the import, not a different one. Export does not read either column: the exported `since`
+comes from the instance's own order history (section 4), so an imported date
+can never be re-exported. Reviews and rating are kept apart by
+`seeded_reviews`, `seeded_rating_sum` and `native_rating_sum`.
 
-The public `rating` tag on order events keeps its three-field shape:
-`{"total_reviews", "total_rating", "since"}` (see 6.1). No `legacy` marker is published.
-The seeded review count acts as an anchor, so new ratings move the average
-slowly, exactly as they would for a long-standing Mostro user.
+The public `rating` tag on order events keeps its shape (see 6.1). No marker
+distinguishing imported from native reputation is published.
 
-Worked example. User with 10 days on Mostro and 2 reviews at 4.5 imports from
-lnp2pBot where they have 347 completed trades, **214 ratings received**, 4.87
-average and 3 years. The cell is `reviews:200+ | rating:4.5+ | age:24m+`, so
-the seed is 200 reviews at 4.5 and 720 days; the 347 trades only decided
-eligibility:
+Worked example. A user with 10 days on Mostro and 2 ratings at 4.5 imports
+from lnp2pBot, where they have 214 ratings received at 4.87 and have traded
+since 3 years ago:
 
 | Field | Before | After |
 |---|---|---|
-| `total_reviews` | 2 | 202 |
-| `total_rating` | 4.5 | 4.5 |
-| `since` | 10 days ago | 720 days ago |
+| `total_reviews` | 2 | 216 |
+| `total_rating` | 4.5 | 4.87 (`(2 × 4.5 + 214 × 4.87) / 216 = 4.866…`) |
+| `since` | 10 days ago | 3 years ago |
 
-Counterparties see "4.5 · 202 reviews · trading for 2 years".
+Counterparties see "4.87 · 216 reviews · trading for 3 years".
 
 ### 6.1 Publish `since` instead of `days`
 
@@ -393,7 +419,7 @@ relays for a while, and it is awkward to merge. The underlying datum is a
 date, so the public field should be one:
 
 ```json
-{"total_reviews": 202, "total_rating": 4.5, "since": 1693526400}
+{"total_reviews": 216, "total_rating": 4.87, "since": 1696204800}
 ```
 
 `since` is a Unix timestamp **truncated to the start of its UTC day**
@@ -403,7 +429,7 @@ of the same user, so it would make trade pubkeys perfectly correlatable.
 Day precision carries exactly the information `days` carries today.
 
 Clients compute the age at display time. The merge rule in section 6 becomes
-`since = min(since_local, since_seed)`.
+`since = min(since_local, since_imported)`.
 
 The day count is exposed in **three** places today, and all three change:
 
@@ -413,81 +439,109 @@ The day count is exposed in **three** places today, and all three change:
 | kind 38384 rating event | `days` tag pushed by `rate_user` next to `Rating::to_tags()` | mostro; `Rating` itself has no date field |
 | `Peer` payload sent to the counterparty | `UserInfo.operating_days`, filled in `util.rs` | mostro-core type, mostro fills it |
 
-The daemon publishes both `days` and `since` for one deprecation window at
-all three sites, then drops `days`. `Rating::from_tags` ignores unknown keys
-and `UserInfo` gains the field as `Option` with a serde default, so old and
-new peers interoperate during the window.
+The daemon publishes both `days` and `since` at all three sites, and drops
+`days` only as the very last step of the rollout (section 9, phase 7). The
+window is not counted in releases: an operator decides when a daemon updates,
+but nobody decides when users update their apps, and a client that predates
+`since` loses the age the moment `days` goes away. Keeping it costs a few bytes
+per event. `Rating::from_tags` ignores unknown keys and `UserInfo` gains the
+field as `Option` with a serde default, so old and new peers interoperate for
+as long as both fields are published.
 
 ## 7. Mostro-to-Mostro specifics
 
 - **Only native reputation is exportable.** When a Mostro acts as issuer it
-  computes the cell from `User::native_stats`, which reads
-  `native_created_at` rather than the backdated `created_at` and undoes the
-  seed arithmetic of section 6 exactly:
+  takes `reviews` and `rating` from `User::native_stats`, which undoes the
+  import arithmetic of section 6:
 
   ```text
   native_reviews = total_reviews - seeded_reviews
-  native_rating  = 0                                     if native_reviews == 0
-                 = native_rating_sum / native_reviews    otherwise
+  native_rating  = native_rating_sum / native_reviews
   ```
 
   where `native_rating_sum` is a new `users` column that `update_rating`
   increments by the raw rating on every native review, and that
-  `apply_reputation_seed` never touches. Reversing `total_rating` instead is
-  not exact: the running mean is stored in `f64`, and the first-vote 1/2
-  weighting means `total_rating × total_reviews` is not the sum of ratings
-  for a user with a single native review. The accumulator keeps the export
-  cell independent of how many seeds arrived and in which order. The
-  displayed `total_rating` is unaffected. Seeds never travel twice, which
-  rules out A→B→A doubling and A→B→C chains. A user who wants A and C on B
-  redeems one token from each; the destination records each issuer once per
-  identity.
-- **One identity across instances.** A token binds the destination identity
-  pubkey inside `m`, and redemption requires that key to sign, so a single
-  token serves one identity — on as many instances as trust the issuer. The
-  app already uses one identity key for every instance, so this is the normal
-  case. Carrying reputation to a *fresh* identity per instance would need one
-  token per identity, and nothing could then stop a user from redeeming two of
-  them under two identities on the same instance: the destination cannot tell
-  they are the same person, which is precisely the property the design
-  provides. Fresh identity per instance and Sybil resistance are mutually
-  exclusive here, and Sybil resistance wins.
+  `apply_reputation_import` never touches. Reversing `total_rating` instead is
+  not exact: the first-vote 1/2 weighting means `total_rating × total_reviews`
+  is the sum of ratings minus half the first one. `since` and the completed
+  trade count come from the instance's own `success` orders, where the
+  identity is the master buyer or seller (`full_privacy` orders carry no
+  master pubkey and do not count), so neither can include imported history.
+  Imports never travel twice, which rules out A→B→A doubling and A→B→C
+  chains. A user who wants A and C on B imports one attestation from each.
+- **Legacy rows.** Rows that exist before the migration have no per-review
+  history to replay, so `native_rating_sum` is backfilled as
+  `total_rating × total_reviews`. Their exported average is therefore the
+  displayed one, damped by the first vote: up to `r₁ / (2n)` below the true
+  mean, which with the 5-rating floor is at most half a star and shrinks with
+  every rating. This is accepted: a legacy user exports what counterparties
+  already see. The issuer's clamp to `[1.00, 5.00]` (section 5.1) covers the
+  case where the damped value falls below 1. Rows created after the migration
+  are exact.
+- **No self-import.** An instance never accepts an attestation signed by its
+  own issuer key (section 5.3, step 3). The same identity importing from
+  Mostro A into Mostro B is the normal case; importing from A into A is not.
+- **One identity across instances.** An attestation names the destination
+  identity pubkey, and redemption requires that key to sign, so a single
+  attestation serves one identity — on as many instances as trust the issuer.
+  The app already uses one identity key for every instance, so this is the
+  normal case.
 - **Reputation is not publicly queryable by identity.** Mostro's rating events
   are keyed by trade pubkey, so a destination cannot simply read the source's
   relays; an issuer attestation is required even between Mostros.
-- **Trust list.** Each instance configures accepted issuers. The reference
-  instance ships with the lnp2pBot issuer pubkey enabled.
+- **Trust list.** Each instance configures accepted issuers and publishes
+  their keys in its info event (section 5.2). An entry is a stable local name
+  with one or more keys, so an issuer can rotate its key without resetting
+  deduplication (section 5.3). The reference instance ships with the
+  lnp2pBot issuer pubkey enabled. An instance that exports configures its own
+  dedicated issuer key, read from the environment like every other secret.
 
 ```toml
 [reputation_import]
 enabled = true
-accepted_epochs = 2
-issuers = [
-  "<lnp2pbot issuer pubkey>",
-  "<another mostro daemon pubkey>",
+max_lifetime = "7d"
+
+[[reputation_import.issuers]]
+name = "lnp2pbot"            # dedup key; never renamed
+keys = ["<lnp2pbot issuer pubkey>"]
+
+[[reputation_import.issuers]]
+name = "other-mostro"
+keys = [
+  "<its current issuer pubkey>",
+  "<its previous key, until its attestations expire>",
 ]
+
+[reputation_export]
+enabled = true
+issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
+lifetime = "7d"
 ```
 
 ## 8. Multi-destination, Sybil and re-issuance
 
-- **One token per source account, bound to one destination identity,
-  redeemable on any number of Mostros.** The binding is to the identity, not
-  to the instance: the issuer never learns where the token is spent, and the
-  same identity can redeem it on every instance that trusts the issuer.
-  Since reputation is per-instance, redeeming on N instances grants exactly
-  what the user had, once each. Restricting the number of destinations is
-  unenforceable without a shared ledger anyway, and issuing per-destination
-  tokens would tell the issuer which instances the user uses.
+- **One source account, one destination identity, any number of Mostros.**
+  The binding is to the identity, not to the instance: the same identity can
+  redeem its attestation on every instance that trusts the issuer, and since
+  reputation is per-instance, that grants exactly what the user had, once
+  each. Restricting the number of destinations is unenforceable without a
+  shared ledger anyway.
 - **Sybil on one instance** (several identities sharing one reputation) is
-  blocked by the identity binding plus the once-only issuance flag. This is
-  what rules out fresh identity per instance (section 7).
-- **No re-issuance in v1.** A lost seed means the token cannot be re-obtained.
-  Re-issuance would let one person hold two reputable identities on the same
-  instance. An admin override for support cases is acceptable; a public
-  re-issuance path is not (*open decision*).
-- **Selling reputation** cannot be prevented cryptographically, since the
-  issuer signs a pubkey it does not see. It is bounded by eligibility, by the
-  one-token rule, and by being equivalent to selling the account.
+  blocked twice: by the issuer's binding (section 5.2) and by the
+  destination's `(issuer, subject)` check (section 5.3). The second holds even
+  across a rebind: an account rebound from X to Y and imported by X on an
+  instance cannot be imported there again by Y.
+- **Re-issuance is free to the bound identity.** A lost attestation, or one
+  that expired before it was used, is simply requested again. Moving the
+  binding to a different identity needs the old identity's signature or an
+  audited admin action (section 5.2).
+- **Refreshing figures** after a first import — replacing an earlier import
+  from the same source with newer figures — is not part of v1: a second
+  import from the same `(issuer, subject)` is refused (*open decision*). The
+  per-import rows of section 6 make it straightforward to add later, because
+  the earlier contribution is known exactly and can be swapped out.
+- **Selling reputation** cannot be prevented, only bounded: by eligibility, by
+  the one-identity binding, and by being equivalent to selling the account.
 
 ## 9. Implementation plan
 
@@ -500,34 +554,39 @@ published.
 
 Repositories: `protocol` (spec), `mostro-core` (shared types, crates.io),
 `mostro` (daemon), `mobile` (app 1.x, pure Dart), `app` (app 2.x, Flutter UI
-over a Rust core through flutter_rust_bridge, already on mostro-core, nostr-sdk
-0.45 and `k256`), `lnp2pbot/bot`.
+over a Rust core through flutter_rust_bridge, already on mostro-core and
+nostr-sdk 0.45), `lnp2pbot/bot`.
 
-Both apps must support the migration. They differ in where the work lands:
-the 1.x app needs its own Dart implementation of everything (blind Schnorr,
-models, parsing), while the 2.x app gets the types from mostro-core and does
-the curve arithmetic with `k256` inside its Rust core, adding only bridge
-functions and UI on the Dart side.
+Both apps must support the migration. No new cryptography is involved:
+building and verifying the attestation is ordinary Nostr event signing, which
+every codebase here already does.
 
 **Protocol compatibility.** `PROTOCOL_VER` stays at 2 and the new actions do
-not gate on it. In core 0.14.6 only `CantDoReason` carries `#[serde(other)]`;
+not gate on it. In core only `CantDoReason` carries `#[serde(other)]`;
 `Action` and `Payload` would fail to deserialise an unknown variant. That is
 safe here because these messages are strictly request/response over targeted
 encrypted direct messages: `export-reputation` and `import-reputation` are only ever sent by
 a client that implements them, and `reputation-exported` / `reputation-imported`
 only ever come back to the client that asked. No new variant is broadcast, so
-no old client is ever handed one. PR 2.3 carries a test that pins this
-reasoning.
+no old client is ever handed one. PR 2.2 carries a test that pins this
+reasoning. The other direction — a new client and an old daemon, which would
+fail to deserialise the new actions and never answer — is closed by the info
+event: a client sends them only to a node that advertises
+`reputation_import_issuers` or `reputation_issuer` (section 5.2).
 
 ### Phase 0: specification
 
+Phase 0 starts once open decisions 1-3 of section 10 are signed off: the kind
+number, the attestation lifetime and the lnp2pBot `subject` are written into
+the schema of 0.2 and the vectors of 0.4, and changing them afterwards means
+redoing both. Decision 4 does not block it.
+
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 0.1 | protocol | Add `since` to the `rating` tag and to the kind 38384 event, day-truncated Unix timestamp. Mark `days` deprecated with a removal version. | Spec merged, example events updated. |
-| 0.2 | protocol | Reputation band grid as a protocol constant: the three dimensions, cuts, floors, cell id string format (`reviews:200+\|rating:4.5+\|age:24m+`), the deterministic K-anonymity merge rule and its raw→effective map. | Open decisions 1-3 closed and written down. |
-| 0.3 | protocol | Issuer keyset event: kind number, `d` tag, `epoch` tag, content schema, accepted-epochs rule. | Kind number reserved. |
-| 0.4 | protocol | Actions `export-reputation`, `reputation-exported`, `import-reputation`, `reputation-imported` — those four kebab-case strings are the wire discriminators, used verbatim in the schema, the core enum serialization, the compatibility note and the vectors. Payload schemas; new `cant-do` reasons; the redemption checks in section 5.4 as normative text. | Spec merged; one name per action across every document. |
-| 0.5 | protocol | Test vectors for the section 5.1 encoding (tagged hashes, point and scalar bytes, a canonical `m`, a cell id and a token id); keyset with a `merges` map; a full clause-blind-Schnorr transcript (`x_cell`, `k_0`, `k_1`, `α_i`, `β_i`, `R_i`, `c'_i`, `b`, `s'_b`, `s`) for fixed randomness; a valid token; and a table of invalid tokens (wrong cell key, wrong identity, expired epoch, mauled `s`, mauled `R`, `s = 0`, `s = n + v` for a valid `v` — must be rejected, not reduced to `v`); plus one per-cell derivation vector (secret key, epoch, cell id → `x_cell`, `P_cell`) for the 4.1 scheme. | Vectors file committed; every implementation below tests against it. |
+| 0.1 | protocol | Add `since` to the `rating` tag and to the kind 38384 event, day-truncated Unix timestamp. Mark `days` deprecated with a removal version. | Done (protocol#59). |
+| 0.2 | protocol | Reputation attestation event: kind number reserved, tag schema and rules from section 5.1 (including the rounding and clamp of `rating`), the rebind authorisation event, the export authentication, confirmation and binding rules of section 5.2 and the redemption checks of section 5.3 as normative text. | Kind number reserved. |
+| 0.3 | protocol | Actions `export-reputation`, `reputation-exported`, `import-reputation`, `reputation-imported` — those four kebab-case strings are the wire discriminators, used verbatim in the schema, the core enum serialization, the compatibility note and the vectors. Payload schemas, with the optional rebind authorisation in the export request; new `cant-do` reasons. The `reputation_import_issuers` and `reputation_issuer` tags of the kind 38385 info event. | Spec merged; one name per action across every document. |
+| 0.4 | protocol | Test vectors: an issuer secret key, a valid attestation signed with it and its event id, the merge of section 6 on a fixed user row, the reversal of that merge, `rating` rounding and clamping cases (`4.8666… → 4.87`, `4.125 → 4.13`, `4.895 → 4.89`, `0.9 → 1.00`), a valid and an invalid rebind authorisation, and a table of invalid attestations (wrong kind, missing or repeated tag, `rating` out of range or not exactly two decimals, `reviews` below 5, `since` not day-aligned, before 2020 or after `created_at`, expired, lifetime over the cap, future `created_at` beyond the skew, `p` not matching the identity, mauled signature, untrusted issuer, own issuer key). | Vectors file committed; every implementation below tests against it. |
 
 ### Phase 1: `since` rollout
 
@@ -535,52 +594,48 @@ Independent of the migration and worth shipping first.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 1.1 | mostro-core | `src/rating.rs`: `Rating` gains `since: Option<u64>` (serde default); `to_tags()` emits a `since` tag when set, `from_tags()` parses it; `Rating::new` keeps its signature and a `with_since(u64)` builder is added so no caller breaks. `src/user.rs`: `UserInfo` gains `since: Option<u64>` (serde default). Unit tests for both round trips. | Released as a **patch** (0.14.7): additive, no signature changes. |
-| 1.2 | mostro | Bump core. One helper `day_truncate(created_at) -> u64` in `util.rs`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
+| 1.1 | mostro-core | `src/rating.rs`: `Rating` gains `since: Option<u64>` (serde default); `to_tags()` emits a `since` tag when set, `from_tags()` parses it; `Rating::new` keeps its signature and a `with_since(u64)` builder is added so no caller breaks. `src/user.rs`: `UserInfo` gains `since: Option<u64>` (serde default). Unit tests for both round trips. | Released (shipped in 0.15.0). |
+| 1.2 | mostro | In progress (mostro#1016). Bump core. One helper `first_trade_since(created_at)` over core's `day_truncate`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
 | 1.3 | mobile | `data/models/rating.dart` parses `since` and falls back to `days`; `data/models/user_info.dart` parses `since` and falls back to `operating_days`; age is computed at display time. Tests for both shapes. | Old and new daemons render the same age. |
-| 1.3b | app | Rust core: `nostr/order_events.rs::parse_rating_tag` reads `since` and falls back to `days`; `mostro/status.rs` maps `UserInfo.since` with fallback to `operating_days`; bump mostro-core to 0.14.7. Bridge exposes `since` and the Dart side (`peer_reputation_card.dart`, trade detail) computes the age at display time. Tests for both shapes. | Old and new daemons render the same age. |
-| 1.4 | mostro | Remove `days` and `operating_days` emission after the deprecation window (open decision 6). `UserInfo.operating_days` removal in core is a **minor** bump and goes with PR 2.3. | Removed with a changelog entry. |
+| 1.3b | app | Rust core: `nostr/order_events.rs::parse_rating_tag` reads `since` and falls back to `days`; `mostro/status.rs` maps `UserInfo.since` with fallback to `operating_days`. Bridge exposes `since` and the Dart side (`peer_reputation_card.dart`, trade detail) computes the age at display time. Tests for both shapes. | Old and new daemons render the same age. |
+| 1.4 | mostro | **Deferred to the last step of the rollout (phase 7), not part of this phase.** Remove `days` and `operating_days` emission. `UserInfo.operating_days` is removed from core in the same step, as a **minor** bump, never earlier: a core that drops it makes every daemon built on it stop sending it. | Removed with a changelog entry. |
 
 ### Phase 2: shared types in mostro-core
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 2.1 | mostro-core | Module `reputation::bands`: `ReviewsBand`, `RatingBand`, `AgeBand` enums with half-open cuts and floors, `Cell { reviews, rating, age }`, `Cell::from_stats(total_reviews, avg_rating, created_at, now)` (callers pass `native_created_at` on a Mostro issuer), `Cell::id()` / `parse()`, and `apply_merges(&MergeMap)` implementing the transitive fold. Pure, exhaustively tested against 0.2 including every boundary value. | Round-trips every cell id; boundary values land in exactly one band; the fold terminates on a cyclic map instead of looping. |
-| 2.2 | mostro-core | `ReputationKeyset` (parse/build the event from 0.3, epoch handling, `cells` **and** `merges`) and `ReputationToken { issuer, epoch, cell, m, r_point, s }` with serde and shape validation. Plus `reputation::encoding`: tagged hashes, point/scalar codecs, `m` builder and parser, token id — the section 5.1 contract, no signing. | Parses the 0.5 vectors byte for byte. |
-| 2.3 | mostro-core | `src/message.rs`: `Action` variants `ExportReputation`, `ReputationExported`, `ImportReputation`, `ReputationImported` (past participle for daemon replies, matching `Released` / `Canceled`); `Payload` variants `BlindedReputationRequest(BlindedReputationRequest)`, `BlindedReputationResponse(BlindedReputationResponse)`, `ReputationToken(ReputationToken)`. `src/error.rs`: `CantDoReason` variants `UntrustedReputationIssuer`, `InvalidReputationToken`, `ReputationAlreadyRedeemed`, `ReputationIdentityMismatch`, `ExpiredReputationKeyset`, `NotEligibleForReputationExport`, `ReputationAlreadyExported`, inserted before `Unknown`. `src/prelude.rs`: `NOSTR_REPUTATION_KEYSET_KIND`. Serde round-trip tests, plus a test asserting an old client never receives these variants (`PROTOCOL_VER` stays 2, see the compatibility note above). | Part of the **minor** release. |
-| 2.4 | mostro-core | `src/user.rs`: `User` gains `seeded_reviews: i64`, `seeded_rating_sum: f64`, `native_rating_sum: f64`, `native_created_at: Option<i64>`, `reputation_exported_at: Option<i64>` (day-truncated), each with `#[sqlx(default)]` and `#[serde(default)]` so a daemon on an un-migrated database still deserialises `SELECT *`. `native_created_at` is an `Option` on purpose: `#[sqlx(default)]` on a plain `i64` would read a missing column as `0`, and `native_stats` would then place every legacy user in 1970. `User::new` sets it to `Some(created_at)`; every reader goes through `User::native_created_at()`, which falls back to `created_at` when the column is absent. | First use of `sqlx(default)` in core; test with a row that lacks the columns and assert the fallback equals `created_at`, never `0`; existing rows backfill `native_created_at` from `created_at`. |
-| 2.5 | mostro-core | `src/user.rs`: `User::apply_reputation_seed(&mut self, cell: &Cell, now: i64)` implementing section 6 next to `update_rating`, plus `User::native_stats(&self) -> (reviews, rating, since)` implementing the section 7 formula: `native_reviews = total_reviews - seeded_reviews`, `native_rating = native_rating_sum / native_reviews` (0 when there are no native reviews), `since` from `native_created_at()`. `update_rating` gains `native_rating_sum += rating`; `apply_reputation_seed` leaves it alone. Unit tests: one native review (rating 5 → native rating 5.0 even though `total_rating` is 2.5 by the first-vote rule); several native reviews match the plain mean of their ratings; one seed then native reviews; several seeds from different issuers; native reviews before and after a seed. Property tests: never decreases `total_reviews`, never moves `created_at` forward, never touches `native_created_at` or `native_rating_sum`, and an A→B→C chain exports the same native stats B had before importing from A. | No I/O; released as **0.15.0** together with 2.1-2.4. |
+| 2.1 | mostro-core | Module `reputation`: `ReputationAttestation { issuer, destination, subject, reviews, rating, since, created_at, expiration }`, `build(&Keys, …) -> Event` (rounding and clamping `rating`) and `parse(&Event, now, max_lifetime) -> Result<ReputationAttestation, _>` applying every rule of section 5.1 plus signature, kind, skew and lifetime checks; `ReputationRebind { issuer, new_identity, expiration }` with the same `build` / `parse` pair. The trust list, the self-issuer check and the identity match stay with the caller. Pure. | Parses and rejects the 0.4 vectors exactly. |
+| 2.2 | mostro-core | `src/message.rs`: `Action` variants `ExportReputation`, `ReputationExported`, `ImportReputation`, `ReputationImported` (past participle for daemon replies, matching `Released` / `Canceled`); `Payload` variants `ReputationExportRequest { destination, rebind: Option<String> }` and `ReputationAttestation(String)` carrying the event JSON. `src/error.rs`: `CantDoReason` variants `UntrustedReputationIssuer`, `InvalidReputationAttestation`, `ExpiredReputationAttestation`, `ReputationIdentityMismatch`, `ReputationIdentityRequired`, `ReputationAlreadyImported`, `NotEligibleForReputationExport`, `ReputationBoundToOtherIdentity`, `InvalidReputationRebind`, inserted before `Unknown`. Serde round-trip tests, plus a test asserting an old client never receives these variants (`PROTOCOL_VER` stays 2, see the compatibility note above). | Part of the **minor** release. |
+| 2.3 | mostro-core | `src/user.rs`: `User` gains `seeded_reviews: i64`, `seeded_rating_sum: f64`, `native_rating_sum: f64`, `native_created_at: Option<i64>`, `reputation_exported_to: Option<String>` and `reputation_exported_at: Option<i64>` (day-truncated), each with `#[sqlx(default)]` and `#[serde(default)]` so a daemon on an un-migrated database still deserialises `SELECT *`. `native_created_at` is an `Option` on purpose: `#[sqlx(default)]` on a plain `i64` would read a missing column as `0`, and reversing an import would then place every legacy user in 1970. `User::new` sets it to `Some(created_at)`; every reader goes through `User::native_created_at()`, which falls back to `created_at` when the column is absent. | Test with a row that lacks the columns and assert the fallback equals `created_at`, never `0`. |
+| 2.4 | mostro-core | `src/user.rs`: `update_rating` gains `native_rating_sum += rating`, and nothing else changes in it. Own PR because it touches the hot path every rating goes through. Unit tests: one native review (rating 5 → `native_rating_sum` 5.0 even though `total_rating` is 2.5 by the first-vote rule); several native reviews sum to the plain total. | Existing `update_rating` tests unchanged and green. |
+| 2.5 | mostro-core | `src/user.rs`: `User::apply_reputation_import(&mut self, &ReputationAttestation)` and `User::revert_reputation_import(&mut self, &ReputationImport, remaining_since: Option<i64>)` implementing section 6 and its reversal next to `update_rating`, plus `User::native_stats(&self) -> (reviews, rating)` implementing the section 7 formula. `apply_reputation_import` leaves `native_rating_sum` and `native_created_at` alone. Unit tests: the 0.4 merge and reversal vectors; several imports from different issuers; native reviews before and after an import. Property tests: never decreases `total_reviews`, never moves `created_at` forward, never touches `native_created_at` or `native_rating_sum`, apply-then-revert restores the row, and an A→B→C chain exports the same native stats B had before importing from A. | No I/O; released together with 2.1-2.4. |
 
 ### Phase 3: mostrod as destination (import)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `issuers`, `accepted_epochs`) with parsing, defaults and validation. No behaviour. | Bad config is rejected at startup with a clear error. |
-| 3.2 | mostro | Bump core to 0.15.0. Migration `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`; no per-review history exists to replay, and this makes a legacy row's native rating equal its displayed `total_rating` exactly — with `seeded_reviews = 0` the division in section 7 returns `total_rating` bit for bit, so legacy users export the reputation they show today), `native_created_at` (backfilled from `created_at`) and `reputation_exported_at` (matching PR 2.4 exactly, `SELECT *` + `FromRow` requires it); new table `redeemed_reputation_tokens(token_id PK, issuer, identity_pubkey, cell, redeemed_at)` with a unique index on `(issuer, identity_pubkey)`. `db.rs` accessors with tests. | Migration applies on an existing database; the `users` insert in `db.rs` binds the new columns. |
-| 3.3 | mostro | Crypto module `reputation::verify` over `k256` (new dependency), using `reputation::encoding` from core so the byte contract is shared: challenge hash and the `s·G == R + H(R‖m)·P_cell` check. Tested against the 0.5 vectors, including every invalid case. | No daemon wiring yet. |
-| 3.4 | mostro | Keyset fetcher: fetch and cache the issuer keyset event per trusted issuer, applying the section 5.2 acceptance rules (event signature, `pubkey` equals the trusted issuer, kind, `d`/`epoch` agreement, content shape) before caching; refresh on epoch change, reject unknown epochs. Tested with the `local-relay` feature, including a keyset signed by the wrong key and one whose `d` and `epoch` disagree. | Cache survives a relay outage; a forged keyset is never cached. |
-| 3.5 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, checks 1-5 of section 5.4 in one transaction, calls `User::apply_reputation_seed` from core, persists through a new `update_user_reputation_seed` in `db.rs`, replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer. | A second redemption of the same token is rejected. |
-| 3.6 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
+| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `max_lifetime`, and `issuers` as named entries with one or more `keys`) with parsing, defaults and validation: unique names, a key in one entry only, never the instance's own issuer key; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
+| 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, issuer_key, subject, identity_pubkey, reviews, rating, since, imported_at)`, `issuer` being the trust-list entry name, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`; a startup check refuses to run if a configured key has rows under a different name. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
+| 3.3 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
+| 3.4 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
+| 3.5 | mostro | Admin RPC to revoke the imports made with an issuer key, optionally only those with `imported_at` after a given date, through `User::revert_reputation_import`, deleting their rows and republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation backdated before the cutoff but imported after it is revoked; imports under the entry's other key are left alone; the user can import again with an attestation from the new key. |
 
 ### Phase 4: mostrod as issuer (export)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 4.1 | mostro | Settings `[reputation_export]` (`enabled`); per-cell key derivation with HKDF-SHA256 (RFC 5869): `ikm` = the daemon secret key as 32 big-endian bytes, `salt` = the ASCII bytes of `mostro/reputation/keyset/v1`, `info` = UTF-8 epoch label ‖ `0x00` ‖ UTF-8 canonical cell id (section 5.1) ‖ one counter byte starting at `0x00`, `L` = 32; `x_cell = int(okm)`, and if that is `0` or `≥ n` the counter byte is incremented and the expand step repeated (probability ≈ 2⁻¹²⁸, but defined). Deterministic, never stored. Unit tests: same inputs, same keys; a different epoch label yields different keys; a different cell id yields different keys; the derived `P_cell` set has no duplicates across the grid. | No publication yet. |
-| 4.2 | mostro | Publish the keyset event at startup and on epoch rollover. The merge is computed **once per epoch**: on first publication the daemon takes cell populations from the database, runs the deterministic merge from section 4, and persists the resulting raw→effective map in a new `reputation_keysets(epoch PK, merges JSON, published_at)` table. Every later startup within the same epoch republishes byte-identical `cells` and `merges` from that row, never from a fresh count, so the event replacing on `(kind, pubkey, d)` is always the same keyset. | Event validates against 2.2; a client applying `merges` reproduces the issuer's assignment for every raw cell; a restart after the population changes republishes the stored keyset unchanged. |
-| 4.3 | mostro | Native stats for the export cell come from `User::native_stats` in core (`total_reviews - seeded_reviews`, `native_rating_sum / native_reviews`, `native_created_at` for age, per section 7). `count_completed_orders_for_identity` in `db.rs` over `orders.master_buyer_pubkey` / `master_seller_pubkey` with status `success` feeds eligibility only (full-privacy orders carry no master pubkey and are simply not counted). Tested. | Seeded values are excluded from the cell. |
-| 4.4 | mostro | Handler `export_reputation_action`: the two-round-trip clause protocol (open session with `R'_0`/`R'_1`, then answer one clause), session store with expiry, eligibility, once-only flag, `reputation_exported_at`. Integration test: export from instance A, import on instance B, both in-process. | Round trip passes on two local daemons; an abandoned session expires without consuming the flag. |
+| 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `issuer_key_env`, `lifetime`) with the dedicated issuer key loaded from the environment, and the `reputation_issuer` tag in the info event. Eligibility from `User::native_stats`, `is_banned`, and a `db.rs` query over the identity's `success` orders returning the completed count and the first trade date. Tested. | Imported values never reach an attestation; the issuer key is never the daemon key. |
+| 4.2 | mostro | Handler `export_reputation_action`: identity required, eligibility, the confirmation-gated binding of section 5.2 as one compare-and-set (`reputation_exported_to`, `reputation_exported_at`), sign with the issuer key, reply `reputation-exported`. Integration test: export from instance A, import on instance B, both in-process; two concurrent exports to different identities. | Round trip passes on two local daemons; exactly one of two concurrent bindings wins; an export to a second identity is refused. |
+| 4.3 | mostro | Rebinding: the rebind authorisation in the export request (section 5.2), and an admin RPC to rebind by hand, logged with the reason. | A valid authorisation moves the binding once; a replayed one is a no-op; one signed by any other key is refused. |
 
 ### Phase 5: mobile (app 1.x, `mobile`)
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 5.1 | mobile | Blind Schnorr client primitives in Dart over secp256k1: blinding factors, challenge, unblinding and signature verification. Tested against the 0.5 vectors. | No UI, no services. |
-| 5.2 | mobile | Models: keyset event parser, `ReputationToken`, band cell; `MostroMessage` support for the new actions and payloads. | Serde round-trip tests. |
-| 5.3 | mobile | Storage: Sembast repository for tokens and for in-flight session state (the open clauses, `α_i`, `β_i`, `m`, issuer) so an interrupted flow resumes. | Survives app restart in a test. |
-| 5.4 | mobile | `MostroService` + notifier: `exportReputation(issuer)` and `importReputation(token)` flows against a Mostro issuer, with the random redemption delay. | Integration test against a local daemon from 4.4. |
-| 5.5 | mobile | Telegram transport: the two deep-link round trips with the bot, cell validation against the user's own stats, signature verification, store token. | Manual test with the bot from phase 6. |
-| 5.6 | mobile | Settings screen "Import reputation": issuer list from the selected node's trust list, status per issuer, localized strings in every `intl_*.arb`. | `flutter analyze` clean, gen-l10n reports no untranslated keys. |
+| 5.1 | mobile | Models: attestation parsing and validation against the 0.4 vectors; `MostroMessage` support for the new actions and payloads. | Serde round-trip tests; every 0.4 vector accepted or rejected as specified. |
+| 5.2 | mobile | `MostroService` + notifier: `exportReputation(issuer)` and `importReputation(attestation)` flows against a Mostro issuer, sent only to nodes whose info event advertises them; confirmation of the destination identity before a first export; signing a rebind authorisation with the old identity; the attestation is stored until imported. | Integration test against a local daemon from 4.2 and 4.3. |
+| 5.3 | mobile | Telegram transport: the `start=rep_…` deep link, receiving the attestation through the app deep link, showing a rebind authorisation to paste into the bot, verification, and a confirmation screen showing the figures before import. | Manual test with the bot from phase 6. |
+| 5.4 | mobile | Settings screen "Import reputation": issuer list from the selected node's info event, status per issuer, localized strings in every `intl_*.arb`. | `flutter analyze` clean, gen-l10n reports no untranslated keys. |
 
 ### Phase 5b: app 2.x (`app`)
 
@@ -588,58 +643,76 @@ Runs in parallel with phase 5; shares the UI copy and the localized strings.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 5b.1 | app | Rust core: bump mostro-core to 0.15.0 so `Cell`, `ReputationKeyset`, `ReputationToken`, the new `Action` / `Payload` / `CantDoReason` variants come from core. Add `rust/src/mostro/reputation.rs` with the blind Schnorr client side over `k256`, already a dependency. Tested against the 0.5 vectors. | No bridge, no UI. |
-| 5b.2 | app | Rust core: token and in-flight blinding state persisted in the existing SQLite (native) / IndexedDB (web) layer, so an interrupted flow resumes on every platform. | Survives restart in a test on native and WASM. |
-| 5b.3 | app | Rust core: `export_reputation(issuer)` and `import_reputation(token)` flows against a Mostro issuer through the existing message queue, with the random redemption delay; keyset fetch and cache per trusted issuer. Bridge functions exposed through flutter_rust_bridge (generated, never hand-written). | Integration test against the local daemon from 4.4. |
-| 5b.4 | app | Telegram transport: the two round trips from Dart, through the deep link scheme on mobile and a paste field on desktop and web, handing each response to the Rust core for cell validation and signature verification. | Manual test with the bot from phase 6. |
-| 5b.5 | app | Dart UI: settings screen "Import reputation" reusing the 1.x copy, localized in every ARB under `lib/l10n/`. | `flutter analyze` clean, no untranslated keys. |
+| 5b.1 | app | Rust core: bump mostro-core so `ReputationAttestation` and the new `Action` / `Payload` / `CantDoReason` variants come from core; `export_reputation(issuer)`, `import_reputation(attestation)` and `sign_reputation_rebind(issuer, new_identity)` through the existing message queue, gated on the node's info event, the attestation persisted until imported. Bridge functions exposed through flutter_rust_bridge (generated, never hand-written). | Integration test against the local daemon from 4.2. |
+| 5b.2 | app | Telegram transport: the deep link on mobile and a paste field on desktop and web, handing the attestation to the Rust core for validation. | Manual test with the bot from phase 6. |
+| 5b.3 | app | Dart UI: settings screen "Import reputation" with the confirmation step, reusing the 1.x copy, localized in every ARB under `lib/l10n/`. | `flutter analyze` clean, no untranslated keys. |
 
 ### Phase 6: lnp2pBot as issuer
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 6.1 | bot | `REPUTATION_ISSUER_SK` in `.env-sample` and config validation — this is the bot's issuer identity: it signs the keyset, appears in trusted lists and fills the token `issuer` field, and is deliberately not `NOSTR_SK`. Per-cell key derivation from it with exactly the 4.1 contract (HKDF-SHA256, same salt, `info` layout, counter byte and range check); `@noble/curves` dependency for secp256k1 arithmetic. Unit tests on derivation, including the 0.5 derivation vector so the bot and mostrod agree byte for byte on the scheme even though each derives from its own secret. | No command yet; the derived pubkey matches what 6.2 publishes. |
-| 6.2 | bot | Publish the keyset event through the existing `nostr` module at startup, signed with `REPUTATION_ISSUER_SK`. As in 4.2 the merge is computed from Mongo once per epoch and stored in a `reputation_keysets` collection; later startups republish the stored `cells` and `merges` unchanged. | Event validates against 2.2; a restart republishes the stored keyset unchanged. |
-| 6.3 | bot | `User.reputation_exported_at` (day-truncated); `computeCell(user)` and `isEligible(user)` in `util/`, the cell from `total_reviews`, `total_rating` and `created_at`, eligibility from `trades_completed`, `disputes` and `banned`. Tests on band edges. | Pure functions only. |
-| 6.4 | bot | `/start migrate_...` handler: the two round trips (open session, then answer one clause), session store with expiry, eligibility, once-only, reply with the app deep link; error messages in every locale YAML. Tests with a mocked user. | Round trip with 5.5. |
+| 6.1 | bot | `REPUTATION_ISSUER_SK` in `.env-sample` and config validation — the bot's issuer identity, deliberately not `NOSTR_SK`. `User.reputation_exported_to` and `reputation_exported_at` (day-truncated); `isEligible(user)` (not banned, 10 completed trades, 5 ratings) and `firstTradeSince(user)` over the user's completed orders in `util/`. Tests. | Pure functions and one query; a user whose order history cannot give a first trade date is not eligible. |
+| 6.2 | bot | `/start rep_…` handler: decode the destination identity, eligibility, the `npub` confirm button, binding with `findOneAndUpdate` conditioned on the field being empty or equal, sign the attestation through the existing `nostr` module, reply with the app deep link; error messages in every locale YAML. Tests against the 0.4 vectors and with a mocked user, including two concurrent bindings. | Round trip with 5.3; exactly one of two concurrent bindings wins. |
+| 6.3 | bot | Rebinding: accept a pasted rebind authorisation in the chat, verify it against the 0.4 vectors, confirm, and move the binding; an admin command for the lost-identity case, logged. | Rebind round trip with 5.3. |
 
 ### Phase 7: rollout
 
-1. Deploy 1.2, then ship 1.3 and 1.3b; wait one release before 1.4.
+1. Deploy 1.2, then ship 1.3 and 1.3b.
 2. Deploy phase 3 on the reference instance with an empty issuer list.
 3. Deploy phase 6 on the bot and phase 4 on the reference instance; add both keys to the trust list.
-4. Ship the 1.x app with phases 5.1-5.6 and the 2.x app with phases 5b.1-5b.5.
+4. Ship the 1.x app with phases 5.1-5.4 and the 2.x app with phases 5b.1-5b.3.
 5. Document the operator side (`docs/REPUTATION_PORTABILITY.md`, settings template) and the user side (mobile in-app help).
+6. Last of all, PR 1.4: stop publishing `days` and `operating_days`, and drop `UserInfo.operating_days` from core. Nothing earlier in the plan depends on it, and it never moves ahead of another step (section 6.1).
 
 ## 10. Open decisions
 
-1. Band cuts for the three dimensions (section 4).
-2. `K` minimum cell population (default 50).
-3. Eligibility minimums (default 10 completed trades, 1 rating, disputes lost < 10%).
-4. Keyset event kind number and epoch length (default yearly).
-5. Admin override for re-issuance: yes or no.
-6. Length of the `days` deprecation window before PR 1.4 (default one minor release).
-7. Width of the random redemption delay window (default 24h, section 3).
+1. Attestation kind number (default `38388`, to be reserved in protocol PR 0.2).
+2. Attestation lifetime (default 7 days, and the destination's cap on it).
+3. lnp2pBot `subject`: internal user id or Telegram id (default internal id).
+4. Refreshing an earlier import with newer figures: in v1 or later (default later).
 
 Closed during review:
 
-- **Signature scheme.** Blind Schnorr on secp256k1, clause variant. BDHKE was
-  ruled out because the destination cannot verify a BDHKE token without the
-  issuer's private key.
+- **`days` deprecation window.** `days` and `operating_days` stay published
+  until the last step of the rollout, not for a fixed number of releases:
+  app updates are outside anyone's control (section 6.1).
+- **Real figures, not bands.** Reputation travels as the user's real figures;
+  unlinkability is not a goal, because importing is opt-in (section 3). This
+  drops the band grid, K-anonymity, the per-cell keysets and blind Schnorr
+  signatures.
+- **`rating` as a two-decimal average**, rounded half away from zero and
+  clamped into `[1.00, 5.00]`, rather than an integer sum of ratings. Two
+  decimals is what clients display; the merge works on the rounded value.
+- **`since` is the first completed trade**, not account creation, so a dormant
+  account cannot import an age it never traded.
+- **Eligibility**: not banned, at least 10 completed trades and 5 ratings
+  received, on native history.
+- **Export authentication.** A Mostro issuer exports only for the proved
+  identity; lnp2pBot only for the Telegram user who asks.
+- **Rebinding.** A first binding requires the user to confirm the destination
+  `npub`. A binding moves only with a signature from the bound identity or an
+  audited admin action.
+- **Discovery.** Nodes advertise their trust list and issuer key in the info
+  event; clients never send the new actions to a node that does not.
+- **No self-import**, and a destination-side cap on attestation lifetime.
+- **Dedicated issuer keys** on every issuer: a Mostro signs attestations with
+  a key of its own, never with its daemon key.
+- **Source identity in the attestation.** The `subject` tag names the source
+  account, so the destination can refuse a second import of it.
+- **Merged, not marked.** Imported reputation is merged into the ordinary
+  fields and no marker is published.
 - **`PROTOCOL_VER`.** Stays at 2; the new actions do not gate on it (section 9).
-- **Trades vs reviews.** The first band dimension counts ratings received;
-  completed trades decide eligibility only.
-- **Fresh identity per instance.** Dropped, as incompatible with Sybil
-  resistance (section 7).
-- **Canonical encoding.** Fixed in section 5.1: compressed points, big-endian
-  scalars, BIP-340-style tagged hashes, a fixed-length 70-byte `m`. Points are
-  not x-only because even-Y normalisation would break the blinding.
-- **K-anonymity vs client validation.** The merge is deterministic and its
-  raw→effective map ships in the keyset, so the client folds its own cell the
-  same way instead of aborting.
-- **Native account age.** `native_created_at` is never backdated, so an
-  imported age cannot be re-exported as native.
-- **Issuer identity.** One key per issuer; for the bot that is
-  `REPUTATION_ISSUER_SK`, not `NOSTR_SK`.
+- **Trades vs reviews.** Ratings received are carried; completed trades decide
+  eligibility only.
+- **Native reputation only.** `seeded_reviews` and `native_rating_sum` keep an
+  imported figure from being re-exported as native; `since` comes from local
+  orders.
+- **Issuer identity.** One dedicated signing key per issuer at a time; for
+  the bot that is `REPUTATION_ISSUER_SK`, not `NOSTR_SK`. Destinations
+  identify an issuer by a named trust-list entry that can hold several keys,
+  so a rotation does not reopen deduplication.
+- **Compromise revocation** selects by issuer key and the destination's own
+  import time, never by the attestation's `created_at`, which the key holder
+  controls.
 - **Action naming.** `reputation-exported` is the wire name for the export
   response, everywhere.

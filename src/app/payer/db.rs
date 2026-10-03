@@ -234,6 +234,10 @@ pub struct SellerExperience {
 ///   re-evaluating a stored snapshot, which must see only trades that had
 ///   already reached Success at that instant (`success_at < as_of`; a NULL
 ///   `success_at` predates every snapshot and counts).
+///
+/// The age term dates each trade from its `success_at`, so an offer that
+/// waited weeks before completing is not credited for the wait; legacy rows
+/// with no stamp fall back to `created_at`.
 pub async fn seller_experience(
     conn: &mut SqliteConnection,
     seller_master_pubkey: &str,
@@ -242,7 +246,7 @@ pub async fn seller_experience(
     as_of: Option<i64>,
 ) -> Result<SellerExperience, MostroError> {
     let row = sqlx::query(
-        "SELECT COUNT(*) AS n, MIN(created_at) AS first_at \
+        "SELECT COUNT(*) AS n, MIN(COALESCE(success_at, created_at)) AS first_at \
            FROM orders \
           WHERE master_seller_pubkey = ?1 \
             AND status = 'success' \

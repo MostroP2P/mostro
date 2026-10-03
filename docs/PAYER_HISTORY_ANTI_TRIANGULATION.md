@@ -975,7 +975,7 @@ and starts counting again.
 `seller_experience`:
 
 ```sql
-SELECT COUNT(*) AS n, MIN(created_at) AS first_at
+SELECT COUNT(*) AS n, MIN(COALESCE(success_at, created_at)) AS first_at
   FROM orders
  WHERE master_seller_pubkey = ?1
    AND status = 'success'
@@ -987,10 +987,12 @@ SELECT COUNT(*) AS n, MIN(created_at) AS first_at
    AND (?4 IS NULL OR success_at IS NULL OR success_at < ?4)
 ```
 
-`created_at` (order creation) is the only per-order timestamp available for the
-**age** term (`D`); it overstates a trade's age by the trade's own duration,
-which is acceptable for a days-granularity threshold and keeps the query to a
-single table.
+The **age** term (`D`) dates each trade from its `success_at`: dating it from
+`created_at` would credit an offer that sat in the book for weeks before
+completing with that whole wait. Orders that succeeded before the
+`success_at` migration have no stamp and fall back to `created_at`, which
+overstates their age by the trade's own duration; that only affects legacy
+rows and keeps the query to a single table.
 
 The `as_of` term is a different matter, and it is why `orders.success_at`
 exists (§9). `status = 'success'` is the order's *current* status, so

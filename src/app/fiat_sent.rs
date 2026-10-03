@@ -1,4 +1,6 @@
 use crate::app::context::AppContext;
+use crate::app::payer;
+use crate::config::payer_history::PayerHistorySettings;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
@@ -24,6 +26,16 @@ pub async fn fiat_sent_action(
     // if someone else tries to send fiat, we return an error
     if order.get_buyer_pubkey().ok() != Some(event.sender) {
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    // Payer history (§10.3): an operator may require the buyer to declare
+    // the payer account before reporting fiat as sent. Checked before the
+    // status transition so a refusal leaves the order untouched.
+    let payer_history = ctx.settings().payer_history.as_ref();
+    if PayerHistorySettings::declaration_required(payer_history)
+        && payer::db::find_declaration(pool, order.id).await?.is_none()
+    {
+        return Err(MostroCantDo(CantDoReason::PayerNotDeclared));
     }
 
     // Get next trade key
@@ -84,10 +96,34 @@ pub async fn fiat_sent_action(
     }
 
     // Update order
-    order_updated
+    let order_updated = order_updated
         .update(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Payer history push (D-8): queued only once `FiatSent` is durable. A
+    // lookup failure here is logged and must not fail `fiat-sent`; the
+    // seller can still pull the history with `payment-history`.
+    if PayerHistorySettings::enabled(payer_history) {
+        match payer::history::build_for_order(pool, &order_updated).await {
+            Ok(Some(history)) => {
+                enqueue_order_msg(
+                    None,
+                    Some(order_updated.id),
+                    Action::PaymentHistory,
+                    Some(Payload::PaymentHistory(history)),
+                    seller_pubkey,
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => {} // the buyer never declared a payer (§6.5)
+            Err(e) => tracing::warn!(
+                "payer history push skipped for order {}: {e}",
+                order_updated.id
+            ),
+        }
+    }
 
     Ok(())
 }
@@ -308,5 +344,243 @@ mod tests {
         assert_eq!(db_order.status, Status::FiatSent.to_string());
         assert_eq!(db_order.next_trade_pubkey, Some(next_trade.to_string()));
         assert_eq!(db_order.next_trade_index, Some(7));
+    }
+
+    // ------------------------------------------------- payer history (§10.3)
+
+    mod payer_history {
+        use super::*;
+        use crate::app::payer::db::{bump_history, current_policy_generation, upsert_declaration};
+        use crate::app::payer::test_support::{
+            assert_cant_do, ctx_with, hash, order_in, payer_settings, queued_for, unwrapped,
+            Parties,
+        };
+
+        async fn send_fiat(
+            ctx: &AppContext,
+            parties: Parties,
+            order_id: uuid::Uuid,
+        ) -> Result<(), MostroError> {
+            let msg = fiat_sent_message(order_id, None);
+            fiat_sent_action(
+                ctx,
+                msg.clone(),
+                &unwrapped(parties.buyer, msg),
+                &Keys::generate(),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn feature_on_without_declaration_sends_no_push() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(db_order.status, Status::FiatSent.to_string());
+            let actions: Vec<Action> = queued_for(order.id)
+                .await
+                .into_iter()
+                .map(|q| q.action)
+                .collect();
+            assert_eq!(actions, vec![Action::FiatSentOk, Action::FiatSentOk]);
+        }
+
+        #[tokio::test]
+        async fn require_declaration_rejects_fiat_sent_without_one() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, true)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+
+            assert_cant_do(
+                send_fiat(&ctx, parties, order.id).await,
+                CantDoReason::PayerNotDeclared,
+            );
+
+            let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(
+                db_order.status,
+                Status::Active.to_string(),
+                "status unchanged"
+            );
+            assert!(queued_for(order.id).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn require_declaration_without_enabled_gates_nothing() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(false, true)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+            let actions: Vec<Action> = queued_for(order.id)
+                .await
+                .into_iter()
+                .map(|q| q.action)
+                .collect();
+            assert_eq!(actions, vec![Action::FiatSentOk, Action::FiatSentOk]);
+        }
+
+        #[tokio::test]
+        async fn declaration_triggers_one_history_push_to_the_seller() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, true)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let queued = queued_for(order.id).await;
+            let actions: Vec<Action> = queued.iter().map(|q| q.action.clone()).collect();
+            assert_eq!(
+                actions,
+                vec![
+                    Action::FiatSentOk,
+                    Action::FiatSentOk,
+                    Action::PaymentHistory
+                ]
+            );
+            let push = &queued[2];
+            assert_eq!(push.destination, parties.seller);
+            assert_eq!(push.request_id, None, "unsolicited push");
+            let h = push.history().unwrap();
+            assert_eq!(h.payment_hash, hash('a'));
+            assert_eq!(h.buyer_mode, BuyerMode::Reputation);
+            assert_eq!(
+                (
+                    h.successful_trades,
+                    h.distinct_counterparties,
+                    h.experienced_counterparties
+                ),
+                (0, 0, 0)
+            );
+        }
+
+        #[tokio::test]
+        async fn push_carries_the_seeded_history() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            let generation = current_policy_generation(&mut conn, (5, 30), 1)
+                .await
+                .unwrap();
+            bump_history(
+                &mut conn,
+                &parties.buyer_master.to_string(),
+                &hash('a'),
+                &hash('1'),
+                true,
+                generation,
+                500,
+            )
+            .await
+            .unwrap();
+            drop(conn);
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let queued = queued_for(order.id).await;
+            let h = queued.iter().find_map(|q| q.history()).unwrap();
+            assert_eq!(
+                (
+                    h.successful_trades,
+                    h.distinct_counterparties,
+                    h.experienced_counterparties
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(h.first_success_at, Some(500));
+        }
+
+        #[tokio::test]
+        async fn full_privacy_buyer_push_is_unavailable() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+            let parties = Parties::full_privacy_buyer();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let queued = queued_for(order.id).await;
+            let h = queued.iter().find_map(|q| q.history()).unwrap();
+            assert_eq!(*h, PaymentHistory::unavailable(hash('a')));
+        }
+
+        #[tokio::test]
+        async fn history_lookup_failure_never_fails_fiat_sent() {
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+            // Break the history read that builds the push.
+            sqlx::query("DROP TABLE payer_history")
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+
+            let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(db_order.status, Status::FiatSent.to_string());
+            let actions: Vec<Action> = queued_for(order.id)
+                .await
+                .into_iter()
+                .map(|q| q.action)
+                .collect();
+            assert_eq!(
+                actions,
+                vec![Action::FiatSentOk, Action::FiatSentOk],
+                "no push, no failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn feature_off_ignores_a_stored_declaration() {
+            // A declaration left over from before the operator turned the
+            // feature off must not produce a push (D-10).
+            init_global_config();
+            let pool = create_test_pool().await;
+            let ctx = ctx_with(&pool, None);
+            let parties = Parties::reputation();
+            let order = order_in(&pool, Status::Active, parties).await;
+            upsert_declaration(&pool, order.id, &hash('a'), 1)
+                .await
+                .unwrap();
+
+            send_fiat(&ctx, parties, order.id).await.unwrap();
+            let actions: Vec<Action> = queued_for(order.id)
+                .await
+                .into_iter()
+                .map(|q| q.action)
+                .collect();
+            assert_eq!(actions, vec![Action::FiatSentOk, Action::FiatSentOk]);
+        }
     }
 }

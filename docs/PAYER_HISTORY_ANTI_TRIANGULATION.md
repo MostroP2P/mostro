@@ -970,7 +970,10 @@ INSERT INTO payer_history_counterparties
    experienced, policy_gen)
 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
 ON CONFLICT(user_pubkey, payment_hash, counterparty_id)
-DO UPDATE SET last_success_at = excluded.last_success_at,
+DO UPDATE SET -- MIN/MAX, not assignment: a success stamped earlier can
+              -- commit after a later one, and must not move either bound.
+              first_success_at = MIN(first_success_at, excluded.first_success_at),
+              last_success_at  = MAX(last_success_at, excluded.last_success_at),
               -- MAX() only when the stored value was evaluated under the SAME
               -- generation; a row left stale by §10.7 is overwritten outright,
               -- because the old-policy 1 must not survive into the new policy.

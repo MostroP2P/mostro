@@ -202,7 +202,8 @@ pub async fn bump_history(
            (user_pubkey, payment_hash, first_success_at, last_success_at, successful_trades) \
          VALUES (?1, ?2, ?3, ?3, 1) \
          ON CONFLICT(user_pubkey, payment_hash) \
-         DO UPDATE SET last_success_at = excluded.last_success_at, \
+         DO UPDATE SET first_success_at = MIN(first_success_at, excluded.first_success_at), \
+                       last_success_at = MAX(last_success_at, excluded.last_success_at), \
                        successful_trades = successful_trades + 1",
     )
     .bind(user_pubkey)
@@ -217,7 +218,8 @@ pub async fn bump_history(
             experienced, policy_gen) \
          VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6) \
          ON CONFLICT(user_pubkey, payment_hash, counterparty_id) \
-         DO UPDATE SET last_success_at = excluded.last_success_at, \
+         DO UPDATE SET first_success_at = MIN(first_success_at, excluded.first_success_at), \
+                       last_success_at = MAX(last_success_at, excluded.last_success_at), \
                        experienced = CASE WHEN policy_gen = excluded.policy_gen \
                                           THEN MAX(experienced, excluded.experienced) \
                                           ELSE excluded.experienced END, \

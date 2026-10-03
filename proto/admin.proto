@@ -34,6 +34,11 @@ service AdminService {
   // Reverse the reputation imports made with an issuer key, after it was
   // compromised (docs/REPUTATION_PORTABILITY.md §5.3). Loopback peers only.
   rpc RevokeReputationImports(RevokeReputationImportsRequest) returns (RevokeReputationImportsResponse);
+
+  // Move the identity an account's reputation export is bound to, for a
+  // user who lost the bound identity and cannot sign a rebind authorisation
+  // (docs/REPUTATION_PORTABILITY.md §5.2). Loopback peers only.
+  rpc RebindReputationExport(RebindReputationExportRequest) returns (RebindReputationExportResponse);
 }
 
 // Request to cancel an order
@@ -169,4 +174,21 @@ message RevokeReputationImportsResponse {
   optional string error_message = 2;
   // How many imports were reversed.
   uint32 revoked = 3;
+}
+
+message RebindReputationExportRequest {
+  // The account: the identity whose reputation this node exports, npub or hex.
+  string identity = 1;
+  // The identity to bind it to, npub or hex.
+  string new_identity = 2;
+  // Why: required, and logged with both identities.
+  string reason = 3;
+  optional string request_id = 4;
+}
+
+message RebindReputationExportResponse {
+  bool success = 1;
+  optional string error_message = 2;
+  // The identity it was bound to before, if any.
+  optional string previous_identity = 3;
 }

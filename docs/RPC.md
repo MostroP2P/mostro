@@ -208,6 +208,27 @@ The selection is by key and by **this node's import time**, never by the attesta
 - `error_message`: Error details, e.g. a key that does not parse
 - `revoked`: How many imports were reversed
 
+### 10. Rebind Reputation Export
+
+Move the identity an account's reputation export is bound to (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md), "Rebinding"). A user moves it themselves with a rebind authorisation signed by the bound identity; this is for one who lost that identity and cannot sign. The move is a compare-and-set on the current binding, and it is logged with both identities and the reason.
+
+A rebind revokes nothing already issued: attestations the old identity holds stay valid until they expire, and what it imported elsewhere stays there.
+
+**Loopback only**, like `SetMaintenanceMode`.
+
+**Request:**
+
+- `identity`: The account, the identity whose reputation this node exports, npub or hex
+- `new_identity`: The identity to bind it to, npub or hex
+- `reason`: Why; required
+- `request_id`: Optional request identifier for tracking
+
+**Response:**
+
+- `success`: Whether the binding moved
+- `error_message`: Error details, e.g. an unknown account or a binding that changed meanwhile
+- `previous_identity`: The identity it was bound to before, if any
+
 ## Protocol Details
 
 The RPC interface uses gRPC with Protocol Buffers. The service definition is:
@@ -222,6 +243,7 @@ service AdminService {
   rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
   rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (SetMaintenanceModeResponse);
   rpc RevokeReputationImports(RevokeReputationImportsRequest) returns (RevokeReputationImportsResponse);
+  rpc RebindReputationExport(RebindReputationExportRequest) returns (RebindReputationExportResponse);
   rpc GetMaintenanceStatus(GetMaintenanceStatusRequest) returns (GetMaintenanceStatusResponse);
 }
 ```
@@ -290,7 +312,7 @@ Optional. Set a shared secret in `settings.toml`:
 auth_token = "a-long-random-string"
 ```
 
-When set, every mutating RPC (`CancelOrder`, `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`, `RevokeReputationImports`) must carry the gRPC metadata header `authorization: Bearer <token>`; a missing or wrong token is refused with `PERMISSION_DENIED` before anything is read or written. The comparison is constant-time. Read-only calls (`GetVersion`, `GetMaintenanceStatus`, `ValidateDbPassword`) are not affected. When unset, the historical bind-address-only model applies.
+When set, every mutating RPC (`CancelOrder`, `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`, `RevokeReputationImports`, `RebindReputationExport`) must carry the gRPC metadata header `authorization: Bearer <token>`; a missing or wrong token is refused with `PERMISSION_DENIED` before anything is read or written. The comparison is constant-time. Read-only calls (`GetVersion`, `GetMaintenanceStatus`, `ValidateDbPassword`) are not affected. When unset, the historical bind-address-only model applies.
 
 ```bash
 grpcurl -plaintext -import-path proto -proto admin.proto \
@@ -303,7 +325,7 @@ grpcurl -plaintext -import-path proto -proto admin.proto \
 
 - The RPC server listens on localhost by default for security
 - Set `[rpc].auth_token` whenever the port is reachable through anything other than the local machine (tunnel, sidecar, non-loopback bind); the peer address alone is not authorization
-- `SetMaintenanceMode` and `RevokeReputationImports` additionally refuse non-loopback peers
+- `SetMaintenanceMode`, `RevokeReputationImports` and `RebindReputationExport` additionally refuse non-loopback peers
 - The RPC interface provides the same admin capabilities as Nostr-based commands
 - Only enable the RPC server in trusted environments
 

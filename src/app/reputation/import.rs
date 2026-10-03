@@ -53,7 +53,7 @@ pub async fn import_reputation_action(
         return Err(MostroCantDo(CantDoReason::ReputationIdentityMismatch));
     }
 
-    let user = record_import(ctx, &issuer.name, &attestation, &event.identity).await?;
+    let user = record_import(ctx, &issuer.name, &attestation, event).await?;
     tracing::info!(
         "reputation: {} imported {} ratings from `{}` (attestation {})",
         event.identity,
@@ -85,10 +85,10 @@ async fn record_import(
     ctx: &AppContext,
     issuer_name: &str,
     attestation: &ReputationAttestation,
-    identity: &PublicKey,
+    event: &UnwrappedMessage,
 ) -> Result<User, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let identity_hex = identity.to_hex();
+    let identity_hex = event.identity.to_hex();
     let now = Timestamp::now().as_secs() as i64;
     let mut tx = ctx.pool().begin().await.map_err(db_err)?;
 
@@ -114,6 +114,7 @@ async fn record_import(
             issuer_key: attestation.issuer.to_hex(),
             subject: attestation.subject.clone(),
             identity_pubkey: identity_hex,
+            trade_pubkey: Some(event.sender.to_hex()),
             reviews: i64::from(attestation.reviews),
             rating_hundredths: i64::from(attestation.rating_hundredths),
             since: attestation.since as i64,
@@ -260,6 +261,7 @@ mod tests {
             ("lnp2pbot", "acct-1")
         );
         assert_eq!(rows[0].issuer_key, f.issuer.public_key().to_hex());
+        assert_eq!(rows[0].trade_pubkey, Some(event.sender.to_hex()));
 
         let replies: Vec<Message> = crate::config::MESSAGE_QUEUES
             .queue_order_msg

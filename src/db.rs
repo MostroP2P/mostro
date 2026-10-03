@@ -1746,6 +1746,8 @@ pub struct ReputationImportRow {
     pub issuer_key: String,
     pub subject: String,
     pub identity_pubkey: String,
+    /// The trade key that sent the import, whose rating event shows it.
+    pub trade_pubkey: Option<String>,
     pub reviews: i64,
     pub rating_hundredths: i64,
     pub since: i64,
@@ -1764,7 +1766,7 @@ impl ReputationImportRow {
 }
 
 const REPUTATION_IMPORT_COLUMNS: &str = "attestation_id, issuer, issuer_key, subject, \
-    identity_pubkey, reviews, rating_hundredths, since, imported_at";
+    identity_pubkey, trade_pubkey, reviews, rating_hundredths, since, imported_at";
 
 /// Record an import. The unique indexes on `(issuer, subject)` and
 /// `(issuer, identity_pubkey)` make a second import of the same source, or a
@@ -1779,13 +1781,14 @@ where
 {
     sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO reputation_imports ({REPUTATION_IMPORT_COLUMNS}) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     )))
     .bind(&row.attestation_id)
     .bind(&row.issuer)
     .bind(&row.issuer_key)
     .bind(&row.subject)
     .bind(&row.identity_pubkey)
+    .bind(&row.trade_pubkey)
     .bind(row.reviews)
     .bind(row.rating_hundredths)
     .bind(row.since)

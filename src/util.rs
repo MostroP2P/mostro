@@ -719,11 +719,18 @@ pub async fn send_dm(
     )
     .await?;
 
+    // Payer hashes and histories are identifiers that must stay inside the
+    // encrypted channel; log the action only.
+    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
+        "<payer-history payload redacted>"
+    } else {
+        payload
+    };
     info!(
         "Sending message, Event ID: {} to {} with payload: {:#?}",
         event.id,
         receiver_pubkey.to_hex(),
-        payload
+        logged_payload
     );
 
     if let Ok(client) = get_nostr_client() {

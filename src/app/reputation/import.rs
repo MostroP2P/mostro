@@ -3,9 +3,10 @@
 //! reputation_attestation.md, "Redemption").
 
 use crate::app::context::AppContext;
+use crate::app::rate_user::rating_event_tags;
 use crate::config::types::ReputationImportSettings;
 use crate::db::{insert_reputation_import, update_user_reputation, ReputationImportRow};
-use crate::util::enqueue_order_msg;
+use crate::util::{enqueue_order_msg, update_user_rating_event};
 use mostro_core::prelude::*;
 use mostro_core::reputation::ReputationImport;
 use nostr_sdk::prelude::*;
@@ -20,12 +21,14 @@ pub fn import_settings(ctx: &AppContext) -> Option<&ReputationImportSettings> {
 
 /// Run the redemption checks on an `import-reputation` request, record the
 /// import and merge it into the identity's reputation in one transaction,
-/// then confirm with `reputation-imported`. Every refusal is a `cant-do`
-/// whose reason says which check failed.
+/// then confirm with `reputation-imported` and republish the user's rating
+/// event with the merged figures. Every refusal is a `cant-do` whose reason
+/// says which check failed.
 pub async fn import_reputation_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedMessage,
+    my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let import = import_settings(ctx).ok_or(MostroCantDo(CantDoReason::InvalidAction))?;
     let kind = msg.get_inner_message_kind();
@@ -50,7 +53,7 @@ pub async fn import_reputation_action(
         return Err(MostroCantDo(CantDoReason::ReputationIdentityMismatch));
     }
 
-    record_import(ctx, &issuer.name, &attestation, &event.identity).await?;
+    let user = record_import(ctx, &issuer.name, &attestation, &event.identity).await?;
     tracing::info!(
         "reputation: {} imported {} ratings from `{}` (attestation {})",
         event.identity,
@@ -67,6 +70,10 @@ pub async fn import_reputation_action(
         None,
     )
     .await;
+    // Rating events are keyed by trade pubkey, like after a rating: the one
+    // that sent the import shows the merged reputation from now on. Order
+    // events published from now on read the merged row too.
+    update_user_rating_event(&event.sender.to_hex(), rating_event_tags(&user), my_keys).await?;
     Ok(())
 }
 
@@ -138,6 +145,9 @@ mod tests {
     }
 
     async fn fixture_with(issuers: Vec<(&str, Vec<String>)>, issuer: Keys) -> Fixture {
+        // The rating event reads the global settings (expiration), like every
+        // handler test that publishes one; installing them is idempotent.
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
         // One connection: an in-memory SQLite database is per connection.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -206,7 +216,7 @@ mod tests {
 
     async fn import(f: &Fixture, identity: &PublicKey, json: &str) -> Result<(), MostroError> {
         let (msg, event) = request(identity, json);
-        import_reputation_action(&f.ctx, msg, &event).await
+        import_reputation_action(&f.ctx, msg, &event, &Keys::generate()).await
     }
 
     fn refused(result: Result<(), MostroError>) -> CantDoReason {
@@ -229,7 +239,9 @@ mod tests {
             .unwrap();
 
         let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
-        import_reputation_action(&f.ctx, msg, &event).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &event, &Keys::generate())
+            .await
+            .unwrap();
 
         let after = is_user_present(f.ctx.pool(), identity.to_hex())
             .await
@@ -262,6 +274,40 @@ mod tests {
         assert_eq!(reply.action, Action::ReputationImported);
         assert_eq!(reply.request_id, Some(7));
         assert!(reply.payload.is_none());
+    }
+
+    /// The rating event is republished under the importing trade key with
+    /// the merged figures, so relays show the imported reputation at once.
+    #[tokio::test]
+    async fn an_import_republishes_the_rating_event_with_the_merged_figures() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
+        let node = Keys::generate();
+        import_reputation_action(&f.ctx, msg, &event, &node)
+            .await
+            .unwrap();
+
+        let tag = |ev: &Event, name: &str| {
+            ev.tags.iter().find_map(|t| {
+                let v = t.clone().to_vec();
+                (v.first().map(String::as_str) == Some(name)).then(|| v[1].clone())
+            })
+        };
+        let published: Vec<Event> = crate::config::MESSAGE_QUEUES
+            .queue_order_rate
+            .read()
+            .await
+            .iter()
+            .filter(|ev| tag(ev, "d") == Some(event.sender.to_hex()))
+            .cloned()
+            .collect();
+        assert_eq!(published.len(), 1);
+        let ev = &published[0];
+        assert_eq!(ev.pubkey, node.public_key());
+        assert_eq!(ev.kind.as_u16(), NOSTR_RATING_EVENT_KIND);
+        assert_eq!(tag(ev, "total_reviews"), Some("214".to_string()));
+        assert_eq!(tag(ev, "since"), Some(SINCE.to_string()));
     }
 
     #[tokio::test]
@@ -347,14 +393,14 @@ mod tests {
         let (msg, mut event) = request(&identity, &valid);
         event.sender = identity;
         assert_eq!(
-            refused(import_reputation_action(&f.ctx, msg, &event).await),
+            refused(import_reputation_action(&f.ctx, msg, &event, &Keys::generate()).await),
             CantDoReason::ReputationIdentityRequired
         );
         // Wrong payload.
         let (_, event) = request(&identity, &valid);
         let wrong = Message::new_order(None, None, None, Action::ImportReputation, None);
         assert_eq!(
-            refused(import_reputation_action(&f.ctx, wrong, &event).await),
+            refused(import_reputation_action(&f.ctx, wrong, &event, &Keys::generate()).await),
             CantDoReason::InvalidPayload
         );
         assert_eq!(

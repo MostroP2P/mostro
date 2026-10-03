@@ -617,14 +617,11 @@ Summary of the contract:
    method, each field normalised as:
    - Unicode NFKC, then uppercase;
    - strip all whitespace, hyphens, dots and slashes from *identifier* fields
-     (IBAN, CBU/CVU, non-e-mail PIX keys, account number, tax id);
-   - strip only whitespace from *e-mail* fields (e-mail PIX keys): dots and
-     hyphens are part of the address;
+     (IBAN, CBU/CVU, account number, tax id);
    - collapse runs of whitespace to one space in *name* fields, trim;
    - country codes ISO-3166 alpha-2, currency ISO-4217.
-2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`,
-   `BR|PIX`), so identical account numbers under different rails never
-   collide.
+2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`), so
+   identical account numbers under different rails never collide.
 3. **Hash** = `sha256("mostro-payer-v1|" + canonical)` (D-12), hex, lowercase.
 4. The hash MUST NOT include order id, trade key, timestamps or salt
    (gist §9) — those would make it unique per trade and defeat history.
@@ -634,7 +631,6 @@ Examples (canonical → hashed):
 ```text
 AR|CVU|0000003100012345678901|27123456789
 EU|SEPA|DE89370400440532013000|ALICE SMITH
-BR|PIX|+5511999998888
 ```
 
 `DE89 3704 0044 0532 0130 00` and `DE89370400440532013000` canonicalise to the
@@ -648,6 +644,12 @@ why the node DB is the only place it lives.
 Methods that cannot expose a sender (cash, gift cards, vouchers) have no
 canonical form; clients MUST NOT declare a payer for them and SHOULD tell the
 seller that sender verification is unavailable (gist §34).
+
+PIX is deliberately not in the registry: a PIX key identifies the account that
+*receives* a transfer, so a buyer's own key is not sender data the seller can
+check, and a PIX receipt shows the payer only partly (name, institution, a
+masked CPF/CNPJ). It needs an entry built from payer fields the seller can
+read in full before clients may declare it.
 
 ---
 
@@ -1087,8 +1089,10 @@ pub async fn declare_payer_action(ctx: &AppContext, msg: Message,
 ```
 
 Design notes
-- Re-declaration overwrites. The seller receives every version; the client
-  keeps the last one. There is no partial-update path.
+- Re-declaration overwrites. The seller receives every version, but forwards
+  carry no sequence and relays may reorder them, so the last one received is
+  provisional; the hash `payment-history` echoes (frozen at `fiat-sent`) is
+  authoritative. There is no partial-update path.
 - The seller may not exist yet in `WaitingBuyerInvoice` for a maker-buyer
   order whose taker has not paid — `get_seller_pubkey()` failing is not an
   error; the seller will get the hash with the `payment-history` push later.
@@ -1595,8 +1599,10 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
 5. If `fiat-sent` answers `payer_not_declared`, go back to step 1.
 
 **Seller side**
-1. On `payer-declared`, store the hash for the order. On receiving the
-   plaintext from the buyer, recompute; if it differs, show a hard warning.
+1. On `payer-declared`, store the hash for the order as provisional. On
+   receiving the plaintext from the buyer, recompute; once fiat is reported
+   sent, compare it with the hash `payment-history` echoes (query it if the
+   push has not arrived) and show a hard warning if it differs.
 2. On `payment-history` (push or reply), render two independent blocks:
    *Sender match* (manual confirmation) and *Payment-account history*.
 3. In the history block, render `experienced_counterparties` alongside the raw

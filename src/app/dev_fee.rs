@@ -80,6 +80,15 @@ use tracing::{debug, error, info, warn};
 
 // ── Public entry point ──────────────────────────────────────────────────
 
+/// Whether a node on `networks` (LND `GetInfo` chains) pays dev fees at all.
+///
+/// [`DEV_FEE_LIGHTNING_ADDRESS`] only issues mainnet invoices, so on any
+/// other chain every cycle would resolve it over LNURL just to reject the
+/// invoice for the wrong currency (#1039). Unknown chains fail closed.
+pub fn dev_fee_payments_enabled(networks: &[String]) -> bool {
+    networks.first().map(String::as_str) == Some("mainnet")
+}
+
 /// Run one full dev‑fee processing cycle.
 ///
 /// Called by the scheduler every tick. Phases run sequentially so each

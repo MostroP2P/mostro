@@ -9,7 +9,8 @@
 //! success hook are wired by PH-2 to PH-5.
 
 // The helpers are wired into the trade flow by PH-2 to PH-5; until then the
-// binary does not call them outside tests. PH-5 removes this attribute.
+// binary does not call them outside tests.
+// TODO(PH-5): remove this attribute once every helper has a caller.
 #![allow(dead_code)]
 
 pub mod db;

@@ -760,12 +760,16 @@ When the feature is disabled or absent, `info_to_tags` emits no payer-history ta
 
 ## 9. Daemon — data model
 
-One migration, `migrations/2026MMDD120000_payer_history.sql`, in the house
-style (long `--` header explaining *why*, per-column comments). Four new tables;
-**no** change to `users`, and exactly one additive, nullable column on `orders`
-(`success_at`, justified in the block below — the `ADD COLUMN` path the
-migration reconciler in `src/db.rs` already special-cases, same shape as
-`payout_claimed_at`).
+Two migrations in the house style (long `--` header explaining *why*,
+per-column comments): `migrations/20261002120000_payer_history.sql` with the
+four new tables and an index on `orders(master_seller_pubkey)`, and
+`migrations/20261002120100_order_success_at.sql` with the one additive,
+nullable column on `orders` (`success_at`, justified in the block below). The
+column gets a file of its own because the migration reconciler in `src/db.rs`
+special-cases only migrations made purely of `ADD COLUMN` statements, the same
+shape as `payout_claimed_at`. **No** change to `users`. The index serves
+`seller_experience` (§10.1), which otherwise scans `orders` on every recorded
+success and once per snapshot in §10.7.
 
 ```sql
 -- Per-order commitment. Short-lived: consumed on success, pruned on any other
@@ -876,6 +880,10 @@ New module `src/app/payer/` (`mod.rs`, `db.rs`, `declare.rs`, `history.rs`,
 
 ### 10.1 Shared helpers (`src/app/payer/db.rs`)
 
+Functions that may run inside the Success CAS transaction take a
+`&mut SqliteConnection` (pass `&mut *tx`) rather than a generic
+`sqlx::Executor`, which is consumed by its first query.
+
 ```rust
 pub struct PayerDeclarationRow { pub order_id: Uuid, pub payment_hash: String,
                                  pub declared_at: i64 }
@@ -884,7 +892,7 @@ pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, now: i64)
     -> Result<(), MostroError>;                         // INSERT … ON CONFLICT(order_id) DO UPDATE
 pub async fn find_declaration(pool, order_id: Uuid)
     -> Result<Option<PayerDeclarationRow>, MostroError>;
-pub async fn take_declaration<'e, E: sqlx::Executor<'e>>(exec: E, order_id: Uuid)
+pub async fn take_declaration(conn: &mut SqliteConnection, order_id: Uuid)
     -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING *  (idempotency token)
 
 pub struct HistoryCounters { pub successful_trades: u32,
@@ -898,7 +906,7 @@ pub struct HistoryCounters { pub successful_trades: u32,
 /// live thresholds (§9, §10.7).
 pub async fn load_history(pool, user_pubkey: &str, hash: &str)
     -> Result<HistoryCounters, MostroError>;
-pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, counterparty_id,
+pub async fn bump_history(conn: &mut SqliteConnection, user_pubkey, hash, counterparty_id,
                                  experienced: bool, policy_gen: i64, now)
     -> Result<(), MostroError>;   // upsert payer_history + counterparty upsert (SQL below)
 
@@ -913,8 +921,8 @@ pub struct SellerExperience { pub qualifying_trades: u32,
 /// `as_of`: `None` on the live success path (§10.5); `Some(instant)` when
 /// re-evaluating a stored snapshot (§10.7), which must see only the trades
 /// that had already reached Success at that instant.
-pub async fn seller_experience<'e, E: sqlx::Executor<'e>>(exec: E,
-    seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Uuid,
+pub async fn seller_experience(conn: &mut SqliteConnection,
+    seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Option<Uuid>,
     as_of: Option<i64>)
     -> Result<SellerExperience, MostroError>;
 pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroError>;
@@ -924,16 +932,17 @@ pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroE
 pub async fn load_experience_policy(pool) -> Result<Option<ExperiencePolicy>, MostroError>;
 pub struct ExperiencePolicy { pub generation: i64, pub min_trades: u32, pub min_days: u32 }
 /// Bumps `generation` and returns the new value.
-pub async fn store_experience_policy<'e, E>(exec: E, min_trades: u32, min_days: u32, now: i64)
+pub async fn store_experience_policy(conn: &mut SqliteConnection, min_trades: u32, min_days: u32, now: i64)
     -> Result<i64, MostroError>;
 /// Generation to stamp into snapshots taken right now (§10.5). Seeds the
 /// policy row from the live config on first use so the success path never
 /// races the boot-time recompute.
-pub async fn current_policy_generation<'e, E>(exec: E) -> Result<i64, MostroError>;
+pub async fn current_policy_generation(conn: &mut SqliteConnection, thresholds: (u32, u32), now: i64)
+    -> Result<i64, MostroError>;
 /// Recompute the whole `experienced` column under `(min_trades, min_days)`.
 /// Runs in one transaction with `store_experience_policy`; see §10.7.
-pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32)
-    -> Result<u64, MostroError>;   // rows whose flag changed
+pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32, now: i64)
+    -> Result<RecomputeOutcome, MostroError>;   // { changed, unresolved } row counts
 ```
 
 `bump_history`'s counterparty write — under a fixed threshold policy the

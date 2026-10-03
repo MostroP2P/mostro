@@ -129,37 +129,35 @@ pub async fn load_history(
     user_pubkey: &str,
     payment_hash: &str,
 ) -> Result<HistoryCounters, MostroError> {
-    let head = sqlx::query(
-        "SELECT successful_trades, first_success_at, last_success_at FROM payer_history \
-         WHERE user_pubkey = ?1 AND payment_hash = ?2",
+    // One statement, so the head row and the counterparty counts are read
+    // from the same snapshot even while a success is being recorded.
+    let row = sqlx::query(
+        "SELECT h.successful_trades, h.first_success_at, h.last_success_at, \
+                (SELECT COUNT(*) FROM payer_history_counterparties c \
+                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash) \
+                  AS distinct_cp, \
+                (SELECT COUNT(*) FROM payer_history_counterparties c \
+                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash \
+                    AND c.experienced = 1 \
+                    AND c.policy_gen = (SELECT generation FROM payer_history_policy WHERE id = 1)) \
+                  AS experienced_cp \
+           FROM payer_history h \
+          WHERE h.user_pubkey = ?1 AND h.payment_hash = ?2",
     )
     .bind(user_pubkey)
     .bind(payment_hash)
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
-    let Some(head) = head else {
+    let Some(row) = row else {
         return Ok(HistoryCounters::default());
     };
-    let counts = sqlx::query(
-        "SELECT COUNT(*) AS distinct_cp, \
-                COALESCE(SUM(CASE WHEN c.experienced = 1 \
-                                   AND c.policy_gen = (SELECT generation FROM payer_history_policy WHERE id = 1) \
-                                  THEN 1 ELSE 0 END), 0) AS experienced_cp \
-           FROM payer_history_counterparties c \
-          WHERE c.user_pubkey = ?1 AND c.payment_hash = ?2",
-    )
-    .bind(user_pubkey)
-    .bind(payment_hash)
-    .fetch_one(pool)
-    .await
-    .map_err(db_err)?;
     Ok(HistoryCounters {
-        successful_trades: to_u32(head.get::<i64, _>("successful_trades")),
-        distinct_counterparties: to_u32(counts.get::<i64, _>("distinct_cp")),
-        experienced_counterparties: to_u32(counts.get::<i64, _>("experienced_cp")),
-        first_success_at: Some(head.get::<i64, _>("first_success_at")),
-        last_success_at: Some(head.get::<i64, _>("last_success_at")),
+        successful_trades: to_u32(row.get::<i64, _>("successful_trades")),
+        distinct_counterparties: to_u32(row.get::<i64, _>("distinct_cp")),
+        experienced_counterparties: to_u32(row.get::<i64, _>("experienced_cp")),
+        first_success_at: Some(row.get::<i64, _>("first_success_at")),
+        last_success_at: Some(row.get::<i64, _>("last_success_at")),
     })
 }
 
@@ -326,15 +324,25 @@ pub async fn current_policy_generation(
     thresholds: (u32, u32),
     now: i64,
 ) -> Result<i64, MostroError> {
-    let existing =
-        sqlx::query_scalar::<_, i64>("SELECT generation FROM payer_history_policy WHERE id = 1")
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(db_err)?;
-    match existing {
-        Some(generation) => Ok(generation),
-        None => store_experience_policy(conn, thresholds.0, thresholds.1, now).await,
-    }
+    // Insert-if-absent first, then read: a write statement up front takes
+    // the write lock directly instead of upgrading a read inside the
+    // caller's transaction, which SQLite can refuse with SQLITE_BUSY.
+    sqlx::query(
+        "INSERT INTO payer_history_policy \
+           (id, generation, experienced_min_trades, experienced_min_days, evaluated_at) \
+         VALUES (1, 1, ?1, ?2, ?3) \
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(i64::from(thresholds.0))
+    .bind(i64::from(thresholds.1))
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    sqlx::query_scalar::<_, i64>("SELECT generation FROM payer_history_policy WHERE id = 1")
+        .fetch_one(conn)
+        .await
+        .map_err(db_err)
 }
 
 /// Outcome of [`recompute_experienced`].
@@ -349,7 +357,9 @@ pub struct RecomputeOutcome {
 }
 
 /// Re-evaluate the whole `experienced` column under `(min_trades, min_days)`
-/// in one transaction, together with the policy row (§10.7). Each snapshot is
+/// in one transaction, together with the policy row (§10.7). The caller
+/// logs [`RecomputeOutcome::unresolved`] at `warn` (never the rows), since on
+/// a healthy node it is zero. Each snapshot is
 /// re-evaluated at its own `last_success_at`, so the result depends only on
 /// `orders`, the node key and the thresholds.
 pub async fn recompute_experienced(

@@ -369,6 +369,40 @@ async fn seller_experience_as_of_ignores_later_successes_but_counts_null_stamps(
     );
 }
 
+#[tokio::test]
+async fn seller_experience_as_of_excludes_a_success_at_the_same_instant() {
+    let pool = pool().await;
+    let (seller, buyer, other) = (key(), key(), key());
+    let snapshot = NOW - 5 * ONE_DAY;
+    let mut same_instant = Trade::success(&seller, &other, NOW - 20 * ONE_DAY);
+    same_instant.success_at = Some(snapshot);
+    insert(&pool, same_instant).await;
+
+    let exp = experience(&pool, &seller, &buyer, None, Some(snapshot)).await;
+    assert_eq!(
+        exp.qualifying_trades, 0,
+        "strictly before the snapshot only"
+    );
+}
+
+#[tokio::test]
+async fn seller_experience_ignores_trades_with_an_unknown_buyer() {
+    let pool = pool().await;
+    let (seller, buyer, other) = (key(), key(), key());
+    let id = insert(&pool, Trade::success(&seller, &other, NOW - 40 * ONE_DAY)).await;
+    sqlx::query("UPDATE orders SET master_buyer_pubkey = NULL WHERE id = ?1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let exp = experience(&pool, &seller, &buyer, None, None).await;
+    assert_eq!(
+        exp.qualifying_trades, 0,
+        "cannot be shown to be another buyer"
+    );
+}
+
 // ---------------------------------------------------------------------- policy
 
 #[tokio::test]

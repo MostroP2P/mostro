@@ -61,3 +61,9 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   experienced_min_days   integer NOT NULL,
   evaluated_at           integer NOT NULL   -- unix secs of the last (re)evaluation
 );
+
+-- D-7 qualification reads every undisputed success of one seller
+-- (`seller_experience`), on each payer-history success and once per stored
+-- snapshot when the thresholds change. Without an index that is a full scan
+-- of `orders` each time.
+CREATE INDEX IF NOT EXISTS idx_orders_master_seller_pubkey ON orders(master_seller_pubkey);

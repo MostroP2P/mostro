@@ -501,6 +501,13 @@ pub async fn recompute_experienced(
             outcome.changed += 1;
         }
     }
+    // Frozen payment-history snapshots (§10.3) hold counts taken under the
+    // previous policy; drop them so the next query re-takes them under the
+    // one the info event now advertises.
+    sqlx::query("UPDATE order_payer_declarations SET history_snapshot = NULL")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
     Ok(outcome)
 }

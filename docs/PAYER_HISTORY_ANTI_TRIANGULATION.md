@@ -1472,6 +1472,12 @@ if Settings::is_payer_history_enabled() {
    with the same triple: the `bump_history` upsert overwrites both columns,
    §10.1.)
 
+6. In the same transaction, every frozen payment-history snapshot
+   (`order_payer_declarations.history_snapshot`, §10.4) is discarded: it holds
+   an `experienced_counterparties` value taken under the previous policy. The
+   next `payment-history` query of a still-open order re-takes it under the
+   policy the info event now advertises.
+
 Properties this gives:
 
 - **Deterministic.** The result depends only on `orders`, the node key and

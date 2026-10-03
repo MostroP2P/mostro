@@ -1938,6 +1938,30 @@ pub async fn completed_trades_for_identity(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// Bind an account's reputation, as an issuer, to `destination`: an atomic
+/// compare-and-set that succeeds only if the account is unbound or already
+/// bound to that identity, and records the day of the export. Of two
+/// concurrent requests for different identities, exactly one binds. Returns
+/// whether it did.
+pub async fn bind_reputation_export(
+    pool: &SqlitePool,
+    identity: &str,
+    destination: &str,
+    day: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE users SET reputation_exported_to = ?2, reputation_exported_at = ?3 \
+         WHERE pubkey = ?1 AND (reputation_exported_to IS NULL OR reputation_exported_to = ?2)",
+    )
+    .bind(identity)
+    .bind(destination)
+    .bind(day)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// The trust-list names `issuer_key` is known under: the names its imports
 /// were recorded under and the name it was first configured under.
 pub async fn reputation_issuer_names_for_key(

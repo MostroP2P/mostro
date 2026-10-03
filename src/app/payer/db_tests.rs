@@ -228,6 +228,45 @@ async fn a_take_rolled_back_to_pending_voids_the_declaration() {
 }
 
 #[tokio::test]
+async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
+    // The status check and the write are one statement, so a declaration
+    // cannot land after a concurrent `fiat-sent` froze the order (§5.1).
+    let pool = pool().await;
+    let (seller, buyer) = (key(), key());
+    let mut active = Trade::success(&seller, &buyer, NOW);
+    active.status = Status::Active;
+    let active = insert(&pool, active).await;
+    let mut frozen = Trade::success(&seller, &buyer, NOW);
+    frozen.status = Status::FiatSent;
+    let frozen = insert(&pool, frozen).await;
+
+    assert!(upsert_open_declaration(&pool, active, &hash('a'), 1)
+        .await
+        .unwrap());
+    assert!(upsert_open_declaration(&pool, active, &hash('b'), 2)
+        .await
+        .unwrap());
+    assert_eq!(
+        find_declaration(&pool, active)
+            .await
+            .unwrap()
+            .map(|d| d.payment_hash),
+        Some(hash('b'))
+    );
+
+    assert!(!upsert_open_declaration(&pool, frozen, &hash('a'), 1)
+        .await
+        .unwrap());
+    assert!(find_declaration(&pool, frozen).await.unwrap().is_none());
+    // Unknown order: nothing to attach the declaration to.
+    assert!(
+        !upsert_open_declaration(&pool, Uuid::new_v4(), &hash('a'), 1)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn prune_removes_terminal_declarations_and_keeps_active_ones() {
     let pool = pool().await;
     let (seller, buyer) = (key(), key());

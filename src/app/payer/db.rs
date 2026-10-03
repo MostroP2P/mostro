@@ -55,6 +55,39 @@ pub async fn upsert_declaration(
     Ok(())
 }
 
+/// Order statuses in which a buyer may (re)declare its payer (§5.1).
+pub const DECLARATION_OPEN_STATUSES: &str = "'waiting-payment','waiting-buyer-invoice','active'";
+
+/// Upsert the declaration for `order_id` only while the order is still in
+/// [`DECLARATION_OPEN_STATUSES`]. Status check and write are one statement,
+/// so a declaration racing a concurrent `fiat-sent` cannot land after the
+/// order froze. Like [`upsert_declaration`], it records the order's current
+/// buyer trade key. Returns `false` when nothing was written.
+pub async fn upsert_open_declaration(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    payment_hash: &str,
+    now: i64,
+) -> Result<bool, MostroError> {
+    let sql = format!(
+        "INSERT INTO order_payer_declarations \
+           (order_id, payment_hash, declared_at, buyer_pubkey) \
+         SELECT ?1, ?2, ?3, o.buyer_pubkey FROM orders o \
+          WHERE o.id = ?1 AND o.status IN ({DECLARATION_OPEN_STATUSES}) \
+         ON CONFLICT(order_id) DO UPDATE SET payment_hash = excluded.payment_hash, \
+                                             declared_at = excluded.declared_at, \
+                                             buyer_pubkey = excluded.buyer_pubkey"
+    );
+    let done = sqlx::query(AssertSqlSafe(sql))
+        .bind(order_id)
+        .bind(payment_hash)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// The current declaration for `order_id`, if any: one made by the order's
 /// current buyer.
 pub async fn find_declaration(

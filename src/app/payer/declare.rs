@@ -40,13 +40,19 @@ pub async fn declare_payer_action(
         _ => return Err(MostroCantDo(CantDoReason::InvalidPayload)),
     };
     validate_payment_hash(&declaration.payment_hash)?;
-    db::upsert_declaration(
+    // Conditional on the status again, inside the write: the check above
+    // gives the precise refusal, this one closes the race with a
+    // concurrent `fiat-sent`.
+    let stored = db::upsert_open_declaration(
         pool,
         order.id,
         &declaration.payment_hash,
         Timestamp::now().as_secs() as i64,
     )
     .await?;
+    if !stored {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
 
     let payload = Some(Payload::PayerDeclaration(declaration));
     enqueue_order_msg(

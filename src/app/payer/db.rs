@@ -123,7 +123,8 @@ fn to_u32(n: i64) -> u32 {
 /// Counters for `(user_pubkey, payment_hash)`; all zero when there is no
 /// history. A row whose `policy_gen` is stale counts toward
 /// `distinct_counterparties` but never toward `experienced_counterparties`,
-/// so a count is always evaluated under the advertised thresholds (§10.7).
+/// so a count is always evaluated under the advertised thresholds (§10.7);
+/// one marked [`UNRESOLVED_POLICY_GENERATION`] counts toward neither.
 pub async fn load_history(
     pool: &Pool<Sqlite>,
     user_pubkey: &str,
@@ -134,7 +135,8 @@ pub async fn load_history(
     let row = sqlx::query(
         "SELECT h.successful_trades, h.first_success_at, h.last_success_at, \
                 (SELECT COUNT(*) FROM payer_history_counterparties c \
-                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash) \
+                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash \
+                    AND c.policy_gen <> ?3) \
                   AS distinct_cp, \
                 (SELECT COUNT(*) FROM payer_history_counterparties c \
                   WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash \
@@ -146,6 +148,7 @@ pub async fn load_history(
     )
     .bind(user_pubkey)
     .bind(payment_hash)
+    .bind(UNRESOLVED_POLICY_GENERATION)
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
@@ -333,6 +336,13 @@ pub async fn store_experience_policy(
     .map_err(db_err)
 }
 
+/// Generation the recompute stamps on a snapshot whose `counterparty_id`
+/// resolves to no seller under the current node key. Such a row cannot be
+/// matched to the seller again (a later trade with that seller gets a new
+/// id), so it leaves the distinct count too, instead of counting the same
+/// seller twice. Its trades still count in `successful_trades`.
+pub const UNRESOLVED_POLICY_GENERATION: i64 = -1;
+
 /// Generation stamped on a snapshot evaluated under thresholds the stored
 /// policy does not hold yet. Real generations start at 1, so such a row
 /// never counts as experienced until the recompute (§10.7) re-evaluates it.
@@ -383,8 +393,9 @@ pub struct RecomputeOutcome {
     /// Rows whose `experienced` flag changed.
     pub changed: u64,
     /// Rows whose `counterparty_id` maps to no seller in `orders` (node key
-    /// rotated, imported database). They keep their old value and old
-    /// generation, which keeps them out of every experienced count.
+    /// rotated, imported database). They keep their value and are stamped
+    /// [`UNRESOLVED_POLICY_GENERATION`], which keeps them out of both the
+    /// experienced and the distinct counts.
     pub unresolved: u64,
 }
 
@@ -438,6 +449,17 @@ pub async fn recompute_experienced(
         let at: i64 = row.get("last_success_at");
         let old = row.get::<i64, _>("experienced") == 1;
         let Some(seller) = by_id.get(&cp) else {
+            sqlx::query(
+                "UPDATE payer_history_counterparties SET policy_gen = ?1 \
+                  WHERE user_pubkey = ?2 AND payment_hash = ?3 AND counterparty_id = ?4",
+            )
+            .bind(UNRESOLVED_POLICY_GENERATION)
+            .bind(&user)
+            .bind(&hash)
+            .bind(&cp)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
             outcome.unresolved += 1;
             continue;
         };

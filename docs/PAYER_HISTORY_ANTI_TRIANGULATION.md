@@ -833,14 +833,16 @@ ALTER TABLE orders ADD COLUMN success_at integer;
 ```
 
 Notes
-- `distinct_counterparties` is `COUNT(*)` on the counterparty table and
+- `distinct_counterparties` is `COUNT(*) WHERE policy_gen <> -1` on the
+  counterparty table (`-1` marks a row §10.7 could not resolve) and
   `experienced_counterparties` is
   `COUNT(*) WHERE experienced = 1 AND policy_gen = <current generation>`; not
   denormalised (the counterparty write is an upsert keyed by the triple, so
   both counts are exact).
 - **`policy_gen` is what makes the advertised policy honest.** A row whose
-  generation is stale — one §10.7 could not re-evaluate — is still counted in
-  `distinct_counterparties` but **never** in `experienced_counterparties`. So a
+  generation is stale is still counted in `distinct_counterparties` but
+  **never** in `experienced_counterparties`; a row §10.7 could not resolve
+  (generation `-1`) is counted in neither. So a
   seller reading the info-event tags (§8.3) is never shown a count that mixes
   old-policy and new-policy values: an unresolvable row degrades the count
   downwards (less trust), which is the conservative direction this document
@@ -1431,13 +1433,15 @@ if Settings::is_payer_history_enabled() {
    way — including the rows whose value did not change, so that "resolved" and
    "current generation" stay the same set.
 4. A row whose `counterparty_id` is **not** in the map (a rotated node key, an
-   imported database) cannot be re-evaluated. It is left with its old
-   `experienced` value **and its old `policy_gen`**, which is what keeps it out
-   of every count taken under the new policy (§9): `load_history` counts
-   `experienced = 1 AND policy_gen = <current>`, so a stale row contributes to
-   `distinct_counterparties` and never to `experienced_counterparties`. The
-   count a seller sees is therefore always evaluated under exactly the
-   thresholds the info event advertises — a stale row can only understate it.
+   imported database) cannot be re-evaluated. It keeps its `experienced` value
+   and is stamped `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), which
+   keeps it out of every count taken under the new policy (§9): not in
+   `experienced_counterparties`, and not in `distinct_counterparties` either,
+   because a later trade with the same seller hashes to a new id under the new
+   key and would otherwise count that seller twice. Its trades still count in
+   `successful_trades`. The count a seller sees is therefore always evaluated
+   under exactly the thresholds the info event advertises — an unresolvable
+   row can only understate it.
    The pass logs the number of unresolvable rows at `warn` (never their
    contents), because on a healthy node that number is zero and anything else
    means the node key changed under a populated database.

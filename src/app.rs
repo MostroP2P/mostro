@@ -264,6 +264,9 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
+        Action::ImportReputation => reputation::import::import_reputation_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -637,6 +640,10 @@ async fn dispatch_cashu(
     match action {
         // Escrow-independent, read-only / session actions — safe in Cashu mode.
         Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Reputation import touches no escrow either.
+        Action::ImportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -1732,6 +1739,48 @@ mod tests {
                 result.is_ok(),
                 "RestoreSession must route to the no-LN handler, got {result:?}"
             );
+        }
+
+        /// `import-reputation` reaches its handler on both routers. With import
+        /// enabled and no payload the handler answers `InvalidPayload`, which
+        /// neither the default arm (`Ok`) nor the Cashu block
+        /// (`InvalidAction`) produces.
+        #[tokio::test]
+        async fn routes_import_reputation_to_its_handler_in_both_modes() {
+            use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+            use crate::config::types::ReputationImportSettings;
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            let mut settings = test_settings();
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled: true,
+                ..Default::default()
+            });
+            let ctx = TestContextBuilder::new()
+                .with_pool(std::sync::Arc::new(pool))
+                .with_settings(settings)
+                .build();
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+            let action = Action::ImportReputation;
+            let msg = create_test_message(action.clone(), None);
+            let invalid_payload = |result: Result<()>| {
+                matches!(
+                    result,
+                    Err(e) if e.downcast_ref::<MostroError>()
+                        == Some(&MostroError::MostroCantDo(CantDoReason::InvalidPayload))
+                )
+            };
+            assert!(invalid_payload(
+                handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx).await
+            ));
+            assert!(invalid_payload(
+                dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await
+            ));
         }
     }
 

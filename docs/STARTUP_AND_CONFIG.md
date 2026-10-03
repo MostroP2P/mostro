@@ -159,6 +159,11 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `picture` (Option\<String\>): URL to avatar image, recommended square max 128x128px (default: None)
 - `website` (Option\<String\>): Operator website URL (default: None)
 
+**Reputation import** (`[reputation_import]`, optional; absent ≡ disabled). Lets users bring reputation earned elsewhere by importing an attestation signed by a trusted issuer (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md)):
+- `enabled` (bool): Master switch. While enabled, the info event carries a `reputation_import_issuers` tag listing every trusted key (default: false)
+- `max_lifetime_seconds` (u64): Longest an attestation may live, `expiration - created_at`; caps a faulty or compromised issuer. Must be > 0 (default: 604800, 7 days)
+- `issuers` (list of `[[reputation_import.issuers]]`): The trust list. Each entry has a `name`, the stable key imports are deduplicated on (never rename one), and `keys`, the issuer's signing keys as npub or hex. To follow a key rotation, add the new key to the same entry and remove the old one once its attestations have expired. Names must be unique and a key belongs to one entry only; a violation, an empty entry or a key that does not parse stops the load, even while the section is disabled
+
 **RPC** (`src/config/types.rs:55-74`):
 - `enabled` (bool): Enable RPC server (Rust Default: false)
 - `listen_address` (String): Bind address (Rust Default: "127.0.0.1")

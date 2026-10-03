@@ -617,7 +617,9 @@ Summary of the contract:
    method, each field normalised as:
    - Unicode NFKC, then uppercase;
    - strip all whitespace, hyphens, dots and slashes from *identifier* fields
-     (IBAN, CBU/CVU, PIX key, account number, tax id);
+     (IBAN, CBU/CVU, non-e-mail PIX keys, account number, tax id);
+   - strip only whitespace from *e-mail* fields (e-mail PIX keys): dots and
+     hyphens are part of the address;
    - collapse runs of whitespace to one space in *name* fields, trim;
    - country codes ISO-3166 alpha-2, currency ISO-4217.
 2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`,
@@ -1550,7 +1552,9 @@ MVP (the Cashu release path does not exist yet); see §13.
   the order id. The `(user, hash)` pair is resolved server-side from the
   order. A seller cannot ask about a hash the buyer did not commit to this
   order, nor about a user who is not their counterparty in this order.
-- Repeating the query returns the same numbers; it leaks nothing further.
+- Repeating the query only returns a fresher snapshot of the same buyer and
+  hash (another success of that pair, or a restart with new thresholds, can
+  change it); it leaks nothing about anyone else.
 - The seller already possesses the plaintext (the buyer sent it); learning
   its hash is not new information.
 - The seller cannot distinguish "buyer B used account X before" from "some
@@ -1602,9 +1606,15 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
    hard-code them.
 4. Never auto-release; never auto-refuse. The release screen shows both blocks
    above `[Release]` / `[Dispute]` (gist §22).
-5. If no `payment-history` arrived by the time fiat is reported sent and the
-   node has the feature enabled, show *"Buyer did not declare a payment
-   sender"* as its own warning.
+5. The push is a separate message that can arrive late or not at all (a
+   relay can drop it; Mostro skips it when it cannot build the history). If
+   it has not arrived once fiat is reported sent, send the `payment-history`
+   query, and show *"Buyer did not declare a payment sender"* as its own
+   warning only when that query answers `not_found` while the order is still
+   `fiat-sent`.
+6. Operators must not set `require_declaration` while accepting payment
+   methods that have no canonical form (cash, gift cards): a buyer paying that
+   way could never report fiat as sent.
 
 **Suggested tiers** (client policy, not protocol):
 

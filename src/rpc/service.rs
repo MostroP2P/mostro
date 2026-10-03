@@ -11,9 +11,10 @@ use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
     CancelOrderResponse, DrainCounters, GetMaintenanceStatusRequest, GetMaintenanceStatusResponse,
-    RevokeReputationImportsRequest, RevokeReputationImportsResponse, SetMaintenanceModeRequest,
-    SetMaintenanceModeResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
-    TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
+    RebindReputationExportRequest, RebindReputationExportResponse, RevokeReputationImportsRequest,
+    RevokeReputationImportsResponse, SetMaintenanceModeRequest, SetMaintenanceModeResponse,
+    SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest, TakeDisputeResponse,
+    ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::transport::UnwrappedMessage;
@@ -588,6 +589,70 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
+    async fn rebind_reputation_export(
+        &self,
+        request: Request<RebindReputationExportRequest>,
+    ) -> Result<Response<RebindReputationExportResponse>, Status> {
+        let ip = Self::require_loopback(&request)?;
+        self.require_auth(&request, "RebindReputationExport")?;
+        let req = request.into_inner();
+        info!(
+            "Received RebindReputationExport from {ip}, request_id: {:?}",
+            req.request_id
+        );
+        let failure = |message: String| {
+            Ok(Response::new(RebindReputationExportResponse {
+                success: false,
+                error_message: Some(message),
+                previous_identity: None,
+            }))
+        };
+        let parse = |key: &str| nostr_sdk::prelude::PublicKey::parse(key.trim()).ok();
+        let (Some(identity), Some(new_identity)) = (parse(&req.identity), parse(&req.new_identity))
+        else {
+            return failure("identity and new_identity must be npub or hex keys".to_string());
+        };
+        if req.reason.trim().is_empty() {
+            return failure("a reason is required".to_string());
+        }
+        let user = match crate::db::is_user_present(&self.pool, identity.to_hex()).await {
+            Ok(user) => user,
+            Err(_) => return failure(format!("no account for {}", identity.to_hex())),
+        };
+        let previous = user.reputation_exported_to.clone();
+        let today =
+            mostro_core::user::day_truncate(nostr_sdk::prelude::Timestamp::now().as_secs() as i64);
+        match crate::db::move_reputation_binding(
+            &self.pool,
+            &user.pubkey,
+            previous.as_deref(),
+            &new_identity.to_hex(),
+            today as i64,
+        )
+        .await
+        {
+            Ok(true) => {
+                warn!(
+                    "reputation: admin rebound the export of {} from {} to {}: {}",
+                    user.pubkey,
+                    previous.as_deref().unwrap_or("none"),
+                    new_identity.to_hex(),
+                    req.reason.trim()
+                );
+                Ok(Response::new(RebindReputationExportResponse {
+                    success: true,
+                    error_message: None,
+                    previous_identity: previous,
+                }))
+            }
+            Ok(false) => failure("the binding changed meanwhile; try again".to_string()),
+            Err(e) => {
+                error!("RebindReputationExport failed: {e}");
+                failure(e.to_string())
+            }
+        }
+    }
+
     async fn get_maintenance_status(
         &self,
         request: Request<GetMaintenanceStatusRequest>,
@@ -1135,6 +1200,93 @@ mod tests {
             (user.min_rating, user.max_rating, user.last_rating),
             (0, 0, 0)
         );
+    }
+
+    fn rebind_req(
+        identity: &str,
+        new_identity: &str,
+        reason: &str,
+    ) -> RebindReputationExportRequest {
+        RebindReputationExportRequest {
+            identity: identity.to_string(),
+            new_identity: new_identity.to_string(),
+            reason: reason.to_string(),
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_reputation_export_needs_loopback_the_token_and_a_reason() {
+        let service = with_token(offline_service().await, "s3cret");
+        let (a, b) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        assert_eq!(
+            service
+                .rebind_reputation_export(Request::new(rebind_req(&a, &b, "lost phone")))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            service
+                .rebind_reputation_export(request_with_addr(rebind_req(&a, &b, "lost phone"), 1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let no_reason = service
+            .rebind_reputation_export(bearer(
+                request_with_addr(rebind_req(&a, &b, " "), 1),
+                "s3cret",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!no_reason.success);
+        assert!(no_reason.error_message.unwrap().contains("reason"));
+    }
+
+    #[tokio::test]
+    async fn rebind_reputation_export_moves_the_binding_and_reports_the_old_one() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let (old, new) = (Keys::generate().public_key(), Keys::generate().public_key());
+        sqlx::query(
+            "INSERT INTO users (pubkey, created_at, reputation_exported_to) VALUES (?1, 1700000000, ?2)",
+        )
+        .bind(&identity)
+        .bind(old.to_hex())
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        let done = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new.to_hex(), "support ticket 7"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(done.success);
+        assert_eq!(done.previous_identity, Some(old.to_hex()));
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!(user.reputation_exported_to, Some(new.to_hex()));
+
+        let unknown = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&Keys::generate().public_key().to_hex(), &new.to_hex(), "x"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!unknown.success);
     }
 
     #[test]

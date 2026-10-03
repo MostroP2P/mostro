@@ -613,13 +613,45 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
 pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
-    build_info_tags(
+    let mut tags = build_info_tags(
         Settings::get_mostro(),
         Settings::get_ln(),
         Settings::get_bond(),
         ln_status,
         maintenance,
     )
+    .to_vec();
+    tags.extend(payer_history_tags(Settings::get_payer_history()));
+    Tags::from_list(tags)
+}
+
+/// Payer-history policy tags of the info event
+/// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md` §8.3). Emitted only when the
+/// feature is enabled; a node that does not run it keeps its info event
+/// unchanged, and clients read a missing `payer_history_enabled` as off.
+/// The thresholds let clients explain `experienced_counterparties` without
+/// hard-coding node policy (D-7).
+fn payer_history_tags(
+    cfg: Option<&crate::config::payer_history::PayerHistorySettings>,
+) -> Vec<Tag> {
+    let Some(cfg) = cfg.filter(|c| c.enabled) else {
+        return Vec::new();
+    };
+    vec![
+        Tag::custom("payer_history_enabled", vec!["true".to_string()]),
+        Tag::custom(
+            "payer_declaration_required",
+            vec![cfg.require_declaration.to_string()],
+        ),
+        Tag::custom(
+            "payer_history_experienced_min_trades",
+            vec![cfg.experienced_min_trades.to_string()],
+        ),
+        Tag::custom(
+            "payer_history_experienced_min_days",
+            vec![cfg.experienced_min_days.to_string()],
+        ),
+    ]
 }
 
 /// Body of [`info_to_tags`] with the settings passed in, so unit tests can
@@ -2136,5 +2168,48 @@ mod tests {
 
         assert_eq!(emit_p, emit_w);
         assert_eq!(status_p, status_w);
+    }
+
+    #[test]
+    fn payer_history_tags_are_absent_unless_enabled() {
+        use crate::config::payer_history::PayerHistorySettings;
+
+        // D-10: an absent or disabled section emits nothing, so the info
+        // event of a node that does not run the feature is unchanged.
+        assert!(super::payer_history_tags(None).is_empty());
+        let off = PayerHistorySettings {
+            require_declaration: true,
+            ..Default::default()
+        };
+        assert!(super::payer_history_tags(Some(&off)).is_empty());
+
+        let on = PayerHistorySettings {
+            enabled: true,
+            require_declaration: false,
+            experienced_min_trades: 7,
+            experienced_min_days: 45,
+        };
+        let tags: Vec<Vec<String>> = super::payer_history_tags(Some(&on))
+            .into_iter()
+            .map(|t| t.to_vec())
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                vec!["payer_history_enabled".to_string(), "true".to_string()],
+                vec![
+                    "payer_declaration_required".to_string(),
+                    "false".to_string()
+                ],
+                vec![
+                    "payer_history_experienced_min_trades".to_string(),
+                    "7".to_string()
+                ],
+                vec![
+                    "payer_history_experienced_min_days".to_string(),
+                    "45".to_string()
+                ],
+            ]
+        );
     }
 }

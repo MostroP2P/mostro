@@ -513,6 +513,12 @@ reused for everything else: `invalid_action` (feature off), `not_found` (order),
 `invalid_pubkey` (not the buyer), `invalid_peer` (not the seller),
 `not_allowed_by_status`, `invalid_payload`.
 
+In practice `invalid_payload` is unreachable for `declare-payer`:
+`MessageKind::verify()` (§6.4) already requires a `PayerDeclaration`
+payload, and the daemon drops a message that fails `verify()` without a
+reply. The handler keeps the check as a second line of defence. The
+`trade_index` field is not used by these actions; clients send `null`.
+
 ### 6.4 `MessageKind::verify()` matrix (`MessageKind::verify()` in `$CORE/src/message.rs`)
 
 The match is exhaustive on `Action`; add:
@@ -529,7 +535,7 @@ Buyer → Mostro:
 
 ```json
 [
-  {"order": {"version": 2, "request_id": 981231, "trade_index": 7,
+  {"order": {"version": 2, "request_id": 981231, "trade_index": null,
              "id": "4f1c…", "action": "declare-payer",
              "payload": {"payer_declaration": {
                "payment_hash": "9b0e…c1"}}}},

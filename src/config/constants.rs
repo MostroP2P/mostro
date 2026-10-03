@@ -36,3 +36,16 @@ pub const ENV_FILENAME: &str = ".env";
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_fee_address_is_self_hosted() {
+        // The previous custodial address was suspended by its custodian
+        // without notice (#1037); dev fees must go to the self-custodial
+        // address on a domain the project controls.
+        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@pay.mostro.foundation");
+    }
+}

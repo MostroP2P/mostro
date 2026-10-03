@@ -367,6 +367,31 @@ async fn stale_generation_rows_are_overwritten_and_not_counted() {
 }
 
 #[tokio::test]
+async fn out_of_order_successes_keep_the_timestamp_extrema() {
+    // A success stamped earlier can commit after a later one.
+    let pool = pool().await;
+    let generation = seed_policy(&pool, 5, 30).await;
+    let (user, h) = (key(), hash('4'));
+    bump(&pool, &user, &h, "cp", false, generation, 200).await;
+    bump(&pool, &user, &h, "cp", false, generation, 100).await;
+
+    let got = load_history(&pool, &user, &h).await.unwrap();
+    assert_eq!(
+        (got.first_success_at, got.last_success_at),
+        (Some(100), Some(200))
+    );
+    let cp: (i64, i64) = sqlx::query_as(
+        "SELECT first_success_at, last_success_at FROM payer_history_counterparties \
+          WHERE user_pubkey = ?1",
+    )
+    .bind(&user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cp, (100, 200));
+}
+
+#[tokio::test]
 async fn bump_history_rejects_a_malformed_hash() {
     let pool = pool().await;
     let mut conn = pool.acquire().await.unwrap();

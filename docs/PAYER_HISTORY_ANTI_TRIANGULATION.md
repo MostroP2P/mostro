@@ -1454,9 +1454,14 @@ if Settings::is_payer_history_enabled() {
    The pass logs the number of unresolvable rows at `warn` (never their
    contents), because on a healthy node that number is zero and anything else
    means the node key changed under a populated database.
-5. Such a row is not stranded forever: the next success with the same triple
-   re-evaluates it under the live policy and the `bump_history` upsert
-   overwrites both columns (§10.1), returning it to the current generation.
+5. Such a row is not repaired by later trades: under the new key the same
+   seller hashes to a different `counterparty_id`, so its next success with
+   this buyer and hash creates a new row, which counts normally, and the old
+   row stays at `-1`. Only if the node returns to the old secret does a later
+   recompute resolve it again. (A row that is merely *stale*, left at an old
+   generation with its id still resolvable, is repaired by the next success
+   with the same triple: the `bump_history` upsert overwrites both columns,
+   §10.1.)
 
 Properties this gives:
 
@@ -1681,8 +1686,8 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
   thresholds into a count advertised under the new ones, and a later trade
   with the same seller under the new key must not count that seller twice.
   Its trades still count in `successful_trades`.
-- a later success with that same triple re-stamps the row to the current
-  generation, and it starts counting again.
+- a later success with the same seller under the new key creates a new
+  counterparty row that counts once, while the `-1` row stays excluded.
 - `as_of` correctness: a seller trade that reached `Success` **after** the
   snapshot's `last_success_at` does not count toward that snapshot, even though
   its current `status` is `'success'` — the recomputed flag must not depend on

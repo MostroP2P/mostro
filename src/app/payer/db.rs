@@ -316,9 +316,17 @@ pub async fn store_experience_policy(
     .map_err(db_err)
 }
 
+/// Generation stamped on a snapshot evaluated under thresholds the stored
+/// policy does not hold yet. Real generations start at 1, so such a row
+/// never counts as experienced until the recompute (§10.7) re-evaluates it.
+pub const UNRECOMPUTED_POLICY_GENERATION: i64 = 0;
+
 /// Generation to stamp into a snapshot taken right now (§10.5). Seeds the
 /// policy row with `thresholds` on first use, so the success path never
-/// races the boot-time recompute.
+/// races the boot-time recompute. When the stored policy holds other
+/// thresholds (they changed and the recompute has not run), returns
+/// [`UNRECOMPUTED_POLICY_GENERATION`] instead of mixing the two policies
+/// under one generation.
 pub async fn current_policy_generation(
     conn: &mut SqliteConnection,
     thresholds: (u32, u32),
@@ -339,10 +347,17 @@ pub async fn current_policy_generation(
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
-    sqlx::query_scalar::<_, i64>("SELECT generation FROM payer_history_policy WHERE id = 1")
-        .fetch_one(conn)
-        .await
-        .map_err(db_err)
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CASE WHEN experienced_min_trades = ?1 AND experienced_min_days = ?2 \
+                     THEN generation ELSE ?3 END \
+         FROM payer_history_policy WHERE id = 1",
+    )
+    .bind(i64::from(thresholds.0))
+    .bind(i64::from(thresholds.1))
+    .bind(UNRECOMPUTED_POLICY_GENERATION)
+    .fetch_one(conn)
+    .await
+    .map_err(db_err)
 }
 
 /// Outcome of [`recompute_experienced`].

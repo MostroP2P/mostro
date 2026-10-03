@@ -936,7 +936,10 @@ pub async fn store_experience_policy(conn: &mut SqliteConnection, min_trades: u3
     -> Result<i64, MostroError>;
 /// Generation to stamp into snapshots taken right now (§10.5). Seeds the
 /// policy row from the live config on first use so the success path never
-/// races the boot-time recompute.
+/// races the boot-time recompute. If the stored policy holds other
+/// thresholds (changed, not yet recomputed), returns
+/// `UNRECOMPUTED_POLICY_GENERATION` (0, never a real generation), so the
+/// snapshot stays out of every experienced count until §10.7 re-evaluates it.
 pub async fn current_policy_generation(conn: &mut SqliteConnection, thresholds: (u32, u32), now: i64)
     -> Result<i64, MostroError>;
 /// Recompute the whole `experienced` column under `(min_trades, min_days)`.

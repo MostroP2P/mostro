@@ -15,6 +15,9 @@
 
 pub mod db;
 pub mod declare;
+pub mod history;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use mostro_core::error::{CantDoReason, MostroError, MostroError::MostroCantDo};

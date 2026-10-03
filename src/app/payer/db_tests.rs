@@ -197,6 +197,37 @@ async fn a_declaration_belongs_to_the_buyer_who_made_it() {
 }
 
 #[tokio::test]
+async fn a_take_rolled_back_to_pending_voids_the_declaration() {
+    // Even when the same trade key takes the order again, a new take starts
+    // with no declaration.
+    let pool = pool().await;
+    let (seller, buyer) = (key(), key());
+    let mut taken = Trade::success(&seller, &buyer, NOW);
+    taken.status = Status::WaitingBuyerInvoice;
+    let order_id = insert(&pool, taken).await;
+    upsert_declaration(&pool, order_id, &hash('a'), NOW)
+        .await
+        .unwrap();
+
+    assert!(
+        crate::db::update_order_to_initial_state(&pool, order_id, 21_000, 0, 0)
+            .await
+            .unwrap()
+    );
+
+    sqlx::query("UPDATE orders SET buyer_pubkey = ?1 WHERE id = ?2")
+        .bind(&buyer)
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        find_declaration(&pool, order_id).await.unwrap().is_none(),
+        "the same buyer retaking the order does not inherit it"
+    );
+}
+
+#[tokio::test]
 async fn prune_removes_terminal_declarations_and_keeps_active_ones() {
     let pool = pool().await;
     let (seller, buyer) = (key(), key());

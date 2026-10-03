@@ -1504,11 +1504,6 @@ async fn job_update_bitcoin_prices() {
     });
 }
 
-/// Processes unpaid development fees for completed orders.
-///
-/// Spawns a background task that runs [`run_dev_fee_cycle`] every 60 seconds.
-/// All state-machine logic lives in [`crate::app::dev_fee`].
-#[mutants::skip]
 /// Cadence of [`job_prune_payer_declarations`], in seconds.
 const PAYER_DECLARATION_PRUNE_INTERVAL_SECS: u64 = 60;
 
@@ -1519,6 +1514,7 @@ const PAYER_DECLARATION_PRUNE_INTERVAL_SECS: u64 = 60;
 /// declarations of trades that succeeded after the operator turned it off.
 /// The query is driven by the (usually empty) declarations table and never
 /// scans `orders`, so a node that never enabled the feature pays nothing.
+#[mutants::skip]
 async fn job_prune_payer_declarations(ctx: AppContext) {
     tokio::spawn(async move {
         let pool = ctx.pool();
@@ -1536,6 +1532,11 @@ async fn job_prune_payer_declarations(ctx: AppContext) {
     });
 }
 
+/// Processes unpaid development fees for completed orders.
+///
+/// Spawns a background task that runs [`run_dev_fee_cycle`] every 60 seconds.
+/// All state-machine logic lives in [`crate::app::dev_fee`].
+#[mutants::skip]
 async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
 

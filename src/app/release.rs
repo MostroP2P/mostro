@@ -1348,15 +1348,23 @@ async fn payment_success_with_payer_history(
     let thresholds =
         PayerHistorySettings::experience_thresholds(ctx.settings().payer_history.as_ref());
     // A failure drops `tx`, rolling the transition back: the order stays
-    // settled-hold-invoice and the declaration stays retryable.
-    payer::success::record_payer_success(
+    // settled-hold-invoice and the declaration stays retryable. Logged at
+    // `error`: while it lasts the paid order cannot finalize.
+    if let Err(e) = payer::success::record_payer_success(
         &mut tx,
         my_keys,
         &order_updated,
         thresholds,
         Timestamp::now().as_secs() as i64,
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            "Order {}: payer history write failed, Success rolled back and left for retry: {e}",
+            order_updated.id
+        );
+        return Err(e.into());
+    }
 
     // From the commit on the DB is the truth and the relays are behind, so
     // queue the order for the orderbook reconciler BEFORE committing: it then

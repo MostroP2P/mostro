@@ -59,6 +59,8 @@ async fn notified(order_id: uuid::Uuid) -> (bool, bool) {
 async fn feature_off_still_stamps_success_at_and_writes_no_payer_rows() {
     // D-10, item 2: the stamp is unconditional; everything else is gated.
     init_global_config();
+    // Reaches the publish path, which writes the global republish queue.
+    let _queue = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
     let pool = create_test_pool().await;
     let ctx = ctx_with(&pool, None);
     let parties = Parties::reputation();
@@ -155,6 +157,8 @@ async fn a_failing_history_write_leaves_no_visible_success() {
 #[tokio::test]
 async fn an_already_finalized_order_records_nothing_and_keeps_its_stamp() {
     init_global_config();
+    // Reaches the publish path, which writes the global republish queue.
+    let _queue = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
     let pool = create_test_pool().await;
     let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
     let parties = Parties::reputation();
@@ -176,11 +180,18 @@ async fn an_already_finalized_order_records_nothing_and_keeps_its_stamp() {
     assert_eq!(success_at(&pool, order.id).await, Some(123));
     assert_eq!(payer_rows(&pool).await, 0);
     assert_eq!(notified(order.id).await, (false, false));
+    assert_eq!(
+        orderbook_publish_attempts(order.id),
+        None,
+        "nothing published or armed"
+    );
 }
 
 #[tokio::test]
 async fn a_second_finalization_does_not_move_the_stamp() {
     init_global_config();
+    // Reaches the publish path, which writes the global republish queue.
+    let _queue = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
     for payer_history in [None, Some(payer_settings(true, false))] {
         let pool = create_test_pool().await;
         let ctx = ctx_with(&pool, payer_history);

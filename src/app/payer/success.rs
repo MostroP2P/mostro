@@ -347,4 +347,22 @@ mod tests {
             "MAX never flips back"
         );
     }
+
+    #[tokio::test]
+    async fn without_a_seller_identity_key_the_trade_key_identifies_the_counterparty() {
+        let pool = create_test_pool().await;
+        let node = Keys::generate();
+        let parties = Parties::reputation();
+        let mut order = finished_trade(&pool, parties, &hash('a')).await;
+        order.master_seller_pubkey = None;
+
+        record(&pool, &node, &order, NOW).await;
+
+        let cp: String =
+            sqlx::query_scalar("SELECT counterparty_id FROM payer_history_counterparties")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cp, counterparty_id(&node, &parties.seller.to_string()));
+    }
 }

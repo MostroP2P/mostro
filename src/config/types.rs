@@ -5,7 +5,7 @@ use crate::config::constants::{
 };
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::PublicKey;
+use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
 
 /// Scope of the anti-abuse bond enforcement.
@@ -318,6 +318,53 @@ impl ReputationImportSettings {
             .iter()
             .flat_map(ReputationIssuer::public_keys)
             .collect()
+    }
+}
+
+/// Reputation export (docs/REPUTATION_PORTABILITY.md, phase 4): this node
+/// issues attestations of the reputation its users earned here. Opt-in; an
+/// absent section or `enabled = false` means the node issues nothing and
+/// does not advertise `reputation_issuer`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ReputationExportSettings {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable holding the issuer's secret key (nsec or hex).
+    /// A key dedicated to issuance, never the node's own key, so either can
+    /// be rotated without the other; read at startup like
+    /// `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`.
+    #[serde(default = "default_reputation_issuer_key_env")]
+    pub issuer_key_env: String,
+    /// Lifetime of an attestation this node signs, in seconds. Destinations
+    /// cap it, 7 days by default, so keep it at or below that.
+    #[serde(default = "default_reputation_max_lifetime_seconds")]
+    pub lifetime_seconds: u64,
+    /// The issuer keys, loaded from `issuer_key_env` at startup. Never read
+    /// from or written to `settings.toml`.
+    #[serde(skip)]
+    pub issuer_keys: Option<Keys>,
+}
+
+fn default_reputation_issuer_key_env() -> String {
+    "MOSTRO_REPUTATION_ISSUER_SK".to_string()
+}
+
+impl Default for ReputationExportSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer_key_env: default_reputation_issuer_key_env(),
+            lifetime_seconds: default_reputation_max_lifetime_seconds(),
+            issuer_keys: None,
+        }
+    }
+}
+
+impl ReputationExportSettings {
+    /// The key this node signs attestations with, once loaded.
+    pub fn issuer_key(&self) -> Option<PublicKey> {
+        self.issuer_keys.as_ref().map(Keys::public_key)
     }
 }
 

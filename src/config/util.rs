@@ -96,7 +96,30 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
     if let Some(import) = settings.reputation_import.as_ref() {
         validate_reputation_import(import)?;
     }
+    if let Some(export) = settings.reputation_export.as_ref() {
+        validate_reputation_export(export)?;
+    }
 
+    Ok(())
+}
+
+/// `[reputation_export]`: a positive lifetime and an environment variable
+/// name. The key itself is loaded and checked when the settings are
+/// initialised (`attach_reputation_issuer_keys`).
+fn validate_reputation_export(
+    export: &crate::config::types::ReputationExportSettings,
+) -> Result<(), MostroError> {
+    let fail = |reason: &str| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_export] {reason}"
+        ))))
+    };
+    if export.lifetime_seconds == 0 {
+        return fail("lifetime_seconds must be greater than 0");
+    }
+    if export.issuer_key_env.trim().is_empty() {
+        return fail("issuer_key_env must name an environment variable");
+    }
     Ok(())
 }
 
@@ -361,6 +384,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            reputation_export: None,
         }
     }
 
@@ -586,6 +610,22 @@ mod reputation_import_validation_tests {
     }
 
     #[test]
+    fn the_export_section_needs_a_lifetime_and_a_variable_name() {
+        use crate::config::types::ReputationExportSettings;
+        assert!(validate_reputation_export(&ReputationExportSettings::default()).is_ok());
+        let zero = ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&zero)).contains("lifetime_seconds"));
+        let unnamed = ReputationExportSettings {
+            issuer_key_env: " ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&unnamed)).contains("issuer_key_env"));
+    }
+
+    #[test]
     fn the_lifetime_cap_must_be_positive_even_while_disabled() {
         let settings = ReputationImportSettings {
             max_lifetime_seconds: 0,
@@ -766,6 +806,7 @@ mod startup_validation_tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            reputation_export: None,
         }
     }
 

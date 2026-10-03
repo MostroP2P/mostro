@@ -1061,6 +1061,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            reputation_export: None,
         });
     }
 

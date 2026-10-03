@@ -280,6 +280,30 @@ port = 50051
 # # Past it the unpublished order expires and the maker is told. Must be > 0.
 # maker_bond_payment_timeout_seconds = 900
 
+# Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
+# Opt-in, disabled by default. Mostro only ever stores a SHA-256 of the
+# buyer's canonicalised payer details, keyed by the buyer's identity key.
+#
+# [payer_history]
+# # Turning this off later keeps the stored history but stops reading and
+# # writing it; trades completed while it is off never enter it (docs D-10).
+# enabled = false
+# # When true, `fiat-sent` is rejected with `payer_not_declared` unless the
+# # buyer sent `declare-payer` first. Leave false unless your market relies
+# # on sender-verifiable rails only.
+# require_declaration = false
+# # "Experienced counterparty" thresholds (D-7): a seller qualifies for a
+# # buyer's history when, at the moment a trade with that buyer succeeds, it
+# # already had >= experienced_min_trades successful, undisputed trades with
+# # OTHER buyers ...
+# experienced_min_trades = 5
+# # ... and its first such trade was >= experienced_min_days days ago.
+# experienced_min_days = 30
+# # Changing either threshold re-evaluates EVERY stored snapshot under the new
+# # pair on the next restart (docs §10.7), so the advertised policy and the
+# # stored data never disagree. The change takes effect at restart, not on
+# # save.
+
 # Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
 # the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens
 # on the single mint configured below. Mutually exclusive with

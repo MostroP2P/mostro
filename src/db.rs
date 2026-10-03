@@ -25,7 +25,7 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 /// disputed order is still active (buyer, seller and the assigned solver keep
 /// messaging), so its trade keys must stay fast-pathed. See
 /// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
-const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
+pub(crate) const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 
 /// Exception carved out of both terminal-status filters: a closed order can
 /// still owe a bond payout to the winning counterparty, so it stays visible

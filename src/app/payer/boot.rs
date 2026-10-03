@@ -9,8 +9,9 @@ use sqlx::{Pool, Sqlite};
 
 /// Re-evaluate every stored `experienced` snapshot when the configured
 /// thresholds differ from the ones they were evaluated under (§10.7), or
-/// when the node key differs from the one their counterparty ids were
-/// resolved with: ids are keyed by the node secret, and only the recompute
+/// when the node secret differs from the one their counterparty ids were
+/// resolved with (compared through [`super::node_key_id`], since the public
+/// key cannot tell `s` from `n - s`): ids are keyed by the node secret, and only the recompute
 /// moves rows a new key cannot resolve out of the counted generation.
 ///
 /// Returns `None` when there was nothing to do: the feature is off (the
@@ -27,10 +28,10 @@ pub async fn sync_experience_policy(
         return Ok(None);
     }
     let (min_trades, min_days) = PayerHistorySettings::experience_thresholds(cfg);
-    let node_pubkey = node_keys.public_key().to_hex();
+    let node_key_id = super::node_key_id(node_keys);
     if let Some(policy) = db::load_experience_policy(pool).await? {
         if (policy.min_trades, policy.min_days) == (min_trades, min_days)
-            && policy.node_pubkey.as_deref() == Some(node_pubkey.as_str())
+            && policy.node_key_id.as_deref() == Some(node_key_id.as_str())
         {
             return Ok(None);
         }
@@ -169,7 +170,10 @@ mod tests {
         assert!(out.is_some(), "recomputed");
         let policy = load_experience_policy(&pool).await.unwrap().unwrap();
         assert_eq!(policy.generation, 2);
-        assert_eq!(policy.node_pubkey, Some(new_key.public_key().to_hex()));
+        assert_eq!(
+            policy.node_key_id,
+            Some(crate::app::payer::node_key_id(&new_key))
+        );
         assert_eq!(
             sync_experience_policy(&pool, &new_key, Some(&cfg), 30)
                 .await

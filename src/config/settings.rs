@@ -2,7 +2,7 @@ use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
-    LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    LightningSettings, MostroSettings, NostrSettings, ReputationImportSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
@@ -40,6 +40,10 @@ pub struct Settings {
     /// Phase 1's migration).
     #[serde(default)]
     pub price: Option<PriceSettings>,
+    /// Reputation import (docs/REPUTATION_PORTABILITY.md, phase 3). Absent
+    /// section ≡ disabled.
+    #[serde(default)]
+    pub reputation_import: Option<ReputationImportSettings>,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
@@ -121,6 +125,17 @@ impl Settings {
     /// configuration.
     pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
+    }
+
+    /// The reputation import settings, only when import is enabled. Like
+    /// [`Settings::get_bond`], never panics before the configuration is
+    /// initialised.
+    pub fn get_reputation_import() -> Option<&'static ReputationImportSettings> {
+        MOSTRO_CONFIG
+            .get()?
+            .reputation_import
+            .as_ref()
+            .filter(|import| import.enabled)
     }
 
     /// Wire transport for protocol messages. Falls back to the daemon

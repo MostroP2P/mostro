@@ -3284,6 +3284,7 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
         });
         let _ = &MOSTRO_CONFIG;
     }

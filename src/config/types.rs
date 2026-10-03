@@ -234,6 +234,84 @@ impl Default for CashuSettings {
     }
 }
 
+/// One issuer whose reputation attestations this node imports
+/// (docs/REPUTATION_PORTABILITY.md §5.3, "Issuer keys and rotation").
+///
+/// The node identifies the issuer by `name`, never by a key: the name is what
+/// it deduplicates imports on, so the issuer can rotate its key — the new key
+/// is added to the same entry — without reopening every account to a second
+/// import. Never rename an entry.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ReputationIssuer {
+    /// Stable local name of the issuer, e.g. `"lnp2pbot"`.
+    pub name: String,
+    /// The issuer's signing keys, npub or hex: its current key, and during a
+    /// planned rotation the previous one until its attestations expire.
+    pub keys: Vec<String>,
+}
+
+impl ReputationIssuer {
+    /// The entry's keys. Settings loading rejects a key that does not
+    /// parse, so none is dropped here.
+    pub fn public_keys(&self) -> Vec<PublicKey> {
+        self.keys
+            .iter()
+            .filter_map(|key| PublicKey::parse(key.trim()).ok())
+            .collect()
+    }
+}
+
+/// Reputation import (docs/REPUTATION_PORTABILITY.md, phase 3): which
+/// issuers' attestations this node accepts. Opt-in; an absent section or
+/// `enabled = false` means the node imports nothing and does not advertise
+/// `reputation_import_issuers`.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ReputationImportSettings {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Longest an attestation may live (`expiration - created_at`), in
+    /// seconds. Caps a faulty or compromised issuer. Must be > 0.
+    #[serde(default = "default_reputation_max_lifetime_seconds")]
+    pub max_lifetime_seconds: u64,
+    /// The trusted issuers. Names are unique, and a key belongs to one entry
+    /// only.
+    #[serde(default)]
+    pub issuers: Vec<ReputationIssuer>,
+}
+
+/// 7 days, the lifetime issuers give an attestation.
+fn default_reputation_max_lifetime_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+impl Default for ReputationImportSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lifetime_seconds: default_reputation_max_lifetime_seconds(),
+            issuers: Vec::new(),
+        }
+    }
+}
+
+impl ReputationImportSettings {
+    /// The trust-list entry a signing key belongs to.
+    pub fn issuer_for(&self, key: &PublicKey) -> Option<&ReputationIssuer> {
+        self.issuers
+            .iter()
+            .find(|issuer| issuer.public_keys().contains(key))
+    }
+
+    /// Every trusted key, across all entries, in configuration order.
+    pub fn trusted_keys(&self) -> Vec<PublicKey> {
+        self.issuers
+            .iter()
+            .flat_map(ReputationIssuer::public_keys)
+            .collect()
+    }
+}
+
 /// The node-wide escrow mode (locked decision §4.1: a node runs in exactly
 /// one mode, fixed in `settings.toml` — never per-order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1421,9 +1421,8 @@ if Settings::is_payer_history_enabled() {
 `recompute_experienced` runs in a single transaction:
 
 1. `store_experience_policy` bumps `generation` and records the new `(N, D)`.
-   Every row re-evaluated below is stamped with that new generation; rows that
-   keep an older one are, by construction, the rows this pass could not
-   re-evaluate.
+   Every row re-evaluated below is stamped with that new generation; the rows
+   this pass cannot re-evaluate are stamped `-1` instead (step 4).
 2. Build the `counterparty_id → master_seller_pubkey` map. The stored ids are
    keyed hashes (D-7) and cannot be inverted, so the map is built *forward*:
    scan the distinct `master_seller_pubkey` values in `orders` and hash each
@@ -1673,12 +1672,15 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
   failure mid-recompute leaves both the old policy row and the old column
   values, so the next boot retries.
 - a `counterparty_id` with no matching `master_seller_pubkey` in `orders`
-  (simulated key rotation) keeps BOTH its old `experienced` value and its old
-  `policy_gen`, is logged, and is not zeroed.
-- such a stale row is counted in `distinct_counterparties` but **not** in
-  `experienced_counterparties`, including the case where its stored value is
-  `1`: `load_history` must never mix a value evaluated under the old
-  thresholds into a count advertised under the new ones.
+  (simulated key rotation) keeps its `experienced` value, is stamped
+  `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), is logged, and is not
+  zeroed.
+- such an unresolved row is counted in **neither** `distinct_counterparties`
+  nor `experienced_counterparties`, including the case where its stored value
+  is `1`: `load_history` must never mix a value evaluated under the old
+  thresholds into a count advertised under the new ones, and a later trade
+  with the same seller under the new key must not count that seller twice.
+  Its trades still count in `successful_trades`.
 - a later success with that same triple re-stamps the row to the current
   generation, and it starts counting again.
 - `as_of` correctness: a seller trade that reached `Success` **after** the
@@ -1802,8 +1804,8 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
       no-op.
 - [ ] After a threshold change on a database holding a snapshot whose
       `counterparty_id` no longer resolves (node key rotated), that row keeps
-      its old value and old generation, is reported in the `warn` line, and is
-      excluded from `experienced_counterparties` while still counting toward
+      its value, is stamped `policy_gen = -1`, is reported in the `warn` line,
+      and is excluded from both `experienced_counterparties` and
       `distinct_counterparties`.
 - [ ] A full-privacy buyer yields `buyer_mode = full_privacy` and writes no
       history rows (DB asserted).

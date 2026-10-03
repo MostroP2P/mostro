@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   generation             integer NOT NULL,  -- bumped on every (N, D) change; stamped into policy_gen
   experienced_min_trades integer NOT NULL,
   experienced_min_days   integer NOT NULL,
-  evaluated_at           integer NOT NULL   -- unix secs of the last (re)evaluation
+  evaluated_at           integer NOT NULL,  -- unix secs of the last (re)evaluation
+  node_pubkey            text               -- node key the counterparty ids were checked under; NULL until the first recompute
 );
 
 -- D-7 qualification reads every undisputed success of one seller

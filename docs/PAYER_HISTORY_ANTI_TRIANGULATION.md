@@ -816,7 +816,8 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   generation             integer NOT NULL,  -- bumped on every (N, D) change; stamped into policy_gen
   experienced_min_trades integer NOT NULL,
   experienced_min_days   integer NOT NULL,
-  evaluated_at           integer NOT NULL   -- unix secs of the last (re)evaluation
+  evaluated_at           integer NOT NULL,  -- unix secs of the last (re)evaluation
+  node_pubkey            text               -- node key the counterparty ids were checked under; NULL until the first recompute
 );
 
 -- The ONE change to `orders`: an immutable "when did this order reach Success"
@@ -930,9 +931,11 @@ pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroE
 /// Threshold policy the stored `experienced` snapshots were evaluated under
 /// (D-7, §10.7). `None` when the feature has never run on this database.
 pub async fn load_experience_policy(pool) -> Result<Option<ExperiencePolicy>, MostroError>;
-pub struct ExperiencePolicy { pub generation: i64, pub min_trades: u32, pub min_days: u32 }
+pub struct ExperiencePolicy { pub generation: i64, pub min_trades: u32, pub min_days: u32,
+                              pub node_pubkey: Option<String> }
 /// Bumps `generation` and returns the new value.
-pub async fn store_experience_policy(conn: &mut SqliteConnection, min_trades: u32, min_days: u32, now: i64)
+pub async fn store_experience_policy(conn: &mut SqliteConnection, node_pubkey: &str,
+                                     min_trades: u32, min_days: u32, now: i64)
     -> Result<i64, MostroError>;
 /// Generation to stamp into snapshots taken right now (§10.5). Seeds the
 /// policy row from the live config on first use so the success path never

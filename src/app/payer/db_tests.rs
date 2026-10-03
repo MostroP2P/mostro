@@ -104,9 +104,14 @@ async fn experience(
         .unwrap()
 }
 
+/// Node key [`seed_policy`] records the policy under.
+const SEED_NODE: &str = "seed-node";
+
 async fn seed_policy(pool: &SqlitePool, n: u32, d: u32) -> i64 {
     let mut conn = pool.acquire().await.unwrap();
-    store_experience_policy(&mut conn, n, d, NOW).await.unwrap()
+    store_experience_policy(&mut conn, SEED_NODE, n, d, NOW)
+        .await
+        .unwrap()
 }
 
 async fn stored_flag(pool: &SqlitePool, user: &str) -> (i64, i64) {
@@ -463,8 +468,10 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
         Some(ExperiencePolicy {
             generation: 1,
             min_trades: 5,
-            min_days: 30
-        })
+            min_days: 30,
+            node_pubkey: None,
+        }),
+        "the success path seeds no node key"
     );
 
     assert_eq!(seed_policy(&pool, 3, 7).await, 2);
@@ -473,7 +480,8 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
         Some(ExperiencePolicy {
             generation: 2,
             min_trades: 3,
-            min_days: 7
+            min_days: 7,
+            node_pubkey: Some(SEED_NODE.to_string()),
         })
     );
 }
@@ -550,16 +558,17 @@ async fn seed_snapshot(
 #[tokio::test]
 async fn recompute_on_empty_database_seeds_the_policy() {
     let pool = pool().await;
-    let out = recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW)
+    let node = Keys::generate();
+    let out = recompute_experienced(&pool, &node, 5, 30, NOW)
         .await
         .unwrap();
     assert_eq!(out, RecomputeOutcome::default());
+    let policy = load_experience_policy(&pool).await.unwrap().unwrap();
+    assert_eq!(policy.generation, 1);
     assert_eq!(
-        load_experience_policy(&pool)
-            .await
-            .unwrap()
-            .map(|p| p.generation),
-        Some(1)
+        policy.node_pubkey,
+        Some(node.public_key().to_hex()),
+        "the recompute records the key it resolved ids with"
     );
 }
 
@@ -704,7 +713,8 @@ async fn recompute_rolls_back_with_the_policy_row() {
         Some(ExperiencePolicy {
             generation,
             min_trades: 5,
-            min_days: 30
+            min_days: 30,
+            node_pubkey: Some(SEED_NODE.to_string()),
         })
     );
 }

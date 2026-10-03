@@ -46,7 +46,7 @@ pub async fn sync_experience_policy(
         // anything else means the node key changed under a populated DB.
         tracing::warn!(
             "payer_history: {} snapshot(s) could not be re-evaluated (unknown counterparty); \
-             they are excluded from experienced counts until their next success",
+             they no longer count as distinct or experienced counterparties",
             outcome.unresolved
         );
     }

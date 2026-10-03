@@ -1276,7 +1276,7 @@ async fn payment_success(
     // dev_fee_payment_hash, etc.). The WHERE guard prevents double success
     // transitions from concurrent tasks. `success_at` is stamped whether or
     // not payer history is enabled (D-10, item 2).
-    let result = success_cas(&order_updated)
+    let result = success_cas(&order_updated, Timestamp::now().as_secs() as i64)
         .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1295,13 +1295,14 @@ async fn payment_success(
 /// `event_id` and `success_at`, never the whole row.
 fn success_cas(
     order_updated: &Order,
+    success_at: i64,
 ) -> sqlx::query::Query<'_, Sqlite, sqlx::sqlite::SqliteArguments> {
     sqlx::query(
         "UPDATE orders SET status = ?, event_id = ?, success_at = ? WHERE id = ? AND status = ?",
     )
     .bind(&order_updated.status)
     .bind(&order_updated.event_id)
-    .bind(Timestamp::now().as_secs() as i64)
+    .bind(success_at)
     .bind(order_updated.id)
     .bind(Status::SettledHoldInvoice.to_string())
 }
@@ -1335,8 +1336,11 @@ async fn payment_success_with_payer_history(
         };
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
 
+    // One instant for the whole transition: the CAS stamps it into
+    // `orders.success_at` and the history records the same value.
+    let now = Timestamp::now().as_secs() as i64;
     let mut tx = pool.begin().await.map_err(db_err)?;
-    let result = success_cas(&order_updated)
+    let result = success_cas(&order_updated, now)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1350,14 +1354,9 @@ async fn payment_success_with_payer_history(
     // A failure drops `tx`, rolling the transition back: the order stays
     // settled-hold-invoice and the declaration stays retryable. Logged at
     // `error`: while it lasts the paid order cannot finalize.
-    if let Err(e) = payer::success::record_payer_success(
-        &mut tx,
-        my_keys,
-        &order_updated,
-        thresholds,
-        Timestamp::now().as_secs() as i64,
-    )
-    .await
+    if let Err(e) =
+        payer::success::record_payer_success(&mut tx, my_keys, &order_updated, thresholds, now)
+            .await
     {
         tracing::error!(
             "Order {}: payer history write failed, Success rolled back and left for retry: {e}",

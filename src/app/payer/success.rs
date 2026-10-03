@@ -240,6 +240,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successes_stamped_after_the_recorded_one_do_not_qualify_the_seller() {
+        // A trade stamped at NOW whose hook runs after another buyer's trade
+        // stamped later: that later trade must not count toward NOW.
+        let pool = create_test_pool().await;
+        let parties = Parties::reputation();
+        prior_success(&pool, parties.seller_master, NOW - 40 * ONE_DAY).await;
+        prior_success(&pool, parties.seller_master, NOW - 35 * ONE_DAY).await;
+        sqlx::query(
+            "UPDATE orders SET success_at = ?1 \
+              WHERE id = (SELECT id FROM orders WHERE created_at = ?2)",
+        )
+        .bind(NOW + 100)
+        .bind(NOW - 35 * ONE_DAY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let order = finished_trade(&pool, parties, &hash('a')).await;
+
+        record(&pool, &Keys::generate(), &order, NOW).await;
+
+        assert_eq!(
+            history(&pool, parties, &hash('a')).await,
+            (1, 1, 0),
+            "only one success precedes NOW"
+        );
+    }
+
+    #[tokio::test]
     async fn a_seller_below_either_threshold_is_not_flagged() {
         let pool = create_test_pool().await;
         // One trade short.

@@ -5,8 +5,10 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 /// Maximum development fee percentage (100% of Mostro fee)
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
-/// Official Mostro development Lightning Address
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.com";
+/// Official Mostro development Lightning Address.
+/// Self-custodial and served from a domain the project controls, so the
+/// backend behind it can change without a mostrod release.
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@pay.mostro.foundation";
 
 /// Nostr event kind for dev fee payment audit events
 /// Kind 8383 is in the regular events range (1000-9999) per NIP-01

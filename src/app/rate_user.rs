@@ -163,6 +163,7 @@ pub async fn update_user_reputation_action(
         user_to_vote.max_rating,
         user_to_vote.total_reviews,
         user_to_vote.total_rating,
+        user_to_vote.native_rating_sum,
     )
     .await?;
 

@@ -4,12 +4,13 @@ Design proposal for letting a user carry reputation earned in one trading venue
 (lnp2pBot, or another Mostro instance) into a Mostro instance, as the
 figures they earned there.
 
-Status: **import implemented, export in review.** The specification, the
-shared types, the `since` rollout, mostrod as a destination (import and
-revocation) and lnp2pBot as an issuer are merged. Exporting from mostrod
-(phase 4) and the two apps (phases 5 and 5b) are in review. Section 11 tracks
-every pull request and explains how to operate what has landed. The open
-decisions were closed on 2026-10-03 with their defaults (section 10).
+Status: **mostrod implemented, pending release; the apps are in review.**
+The specification, the shared types, the `since` rollout, mostrod as a
+destination (import and revocation) and as an issuer (export and rebind), and
+lnp2pBot as an issuer are merged. The two apps (phases 5 and 5b) are in
+review. Section 11 tracks every pull request and explains how to operate what
+has landed. The open decisions were closed on 2026-10-03 with their defaults
+(section 10).
 
 ## 1. Goals
 
@@ -822,8 +823,46 @@ reputation:
    reversed user can import again with an attestation from the new key. The
    RPC answers loopback peers only; see `docs/RPC.md` for the details.
 
-Exporting from mostrod (phase 4) is not merged yet; its operator guide comes
-with it.
+### Exporting reputation
+
+Export is opt-in and disabled by default. To issue attestations for your
+users:
+
+1. Generate a key dedicated to issuing, never the node's own key, and put it
+   in the environment, for example in `<settings dir>/.env`:
+
+   ```bash
+   MOSTRO_REPUTATION_ISSUER_SK=<nsec or hex>
+   ```
+
+2. Enable the section:
+
+   ```toml
+   [reputation_export]
+   enabled = true
+   issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
+   lifetime_seconds = 604800
+   ```
+
+   mostrod refuses to start if the variable is missing or invalid, or if it
+   contains the node's own key or a key that is also listed in
+   `[reputation_import]`. It also refuses a `lifetime_seconds` above 604800
+   (7 days), the most an attestation can carry; destinations cap it there by
+   default. `docs/STARTUP_AND_CONFIG.md` lists every field.
+3. Restart mostrod. Its info event now carries `reputation_issuer`; publish
+   that key so other operators can add it to their trust list.
+4. **A user lost the identity their export is bound to** and cannot sign a
+   rebind authorisation: rebind it by hand. The reason is required and is
+   logged with both identities (add `-H 'authorization: Bearer <token>'` when
+   `[rpc].auth_token` is set):
+
+   ```bash
+   grpcurl -plaintext -import-path proto -proto admin.proto \
+     -d '{"identity": "<npub or hex>", "new_identity": "<npub or hex>", "reason": "support ticket"}' \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/RebindReputationExport
+   ```
+
+   The RPC answers loopback peers only; see `docs/RPC.md` for the details.
 
 ### Implementation status
 
@@ -833,7 +872,7 @@ with it.
 | 1, `since` | MostroP2P/mostro-core#169, mostro#1016, mobile#740, app#664 | Released: core 0.15.0, mostrod 0.19.2, mobile 1.5.0, app 2.0.16. PR 1.4 waits for the end of the rollout |
 | 2, core | MostroP2P/mostro-core#177–#181, #187 (vectors in sync with protocol#76) | Released in mostro-core 0.17.0 |
 | 3, import | #1028 (3.1), #1029 (3.2), #1030 (3.3), #1031 (3.4), #1032 (3.5) | Merged. 3.1 shipped in mostrod 0.19.3; 3.2–3.5 ship in the next release |
-| 4, export | #1033 (4.1), #1034 (4.2), #1035 (4.3) | In review |
+| 4, export | #1033 (4.1), #1034 (4.2), #1035 (4.3) | Merged; ships in the next release |
 | 5, mobile | MostroP2P/mobile#742 (5.1), #743 (5.2), #744 (5.3), #745 (5.4) | In review |
 | 5b, app | MostroP2P/app#675 (5b.1), #676 (5b.2), #677 (5b.3) | 5b.1 and 5b.2 merged; 5b.3 in review |
 | 6, lnp2pBot | lnp2pBot/bot#932 (6.1), #933 (6.2), #934 (6.3) | Merged |
@@ -846,9 +885,6 @@ Where the code departs from the text above:
 - **`trade_pubkey` column.** `reputation_imports` also keeps the trade key
   that sent the import. The rating event is republished under it after the
   import and after a reversal.
-- **Own issuer key.** The refusal of an attestation signed by the node's own
-  issuer key (section 5.3, step 3) lands with 4.1, together with that key.
-  Until then a node has no issuer key, so there is nothing to refuse.
 - **Telegram hand-off.** lnp2pBot sends the attestation as a message to copy,
   not as a button: Telegram URL buttons cannot open an app scheme, so pasting
   is the hand-off on every platform (section 5.2).
@@ -858,12 +894,11 @@ Where the code departs from the text above:
 Phase 7 of section 9, step by step:
 
 1. Done: mostrod, mobile and app publish and read `since`.
-2. Next mostrod release: deploy phase 3 on the reference instance with an
-   empty issuer list.
-3. Pending: merge phase 4, release lnp2pBot with `REPUTATION_ISSUER_SK`, then
-   add both issuer keys to the reference instance's trust list.
+2. Next mostrod release: deploy phases 3 and 4 on the reference instance
+   with an empty issuer list.
+3. Pending: release lnp2pBot with `REPUTATION_ISSUER_SK`, then add both
+   issuer keys to the reference instance's trust list.
 4. Pending: ship mobile with phases 5.1–5.4 and app with 5b.1–5b.3.
 5. Operator side: this section, the settings template and
-   `docs/STARTUP_AND_CONFIG.md`; the export guide comes with phase 4. User
-   side: in-app help, pending.
+   `docs/STARTUP_AND_CONFIG.md`. User side: in-app help, pending.
 6. Last: PR 1.4 stops publishing `days` and `operating_days`.

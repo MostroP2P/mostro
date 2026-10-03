@@ -626,12 +626,21 @@ Summary of the contract:
    - strip all whitespace, hyphens, dots and slashes from *identifier* fields
      (IBAN, CBU/CVU, account number, tax id);
    - collapse runs of whitespace to one space in *name* fields, trim;
+   - "whitespace" is exactly the Unicode `White_Space` set, and after these
+     steps every code point must lie in U+0020–U+007E or U+00A0–U+017F
+     (stable NFKC and case mappings across Unicode versions); anything else
+     has no canonical form;
    - country codes ISO-3166 alpha-2, currency ISO-4217.
 2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`), so
    identical account numbers under different rails never collide.
-3. **Hash** = `sha256("mostro-payer-v1|" + canonical)` (D-12), hex, lowercase.
-4. The hash MUST NOT include order id, trade key, timestamps or salt
-   (gist §9) — those would make it unique per trade and defeat history.
+3. **Hash**, by buyer mode, hex, lowercase:
+   - reputation mode: `sha256("mostro-payer-v1|" + canonical)` (D-12);
+   - full-privacy mode: the order-bound
+     `sha256("mostro-payer-order-v1|" + order_id + "|" + canonical)` (D-4),
+     so the node cannot link the buyer's orders.
+4. Apart from that full-privacy exception, the hash MUST NOT include order id,
+   trade key, timestamps or salt (gist §9) — those would make it unique per
+   trade and defeat history.
 
 Examples (canonical → hashed):
 

@@ -1120,8 +1120,9 @@ pub async fn send_dev_fee_payment(
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_stale_pending_markers, handle_payment_failure, handle_payment_success,
-        parse_pending_timestamp, release_pending_claim, try_claim_order_for_dev_fee,
+        cleanup_stale_pending_markers, dev_fee_payments_enabled, handle_payment_failure,
+        handle_payment_success, parse_pending_timestamp, release_pending_claim,
+        try_claim_order_for_dev_fee,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
@@ -1635,6 +1636,23 @@ mod tests {
     }
 
     const VALID_HEX_HASH: &str = "abababababababababababababababababababababababababababababababab";
+
+    #[test]
+    fn dev_fee_payments_only_run_on_mainnet() {
+        // The dev fund address only issues mainnet invoices: any other chain
+        // would hit its LNURL server every cycle for a payment that can never
+        // succeed (#1039).
+        let networks = |n: &str| vec![n.to_string()];
+        assert!(dev_fee_payments_enabled(&networks("mainnet")));
+        for n in ["regtest", "testnet", "testnet4", "signet", "simnet"] {
+            assert!(
+                !dev_fee_payments_enabled(&networks(n)),
+                "{n} must not pay dev fees"
+            );
+        }
+        // Unknown chain (no GetInfo data): fail closed.
+        assert!(!dev_fee_payments_enabled(&[]));
+    }
 
     #[tokio::test]
     async fn run_dev_fee_cycle_on_empty_db_is_a_noop() {

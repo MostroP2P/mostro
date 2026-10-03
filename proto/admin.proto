@@ -30,6 +30,10 @@ service AdminService {
   // Maintenance flag plus the counters of what is still bound to the
   // connected Lightning node (docs/MAINTENANCE_MODE_LN_MIGRATION.md §1.3).
   rpc GetMaintenanceStatus(GetMaintenanceStatusRequest) returns (GetMaintenanceStatusResponse);
+
+  // Reverse the reputation imports made with an issuer key, after it was
+  // compromised (docs/REPUTATION_PORTABILITY.md §5.3). Loopback peers only.
+  rpc RevokeReputationImports(RevokeReputationImportsRequest) returns (RevokeReputationImportsResponse);
 }
 
 // Request to cancel an order
@@ -147,4 +151,22 @@ message GetMaintenanceStatusResponse {
   string ln_node_pubkey = 6;
   // pubkey persisted by the boot guard (Phase 4); absent until first written
   optional string stored_ln_node_pubkey = 7;
+}
+
+message RevokeReputationImportsRequest {
+  // The compromised issuer key, npub or hex.
+  string issuer_key = 1;
+  // Only imports this node recorded at or after this Unix time (its own
+  // clock). Absent: every import made with the key.
+  optional int64 imported_after = 2;
+  // Why, for the log.
+  optional string reason = 3;
+  optional string request_id = 4;
+}
+
+message RevokeReputationImportsResponse {
+  bool success = 1;
+  optional string error_message = 2;
+  // How many imports were reversed.
+  uint32 revoked = 3;
 }

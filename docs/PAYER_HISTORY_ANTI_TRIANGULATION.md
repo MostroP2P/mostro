@@ -990,6 +990,13 @@ SELECT COUNT(*) AS n, MIN(COALESCE(success_at, created_at)) AS first_at
    AND (?4 IS NULL OR success_at IS NULL OR success_at < ?4)
 ```
 
+The `as_of` bound is strict. Stamps have second resolution, so a success
+stamped in the same second as the snapshot cannot be ordered against it: it
+may have committed just before the snapshot's trade or just after. Leaving
+it out means a recompute can under-count such a trade and lower a flag the
+live path set, but it can never raise a flag on a trade that came later,
+which is the direction that matters for an anti-Sybil signal.
+
 The **age** term (`D`) dates each trade from its `success_at`: dating it from
 `created_at` would credit an offer that sat in the book for weeks before
 completing with that whole wait. Orders that succeeded before the

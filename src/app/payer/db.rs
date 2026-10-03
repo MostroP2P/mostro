@@ -233,7 +233,10 @@ pub struct SellerExperience {
 /// * `as_of`: `None` on the live success path; `Some(instant)` when
 ///   re-evaluating a stored snapshot, which must see only trades that had
 ///   already reached Success at that instant (`success_at < as_of`; a NULL
-///   `success_at` predates every snapshot and counts).
+///   `success_at` predates every snapshot and counts). Strictly before on
+///   purpose: stamps have second resolution, so a success in the snapshot's
+///   own second cannot be ordered against it and is left out. A recompute
+///   can therefore under-count such a trade, never over-count one.
 ///
 /// The age term dates each trade from its `success_at`, so an offer that
 /// waited weeks before completing is not credited for the wait; legacy rows

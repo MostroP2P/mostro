@@ -892,10 +892,11 @@ Functions that may run inside the Success CAS transaction take a
 pub struct PayerDeclarationRow { pub order_id: Uuid, pub payment_hash: String,
                                  pub declared_at: i64 }
 
-// Every declaration records the order's buyer trade key when it was made.
-// A take that rolls back to `pending` (taker timeout) later gives the order a
-// new buyer; reads ignore a row made by a previous one, so it never satisfies
-// the fiat-sent gate nor becomes the new buyer's history.
+// A take that rolls back to `pending` (taker timeout, taker cancel) voids
+// the declaration: `db::update_order_to_initial_state` deletes it in the same
+// transaction, so the next take starts with none even under the same trade
+// key. As a second guard, every declaration records the order's buyer trade
+// key when it was made, and reads ignore a row made by a previous buyer.
 pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, now: i64)
     -> Result<(), MostroError>;                         // INSERT … ON CONFLICT(order_id) DO UPDATE
 pub async fn find_declaration(pool, order_id: Uuid)     // only the current buyer's row

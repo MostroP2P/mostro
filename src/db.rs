@@ -711,6 +711,10 @@ pub async fn update_order_to_initial_state(
     let preimage: Option<String> = None;
     let buyer_invoice: Option<String> = None;
 
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query(
         r#"
             UPDATE orders
@@ -737,10 +741,22 @@ pub async fn update_order_to_initial_state(
     .bind(0_i64)
     .bind(0_i64)
     .bind(order_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
+
+    // The take is gone, and so is its payer declaration: the next take,
+    // even by the same trade key, starts with none (payer history, §10.2).
+    // Runs whatever `[payer_history]` says, like the prune job (D-10).
+    sqlx::query("DELETE FROM order_payer_declarations WHERE order_id = ?1")
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(rows_affected > 0)
 }
@@ -2149,6 +2165,22 @@ mod tests {
                 cashu_escrow_locked_at integer,
                 payout_payment_hash char(64),
                 payout_claimed_at integer
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        // Payer declarations: `update_order_to_initial_state` voids the
+        // order's declaration in the same transaction, so the table has to
+        // exist here. Same shape as the real migration.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS order_payer_declarations (
+                order_id char(36) PRIMARY KEY NOT NULL,
+                payment_hash char(64) NOT NULL,
+                declared_at integer NOT NULL,
+                buyer_pubkey char(64)
             )
             "#,
         )

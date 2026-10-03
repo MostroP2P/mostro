@@ -49,6 +49,7 @@ pub async fn declare_payer_action(
         order.id,
         &event.sender,
         order.seller_pubkey.as_deref(),
+        order.taken_at,
         &declaration.payment_hash,
         Timestamp::now().as_secs() as i64,
     )

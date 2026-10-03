@@ -246,6 +246,7 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         active,
         &buyer_key,
         Some(seller.as_str()),
+        0,
         &hash('a'),
         1
     )
@@ -256,6 +257,7 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         active,
         &buyer_key,
         Some(seller.as_str()),
+        0,
         &hash('b'),
         2
     )
@@ -274,6 +276,7 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         frozen,
         &buyer_key,
         Some(seller.as_str()),
+        0,
         &hash('a'),
         1
     )
@@ -283,11 +286,17 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
     // Not the order's buyer (a request that raced a rollback and a new
     // take): refused, and the stored declaration is untouched.
     let other = Keys::generate().public_key();
-    assert!(
-        !upsert_open_declaration(&pool, active, &other, Some(seller.as_str()), &hash('c'), 3)
-            .await
-            .unwrap()
-    );
+    assert!(!upsert_open_declaration(
+        &pool,
+        active,
+        &other,
+        Some(seller.as_str()),
+        0,
+        &hash('c'),
+        3
+    )
+    .await
+    .unwrap());
     assert_eq!(
         find_declaration(&pool, active)
             .await
@@ -302,8 +311,27 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         active,
         &buyer_key,
         Some(new_seller.as_str()),
+        0,
         &hash('d'),
         4
+    )
+    .await
+    .unwrap());
+    // Same two keys, but another take (`taken_at` moved): a request read
+    // before a rollback and retake must not attach to the new take.
+    sqlx::query("UPDATE orders SET taken_at = 77 WHERE id = ?1")
+        .bind(active)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!upsert_open_declaration(
+        &pool,
+        active,
+        &buyer_key,
+        Some(seller.as_str()),
+        0,
+        &hash('e'),
+        5
     )
     .await
     .unwrap());
@@ -313,6 +341,7 @@ async fn open_declaration_upsert_only_lands_while_the_window_is_open() {
         Uuid::new_v4(),
         &buyer_key,
         Some(seller.as_str()),
+        0,
         &hash('a'),
         1
     )

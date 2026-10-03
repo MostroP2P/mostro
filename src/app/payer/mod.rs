@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod db;
+pub mod declare;
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use mostro_core::error::{CantDoReason, MostroError, MostroError::MostroCantDo};

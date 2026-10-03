@@ -81,6 +81,24 @@ async fn main() -> Result<()> {
         exit(1);
     };
 
+    // Payer history (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md §10.7, §13):
+    // re-evaluate the stored snapshots when the operator changed the D-7
+    // thresholds. No-op unless the feature is enabled. A failure rolls the
+    // pass back and is retried at the next boot.
+    if let Some(warning) = app::payer::boot::cashu_conflict_warning(
+        Settings::is_cashu_enabled(),
+        Settings::is_payer_history_enabled(),
+    ) {
+        tracing::warn!("{warning}");
+    }
+    app::payer::boot::sync_experience_policy(
+        get_db_pool().as_ref(),
+        util::get_keys()?,
+        Settings::get_payer_history(),
+        Timestamp::now().as_secs() as i64,
+    )
+    .await?;
+
     // Serbero, the dispute assistant: the configured key must be a read-only
     // solver. Registered here when it has no row yet; any other kind of row
     // is left untouched and stops the boot (docs/SOLVER_PERMISSION_LEVELS.md).

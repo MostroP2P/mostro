@@ -28,7 +28,9 @@ Summary of order lifecycle and key handlers.
 | `take-buy` | https://github.com/MostroP2P/mostro/blob/main/src/app/take_buy.rs#L12 | Taker accepts sell; validate status, set amounts, reserve |
 | `take-sell` | https://github.com/MostroP2P/mostro/blob/main/src/app/take_sell.rs | Taker accepts buy; mirror of take-buy for sell side |
 | `add-invoice` | https://github.com/MostroP2P/mostro/blob/main/src/app/add_invoice.rs#L34 | Store buyer invoice or create hold invoice; notify parties |
-| `fiat-sent` | https://github.com/MostroP2P/mostro/blob/main/src/app/fiat_sent.rs | Buyer signals fiat transfer; move to FiatSent |
+| `fiat-sent` | https://github.com/MostroP2P/mostro/blob/main/src/app/fiat_sent.rs | Buyer signals fiat transfer; move to FiatSent. With `[payer_history]` on, may require a prior `declare-payer` and pushes `payment-history` to the seller |
+| `declare-payer` | https://github.com/MostroP2P/mostro/blob/main/src/app/payer/declare.rs | Buyer commits to its fiat payer account by hash; ack to buyer, forward to seller (opt-in `[payer_history]`, see PAYER_HISTORY_ANTI_TRIANGULATION.md) |
+| `payment-history` | https://github.com/MostroP2P/mostro/blob/main/src/app/payer/history.rs | Seller queries the aggregate history of the buyer's committed account (opt-in `[payer_history]`) |
 | `release` | https://github.com/MostroP2P/mostro/blob/main/src/app/release.rs#L160 | Seller releases; settle hold invoice and finalize |
 | `cancel` | https://github.com/MostroP2P/mostro/blob/main/src/app/cancel.rs#L319 | Cancel pending order; cancel hold if present |
 | `dispute` | https://github.com/MostroP2P/mostro/blob/main/src/app/dispute.rs#L141 | Open dispute and notify admin/solver |

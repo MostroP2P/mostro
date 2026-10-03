@@ -138,6 +138,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_history_is_frozen_at_the_first_build() {
+        // The fiat-sent push builds it first; a later query must not reveal
+        // that the buyer finished another trade with the account meanwhile.
+        let pool = create_test_pool().await;
+        let parties = Parties::reputation();
+        let order = order_in(&pool, Status::FiatSent, parties).await;
+        upsert_declaration(&pool, order.id, &hash('a'), 1)
+            .await
+            .unwrap();
+        seed_history(&pool, &parties.buyer_master, &hash('a')).await;
+        let pushed = build_for_order(&pool, &order).await.unwrap().unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let generation = current_policy_generation(&mut conn, (5, 30), 1)
+            .await
+            .unwrap();
+        bump_history(
+            &mut conn,
+            &parties.buyer_master.to_string(),
+            &hash('a'),
+            &hash('3'),
+            true,
+            generation,
+            3_000,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let queried = build_for_order(&pool, &order).await.unwrap().unwrap();
+        assert_eq!(queried, pushed, "same snapshot as the push");
+    }
+
+    #[tokio::test]
     async fn build_for_order_reads_the_buyers_identity_history() {
         let pool = create_test_pool().await;
         let parties = Parties::reputation();

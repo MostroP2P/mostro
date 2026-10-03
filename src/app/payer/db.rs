@@ -29,6 +29,9 @@ pub struct PayerDeclarationRow {
 }
 
 /// Insert or overwrite the declaration for `order_id` (last write wins).
+/// The row records the order's buyer trade key at that moment: a take that
+/// rolls back to `pending` gives the order a new buyer later, and every read
+/// below ignores a declaration made by a previous one.
 pub async fn upsert_declaration(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
@@ -36,10 +39,12 @@ pub async fn upsert_declaration(
     now: i64,
 ) -> Result<(), MostroError> {
     sqlx::query(
-        "INSERT INTO order_payer_declarations (order_id, payment_hash, declared_at) \
-         VALUES (?1, ?2, ?3) \
+        "INSERT INTO order_payer_declarations \
+           (order_id, payment_hash, declared_at, buyer_pubkey) \
+         VALUES (?1, ?2, ?3, (SELECT buyer_pubkey FROM orders WHERE id = ?1)) \
          ON CONFLICT(order_id) DO UPDATE SET payment_hash = excluded.payment_hash, \
-                                             declared_at = excluded.declared_at",
+                                             declared_at = excluded.declared_at, \
+                                             buyer_pubkey = excluded.buyer_pubkey",
     )
     .bind(order_id)
     .bind(payment_hash)
@@ -50,14 +55,16 @@ pub async fn upsert_declaration(
     Ok(())
 }
 
-/// The current declaration for `order_id`, if any.
+/// The current declaration for `order_id`, if any: one made by the order's
+/// current buyer.
 pub async fn find_declaration(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
 ) -> Result<Option<PayerDeclarationRow>, MostroError> {
     sqlx::query_as::<_, PayerDeclarationRow>(
-        "SELECT order_id, payment_hash, declared_at FROM order_payer_declarations \
-         WHERE order_id = ?1",
+        "SELECT d.order_id, d.payment_hash, d.declared_at \
+           FROM order_payer_declarations d JOIN orders o ON o.id = d.order_id \
+          WHERE d.order_id = ?1 AND d.buyer_pubkey = o.buyer_pubkey",
     )
     .bind(order_id)
     .fetch_optional(pool)
@@ -65,20 +72,31 @@ pub async fn find_declaration(
     .map_err(db_err)
 }
 
-/// Delete and return the declaration for `order_id`. The row can be taken
-/// exactly once, which makes it the idempotency token of the success hook.
+/// Delete the declaration for `order_id` and return it when the order's
+/// current buyer made it. The row can be taken exactly once, which makes it
+/// the idempotency token of the success hook. A row left by a previous buyer
+/// is deleted too, and reads as `None`.
 pub async fn take_declaration(
     conn: &mut SqliteConnection,
     order_id: Uuid,
 ) -> Result<Option<PayerDeclarationRow>, MostroError> {
-    sqlx::query_as::<_, PayerDeclarationRow>(
+    let row = sqlx::query(
         "DELETE FROM order_payer_declarations WHERE order_id = ?1 \
-         RETURNING order_id, payment_hash, declared_at",
+         RETURNING order_id, payment_hash, declared_at, \
+                   buyer_pubkey IS (SELECT buyer_pubkey FROM orders WHERE id = ?1) \
+                     AND buyer_pubkey IS NOT NULL AS current_buyer",
     )
     .bind(order_id)
     .fetch_optional(conn)
     .await
-    .map_err(db_err)
+    .map_err(db_err)?;
+    Ok(row
+        .filter(|r| r.get::<bool, _>("current_buyer"))
+        .map(|r| PayerDeclarationRow {
+            order_id: r.get("order_id"),
+            payment_hash: r.get("payment_hash"),
+            declared_at: r.get("declared_at"),
+        }))
 }
 
 /// Delete the declarations of every order in a terminal status. Correlated

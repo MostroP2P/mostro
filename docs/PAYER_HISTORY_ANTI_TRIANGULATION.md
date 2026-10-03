@@ -777,7 +777,8 @@ success and once per snapshot in §10.7.
 CREATE TABLE IF NOT EXISTS order_payer_declarations (
   order_id        char(36)  PRIMARY KEY NOT NULL,  -- orders.id (uuid)
   payment_hash    char(64)  NOT NULL,              -- sha256 hex, lowercase
-  declared_at     integer   NOT NULL               -- unix secs of last upsert
+  declared_at     integer   NOT NULL,              -- unix secs of last upsert
+  buyer_pubkey    char(64)                         -- orders.buyer_pubkey when declared; a later buyer never inherits the row
 );
 
 -- Aggregate history. One row per (buyer identity key, payment hash).
@@ -891,12 +892,17 @@ Functions that may run inside the Success CAS transaction take a
 pub struct PayerDeclarationRow { pub order_id: Uuid, pub payment_hash: String,
                                  pub declared_at: i64 }
 
+// Every declaration records the order's buyer trade key when it was made.
+// A take that rolls back to `pending` (taker timeout) later gives the order a
+// new buyer; reads ignore a row made by a previous one, so it never satisfies
+// the fiat-sent gate nor becomes the new buyer's history.
 pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, now: i64)
     -> Result<(), MostroError>;                         // INSERT … ON CONFLICT(order_id) DO UPDATE
-pub async fn find_declaration(pool, order_id: Uuid)
+pub async fn find_declaration(pool, order_id: Uuid)     // only the current buyer's row
     -> Result<Option<PayerDeclarationRow>, MostroError>;
 pub async fn take_declaration(conn: &mut SqliteConnection, order_id: Uuid)
-    -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING *  (idempotency token)
+    -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING (idempotency token);
+                                                         // a previous buyer's row is deleted, reads None
 
 pub struct HistoryCounters { pub successful_trades: u32,
                              pub distinct_counterparties: u32,

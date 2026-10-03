@@ -17,7 +17,8 @@
 CREATE TABLE IF NOT EXISTS order_payer_declarations (
   order_id        char(36)  PRIMARY KEY NOT NULL,  -- orders.id (uuid)
   payment_hash    char(64)  NOT NULL,              -- sha256 hex, lowercase
-  declared_at     integer   NOT NULL               -- unix secs of last upsert
+  declared_at     integer   NOT NULL,              -- unix secs of last upsert
+  buyer_pubkey    char(64)                         -- orders.buyer_pubkey when declared; a later buyer never inherits the row
 );
 
 -- Aggregate history. One row per (buyer identity key, payment hash).

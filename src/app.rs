@@ -264,9 +264,11 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
-        Action::ImportReputation => reputation::import::import_reputation_action(ctx, msg, event)
-            .await
-            .map_err(|e| e.into()),
+        Action::ImportReputation => {
+            reputation::import::import_reputation_action(ctx, msg, event, my_keys)
+                .await
+                .map_err(|e| e.into())
+        }
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())

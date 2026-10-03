@@ -23,6 +23,7 @@ pub mod util;
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
+use crate::app::dev_fee::{dev_fee_payments_enabled, release_all_pending_claims};
 use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
 use crate::app::serbero::{serbero_guard, SerberoDecision};
 use crate::app::{run, run_cashu};
@@ -274,6 +275,23 @@ async fn main() -> Result<()> {
     // them, so starting against a different node while escrow is still open
     // on the old one would strand every release/cancel. Refuse loudly here
     // instead of failing one order at a time (spec §3.6).
+    // Off mainnet the dev fee job never runs (#1039), so release the claims
+    // an interrupted run left behind before the guard below counts them as
+    // in-flight dev fees.
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        match release_all_pending_claims(get_db_pool().as_ref()).await {
+            Ok(0) => {}
+            Ok(released) => tracing::info!(
+                "Released {released} interrupted dev fee claim(s) left by a previous run"
+            ),
+            Err(e) => tracing::warn!("Failed to release interrupted dev fee claims: {e}"),
+        }
+    }
+
     let allow_node_change = Settings::get_ln().allow_node_change;
     match node_identity_guard(get_db_pool().as_ref(), &node_pubkey, allow_node_change).await? {
         NodeIdentityDecision::FirstBoot => {

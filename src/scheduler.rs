@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
-use crate::app::dev_fee::run_dev_fee_cycle;
+use crate::app::dev_fee::{dev_fee_payments_enabled, run_dev_fee_cycle};
 use crate::app::release::{do_payment, reconcile_inflight_payout};
 use crate::config;
 use crate::db::*;
@@ -1507,6 +1507,17 @@ async fn job_update_bitcoin_prices() {
 #[mutants::skip]
 async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
+
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        return info!(
+            "Lightning node is not on mainnet (networks: {:?}); dev fee payments are disabled",
+            networks
+        );
+    }
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client

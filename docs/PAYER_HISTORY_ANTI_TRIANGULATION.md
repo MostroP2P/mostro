@@ -626,6 +626,9 @@ Summary of the contract:
    - strip all whitespace, hyphens, dots and slashes from *identifier* fields
      (IBAN, CBU/CVU, account number, tax id);
    - collapse runs of whitespace to one space in *name* fields, trim;
+   - before NFKC, the input may only hold repertoire code points, whitespace
+     and combining marks U+0300–U+036F (NFKC can map an unassigned code point
+     into the repertoire in a newer Unicode version);
    - "whitespace" is exactly the Unicode `White_Space` set, and after these
      steps every code point must lie in U+0020–U+007E, U+00A0–U+017F or
      U+0218–U+021B (stable NFKC and case mappings across Unicode versions);

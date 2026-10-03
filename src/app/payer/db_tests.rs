@@ -812,6 +812,38 @@ async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
 }
 
 #[tokio::test]
+async fn recompute_discards_frozen_history_snapshots() {
+    // A snapshot frozen under the old thresholds would contradict the policy
+    // the info event now advertises; the next query re-takes it.
+    let pool = pool().await;
+    let (seller, buyer) = (key(), key());
+    let mut open = Trade::success(&seller, &buyer, NOW);
+    open.status = Status::FiatSent;
+    let order_id = insert(&pool, open).await;
+    upsert_declaration(&pool, order_id, &hash('a'), NOW)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE order_payer_declarations SET history_snapshot = '{}' WHERE order_id = ?1")
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    recompute_experienced(&pool, &Keys::generate(), 3, 7, NOW)
+        .await
+        .unwrap();
+
+    let snapshot: Option<String> = sqlx::query_scalar(
+        "SELECT history_snapshot FROM order_payer_declarations WHERE order_id = ?1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshot, None);
+}
+
+#[tokio::test]
 async fn recompute_rolls_back_with_the_policy_row() {
     // The policy bump and the column rewrite share one transaction: when the
     // pass fails, neither is applied, so the next boot retries.

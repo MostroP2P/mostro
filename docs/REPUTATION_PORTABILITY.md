@@ -263,9 +263,11 @@ daemon's ordinary protocol transport. The destination daemon:
 
 1. Parses the event and verifies its id and signature.
 2. Checks the kind, the `z` tag, and every tag rule in section 5.1.
-3. Checks `pubkey` is in its trusted issuer list, and is **not** its own
-   issuer key. A Mostro trusting itself would otherwise let a user import
-   their own reputation on the same instance and double it.
+3. Checks `pubkey` is one of the keys of an entry in its trust list, and is
+   **not** its own issuer key. A Mostro trusting itself would otherwise let a
+   user import their own reputation on the same instance and double it. The
+   entry's name, not the key, is the issuer from here on (see *Issuer keys
+   and rotation* below).
 4. Checks the times, allowing a clock skew of 300 seconds: `created_at` is not
    in the future, `expiration` has not passed, and `expiration - created_at`
    does not exceed the destination's own maximum lifetime (default 7 days).
@@ -283,8 +285,9 @@ daemon's ordinary protocol transport. The destination daemon:
    imported before on this instance. The first stops a source account from
    seeding two identities here, even after a rebind or if an issuer broke its
    own binding; the second stops an identity from importing two accounts from
-   one issuer. Both are unique indexes, so two concurrent imports cannot both
-   pass.
+   one issuer. `issuer` is the trust-list entry name, so both checks hold
+   across a rotation of the issuer's key. Both are unique indexes, so two
+   concurrent imports cannot both pass.
 8. Records the import and applies it to the user row (section 6) in the same
    transaction.
 
@@ -294,17 +297,43 @@ one enum in core carrying `#[serde(other)]`, so an old client degrades a new
 reason to `Unknown` instead of failing. `Action` and `Payload` have no such
 fallback — see section 9 for why that is still safe.
 
-The issuer's identity is **one key**: it signs attestations, and it is what a
-destination lists as trusted (section 5.1).
+**Issuer keys and rotation.** An issuer signs with one key at a time, but a
+destination does not identify it by that key. Each trust-list entry has a
+local, stable `name` and one or more `keys` (section 7); the name is what
+`reputation_imports.issuer` stores and what step 7 deduplicates on, and the
+signing key is stored next to it as `issuer_key`. If the dedup key were the
+pubkey, an issuer rotating its key would look like a new issuer, and every
+account already imported under the old key could import again under the new
+one. Rotation is therefore done by adding the new key to the existing entry:
 
-**Revoking an issuer.** Removing a key from the trust list stops new imports
-but does not unwind earlier ones. Because every import is kept as a row of
-`reputation_imports` with its figures (section 6), an operator who learns that
-an issuer key was compromised can list the imports whose attestation was
-signed after a given date and reverse each one. The row keeps the
-attestation's `created_at` for this: the import date says nothing about when
-the attestation was signed, and the attestation itself is on no relay. The
-reversal: subtract its `reviews` from `total_reviews` and
+- **Planned rotation.** Add the new key to the entry; once every attestation
+  signed by the old key has expired (the destination's maximum lifetime),
+  remove the old key.
+- **Compromise.** Remove the old key from the entry at once, then revoke as
+  below.
+
+A key belongs to one entry only, and the daemon refuses to start if a
+configured key already has imports recorded under a different name, so
+renaming an entry or moving a key cannot reset the deduplication. The issuer
+announces its current key in its own info event (`reputation_issuer`,
+section 5.2); operators learn of a rotation through it, and through the
+issuer's own channels.
+
+**Revoking an issuer key.** Removing a key from the trust list stops new
+imports but does not unwind earlier ones. Because every import is kept as a
+row of `reputation_imports` with its figures (section 6), an operator who
+learns that an issuer key was compromised can reverse the imports made with
+that key. The selection is by `issuer_key` and by `imported_at`, the
+destination's own clock, from the earliest moment the key may have leaked;
+without a known date it is every import made with that key. It is never by
+the attestation's `created_at`: whoever holds the key chooses that value, and
+could backdate a forged attestation to just before the cutoff while keeping
+it valid for the whole lifetime. Legitimate imports made with the key after
+the cutoff are reversed too; the reversal deletes their rows, so those users
+request a new attestation, signed with the new key, and import again. Imports
+signed by the entry's other keys are untouched.
+
+The reversal: subtract its `reviews` from `total_reviews` and
 `seeded_reviews`, take `rating × reviews` back out of the weighted average and
 of `seeded_rating_sum`, and recompute `created_at` as the minimum of
 `native_created_at` and the `since` of the imports that remain. Native ratings
@@ -351,11 +380,11 @@ anchor effect.
 | `seeded_rating_sum` (new) | `+= rating × reviews`, internal only |
 | `native_rating_sum` (new) | **unchanged**; incremented by `update_rating` on native reviews only, internal only |
 
-Each import is also kept as a row of `reputation_imports` (issuer, subject,
-identity, the three figures, the attestation id, the attestation's
-`created_at` and the import date): it is what step 7 of section 5.3 checks, it
-keeps every seed attributable, and it is what revoking an issuer selects by
-signing time (section 5.3).
+Each import is also kept as a row of `reputation_imports` (issuer entry
+name, issuer key, subject, identity, the three figures, the attestation id and
+the import date): it is what step 7 of section 5.3 checks, it keeps every seed
+attributable, and it is what revoking an issuer key selects, by key and import
+date (section 5.3).
 
 `native_created_at` is set once, when the row is created, and no import ever
 moves it. Because the merge for age is a minimum, `created_at` alone cannot be
@@ -461,7 +490,9 @@ as long as both fields are published.
   are keyed by trade pubkey, so a destination cannot simply read the source's
   relays; an issuer attestation is required even between Mostros.
 - **Trust list.** Each instance configures accepted issuers and publishes
-  them in its info event (section 5.2). The reference instance ships with the
+  their keys in its info event (section 5.2). An entry is a stable local name
+  with one or more keys, so an issuer can rotate its key without resetting
+  deduplication (section 5.3). The reference instance ships with the
   lnp2pBot issuer pubkey enabled. An instance that exports configures its own
   dedicated issuer key, read from the environment like every other secret.
 
@@ -469,9 +500,16 @@ as long as both fields are published.
 [reputation_import]
 enabled = true
 max_lifetime = "7d"
-issuers = [
-  "<lnp2pbot issuer pubkey>",
-  "<another mostro's issuer pubkey>",
+
+[[reputation_import.issuers]]
+name = "lnp2pbot"            # dedup key; never renamed
+keys = ["<lnp2pbot issuer pubkey>"]
+
+[[reputation_import.issuers]]
+name = "other-mostro"
+keys = [
+  "<its current issuer pubkey>",
+  "<its previous key, until its attestations expire>",
 ]
 
 [reputation_export]
@@ -576,11 +614,11 @@ Independent of the migration and worth shipping first.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `issuers`, `max_lifetime`) with parsing, defaults and validation; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
-| 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, subject, identity_pubkey, reviews, rating, since, signed_at, imported_at)`, `signed_at` being the attestation's `created_at`, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
+| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `max_lifetime`, and `issuers` as named entries with one or more `keys`) with parsing, defaults and validation: unique names, a key in one entry only, never the instance's own issuer key; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
+| 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, issuer_key, subject, identity_pubkey, reviews, rating, since, imported_at)`, `issuer` being the trust-list entry name, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`; a startup check refuses to run if a configured key has rows under a different name. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
 | 3.3 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
 | 3.4 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
-| 3.5 | mostro | Admin RPC to revoke the imports of an issuer whose `signed_at` is after a given date, through `User::revert_reputation_import`, republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation signed before the cutoff but imported after it is left alone. |
+| 3.5 | mostro | Admin RPC to revoke the imports made with an issuer key, optionally only those with `imported_at` after a given date, through `User::revert_reputation_import`, deleting their rows and republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation backdated before the cutoff but imported after it is revoked; imports under the entry's other key are left alone; the user can import again with an attestation from the new key. |
 
 ### Phase 4: mostrod as issuer (export)
 
@@ -669,7 +707,12 @@ Closed during review:
 - **Native reputation only.** `seeded_reviews` and `native_rating_sum` keep an
   imported figure from being re-exported as native; `since` comes from local
   orders.
-- **Issuer identity.** One dedicated key per issuer; for the bot that is
-  `REPUTATION_ISSUER_SK`, not `NOSTR_SK`.
+- **Issuer identity.** One dedicated signing key per issuer at a time; for
+  the bot that is `REPUTATION_ISSUER_SK`, not `NOSTR_SK`. Destinations
+  identify an issuer by a named trust-list entry that can hold several keys,
+  so a rotation does not reopen deduplication.
+- **Compromise revocation** selects by issuer key and the destination's own
+  import time, never by the attestation's `created_at`, which the key holder
+  controls.
 - **Action naming.** `reputation-exported` is the wire name for the export
   response, everywhere.

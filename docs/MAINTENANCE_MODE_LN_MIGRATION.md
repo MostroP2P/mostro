@@ -355,9 +355,10 @@ does not ask for it.
 | Client releases / cancels an escrowed order | unchanged |
 | Pending order reaches `expiration` | `job_expire_pending_older_orders` expires it as today |
 | Operator sends `CancelOrder` for a `pending` / `waiting-taker-bond` order | `canceled-by-admin`; maker and bonded takers get `AdminCanceled`; taker bonds released, maker bond resolved at range close (`admin_cancel::admin_cancel_pending_order`) |
+| Operator sends `CancelOrder` for a `waiting-maker-bond` order | `canceled-by-admin` in the DB only (never published, no event); maker bond released; maker gets `AdminCanceled` (`bond::close_unpublished_maker_order`) |
 | `waiting-payment` seller never pays | `job_cancel_orders` cancels the hold as today |
 | Dispute opened / resolved | unchanged; solver uses `AdminSettle`/`AdminCancel` |
-| Maker bond outstanding (`waiting-maker-bond`) | maker can still pay it; on payment the order is published as `pending` and simply cannot be taken |
+| Maker bond outstanding (`waiting-maker-bond`) | maker can still pay it until `maker_bond_payment_timeout_seconds` (the invoice expiry); on payment the order is published as `pending` and simply cannot be taken. Unpaid past the timeout, the order is expired (DB only) and its bond released, so it stops counting against `drained` |
 | Daemon restart | flag reloaded from `daemon_state`; still enabled |
 | RPC `GetMaintenanceStatus` | live counters |
 

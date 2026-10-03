@@ -421,6 +421,18 @@ pub(crate) fn decode_hash32(field: &str, value: &str) -> Result<Vec<u8>, MostroE
     Ok(bytes)
 }
 
+/// Map a failed `lookup_invoice` call to a [`MostroError`], keeping the
+/// gRPC code in the same `code=… message=…` shape as
+/// `cancel_hold_invoice` so callers can tell `NotFound` from transport
+/// failures.
+pub(crate) fn lookup_invoice_error(status: fedimint_tonic_lnd::tonic::Status) -> MostroError {
+    MostroInternalErr(ServiceError::LnNodeError(format!(
+        "code={:?} message={}",
+        status.code(),
+        status.message()
+    )))
+}
+
 impl LndConnector {
     pub async fn new() -> Result<Self, MostroError> {
         let ln_settings = Settings::get_ln();
@@ -443,6 +455,19 @@ impl LndConnector {
         description: &str,
         amount: i64,
     ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
+        self.create_hold_invoice_with_expiry(description, amount, None)
+            .await
+    }
+
+    /// [`Self::create_hold_invoice`] with an explicit invoice expiry in
+    /// seconds. `None` leaves LND's default (86 400 s), which is what every
+    /// hold invoice got before #942.
+    pub async fn create_hold_invoice_with_expiry(
+        &mut self,
+        description: &str,
+        amount: i64,
+        expiry_secs: Option<i64>,
+    ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
@@ -454,6 +479,7 @@ impl LndConnector {
             memo: description.to_string(),
             value: amount,
             cltv_expiry,
+            expiry: expiry_secs.unwrap_or_default(),
             ..Default::default()
         };
         let holdinvoice = self
@@ -577,7 +603,7 @@ impl LndConnector {
                 ..Default::default()
             })
             .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .map_err(lookup_invoice_error)?
             .into_inner();
 
         Ok(invoice
@@ -586,6 +612,46 @@ impl LndConnector {
             .filter(|htlc| htlc.state == InvoiceHtlcState::Accepted as i32)
             .map(|htlc| htlc.expiry_height.max(0) as u32)
             .min())
+    }
+
+    /// Current state of a hold invoice at LND, or `None` when the node has no
+    /// record of it (already garbage-collected, or a hash we never created).
+    ///
+    /// Callers about to cancel an escrow need this: on an order still waiting
+    /// for the seller's payment, `Accepted` means their HTLC is locked in
+    /// *right now*, and canceling refunds it. See
+    /// `crate::app::cancel::classify_escrow_cancel`.
+    pub async fn lookup_invoice_state(
+        &mut self,
+        hash: &str,
+    ) -> Result<Option<InvoiceState>, MostroError> {
+        let r_hash = decode_hash32("payment hash", hash)?;
+
+        let invoice = match self
+            .client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(invoice) => invoice.into_inner(),
+            Err(status) => {
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
+                    return Ok(None);
+                }
+                return Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))));
+            }
+        };
+
+        InvoiceState::try_from(invoice.state)
+            .map(Some)
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))
     }
 
     pub async fn send_payment(
@@ -623,6 +689,7 @@ impl LndConnector {
         .await
         {
             Ok(Ok(Some(payment::PaymentStatus::InFlight)))
+            | Ok(Ok(Some(payment::PaymentStatus::Initiated)))
             | Ok(Ok(Some(payment::PaymentStatus::Succeeded))) => {
                 info!(
                     "Aborting payment for hash {}: already in flight or settled",
@@ -795,9 +862,13 @@ impl LndConnector {
         let mut total: u32 = 0;
         let mut to_destination: u32 = 0;
         for payment in response.into_inner().payments {
-            let in_flight =
-                fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
-                    == Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight);
+            // `Initiated` payments are about to dispatch HTLCs; count them
+            // toward the slot ceiling so the gate cannot be raced.
+            let in_flight = matches!(
+                fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status),
+                Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::InFlight)
+                    | Ok(fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::Initiated)
+            );
             if !in_flight {
                 continue;
             }
@@ -949,7 +1020,9 @@ impl LnStatus {
             node_pubkey: info.identity_pubkey,
             commit_hash: info.commit_hash,
             node_alias: info.alias,
-            chains: info.chains.iter().map(|c| c.chain.to_string()).collect(),
+            // `Chain::chain` is deprecated since LND 0.17: the chain is
+            // always bitcoin, so report that for every entry.
+            chains: info.chains.iter().map(|_| "bitcoin".to_string()).collect(),
             networks: info.chains.iter().map(|c| c.network.to_string()).collect(),
             uris: info.uris.iter().map(|u| u.to_string()).collect(),
         }
@@ -1511,8 +1584,8 @@ mod offline_connector_tests {
             commit_hash: "deadbeef".to_string(),
             alias: "test-node".to_string(),
             chains: vec![fedimint_tonic_lnd::lnrpc::Chain {
-                chain: "bitcoin".to_string(),
                 network: "regtest".to_string(),
+                ..Default::default()
             }],
             uris: vec!["02abc@127.0.0.1:9735".to_string()],
             ..Default::default()

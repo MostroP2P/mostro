@@ -38,6 +38,7 @@ Before settings initialization, the daemon performs (see `src/main.rs`):
 - Parses TOML into Settings struct
 - Stores in global `config::MOSTRO_CONFIG` via `init_mostro_settings()`
 - Accessible via `Settings::get_*()` methods throughout application
+- Logs the node's pubkey (npub and hex) right after the keys load, before `Settings correctly loaded!`. Nothing is logged earlier on a normal start, so it is the first line of the log
 
 ### Database Connection (db::connect)
 
@@ -66,6 +67,7 @@ Before settings initialization, the daemon performs (see `src/main.rs`):
 
 1) Settings init: `cli::settings_init()` loads `settings.toml` (template: `settings.tpl.toml`).
 2) DB connect: `db::connect()` sets `config::DB_POOL`.
+   - Serbero: when `serbero_pubkey` is set, `app::serbero::serbero_guard` makes sure that key is a read-only solver, registering it when it has no row yet, and logs `Serbero <npub> configured: ...`. A key that is a write solver, a user that is not a solver, or the node's own key stops the boot with `REFUSING TO START`; the row is never changed. See [SOLVER_PERMISSION_LEVELS.md](SOLVER_PERMISSION_LEVELS.md#serbero).
 3) Nostr: `util::connect_nostr()` sets `config::NOSTR_CLIENT`.
 4) NIP-01 Kind 0 Metadata: If any metadata fields (`name`, `about`, `picture`, `website`) are configured, publishes a kind 0 metadata event so clients can display the Mostro instance's profile.
 5) LND: `LndConnector::new()` + `get_node_info()` → `config::LN_STATUS`.
@@ -107,7 +109,7 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `lnd_grpc_host` (String): LND gRPC endpoint URL
 - `invoice_expiration_window` (u32): Required invoice validity window in seconds (default: 3600)
 - `hold_invoice_cltv_delta` (u32): Hold invoice CLTV delta in blocks (default: 144)
-- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300)
+- `hold_invoice_expiration_window` (u32): Hold invoice expiration in seconds (default: 300). Also the taker bond invoice expiry, so it must be greater than 0; mostrod refuses to start with 0.
 - `payment_attempts` (u32): Max payment retry attempts (default: 3)
 - `payment_retries_interval` (u32): Retry interval in seconds (default: 60)
 - `max_final_cltv_expiry_delta` (u32): Upper bound, in blocks, on the `min_final_cltv_expiry_delta` of a user-supplied payout invoice (buyer payout, bond payout, dev fee). It bounds how long that payee can hold the outgoing HTLC without settling — the node cannot cancel a locked-in HTLC. 144 (~1 day) is the top of the range real wallets ask for; raise it only if a legitimate wallet is rejected, and never set it to 0 (the check is `delta > bound`, and BOLT11 substitutes 18 when the field is absent, so 0 rejects every invoice) (default: 144)
@@ -140,12 +142,16 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 *Network/API:*
 - `pow` (u8): Proof-of-work difficulty (leading-zero bits, NIP-13) required of every incoming event, checked on the outer event before anything else (default: 0, i.e. no requirement)
-- `pow_first_contact` (Option\<u8\>): Stiffer PoW demanded of a *first-contact* event — one whose visible sender is not in the active-trade cache — checked before the NIP-44 decrypt. Only enforced on the `nip44` transport; `None` falls back to `pow` (default: None). Setting it *below* `pow` has no effect, since the base check runs first. See [TRANSPORT_V2_SPEC.md](TRANSPORT_V2_SPEC.md) §6 Phase 2
+- `pow_first_contact` (Option\<u8\>): Stiffer PoW demanded of a *first-contact* event — one whose visible sender is not in the active-trade cache — checked before the NIP-44 decrypt. `None` falls back to `pow` (default: None). Setting it *below* `pow` has no effect, since the base check runs first. See [TRANSPORT_V2_SPEC.md](TRANSPORT_V2_SPEC.md) §6 Phase 2
+- `transport` (String, optional): Wire protocol. The only value is `"nip44"` (protocol v2), which is also the default, so the line is not needed and is not in the template. A leftover `"gift-wrap"` (protocol v1, removed in v0.19.0) makes mostrod refuse to start with an error that explains why
 - `active_pubkeys_refresh_interval` (u64): How often, in seconds, to rebuild the active-trade-pubkey cache that the first-contact gate consults (default: 60)
 - `bitcoin_price_api_url` (String): Bitcoin price API base URL (default: [`https://api.yadio.io`](https://api.yadio.io))
 
 *Market Support:*
 - `fiat_currencies_accepted` (Vec<String>): Accepted fiat currencies; empty list accepts all (default: ['USD', 'EUR', 'ARS', 'CUP'])
+
+*Dispute assistant (optional):*
+- `serbero_pubkey` (Option\<String\>): Public key (npub or hex) of the node's [Serbero](https://github.com/MostroP2P/serbero). Registered at startup as a read-only solver and announced in the info event's `serbero` tag. A malformed key stops the load; a blank value means none (default: None). See [SOLVER_PERMISSION_LEVELS.md](SOLVER_PERMISSION_LEVELS.md#serbero)
 
 *NIP-01 Kind 0 Metadata (optional):*
 - `name` (Option\<String\>): Human-readable name for this Mostro instance (default: None)

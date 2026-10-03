@@ -1,6 +1,7 @@
 use crate::app::bond;
+use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
-use crate::app::dev_fee::run_dev_fee_cycle;
+use crate::app::dev_fee::{dev_fee_payments_enabled, run_dev_fee_cycle};
 use crate::app::release::{do_payment, reconcile_inflight_payout};
 use crate::config;
 use crate::db::*;
@@ -45,6 +46,8 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+        job_reconcile_stranded_taker_bonds(ctx.clone()).await;
+        job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -61,18 +64,22 @@ pub async fn start_scheduler(ctx: AppContext) {
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey
 /// cache from the DB (spec §6 Phase 2). Status mutations are scattered across
 /// many handlers with no single choke-point, so a periodic full reload is the
-/// robust, low-coupling refresh strategy: a just-taken order's keys begin
-/// fast-pathing within one `active_pubkeys_refresh_interval`. Inert on the v1
-/// transport (the event loop only consults the gate for kind-14 events).
+/// robust, low-coupling refresh strategy. The event loop also adds a key the
+/// moment it accepts a create or take (#857); this rebuild is what prunes keys
+/// whose orders have gone terminal.
 async fn job_refresh_active_pubkeys(ctx: AppContext) {
     let interval = ctx.settings().mostro.active_pubkeys_refresh_interval.max(1);
     tokio::spawn(async move {
         loop {
+            let gate = crate::spam_gate::SpamGate::global();
+            // Before the DB read, so keys the event loop adds while it runs
+            // survive this snapshot (#857).
+            let mark = gate.map(|gate| gate.begin_rebuild());
             match find_active_trade_pubkeys(ctx.pool()).await {
                 Ok(keys) => {
-                    if let Some(gate) = crate::spam_gate::SpamGate::global() {
+                    if let (Some(gate), Some(mark)) = (gate, mark) {
                         let n = keys.len();
-                        gate.set_known(keys);
+                        gate.finish_rebuild(mark, keys);
                         tracing::debug!(
                             "spam_gate: refreshed active-trade-pubkey cache ({n} keys)"
                         );
@@ -257,7 +264,7 @@ async fn job_retry_failed_payments(ctx: AppContext) {
     tokio::spawn(async move {
         loop {
             info!(
-                "I run async every {} minutes - checking for failed lighting payment",
+                "I run async every {} seconds - checking for failed lightning payment",
                 interval
             );
 
@@ -534,9 +541,50 @@ async fn job_cancel_orders(ctx: AppContext) {
                     if order.status == Status::WaitingBuyerInvoice.to_string()
                         || order.status == Status::WaitingPayment.to_string()
                     {
+                        // Resolved before touching the escrow: an order whose
+                        // status or kind cannot be parsed must not have its
+                        // hold invoice canceled either, and the escrow guard
+                        // below needs the status.
+                        let (order_status, order_kind) =
+                            match (order.get_order_status(), order.get_order_kind()) {
+                                (Ok(status), Ok(kind)) => (status, kind),
+                                _ => {
+                                    tracing::warn!(
+                                        "Error getting order status or kind in order {} cancel",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                            };
                         // If hold invoice is paid return funds to seller
                         // We return funds to seller
                         if let Some(hash) = order.hash.as_ref() {
+                            // The seller may have paid in the gap between
+                            // `reconfirm_timeout_eligibility` above and this
+                            // moment — the timeout boundary is public, so this
+                            // is also where a seller can aim deliberately.
+                            // Canceling then refunds their live escrow while
+                            // `hold_invoice_paid` tells the buyer to send
+                            // fiat, so ask LND first and leave a paid escrow
+                            // alone: the next tick sees the order active (or
+                            // re-anchored) and skips it on its own.
+                            match decide_escrow_cancel(&mut ln_client, order_status, hash).await {
+                                EscrowCancelDecision::Cancel => {}
+                                EscrowCancelDecision::SkipPaid => {
+                                    warn!(
+                                        "scheduler_timeout: order {} has a funded escrow — the seller paid at the timeout boundary; leaving it for the trade to advance",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                                EscrowCancelDecision::SkipUnknown(cause) => {
+                                    warn!(
+                                        "scheduler_timeout: could not read the escrow state for order {} ({cause}); skipping so next tick retries",
+                                        order.id
+                                    );
+                                    continue;
+                                }
+                            }
                             // The cancel must succeed before we clear the
                             // order. Falling through on error would take the
                             // order out of `find_order_by_seconds`'s
@@ -546,7 +594,9 @@ async fn job_cancel_orders(ctx: AppContext) {
                             // Same reasoning as the bond slash/release below:
                             // stay eligible and retry rather than persist a
                             // state that doesn't match the HTLC.
-                            if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
+                            if let Err(e) =
+                                cancel_escrow_idempotent(&mut ln_client, order.id, hash).await
+                            {
                                 error!(
                                     "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
                                     order.id
@@ -574,19 +624,6 @@ async fn job_cancel_orders(ctx: AppContext) {
                             order.amount = 0;
                             order.fee = 0;
                         }
-
-                        // Get order status and kind
-                        let (order_status, order_kind) =
-                            match (order.get_order_status(), order.get_order_kind()) {
-                                (Ok(status), Ok(kind)) => (status, kind),
-                                _ => {
-                                    tracing::warn!(
-                                        "Error getting order status or kind in order {} cancel",
-                                        order.id
-                                    );
-                                    continue;
-                                }
-                            };
 
                         // Phase 4: run the bond slash/release **before** any
                         // DB mutation that takes the order out of
@@ -1239,35 +1276,24 @@ async fn job_expire_pending_older_orders(ctx: AppContext) {
                     // Going through `update_order_event` would publish a
                     // brand-new Expired/Canceled event for an order that
                     // never appeared in the book — a ghost entry the
-                    // §10.4 acceptance forbids. Mark it Expired directly
-                    // in the DB and release any bond row instead.
+                    // §10.4 acceptance forbids. The shared close marks it
+                    // Expired in the DB only, releases the bond and tells
+                    // the maker (#942). Bonds are Lightning-only (CF-1), and
+                    // the close skips the release on a cashu node.
                     if order.status == Status::WaitingMakerBond.to_string() {
-                        let order_id = order.id;
-                        let mut expired = order.clone();
-                        expired.status = Status::Expired.to_string();
-                        match expired.update(pool).await {
-                            Ok(_) => {
-                                // Bonds are Lightning-only and mutually exclusive
-                                // with Cashu mode (CF-1), which has no LND — the
-                                // release helpers open `LndConnector::new()`, so
-                                // skip them here. A cashu node should carry no
-                                // bond rows; any left over (e.g. a reused DB) are
-                                // a misconfiguration, not this job's concern.
-                                if !Settings::is_cashu_enabled() {
-                                    bond::release_bonds_for_order_or_warn(
-                                        pool,
-                                        order_id,
-                                        "maker_bond_expiry",
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "maker_bond_expiry: persist failed for order {} ({}); skipping bond release — will retry next tick",
-                                    order_id, e
-                                );
-                            }
+                        if let Err(e) = bond::close_unpublished_maker_order(
+                            pool,
+                            order.id,
+                            Status::Expired,
+                            Action::Canceled,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "maker_bond_expiry: close failed for order {} ({}); will retry next tick",
+                                order.id, e
+                            );
                         }
                         continue;
                     }
@@ -1368,6 +1394,46 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
     });
 }
 
+/// Bound the taker-bond window (issue #927 part 2). LND cancels the bond
+/// hold invoice at `hold_invoice_expiration_window` (#990 / #999); this
+/// job is the belt-and-braces path when that cancel signal is missed. It
+/// releases stale `Requested` taker bonds after the window plus grace and
+/// drops the order back to `Pending`.
+///
+/// Sleeps one interval before the first tick so startup
+/// `resubscribe_active_bonds` can deliver replayed `Accepted` events and
+/// lock paid bonds before the sweep runs (otherwise a still-`Requested`
+/// row with an accepted HTLC is cancelled — grunch on #986).
+async fn job_reconcile_stranded_taker_bonds(ctx: AppContext) {
+    let interval = 300u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            bond::reconcile_stranded_taker_bonds(pool).await;
+        }
+    });
+}
+
+/// #942: give the maker a deadline to pay the maker bond. Every minute,
+/// orders whose maker bond is still unpaid past
+/// `maker_bond_payment_timeout_seconds` are closed as `expired` (DB only,
+/// they were never published) and the maker is told. Before this, nothing
+/// but LND's 24 h default invoice expiry and the order's own `expires_at`
+/// ended them.
+async fn job_expire_unpaid_maker_bonds(ctx: AppContext) {
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            if let Err(e) = bond::expire_unpaid_maker_bonds(pool, Utc::now().timestamp()).await {
+                warn!("expire_unpaid_maker_bonds: {e}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
 async fn job_update_bitcoin_prices() {
     tokio::spawn(async {
         let Some(manager) = PriceManager::global() else {
@@ -1423,10 +1489,10 @@ async fn job_update_bitcoin_prices() {
                 // covered. A summary at warn is enough; per-provider info
                 // is already in the manager's per-provider logs.
                 warn!(
-                    "price: {}/{} providers failed this tick (still {} fresh currencies)",
+                    "price: {}/{} providers failed this tick ({} currencies still servable)",
                     report.failures.len(),
                     report.failures.len() + report.successes.len(),
-                    report.fresh_currencies
+                    report.servable_currencies
                 );
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(update_interval)).await;
@@ -1441,6 +1507,17 @@ async fn job_update_bitcoin_prices() {
 #[mutants::skip]
 async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
+
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        return info!(
+            "Lightning node is not on mainnet (networks: {:?}); dev fee payments are disabled",
+            networks
+        );
+    }
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client

@@ -1300,9 +1300,9 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fedimint-tonic-lnd"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "374d7b804191264442b33656b9d1e2800c38f8431c64644bb0f4419f3c7be4bc"
+checksum = "544e07140e0b295035d28068a66ed752ada57762571ddbb3ac54124c3d9cc892"
 dependencies = [
  "hex",
  "hyper",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "mostro"
-version = "0.18.7"
+version = "0.19.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2386,9 +2386,9 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.14.6"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad0df29fd70a740c32cfefdf975e5499925e24d820dc95c8c016dc2f94435d7a"
+checksum = "a7a75b4e5ba5756d8d6e0a952b59e752080694cfeb92112d2c75f33af8e45608"
 dependencies = [
  "bitcoin",
  "chrono",

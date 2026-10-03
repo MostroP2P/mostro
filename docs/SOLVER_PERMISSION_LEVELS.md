@@ -71,6 +71,35 @@ The current RPC `AddSolverRequest` still only exposes `solver_pubkey`.
 
 That means RPC registration remains backward compatible and defaults to `read-write` until the protobuf/API is extended.
 
+## Serbero
+
+[Serbero](https://github.com/MostroP2P/serbero) is a dispute assistant: it takes a dispute first, helps the parties establish the payment facts, and hands the case to a human solver when needed. It must never move funds, so it runs as a `read` solver.
+
+The operator configures it with one setting, and the daemon does the rest:
+
+```toml
+[mostro]
+serbero_pubkey = "npub1..."   # or hex
+```
+
+At startup, right after the database connects, `app::serbero::serbero_guard` looks the key up in `users`:
+
+| Row for `serbero_pubkey` | Startup |
+|---|---|
+| none | registered as a solver with `category = 1` (`read`), then starts |
+| `read` solver | starts |
+| solver with another category (`read-write`) | refuses to start |
+| user that is not a solver | refuses to start |
+| the node's own key | refuses to start |
+
+The log says which: `Serbero <npub> configured: registered as a read-only solver`, `Serbero <npub> configured: read-only solver`, or a `REFUSING TO START` line with the reason. A refused key is never converted: changing its row silently could strip a human solver's `read-write` permission after a pasted npub.
+
+While the daemon runs, the Serbero stays read-only: `users.pubkey` is the primary key and nothing updates `category`, so `admin-add-solver` cannot register the same key again with `read-write`.
+
+The info event (kind 38385) announces the key in a `serbero` tag, in hex: `["serbero", "<hex pubkey>"]`. The tag is absent when no Serbero is configured. Clients compare it with the solver pubkey of `admin-took-dispute` to tell the assistant from a human solver. A `read-write` solver can take over an `in-progress` dispute held by a `read` solver (`src/app/admin_take_dispute.rs`), which is how a person takes a case from Serbero.
+
+Changing or removing `serbero_pubkey` leaves the previous key as an ordinary `read` solver. Only the configured key is announced.
+
 ## Dependency
 
 This feature requires `mostro-core >= 0.8.4` because it uses `CantDoReason::NotAuthorized`.

@@ -20,6 +20,7 @@ use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
+use mostro_core::user::day_truncate;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
@@ -502,34 +503,23 @@ async fn finalize_order_publication(
     )
     .await;
 
-    NOSTR_CLIENT
-        .get()
-        .unwrap()
-        .send_event(&event)
-        .await
-        .map(|output| {
-            // A per-relay rejection resolves to `Ok` with the refusing
-            // relays in `output.failed`. The publish still stands — the row
-            // is `Pending` and at least one side of the wire may have it —
-            // but the divergent relays must be converged, so queue the
-            // order for the reconciler.
-            if !output.failed.is_empty() {
-                tracing::warn!(
-                    "initial orderbook publish rejected by {} relay(s) for order {}: {:?}; queued for republish",
-                    output.failed.len(),
-                    order_id,
-                    output.failed
-                );
-                mark_orderbook_publish_failed(order_id);
-            }
-        })
-        .map_err(|err| {
-            // The row is already `Pending` in the DB; queue it so the
-            // orderbook reconciler retries the publish instead of leaving
-            // an order that exists in the DB but never reached relays.
+    // Resolves on the first relay's `OK` (#991); the per-relay verdict comes
+    // later, in the callback. Any relay that did not take the event — a
+    // refusal, a timeout, or no relay at all — leaves the book divergent
+    // there while the row is already `Pending` in the DB, so the order is
+    // queued for the reconciler to republish.
+    crate::publish::send_event_first_ack(NOSTR_CLIENT.get().unwrap(), &event, move |report| {
+        if !report.failed.is_empty() || report.success.is_empty() {
+            tracing::warn!(
+                "initial orderbook publish not accepted by {} relay(s) for order {}: {:?}; queued for republish",
+                report.failed.len(),
+                order_id,
+                report.failed
+            );
             mark_orderbook_publish_failed(order_id);
-            MostroInternalErr(ServiceError::NostrError(err.to_string()))
-        })
+        }
+    })
+    .await
 }
 
 /// Finish publishing an order whose maker bond has just locked.
@@ -662,20 +652,13 @@ async fn prepare_new_order(
 }
 
 /// Overwrite the inner protocol version of `message` so it matches the wire
-/// `transport` (`gift-wrap` -> v1, `nip44` -> v2).
+/// `transport`.
 ///
-/// `MessageKind::new` always stamps the crate-wide `PROTOCOL_VER`, so without
-/// this every reply would advertise v2 even when it is served over the v1
-/// gift-wrap transport. Keeping the inner version aligned with the transport
-/// lets the protocol version follow the negotiated wire format.
-///
-/// DEPRECATED(v0.19.0, #786): transitional mechanism from PR #785. v0.19.0
-/// runs protocol v2 only, the inner version becomes the `PROTOCOL_VER`
-/// constant again and this function is deleted.
-#[deprecated(
-    since = "0.18.0",
-    note = "transitional version-follows-transport stamping; removed in v0.19.0 (protocol v2 only) — see issue #786"
-)]
+/// `MessageKind::new` stamps the crate-wide `PROTOCOL_VER`; stamping from the
+/// transport instead keeps the kind, the envelope, the inner version and the
+/// advertised `protocol_version` tag on one source of truth. That is what let
+/// v1 and v2 coexist during their migration (#785), and it is kept for the
+/// same reason (docs/TRANSPORT_V2_SPEC.md §8).
 fn stamp_protocol_version(message: &mut Message, transport: Transport) {
     let version = transport.protocol_version();
     match message {
@@ -704,25 +687,20 @@ pub async fn send_dm(
 
     // Non-panicking accessor: send_dm sits on every reply path and is
     // exercised by unit tests that don't initialize the global config.
-    // DEPRECATED(v0.19.0, #786): both calls below go away with the
-    // `transport` setting.
-    #[allow(deprecated)]
     let transport = Settings::get_transport();
 
     // Stamp the inner protocol version to match the active wire transport.
     // Done before wrapping so the version is covered by the message/trade
     // signatures.
-    #[allow(deprecated)]
     stamp_protocol_version(&mut message, transport);
 
     // Kind-14 events are visible to relays, so they always carry a NIP-40
     // expiration tag (default 30 days via `dm_days`) instead of lingering
     // forever. Callers that pass an explicit expiration keep it.
-    let expiration = match (transport, expiration) {
-        (Transport::Nip44Direct, None) => get_expiration_timestamp_for_kind(DM_EVENT_KIND)
-            .map(|secs| Timestamp::from_secs(secs as u64)),
-        (_, exp) => exp,
-    };
+    let expiration = expiration.or_else(|| {
+        get_expiration_timestamp_for_kind(DM_EVENT_KIND)
+            .map(|secs| Timestamp::from_secs(secs as u64))
+    });
 
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
@@ -749,10 +727,19 @@ pub async fn send_dm(
     );
 
     if let Ok(client) = get_nostr_client() {
-        client
-            .send_event(&event)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+        // Resolves on the first relay's `OK`: a relay that never answers must
+        // not hold the reply queue for its whole timeout (#991).
+        let event_id = event.id;
+        crate::publish::send_event_first_ack(client, &event, move |report| {
+            if !report.failed.is_empty() {
+                tracing::warn!(
+                    "message {event_id} not accepted by {} relay(s): {:?}",
+                    report.failed.len(),
+                    report.failed
+                );
+            }
+        })
+        .await?;
     }
 
     Ok(())
@@ -1403,38 +1390,42 @@ async fn update_order_event_stamped(
         // state. Queue the order so the scheduler's orderbook reconciler
         // republishes the current DB state until the wire converges.
         match get_nostr_client() {
-            Ok(client) => match client.send_event(&event).await {
-                // Only failures recorded by publications stamped no later
-                // than this one may be cleared: a newer concurrent
-                // publication's failure must survive this older success.
-                Ok(output) if output.failed.is_empty() => {
-                    clear_orderbook_publish_failure_up_to(order.id, stamp.generation)
-                }
-                // A per-relay rejection or timeout resolves to `Ok` with the
-                // refusing relays in `output.failed` — `send_event` returns
-                // `Err` only when there was no relay to send to at all. Any
-                // rejected relay means the book is divergent there, so the
-                // publish counts as failed and stays queued until a
-                // republish converges it.
-                Ok(output) => {
+            // Resolves on the first relay's `OK`: the event loop awaits this
+            // inline, and a relay that never answers held it — and every
+            // request queued behind it — for the relay's whole timeout
+            // (#991). The per-relay verdict arrives in the callback, possibly
+            // after this function has returned; the reconciler bookkeeping is
+            // generation-guarded, so a verdict landing late cannot clear a
+            // newer publication's failure.
+            Ok(client) => {
+                let (order_id, generation) = (order.id, stamp.generation);
+                let status = status.to_string();
+                let published = crate::publish::send_event_first_ack(client, &event, move |report| {
+                    // Only failures recorded by publications stamped no later
+                    // than this one may be cleared: a newer concurrent
+                    // publication's failure must survive this older success.
+                    if report.failed.is_empty() && !report.success.is_empty() {
+                        clear_orderbook_publish_failure_up_to(order_id, generation);
+                        return;
+                    }
+                    // Any relay that did not take the event — a refusal, a
+                    // timeout, or no relay at all — leaves the book divergent
+                    // there, so the publish counts as failed and stays queued
+                    // until a republish converges it.
                     tracing::warn!(
-                        "orderbook publish rejected by {} relay(s) for order {} (status {}): {:?}; queued for republish",
-                        output.failed.len(),
-                        order_updated.id,
+                        "orderbook publish not accepted by {} relay(s) for order {} (status {}): {:?}; queued for republish",
+                        report.failed.len(),
+                        order_id,
                         status,
-                        output.failed
+                        report.failed
                     );
-                    mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                    mark_orderbook_publish_failed_at(order_id, generation);
+                })
+                .await;
+                if let Err(e) = published {
+                    tracing::warn!("orderbook publish failed for order {order_id}: {e}");
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "orderbook publish failed for order {} (status {}): {e}; queued for republish",
-                        order_updated.id,
-                        status
-                    );
-                    mark_orderbook_publish_failed_at(order.id, stamp.generation);
-                }
-            },
+            }
             Err(e) => {
                 tracing::warn!(
                     "orderbook publish skipped for order {} (status {}): no nostr client ({e}); queued for republish",
@@ -2270,6 +2261,35 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     Ok(payment_request)
 }
 
+/// The `since` Mostro publishes for a user whose record was created at
+/// `created_at`: the date of their first trade, truncated to its UTC day by
+/// core so it cannot link the user's trade pubkeys together.
+///
+/// `None` when there is no real date (`created_at` unset or corrupt), so the
+/// field is omitted instead of reading as 1 January 1970.
+pub fn first_trade_since(created_at: i64) -> Option<u64> {
+    (created_at > 0).then(|| day_truncate(created_at))
+}
+
+/// Reputation sent to the counterparty in the `Peer` payload; zeroed for a
+/// user Mostro does not know. `operating_days` stays next to `since` for the
+/// deprecation window.
+fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
+    match user {
+        Some(user) => UserInfo {
+            rating: user.total_rating,
+            reviews: user.total_reviews,
+            // Same rule as `days` on the published events: no date, no age.
+            operating_days: match user.created_at {
+                created_at if created_at > 0 => now.saturating_sub(created_at as u64) / 86400,
+                _ => 0,
+            },
+            since: first_trade_since(user.created_at),
+        },
+        None => UserInfo::default(),
+    }
+}
+
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
     order: &Order,
@@ -2287,21 +2307,8 @@ pub async fn notify_taker_reputation(
         None => return Err(MostroCantDo(CantDoReason::InvalidPubkey)),
     };
 
-    let reputation_data = match is_user_present(pool, master_key).await {
-        Ok(user) => {
-            let now = Timestamp::now().as_secs();
-            UserInfo {
-                rating: user.total_rating,
-                reviews: user.total_reviews,
-                operating_days: (now - user.created_at as u64) / 86400,
-            }
-        }
-        Err(_) => UserInfo {
-            rating: 0.0,
-            reviews: 0,
-            operating_days: 0,
-        },
-    };
+    let user = is_user_present(pool, master_key).await.ok();
+    let reputation_data = peer_reputation(user.as_ref(), Timestamp::now().as_secs());
 
     // Get order status
     let order_status = order.get_order_status().map_err(MostroInternalErr)?;
@@ -2367,6 +2374,59 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    // ───────────────── first-trade date (`since`) ─────────────────
+
+    #[test]
+    fn first_trade_since_truncates_to_the_utc_day() {
+        // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+        assert_eq!(first_trade_since(1_700_000_000), Some(1_699_920_000));
+        assert_eq!(first_trade_since(1_699_920_000), Some(1_699_920_000));
+    }
+
+    #[test]
+    fn first_trade_since_is_none_without_a_real_date() {
+        assert_eq!(first_trade_since(0), None);
+        assert_eq!(first_trade_since(-1), None);
+    }
+
+    #[test]
+    fn peer_reputation_fills_since_next_to_operating_days() {
+        let user = User {
+            total_rating: 4.5,
+            total_reviews: 7,
+            created_at: 1_700_000_000,
+            ..Default::default()
+        };
+        let now = 1_700_000_000 + 10 * 86_400;
+        let info = peer_reputation(Some(&user), now);
+        assert_eq!(info.rating, 4.5);
+        assert_eq!(info.reviews, 7);
+        assert_eq!(info.operating_days, 10);
+        assert_eq!(info.since, Some(1_699_920_000));
+    }
+
+    #[test]
+    fn peer_reputation_of_unknown_user_has_no_since() {
+        let info = peer_reputation(None, 1_700_000_000);
+        assert_eq!(info.reviews, 0);
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
+    }
+
+    #[test]
+    fn peer_reputation_without_a_first_trade_date_has_no_age() {
+        let user = User {
+            total_reviews: 2,
+            created_at: 0,
+            ..Default::default()
+        };
+        let info = peer_reputation(Some(&user), 1_700_000_000);
+        assert_eq!(info.reviews, 2);
+        // Not ~19,675 days since the epoch.
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
     }
 
     /// Regression: the CAS-miss repair timestamp must be strictly newer than
@@ -2634,35 +2694,13 @@ mod tests {
     }
 
     #[test]
-    // DEPRECATED(v0.19.0, #786): delete along with `stamp_protocol_version`.
-    #[allow(deprecated)]
-    fn stamp_protocol_version_follows_transport() {
+    fn stamp_protocol_version_follows_transport_on_every_variant() {
         use mostro_core::message::Action;
 
-        // A v2-stamped message (the `MessageKind::new` default) must be
-        // downgraded to v1 when served over the gift-wrap transport...
-        let mut msg = Message::new_order(
-            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
-            Some(1),
-            None,
-            Action::NewOrder,
-            None,
-        );
-        stamp_protocol_version(&mut msg, Transport::GiftWrap);
-        assert_eq!(msg.get_inner_message_kind().version, 1);
-
-        // ...and stamped back to v2 over the nip44 direct transport.
-        stamp_protocol_version(&mut msg, Transport::Nip44Direct);
-        assert_eq!(msg.get_inner_message_kind().version, 2);
-    }
-
-    #[test]
-    // DEPRECATED(v0.19.0, #786): delete along with `stamp_protocol_version`.
-    #[allow(deprecated)]
-    fn stamp_protocol_version_covers_all_variants() {
-        use mostro_core::message::Action;
-
-        let kind = MessageKind::new(None, Some(1), None, Action::CantDo, None);
+        // Whatever version a message carries, it goes out with the one the
+        // transport speaks.
+        let mut kind = MessageKind::new(None, Some(1), None, Action::CantDo, None);
+        kind.version = 1;
         for mut msg in [
             Message::Order(kind.clone()),
             Message::Dispute(kind.clone()),
@@ -2671,8 +2709,11 @@ mod tests {
             Message::Dm(kind.clone()),
             Message::Restore(kind.clone()),
         ] {
-            stamp_protocol_version(&mut msg, Transport::GiftWrap);
-            assert_eq!(msg.get_inner_message_kind().version, 1);
+            stamp_protocol_version(&mut msg, Transport::Nip44Direct);
+            assert_eq!(
+                msg.get_inner_message_kind().version,
+                Transport::Nip44Direct.protocol_version()
+            );
         }
     }
 

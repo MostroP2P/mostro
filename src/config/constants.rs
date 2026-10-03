@@ -5,8 +5,10 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 /// Maximum development fee percentage (100% of Mostro fee)
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
-/// Official Mostro development Lightning Address
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.com";
+/// Official Mostro development Lightning Address.
+/// Self-custodial and served from a domain the project controls, so the
+/// backend behind it can change without a mostrod release.
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@pay.mostro.foundation";
 
 /// Nostr event kind for dev fee payment audit events
 /// Kind 8383 is in the regular events range (1000-9999) per NIP-01
@@ -36,3 +38,16 @@ pub const ENV_FILENAME: &str = ".env";
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_fee_address_is_self_hosted() {
+        // The previous custodial address was suspended by its custodian
+        // without notice (#1037); dev fees must go to the self-custodial
+        // address on a domain the project controls.
+        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@pay.mostro.foundation");
+    }
+}

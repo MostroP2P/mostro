@@ -43,12 +43,19 @@ use tracing::{error, info, warn};
 ///
 /// Returns `MostroError` if:
 /// - Solver is not assigned to the dispute
-/// - A pre-trade (`Pending` / `WaitingTakerBond`) order is cancelled by
-///   anything but the daemon key
+/// - A pre-trade (`Pending` / `WaitingTakerBond` / `WaitingMakerBond`)
+///   order is cancelled by anything but the daemon key
 /// - Order/dispute not found
+/// - The dispute initiator flags are unset or ambiguous, or a counterparty
+///   pubkey is missing/unparseable — both are checked before the refund, so
+///   they leave the escrow and the order untouched (#805)
 /// - Lightning invoice cancellation fails
 /// - Database update fails
 /// - Nostr publish fails
+///
+/// Failures *after* the refund are logged and swallowed rather than
+/// returned (DM fan-out, bond resolution), so the handler always runs to
+/// the end once the escrow has moved. Making that tail atomic is #810.
 pub async fn admin_cancel_action(
     ctx: &AppContext,
     msg: Message,
@@ -79,6 +86,34 @@ pub async fn admin_cancel_action(
             return Err(MostroCantDo(CantDoReason::NotAuthorized));
         }
         return admin_cancel_pending_order(pool, &order, my_keys, ln_client).await;
+    }
+
+    // #942: an order still waiting for its maker bond was never published,
+    // so the pre-trade cancel above (which replaces the NIP-33 event) does
+    // not fit: it is closed in the DB only, its bond released and the maker
+    // told. Same daemon-key gate. Lets a drain close these instead of
+    // waiting for the maker's deadline.
+    if order.check_status(Status::WaitingMakerBond).is_ok() {
+        if event.identity != my_keys.public_key() {
+            return Err(MostroCantDo(CantDoReason::NotAuthorized));
+        }
+        let closed = bond::close_unpublished_maker_order(
+            pool,
+            order.id,
+            Status::CanceledByAdmin,
+            Action::AdminCanceled,
+            None,
+        )
+        .await?;
+        if !closed {
+            // The bond locked (or another path closed the order) meanwhile.
+            return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+        }
+        info!(
+            "Order Id {}: unpublished maker-bond order cancelled by operator",
+            order.id
+        );
+        return Ok(());
     }
 
     // Check if the solver is assigned to the order
@@ -139,6 +174,51 @@ pub async fn admin_cancel_action(
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
+    // Resolve the dispute initiator *before* the escrow is touched (#805).
+    // This match rejects orders whose initiator flags are unset or ambiguous,
+    // and `cancel_hold_invoice` below is irreversible: running it first meant
+    // a rejected request could still refund the seller while leaving the order
+    // in `Dispute`, so the LN side and the DB disagreed with no way back.
+    // This initiator check now precedes the refund, as does the counterparty
+    // resolution below. What remains after the refund either can't reject the
+    // call (the DM fan-out is best effort) or is a DB/event write whose
+    // atomicity is tracked separately in #810.
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (seller_dispute, buyer_dispute) => {
+            // A bare `DisputeEventError` doesn't tell the operator why the
+            // cancel bounces. The pair is only reachable through a corrupted
+            // row — `dispute_action` gates on `Active`/`FiatSent`, so exactly
+            // one flag is set by the time an order reaches `Dispute`.
+            error!(
+                order_id = %order.id,
+                seller_dispute,
+                buyer_dispute,
+                "admin_cancel: ambiguous dispute initiator flags; refusing before the escrow is touched"
+            );
+            return Err(MostroInternalErr(ServiceError::DisputeEventError));
+        }
+    };
+
+    // Same reasoning as the initiator check above: resolving the
+    // counterparties is pure validation over the `order` snapshot, so it
+    // belongs before the irreversible refund rather than after it. Left
+    // where it was, an unparseable or missing pubkey aborted the handler
+    // once the escrow was already refunded and the order already
+    // `CanceledByAdmin` — past the point where a solver retry is possible
+    // (the `Dispute` guard above rejects it) and before the bond resolution
+    // below, stranding every `Locked` bond with no reconciler.
+    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
+        (Some(seller), Some(buyer)) => (
+            PublicKey::from_str(seller.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+            PublicKey::from_str(buyer.as_str())
+                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
+        ),
+        (None, _) | (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
+    };
+
     if let Some(hash) = order.hash.as_ref() {
         // We return funds to seller. A hold invoice that LND already
         // canceled (CLTV expiry refunded the seller long ago) or does not
@@ -152,13 +232,6 @@ pub async fn admin_cancel_action(
 
     // we check if there is a dispute
     let dispute = find_dispute_by_order_id(pool, order.id).await;
-
-    // Get the creator of the dispute
-    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-        (true, false) => "seller",
-        (false, true) => "buyer",
-        (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
-    };
 
     if let Ok(mut d) = dispute {
         let dispute_id = d.id;
@@ -209,27 +282,24 @@ pub async fn admin_cancel_action(
     let message = message
         .as_json()
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    // Message to admin
-    send_dm(event.sender, my_keys, &message, None)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    let (seller_pubkey, buyer_pubkey) = match (&order.seller_pubkey, &order.buyer_pubkey) {
-        (Some(seller), Some(buyer)) => (
-            PublicKey::from_str(seller.as_str())
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            PublicKey::from_str(buyer.as_str())
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-        ),
-        (None, _) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-        (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
-    };
-    send_dm(seller_pubkey, my_keys, &message, None)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-    send_dm(buyer_pubkey, my_keys, &message, None)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // The escrow is already refunded and the order already `CanceledByAdmin`
+    // by this point, so a relay hiccup on a notification must not abort the
+    // handler: an early return here skips the bond resolution below and
+    // strands every `Locked` bond with no retry path (a second admin cancel
+    // is rejected by the `Dispute` guard, and only range maker bonds have a
+    // reconciler). Delivery is best effort, mirroring `notify_bond_slashed`.
+    for (role, destination) in [
+        ("admin", event.sender),
+        ("seller", seller_pubkey),
+        ("buyer", buyer_pubkey),
+    ] {
+        if let Err(e) = send_dm(destination, my_keys, &message, None).await {
+            error!(
+                order_id = %order.id,
+                "admin_cancel: failed to notify the {role} of the cancellation: {e}"
+            );
+        }
+    }
 
     // Phase 2: apply the solver's `BondResolution` to the bond rows
     // (release-by-default when absent). The buyer/seller pubkeys on
@@ -658,9 +728,11 @@ mod tests {
         ));
     }
 
-    /// A dispute order with no `hash` skips the LND cancel and, when
-    /// neither `seller_dispute` nor `buyer_dispute` is set, fails the
-    /// dispute-initiator resolution with `DisputeEventError`.
+    /// With neither `seller_dispute` nor `buyer_dispute` set, the
+    /// dispute-initiator resolution fails with `DisputeEventError`. The
+    /// order carries no `hash`, so this covers the resolution itself
+    /// independently of the escrow; the pre-refund ordering is pinned by
+    /// `dispute_without_initiator_flag_errors_before_refunding` below.
     #[tokio::test]
     async fn dispute_without_initiator_flag_errors() {
         let pool = setup_pool().await;
@@ -690,6 +762,133 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::DisputeEventError))
         ));
+    }
+
+    /// Regression for #805: an order carrying a hold-invoice `hash` whose
+    /// dispute-initiator flags are unset must fail validation *before* the
+    /// irreversible `cancel_hold_invoice`. Reaching the LND seam here would
+    /// surface as `LnNodeError` and would mean the seller was already
+    /// refunded on a request that goes on to be rejected.
+    ///
+    /// The discriminator is the error *type*, which depends on `dead_lnd`
+    /// making every RPC fail: if the LND seam is ever replaced by a mock
+    /// that returns `Ok`, the pre-fix ordering would also end in
+    /// `DisputeEventError` and this test would stop guarding the invariant.
+    /// Assert on a cancel-call spy instead if that day comes.
+    #[tokio::test]
+    async fn dispute_without_initiator_flag_errors_before_refunding() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        // Hold invoice present, but neither side is flagged as the dispute
+        // initiator, so `dispute_initiator` resolution must reject the call.
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DisputeEventError))
+            ),
+            "expected the initiator check to reject before the LND cancel, got {result:?}"
+        );
+
+        // The order must be left untouched so the solver can retry.
+        let stored = get_order(&cancel_msg(order.id), ctx.pool()).await.unwrap();
+        assert_eq!(stored.status, Status::Dispute.to_string());
+    }
+
+    /// Both initiator flags set is as ambiguous as neither: the same arm
+    /// rejects it before the escrow is touched, so a corrupted row can't
+    /// pick an arbitrary side for the kind-38386 `initiator` tag.
+    #[tokio::test]
+    async fn dispute_with_both_initiator_flags_errors_before_refunding() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.buyer_dispute = true;
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DisputeEventError))
+            ),
+            "expected the initiator check to reject before the LND cancel, got {result:?}"
+        );
+    }
+
+    /// Counterparty resolution is validation too, so a missing pubkey must
+    /// be rejected before the refund (#805). Pre-fix this parsed only after
+    /// `cancel_hold_invoice`, the dispute row and the order status had all
+    /// been written — a rejection that had already moved the money and left
+    /// the bonds `Locked` past any retry.
+    #[tokio::test]
+    async fn missing_counterparty_pubkey_errors_before_refunding() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.buyer_pubkey = None;
+        order.hash = Some("11".repeat(32));
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::InvalidPubkey))),
+            "expected the pubkey check to reject before the LND cancel, got {result:?}"
+        );
+
+        // Untouched: no refund, no status change, so the row is still
+        // recoverable once the pubkey is repaired.
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Dispute.to_string());
     }
 
     /// A dispute order carrying a hold-invoice `hash` returns funds to the
@@ -729,9 +928,10 @@ mod tests {
 
     /// Full no-LND cancel path: a seller-initiated dispute with no hold
     /// invoice hash. The dispute row is moved to `SellerRefunded` and the
-    /// order to `CanceledByAdmin` before the DM fan-out. Those DB writes are
-    /// deterministic; the terminal `send_dm` depends on the process-global
-    /// Nostr client, so the top-level result is not asserted.
+    /// order to `CanceledByAdmin`, and the handler runs to completion even
+    /// though the DM fan-out fails here (no process-global Nostr client) —
+    /// notifications are best effort precisely so a relay failure can't skip
+    /// the bond resolution that follows them.
     #[tokio::test]
     async fn seller_dispute_without_hash_refunds_and_cancels() {
         let pool = setup_pool().await;
@@ -750,7 +950,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let _ = admin_cancel_action(
+        let result = admin_cancel_action(
             &ctx,
             cancel_msg(order.id),
             &admin_event(admin.public_key()),
@@ -758,6 +958,11 @@ mod tests {
             &mut ln,
         )
         .await;
+
+        assert!(
+            result.is_ok(),
+            "a failed DM must not abort the handler before bond resolution: {result:?}"
+        );
 
         let stored_order = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
         assert_eq!(stored_order.status, Status::CanceledByAdmin.to_string());
@@ -956,6 +1161,96 @@ mod tests {
         assert!(queued_actions_for(taker)
             .await
             .contains(&Action::AdminCanceled));
+    }
+
+    /// #942: an order waiting for its maker bond was never published. The
+    /// operator can close it: DB only, the maker bond released and the
+    /// maker told.
+    #[tokio::test]
+    async fn daemon_key_cancels_waiting_maker_bond_order_and_releases_bond() {
+        use crate::app::bond::{db::create_bond, model::Bond, BondRole, BondState};
+
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let mut order = pending_sell_order(maker);
+        order.status = Status::WaitingMakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+        let bond = create_bond(
+            ctx.pool(),
+            Bond {
+                id: uuid::Uuid::new_v4(),
+                order_id: order.id,
+                pubkey: maker.to_string(),
+                role: BondRole::Maker.to_string(),
+                amount_sats: 1_000,
+                state: BondState::Requested.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Act
+        admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(daemon.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await
+        .expect("operator cancel during the maker bond window succeeds");
+
+        // Assert
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::CanceledByAdmin.to_string());
+        assert!(
+            stored.event_id.is_empty(),
+            "a never-published order must not get a NIP-33 event"
+        );
+        let stored_bond = crate::app::bond::db::find_bond_by_id(ctx.pool(), bond.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_bond.state, BondState::Released.to_string());
+        assert!(queued_actions_for(maker)
+            .await
+            .contains(&Action::AdminCanceled));
+    }
+
+    /// The maker-bond close keeps the daemon-key gate of the pre-trade one.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_refuses_non_daemon_identity() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let daemon = Keys::generate();
+        let solver = Keys::generate();
+        let maker = Keys::generate().public_key();
+        let mut order = pending_sell_order(maker);
+        order.status = Status::WaitingMakerBond.to_string();
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let result = admin_cancel_action(
+            &ctx,
+            cancel_msg(order.id),
+            &admin_event(solver.public_key()),
+            &daemon,
+            &mut ln,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAuthorized))
+        ));
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::WaitingMakerBond.to_string());
+        assert!(queued_actions_for(maker).await.is_empty());
     }
 
     /// A take that commits between the operator's read and the CAS wins:

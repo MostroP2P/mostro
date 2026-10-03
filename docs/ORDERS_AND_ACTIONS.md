@@ -43,7 +43,7 @@ Summary of order lifecycle and key handlers.
 | `last-trade-index` | https://github.com/MostroP2P/mostro/blob/main/src/app/last_trade_index.rs | Retrieve user's last trade index from database |
 
 ## Typical Flow
-1) Maker posts New Order (GiftWrap message).
+1) Maker posts New Order (kind-14 protocol message).
 2) Taker executes Take Buy/Sell; DB validates and reserves.
 3) Buyer Add Invoice; Mostro creates hold invoice if needed.
 4) Buyer Fiat Sent; seller later Release.

@@ -167,6 +167,25 @@ dev_fee_percentage = 0.30
 - `dev_fee_percentage`: 0.30 (30%)
 - Configured in `src/config/types.rs::MostroSettings::default()`
 
+### Mainnet Only
+
+Dev fees are only paid when the connected LND reports `mainnet` in `GetInfo`.
+`DEV_FEE_LIGHTNING_ADDRESS` only issues mainnet invoices, so on regtest,
+testnet or signet (local Polar setups, E2E runs) the payment job is not
+started at all and the daemon logs once at startup:
+
+```text
+Lightning node is not on mainnet (networks: ["regtest"]); dev fee payments are disabled
+```
+
+Dev fee amounts are still calculated and stored on orders as usual; they
+simply stay unpaid (`dev_fee_paid = 0`). Since no cycle runs there to clean
+them up, startup also releases any `PENDING-…` claim marker an interrupted
+run left behind (`release_all_pending_claims`), before the node-identity
+guard would count it as an in-flight dev fee. The gate lives in
+`dev_fee_payments_enabled` (`src/app/dev_fee.rs`), checked by
+`job_process_dev_fee_payment` (`src/scheduler.rs`).
+
 ## Technical Implementation
 
 ### Fee Calculation

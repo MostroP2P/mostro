@@ -8,8 +8,10 @@ use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
+use std::str::FromStr;
 
 use mostro_core::db::Crud;
+use sqlx::{Pool, Sqlite};
 use uuid::Uuid;
 
 /// Publishes a dispute event to the Nostr network.
@@ -125,14 +127,76 @@ async fn notify_dispute_to_users(
     Ok(())
 }
 
+/// Persists a new dispute and the order's dispute state in one transaction.
+///
+/// The dispute row and the order's flag + status land together or not at
+/// all: either half alone strands the order (#921).
+///
+/// Raw sqlx because `Crud::create`/`update` take `&Pool<Sqlite>`, not an
+/// executor, so they cannot join a transaction. sqlx-crud, which
+/// mostro-core#154 replaced, was generic over the executor; this works
+/// around what that rewrite narrowed. The column list mirrors
+/// `Crud::create`'s, so a new `disputes` column upstream has to be added
+/// here too — until an executor-generic `Crud` makes this call site
+/// unnecessary.
+async fn persist_dispute(
+    pool: &Pool<Sqlite>,
+    dispute: &Dispute,
+    order: &Order,
+) -> Result<(), MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
+         created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(dispute.id)
+    .bind(dispute.order_id)
+    .bind(&dispute.status)
+    .bind(&dispute.order_previous_status)
+    .bind(&dispute.solver_pubkey)
+    .bind(dispute.created_at)
+    .bind(dispute.taken_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Only what `setup_dispute` changed, not the whole row from a snapshot,
+    // and only if the order is still in the status `get_valid_order` admitted
+    // — `dispute.order_previous_status` is that status. Another user message
+    // cannot commit in between: the event loop awaits each handler before it
+    // reads the next event. Two tasks of our own can, and both move an
+    // `Active` order to `Canceled` — the scheduler's
+    // `enforce_escrow_deadline_pass`, and `hold_invoice_canceled` on the LND
+    // invoice subscription once the escrow deadline has passed. Matching on
+    // `id` alone would drag such an order back to `Dispute`; a miss rolls the
+    // inserted row back with it.
+    let updated = sqlx::query(
+        "UPDATE orders SET status = ?, buyer_dispute = ?, seller_dispute = ? \
+         WHERE id = ? AND status = ?",
+    )
+    .bind(&order.status)
+    .bind(order.buyer_dispute)
+    .bind(order.seller_dispute)
+    .bind(order.id)
+    .bind(&dispute.order_previous_status)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(())
+}
+
 /// Main handler for dispute actions.
 ///
 /// This function:
 /// 1. Validates the order and dispute status
-/// 2. Updates the order status
-/// 3. Creates a new dispute record
-/// 4. Notifies both parties
-/// 5. Publishes the dispute event to the network
+/// 2. Atomically persists the new dispute record and the order's dispute
+///    state (see `persist_dispute`)
+/// 3. Notifies both parties
+/// 4. Publishes the dispute event to the network
 pub async fn dispute_action(
     ctx: &AppContext,
     msg: Message,
@@ -168,21 +232,15 @@ pub async fn dispute_action(
     // Create new dispute record
     let dispute = Dispute::new(order_id, order.status.clone());
 
-    // Setup dispute
+    // Setup dispute. `setup_dispute` leaves `order.status` dirty on `Err`;
+    // returning here keeps that out of the database.
     order
         .setup_dispute(is_buyer_dispute)
         .map_err(MostroCantDo)?;
-    order
-        .clone()
-        .update(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
-    // Save dispute to database
-    let dispute = dispute
-        .create(pool)
-        .await
-        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
+    // The dispute row and the order's flag + status land together or not at
+    // all: either half alone strands the order (#921).
+    persist_dispute(pool, &dispute, &order).await?;
 
     // Get pubkeys of initiator and counterpart
     let (initiator_pubkey, counterpart_pubkey) = if is_buyer_dispute {
@@ -226,14 +284,17 @@ pub async fn dispute_action(
 ///
 /// This is a best-effort operation: if the dispute update or event publishing fails,
 /// errors are logged but not propagated, since the primary order operation has already
-/// succeeded.
+/// succeeded. The solver is notified via DM when one is assigned and the dispute
+/// reaches a terminal status. Non-terminal statuses do not trigger a notification.
 ///
 /// # Arguments
-/// * `pool` - Database connection pool
+/// * `ctx` - Application context containing the database pool and Nostr client
 /// * `order` - The order associated with the dispute
-/// * `new_status` - The new dispute status (e.g., SellerRefunded or Settled)
+/// * `new_status` - The new dispute status: `Released` after a release,
+///   `CooperativelyCanceled` after a cooperative cancel. Never `Settled`, which marks
+///   a solver's `admin-settle`.
 /// * `my_keys` - Mostro's keys for signing the dispute event
-/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
+/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel", "release")
 pub async fn close_dispute_after_user_resolution(
     ctx: &AppContext,
     order: &Order,
@@ -245,6 +306,10 @@ pub async fn close_dispute_after_user_resolution(
     if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
         let dispute_id = dispute.id;
         let opened_at = dispute.created_at;
+
+        // Clone solver_pubkey before update, as dispute.update() consumes the struct
+        let solver_pubkey_opt = dispute.solver_pubkey.clone();
+
         dispute.status = new_status.to_string();
 
         if let Err(e) = dispute.update(pool).await {
@@ -273,7 +338,7 @@ pub async fn close_dispute_after_user_resolution(
                         dispute_id,
                         order.id,
                         order.seller_dispute,
-                        order.buyer_dispute,
+                        order.buyer_dispute
                     );
                     "unknown"
                 }
@@ -301,6 +366,38 @@ pub async fn close_dispute_after_user_resolution(
                         dispute_id,
                         e
                     );
+                }
+            }
+
+            // --- NOTIFY SOLVER ---
+            let solver_action = match new_status {
+                DisputeStatus::CooperativelyCanceled => Some(Action::CooperativeCancelAccepted),
+                DisputeStatus::SellerRefunded => Some(Action::CooperativeCancelAccepted),
+                DisputeStatus::Settled | DisputeStatus::Released => Some(Action::Released),
+                DisputeStatus::Initiated | DisputeStatus::InProgress => None,
+            };
+
+            if let (Some(action), Some(pk_str)) = (solver_action, solver_pubkey_opt.as_ref()) {
+                match PublicKey::from_str(pk_str) {
+                    Ok(solver_pubkey) => {
+                        enqueue_order_msg(
+                            None,
+                            Some(order.id),
+                            action,
+                            Some(Payload::Dispute(dispute_id, None)),
+                            solver_pubkey,
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse solver pubkey for dispute {} on order {}: {}",
+                            dispute_id,
+                            order.id,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -435,6 +532,55 @@ mod tests {
             result,
             Err(MostroInternalErr(ServiceError::DisputeAlreadyExists))
         ));
+    }
+
+    #[tokio::test]
+    async fn dispute_action_rejects_order_with_dispute_flag_but_no_dispute_row() {
+        // #848 made a `setup_dispute` failure reach the client instead of
+        // being swallowed. That arm needs an order whose dispute flag is
+        // already set with no matching `disputes` row: the normal
+        // double-dispute path trips the `DisputeAlreadyExists` guard above
+        // and never reaches `setup_dispute`.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET buyer_dispute = 1 WHERE id = ?1")
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let event = create_event(buyer);
+        let err = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &event,
+            &Keys::generate(),
+        )
+        .await
+        .expect_err("inconsistent dispute state must be rejected");
+
+        assert!(matches!(
+            err,
+            MostroCantDo(CantDoReason::DisputeCreationError)
+        ));
+
+        // The behaviour #848 changed: the old code created the row anyway.
+        // `find_dispute_by_order_id` uses `fetch_one`, so a missing row is
+        // `Err`, not `Ok(None)`.
+        assert!(find_dispute_by_order_id(&pool, order.id).await.is_err());
+
+        // Nothing was persisted before the early return.
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Active.to_string());
+        assert!(stored.buyer_dispute);
+        assert!(!stored.seller_dispute);
     }
 
     #[tokio::test]
@@ -662,7 +808,7 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::Settled,
+            DisputeStatus::Released,
             &Keys::generate(),
             "release",
         )
@@ -692,14 +838,17 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::SellerRefunded,
+            DisputeStatus::CooperativelyCanceled,
             &Keys::generate(),
             "cooperative cancel",
         )
         .await;
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        assert_eq!(dispute.status, DisputeStatus::SellerRefunded.to_string());
+        assert_eq!(
+            dispute.status,
+            DisputeStatus::CooperativelyCanceled.to_string()
+        );
     }
 
     /// Inconsistent flags (both unset) fall into the "unknown" initiator
@@ -724,13 +873,274 @@ mod tests {
         close_dispute_after_user_resolution(
             &ctx,
             &order,
-            DisputeStatus::Settled,
+            DisputeStatus::Released,
             &Keys::generate(),
             "release",
         )
         .await;
 
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+        assert_eq!(dispute.status, DisputeStatus::Released.to_string());
+    }
+
+    /// The `disputes` insert is made to fail deterministically by dropping the
+    /// table: the order must not carry the dispute flag (nor the `Dispute`
+    /// status) when the row that makes the dispute visible was not written.
+    #[tokio::test]
+    async fn dispute_action_leaves_the_order_untouched_when_the_dispute_row_fails() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE disputes")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &create_event(buyer),
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
+
+        let stored_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(!stored_order.buyer_dispute);
+        assert!(!stored_order.seller_dispute);
+        assert_eq!(stored_order.status, Status::Active.to_string());
+    }
+
+    /// The inverse window: the insert succeeds and the order update fails.
+    /// Both writes are one transaction, so the row must roll back with it,
+    /// from either status a dispute can be filed in. A trigger aborting any
+    /// `orders` update injects the failure deterministically.
+    #[tokio::test]
+    async fn dispute_action_rolls_back_the_row_when_the_order_update_fails() {
+        for status in [Status::Active, Status::FiatSent] {
+            let pool = create_test_pool().await;
+            let ctx = build_ctx(&pool);
+            let buyer = Keys::generate().public_key();
+            let seller = Keys::generate().public_key();
+            let order = create_order(Some(buyer), Some(seller), status)
+                .create(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER fail_order_update BEFORE UPDATE ON orders \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let result = dispute_action(
+                &ctx,
+                dispute_msg_for(Some(order.id)),
+                &create_event(buyer),
+                &Keys::generate(),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+                ),
+                "{status}: got {result:?}"
+            );
+            assert!(
+                find_dispute_by_order_id(&pool, order.id).await.is_err(),
+                "{status}: the dispute row must roll back with the failed order update"
+            );
+        }
+    }
+
+    /// The order update is guarded by the status `get_valid_order` admitted,
+    /// so a transition that commits in between cannot be dragged back to
+    /// `Dispute` — and the inserted row rolls back with the miss. Injected
+    /// with a trigger that moves the order on as soon as the dispute row
+    /// lands, inside this very transaction.
+    #[tokio::test]
+    async fn dispute_action_rolls_back_when_the_order_moved_on() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let order = create_order(Some(buyer), Some(seller), Status::Active)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER move_order_on AFTER INSERT ON disputes \
+             BEGIN UPDATE orders SET status = 'settled-hold-invoice' WHERE id = NEW.order_id; END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = dispute_action(
+            &ctx,
+            dispute_msg_for(Some(order.id)),
+            &create_event(buyer),
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a concurrent transition must refuse the dispute, got {result:?}"
+        );
+        assert!(
+            find_dispute_by_order_id(&pool, order.id).await.is_err(),
+            "the inserted row must roll back with the refused update"
+        );
+        let stored = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Active.to_string());
+        assert!(!stored.buyer_dispute);
+    }
+
+    /// When a dispute has a solver assigned and users resolve it via
+    /// cooperative cancel (SellerRefunded), the solver must receive
+    /// Action::CooperativeCancelAccepted so their client knows the case is closed.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_notifies_solver() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let solver = Keys::generate();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+
+        let mut dispute = Dispute::new(order.id, Status::Active.to_string());
+        dispute.solver_pubkey = Some(solver.public_key().to_string());
+        dispute.create(&pool).await.unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::CooperativelyCanceled,
+            &Keys::generate(),
+            "cooperative cancel",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let solver_msgs: Vec<_> = queue
+            .iter()
+            .filter(|(msg, dest)| {
+                *dest == solver.public_key()
+                    && msg.get_inner_message_kind().action == Action::CooperativeCancelAccepted
+                    && msg.get_inner_message_kind().id == Some(order.id)
+            })
+            .collect();
+
+        assert_eq!(solver_msgs.len(), 1);
+
+        // Verify the payload contains the dispute_id
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        let (msg, _) = solver_msgs[0];
+        assert!(matches!(
+            msg.get_inner_message_kind().payload,
+            Some(Payload::Dispute(id, None)) if id == dispute.id
+        ));
+    }
+
+    /// When a dispute has a solver assigned and users resolve it via
+    /// release (Settled), the solver must receive Action::Released
+    /// so their client knows the case is closed.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_notifies_solver_on_settled() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let solver = Keys::generate();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+
+        let mut dispute = Dispute::new(order.id, Status::Active.to_string());
+        dispute.solver_pubkey = Some(solver.public_key().to_string());
+        dispute.create(&pool).await.unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::Settled,
+            &Keys::generate(),
+            "release",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        let solver_msgs: Vec<_> = queue
+            .iter()
+            .filter(|(msg, dest)| {
+                *dest == solver.public_key()
+                    && msg.get_inner_message_kind().action == Action::Released
+                    && msg.get_inner_message_kind().id == Some(order.id)
+            })
+            .collect();
+
+        assert_eq!(solver_msgs.len(), 1);
+
+        // Verify the payload contains the dispute_id
+        let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
+        let (msg, _) = solver_msgs[0];
+        assert!(matches!(
+            msg.get_inner_message_kind().payload,
+            Some(Payload::Dispute(id, None)) if id == dispute.id
+        ));
+    }
+
+    /// When no solver is assigned (solver_pubkey is None), no DM is queued.
+    #[tokio::test]
+    async fn close_dispute_after_user_resolution_skips_notification_without_solver() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+
+        let mut order = create_order(Some(buyer), Some(seller), Status::Dispute);
+        order.seller_dispute = true;
+        let order = order.create(&pool).await.unwrap();
+        Dispute::new(order.id, Status::Active.to_string())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        close_dispute_after_user_resolution(
+            &ctx,
+            &order,
+            DisputeStatus::SellerRefunded,
+            &Keys::generate(),
+            "cooperative cancel",
+        )
+        .await;
+
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        assert!(
+            queue
+                .iter()
+                .all(|(msg, _)| msg.get_inner_message_kind().id != Some(order.id)),
+            "No message should be queued when solver is not assigned"
+        );
     }
 }

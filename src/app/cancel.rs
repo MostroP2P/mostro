@@ -1,9 +1,11 @@
 use crate::app::bond;
+use crate::app::bond::flow::{classify_cancel_error, CancelOutcome};
 use crate::app::context::AppContext;
 use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{edit_pubkeys_order, update_order_to_initial_state};
 use crate::lightning::LndConnector;
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
+use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -11,11 +13,24 @@ use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
 use tracing::{info, warn};
 
+/// The Lightning capabilities the cancel paths need: cancel an escrow, and
+/// first find out whether it is safe to.
 pub trait CancelLightning {
     fn cancel_hold_invoice<'a>(
         &'a mut self,
         hash: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>;
+
+    /// Current state of the escrow invoice at LND, `None` when the node has no
+    /// record of it. See [`LndConnector::lookup_invoice_state`].
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a,
+        >,
+    >;
 }
 
 impl CancelLightning for LndConnector {
@@ -29,6 +44,104 @@ impl CancelLightning for LndConnector {
                 .await
                 .map(|_| ())
         })
+    }
+
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { LndConnector::lookup_invoice_state(self, hash).await })
+    }
+}
+
+/// What to do with an escrow hold invoice a cancel path is about to void.
+#[derive(Debug, PartialEq)]
+pub(crate) enum EscrowCancelDecision {
+    /// Nothing is locked in — cancel the invoice.
+    Cancel,
+    /// The seller's HTLC is accepted *right now*: canceling refunds it while
+    /// `hold_invoice_paid` is concurrently telling the buyer the payment went
+    /// through. Leave the escrow alone and let the trade advance.
+    SkipPaid,
+    /// LND could not be asked. Skipping only delays a cancel; canceling blind
+    /// can refund a live escrow, so this is the safe direction.
+    SkipUnknown(String),
+}
+
+/// Decide whether an escrow invoice may be canceled, from the order's status
+/// and the invoice's state at LND.
+///
+/// The two waiting states give the same `Accepted` opposite meanings:
+///
+/// - `waiting-payment` — the seller is supposed *not* to have paid yet. An
+///   accepted HTLC means they just did, in the gap between the caller's read
+///   and now. That is the race that turns a timeout (or a counterparty
+///   cancel) into a refund of a live escrow while the buyer is being told to
+///   send fiat. Skip.
+/// - `waiting-buyer-invoice` — the seller has already paid by definition, and
+///   returning their funds is precisely what canceling here is for. Cancel.
+///
+/// `Settled` cannot arise in `waiting-payment` (only a release settles, and
+/// only from a live trade), but it is treated like `Accepted`: whatever it
+/// means, it is not something to void blindly. `Open`, `Canceled` and an
+/// invoice LND has no record of all mean no live escrow.
+pub(crate) fn classify_escrow_cancel(
+    status: Status,
+    lookup: Result<Option<InvoiceState>, MostroError>,
+) -> EscrowCancelDecision {
+    if status != Status::WaitingPayment {
+        return EscrowCancelDecision::Cancel;
+    }
+    match lookup {
+        Ok(Some(InvoiceState::Accepted)) | Ok(Some(InvoiceState::Settled)) => {
+            EscrowCancelDecision::SkipPaid
+        }
+        Ok(_) => EscrowCancelDecision::Cancel,
+        Err(e) => EscrowCancelDecision::SkipUnknown(e.to_string()),
+    }
+}
+
+/// [`classify_escrow_cancel`] evaluated against the live node.
+pub(crate) async fn decide_escrow_cancel<L: CancelLightning + Send + ?Sized>(
+    ln_client: &mut L,
+    status: Status,
+    hash: &str,
+) -> EscrowCancelDecision {
+    classify_escrow_cancel(status, ln_client.lookup_invoice_state(hash).await)
+}
+
+/// Cancel an escrow hold invoice, treating an invoice LND has already voided
+/// as success.
+///
+/// `cancel_hold_invoice` reports `already canceled` / `not found` as an error,
+/// which is a fact rather than a failure — and aborting on it strands the
+/// order. Every cancel path here voids the escrow before persisting, so a
+/// first attempt that dies in between leaves exactly that shape: the escrow is
+/// gone and the order is still live. Without this, the retry that should
+/// finish the job (the caller's, or the scheduler's next timeout tick) hits
+/// the error again and can never converge.
+///
+/// [`classify_cancel_error`] is the same classifier the bond module uses for
+/// its own idempotent cancels; anything it cannot place confidently stays an
+/// error, so a transient LND problem still aborts.
+pub(crate) async fn cancel_escrow_idempotent<L: CancelLightning + Send + ?Sized>(
+    ln_client: &mut L,
+    order_id: uuid::Uuid,
+    hash: &str,
+) -> Result<(), MostroError> {
+    match ln_client.cancel_hold_invoice(hash).await {
+        Ok(()) => Ok(()),
+        Err(e) => match classify_cancel_error(&e) {
+            CancelOutcome::AlreadyDone => {
+                info!("Order Id {order_id}: escrow was already void at LND ({e}); continuing");
+                Ok(())
+            }
+            CancelOutcome::Transient => Err(e),
+        },
     }
 }
 
@@ -95,7 +208,7 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
     // Cancel hold invoice if present; if funds were locked, this returns them to the seller.
     if let Some(hash) = &order.hash {
         // We return funds to seller
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!(
             "Cooperative cancel: Order Id {}: Funds returned to seller",
             &order.id
@@ -137,10 +250,14 @@ async fn cancel_cooperative_execution_step_2<L: CancelLightning + Send>(
 
     // If there was an active dispute on this order, close it since the users
     // resolved the situation themselves via cooperative cancellation.
+    // `CooperativelyCanceled`, not `SellerRefunded`: the seller is refunded
+    // either way, but `SellerRefunded` is what a solver's `admin-cancel`
+    // writes, and keeping the two apart is what tells a dispute the users
+    // closed themselves from one a solver decided.
     close_dispute_after_user_resolution(
         ctx,
         &order,
-        DisputeStatus::SellerRefunded,
+        DisputeStatus::CooperativelyCanceled,
         my_keys,
         "cooperative cancel",
     )
@@ -286,7 +403,7 @@ async fn cancel_order_by_taker_inner<L: CancelLightning + Send>(
 ) -> Result<(), MostroError> {
     // Cancel hold invoice if present
     if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
 
@@ -344,18 +461,31 @@ async fn cancel_order_by_maker<L: CancelLightning + Send>(
     request_id: Option<u64>,
     ln_client: &mut L,
 ) -> Result<(), MostroError> {
-    // We publish a new replaceable kind nostr event with the status updated
-    if let Ok(order_updated) = update_order_event(my_keys, Status::Canceled, &order).await {
-        order_updated
-            .update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    }
-    // Cancel hold invoice if present
+    // Void the escrow *before* persisting the cancel. On a cancel failure `?`
+    // returns with the order untouched, so the caller retries against a state
+    // that still matches the HTLC. Persisting first left a canceled order
+    // whose hold invoice was still live at LND — payable for as long as its
+    // expiry allows, and cleaned up by nothing: `find_held_invoices` and the
+    // escrow-deadline guardian both ignore canceled orders, so the seller's
+    // funds would sit locked until LND itself voided the invoice near the
+    // CLTV horizon. Same ordering, and the same reasoning, as the scheduler's
+    // timeout path and the taker branch above.
     if let Some(hash) = &order.hash {
-        ln_client.cancel_hold_invoice(hash).await?;
+        cancel_escrow_idempotent(ln_client, order.id, hash).await?;
         info!("Order Id {}: Funds returned to seller", &order.id);
     }
+    // We publish a new replaceable kind nostr event with the status updated.
+    // A failure here must surface instead of being skipped: the escrow is
+    // already void above, so silently dropping the write left the order live
+    // behind a dead escrow *and* told both parties it was canceled. Note that
+    // a relay rejection is not this branch — `update_order_event` queues those
+    // for republish and returns `Ok` — so this only fires when the event could
+    // not be built at all. Mirrors the taker branch and `hold_invoice_paid`.
+    let order_updated = update_order_event(my_keys, Status::Canceled, &order).await?;
+    order_updated
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     enqueue_order_msg(
         request_id,
@@ -485,6 +615,42 @@ async fn cancel_pending_order_from_maker(
     Ok(())
 }
 
+/// Cancel an order whose maker has not paid the bond yet (#993).
+///
+/// The order was never published, so it is closed in the DB only: an
+/// event would put a ghost entry in the book. This ends in the same state
+/// as the `WaitingMakerBond` branch of `job_expire_pending_older_orders`,
+/// a closed row and a released bond, but as `Canceled` rather than
+/// `Expired`.
+async fn cancel_waiting_maker_bond_order(
+    pool: &Pool<Sqlite>,
+    event: &UnwrappedMessage,
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    order
+        .sent_from_maker(event.sender)
+        .map_err(|_| MostroCantDo(CantDoReason::IsNotYourOrder))?;
+    // The bond can lock while this cancel is in flight. Same close as the
+    // #942 deadline and the operator cancel: it refuses while the maker
+    // bond is `Locked`, so a maker who paid a moment before cancelling gets
+    // the order published, then cancels it as a `Pending` order. Once the
+    // close commits the bond can no longer lock (`Canceled` is in
+    // `UNPUBLISHED_CLOSE_STATUSES`), and the close releases it.
+    let closed = bond::close_unpublished_maker_order(
+        pool,
+        order.id,
+        Status::Canceled,
+        Action::Canceled,
+        request_id,
+    )
+    .await?;
+    if !closed {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+    Ok(())
+}
+
 /// Cancel action entry point using dependency-injected context.
 ///
 /// The database connection pool and other dependencies are extracted from `ctx`.
@@ -586,6 +752,9 @@ async fn cancel_action_generic<L: CancelLightning + Send>(
     // Do the appropriate cancellation flow based on the order status
     // Route to the appropriate cancellation flow based on active vs not-active states.
     match order.get_order_status().map_err(MostroInternalErr)? {
+        Status::WaitingMakerBond => {
+            cancel_waiting_maker_bond_order(pool, event, &order, request_id).await?
+        }
         Status::WaitingPayment | Status::WaitingBuyerInvoice => {
             cancel_not_active_order(pool, event, order, my_keys, request_id, ln_client).await?
         }
@@ -686,7 +855,42 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
         return Err(MostroInternalErr(ServiceError::InvalidPubkey));
     };
 
-    if order.sent_from_maker(event.sender).is_ok() {
+    // Resolve the caller's role *before* the escrow guard below, which talks
+    // to LND: a sender who is neither party must be rejected as such, without
+    // costing a lookup RPC and without learning from the error whether the
+    // escrow is funded.
+    let sender_is_maker = order.sent_from_maker(event.sender).is_ok();
+    if !sender_is_maker && event.sender != taker_pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
+    // Never void an escrow that is already funded. Both branches below cancel
+    // the hold invoice, and in `waiting-payment` an accepted HTLC means the
+    // seller paid between this handler's read and now — refunding them here
+    // would leave the buyer sending fiat against nothing, since
+    // `hold_invoice_paid` is concurrently telling them the payment landed.
+    if let Some(hash) = order.hash.as_deref() {
+        let status = order.get_order_status().map_err(MostroInternalErr)?;
+        match decide_escrow_cancel(ln_client, status, hash).await {
+            EscrowCancelDecision::Cancel => {}
+            EscrowCancelDecision::SkipPaid => {
+                warn!(
+                    "Order Id {}: refusing to cancel — the seller's escrow payment just landed",
+                    order.id
+                );
+                return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+            }
+            EscrowCancelDecision::SkipUnknown(cause) => {
+                warn!(
+                    "Order Id {}: could not read the escrow state before canceling ({cause}); rejecting so the caller retries",
+                    order.id
+                );
+                return Err(MostroInternalErr(ServiceError::LnNodeError(cause)));
+            }
+        }
+    }
+
+    if sender_is_maker {
         cancel_order_by_maker(
             pool,
             event,
@@ -697,7 +901,7 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
             ln_client,
         )
         .await?;
-    } else if event.sender == taker_pubkey {
+    } else {
         cancel_order_by_taker(
             pool,
             event,
@@ -708,8 +912,6 @@ async fn cancel_not_active_order<L: CancelLightning + Send>(
             taker_pubkey,
         )
         .await?;
-    } else {
-        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     Ok(())
 }
@@ -799,6 +1001,186 @@ mod tests {
         {
             Box::pin(async move { Ok(()) })
         }
+
+        /// Unpaid escrow: the state every existing cancel test assumes.
+        fn lookup_invoice_state<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Some(InvoiceState::Open)) })
+        }
+    }
+
+    /// Escrow stub that reports a chosen invoice state and records whether the
+    /// hold invoice was canceled, so a test can assert the escrow was *not*
+    /// touched — the whole point of the guard.
+    struct StubEscrowLnClient {
+        /// `None` models an invoice LND has no record of.
+        state: Option<InvoiceState>,
+        fail_lookup: bool,
+        fail_cancel: Option<String>,
+        canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        looked_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StubEscrowLnClient {
+        fn reporting(state: Option<InvoiceState>) -> Self {
+            Self {
+                state,
+                fail_lookup: false,
+                fail_cancel: None,
+                canceled: Default::default(),
+                looked_up: Default::default(),
+            }
+        }
+
+        fn unreachable() -> Self {
+            Self {
+                state: None,
+                fail_lookup: true,
+                fail_cancel: None,
+                canceled: Default::default(),
+                looked_up: Default::default(),
+            }
+        }
+
+        /// Unpaid escrow whose cancel LND refuses with a transient error.
+        fn refusing_cancel() -> Self {
+            Self {
+                state: Some(InvoiceState::Open),
+                fail_lookup: false,
+                fail_cancel: Some("cancel refused".to_string()),
+                canceled: Default::default(),
+                looked_up: Default::default(),
+            }
+        }
+
+        /// LND reports the invoice as already void — a fact, not a failure.
+        fn already_canceled() -> Self {
+            Self {
+                state: Some(InvoiceState::Canceled),
+                fail_lookup: false,
+                fail_cancel: Some(
+                    "code=Unknown message=invoice with that hash already canceled".to_string(),
+                ),
+                canceled: Default::default(),
+                looked_up: Default::default(),
+            }
+        }
+
+        fn escrow_was_canceled(&self) -> bool {
+            self.canceled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn escrow_was_looked_up(&self) -> bool {
+            self.looked_up.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CancelLightning for StubEscrowLnClient {
+        fn cancel_hold_invoice<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MostroError>> + Send + 'a>>
+        {
+            let canceled = self.canceled.clone();
+            let fail = self.fail_cancel.clone();
+            Box::pin(async move {
+                if let Some(cause) = fail {
+                    return Err(MostroInternalErr(ServiceError::LnNodeError(cause)));
+                }
+                canceled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn lookup_invoice_state<'a>(
+            &'a mut self,
+            _hash: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<InvoiceState>, MostroError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let (state, fail) = (self.state, self.fail_lookup);
+            let looked_up = self.looked_up.clone();
+            Box::pin(async move {
+                looked_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                if fail {
+                    Err(MostroInternalErr(ServiceError::LnNodeError(
+                        "node unreachable".to_string(),
+                    )))
+                } else {
+                    Ok(state)
+                }
+            })
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // classify_escrow_cancel
+    // ---------------------------------------------------------------
+
+    /// The invariant the whole guard exists for: an accepted HTLC on an order
+    /// that is still waiting for the seller's payment means they paid just
+    /// now, so canceling would refund a live escrow.
+    #[test]
+    fn escrow_cancel_skips_a_funded_waiting_payment_escrow() {
+        for state in [InvoiceState::Accepted, InvoiceState::Settled] {
+            assert_eq!(
+                classify_escrow_cancel(Status::WaitingPayment, Ok(Some(state))),
+                EscrowCancelDecision::SkipPaid,
+                "{state:?} must not be voided"
+            );
+        }
+    }
+
+    /// Nothing locked in — including an invoice LND no longer has a record of,
+    /// which cannot be refunding anyone.
+    #[test]
+    fn escrow_cancel_proceeds_when_nothing_is_locked_in() {
+        for lookup in [
+            Ok(Some(InvoiceState::Open)),
+            Ok(Some(InvoiceState::Canceled)),
+            Ok(None),
+        ] {
+            assert_eq!(
+                classify_escrow_cancel(Status::WaitingPayment, lookup),
+                EscrowCancelDecision::Cancel
+            );
+        }
+    }
+
+    /// Delaying a cancel is recoverable; refunding a live escrow is not.
+    #[test]
+    fn escrow_cancel_skips_when_lnd_cannot_be_asked() {
+        let err = MostroInternalErr(ServiceError::LnNodeError("boom".to_string()));
+        assert!(matches!(
+            classify_escrow_cancel(Status::WaitingPayment, Err(err)),
+            EscrowCancelDecision::SkipUnknown(_)
+        ));
+    }
+
+    /// The asymmetry that makes the guard status-keyed: in
+    /// `waiting-buyer-invoice` the seller has paid by definition, and handing
+    /// their funds back is exactly what the cancel is for.
+    #[test]
+    fn escrow_cancel_still_refunds_the_seller_in_waiting_buyer_invoice() {
+        assert_eq!(
+            classify_escrow_cancel(
+                Status::WaitingBuyerInvoice,
+                Ok(Some(InvoiceState::Accepted))
+            ),
+            EscrowCancelDecision::Cancel
+        );
     }
 
     #[tokio::test]
@@ -1321,6 +1703,242 @@ mod tests {
         assert!(after.buyer_pubkey.is_none());
     }
 
+    /// A cancel racing the seller's payment must not void the escrow: the
+    /// buyer is being told the payment landed at that very moment, so a refund
+    /// here leaves them sending fiat against nothing.
+    #[tokio::test]
+    async fn maker_cancel_is_rejected_when_the_escrow_is_already_funded() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::reporting(Some(InvoiceState::Accepted));
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a funded escrow must reject the cancel: {result:?}"
+        );
+        assert!(
+            !ln.escrow_was_canceled(),
+            "the seller's accepted HTLC must not be refunded"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingPayment.to_string(),
+            "the order must be left for the trade to advance"
+        );
+    }
+
+    /// The guard sits above the maker/taker routing, so the taker side of the
+    /// same race is covered too.
+    #[tokio::test]
+    async fn taker_cancel_is_rejected_when_the_escrow_is_already_funded() {
+        set_global_config();
+        let pool = setup_pool().await;
+        set_global_db_pool(&pool);
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.master_seller_pubkey = Some(maker.to_string());
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let mut ln = StubEscrowLnClient::reporting(Some(InvoiceState::Accepted));
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "a funded escrow must reject the cancel: {result:?}"
+        );
+        assert!(!ln.escrow_was_canceled());
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingPayment.to_string()
+        );
+    }
+
+    /// An unreadable escrow state is rejected rather than canceled blind, and
+    /// as an internal error so the caller retries instead of believing the
+    /// order is gone.
+    #[tokio::test]
+    async fn cancel_is_rejected_when_the_escrow_state_cannot_be_read() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::unreachable();
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::LnNodeError(_)))),
+            "an unreadable escrow must reject the cancel: {result:?}"
+        );
+        assert!(!ln.escrow_was_canceled());
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingPayment.to_string()
+        );
+    }
+
+    /// The buyer-side timeout still refunds the seller: in
+    /// `waiting-buyer-invoice` the escrow is funded on purpose, and the guard
+    /// must not stand in the way of returning it.
+    #[tokio::test]
+    async fn waiting_buyer_invoice_cancel_still_returns_the_funded_escrow() {
+        set_global_config();
+        let pool = setup_pool().await;
+        set_global_db_pool(&pool);
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingBuyerInvoice.to_string();
+        order.master_seller_pubkey = Some(maker.to_string());
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(taker);
+        let mut ln = StubEscrowLnClient::reporting(Some(InvoiceState::Accepted));
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(result.is_ok(), "taker cancel must succeed: {result:?}");
+        assert!(
+            ln.escrow_was_canceled(),
+            "the seller's funds must be returned"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Pending.to_string()
+        );
+    }
+
+    /// The escrow is voided before the cancel is persisted, so a refused
+    /// cancel leaves the order intact for the caller to retry. Persisting
+    /// first would strand a canceled order behind a live, still-payable hold
+    /// invoice that no job cleans up.
+    #[tokio::test]
+    async fn maker_cancel_is_not_persisted_when_the_escrow_cancel_fails() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::refusing_cancel();
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroInternalErr(ServiceError::LnNodeError(_)))),
+            "a refused escrow cancel must surface: {result:?}"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingPayment.to_string(),
+            "the order must not be canceled while its hold invoice is live"
+        );
+    }
+
+    /// An escrow LND already voided must not block the cancel: that is the
+    /// retry that finishes a first attempt which died between voiding the
+    /// escrow and persisting, and without this it can never converge.
+    #[tokio::test]
+    async fn maker_cancel_converges_when_the_escrow_is_already_void() {
+        set_global_config();
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let taker = Keys::generate().public_key();
+
+        let mut order = create_pending_order(maker, taker);
+        order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let event = create_unwrapped_message_with_pubkey(maker);
+        let mut ln = StubEscrowLnClient::already_canceled();
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an already-void escrow must not abort the cancel: {result:?}"
+        );
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::Canceled.to_string(),
+            "the retry must finish what the first attempt left half-done"
+        );
+    }
+
     #[tokio::test]
     async fn cancel_not_active_order_rejects_intruder() {
         let pool = setup_pool().await;
@@ -1330,15 +1948,17 @@ mod tests {
 
         let mut order = create_pending_order(maker, taker);
         order.status = Status::WaitingPayment.to_string();
+        order.hash = Some("stub-hold-invoice-hash".to_string());
         let order = order.create(ctx.pool()).await.unwrap();
 
         let event = create_unwrapped_message_with_pubkey(Keys::generate().public_key());
+        let mut ln = StubEscrowLnClient::reporting(Some(InvoiceState::Accepted));
         let result = cancel_action_generic(
             &ctx,
             cancel_msg(order.id),
             &event,
             &Keys::generate(),
-            &mut StubLnClient,
+            &mut ln,
         )
         .await;
 
@@ -1346,6 +1966,14 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidPubkey))
         ));
+        // The escrow guard runs after authorization, so a stranger neither
+        // costs a lookup RPC nor learns from the error that the escrow is
+        // funded — the funded escrow above would otherwise answer
+        // `NotAllowedByStatus`.
+        assert!(
+            !ln.escrow_was_looked_up(),
+            "an unauthorized sender must not reach the node"
+        );
     }
 
     #[tokio::test]
@@ -1582,8 +2210,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             dispute.status,
-            DisputeStatus::SellerRefunded.to_string(),
-            "the open dispute must be closed as seller-refunded"
+            DisputeStatus::CooperativelyCanceled.to_string(),
+            "the open dispute must be closed as cooperatively-canceled, \
+             not the seller-refunded of a solver's admin-cancel"
         );
         assert!(queued_actions_for(maker)
             .await
@@ -1658,6 +2287,204 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
         ));
+    }
+
+    /// A sell order parked at `WaitingMakerBond`: created, never published,
+    /// its maker bond still `Requested`.
+    async fn waiting_maker_bond_order(pool: &SqlitePool, maker: PublicKey) -> Order {
+        let order = Order {
+            id: uuid::Uuid::new_v4(),
+            status: Status::WaitingMakerBond.to_string(),
+            kind: mostro_core::order::Kind::Sell.to_string(),
+            fiat_code: "USD".to_string(),
+            creator_pubkey: maker.to_string(),
+            seller_pubkey: Some(maker.to_string()),
+            amount: 21_000,
+            ..Default::default()
+        }
+        .create(pool)
+        .await
+        .unwrap();
+        // `hash: None` keeps `release_bond` off the LND connect path.
+        crate::app::bond::Bond::new_requested(
+            order.id,
+            maker.to_string(),
+            crate::app::bond::BondRole::Maker,
+            1_000,
+        )
+        .create(pool)
+        .await
+        .unwrap();
+        order
+    }
+
+    /// #993: the maker walks away before paying the bond. The order closes
+    /// in the DB only (it was never published, so no event), the bond is
+    /// released so its invoice can no longer be paid, and the maker gets
+    /// `canceled` on its own request id.
+    #[tokio::test]
+    async fn maker_cancel_of_waiting_maker_bond_order_closes_it_without_publishing() {
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(ctx.pool(), maker).await;
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &event,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok(), "maker cancel must succeed: {result:?}");
+        let after = order_by_id(ctx.pool(), order.id).await;
+        assert_eq!(after.status, Status::Canceled.to_string());
+        assert_eq!(
+            after.event_id, order.event_id,
+            "a never-published order must not get an event"
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert!(active.is_empty(), "the maker bond must be released");
+        let replies: Vec<_> = crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == maker)
+            .map(|(m, _)| {
+                let kind = m.get_inner_message_kind();
+                (kind.action.clone(), kind.request_id)
+            })
+            .collect();
+        assert_eq!(replies, vec![(Action::Canceled, Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn only_the_maker_can_cancel_a_waiting_maker_bond_order() {
+        // Arrange
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(ctx.pool(), maker).await;
+        let stranger = create_unwrapped_message_with_pubkey(Keys::generate().public_key());
+
+        // Act
+        let result = cancel_action_generic(
+            &ctx,
+            cancel_msg(order.id),
+            &stranger,
+            &Keys::generate(),
+            &mut StubLnClient,
+        )
+        .await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::IsNotYourOrder))
+        ));
+        assert_eq!(
+            order_by_id(ctx.pool(), order.id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(ctx.pool(), order.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "a stranger must not release the maker bond"
+        );
+    }
+
+    /// The maker paid a moment before cancelling: the bond locked and the
+    /// deferred publish moved the order to `Pending` after the cancel read
+    /// it. The cancel must lose, leaving the published order and its locked
+    /// bond alone; the maker cancels it as a `Pending` order instead.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_loses_once_the_bond_locked() {
+        // Arrange
+        let pool = setup_pool().await;
+        let maker = Keys::generate().public_key();
+        let stale = waiting_maker_bond_order(&pool, maker).await;
+        sqlx::query("UPDATE orders SET status = 'pending' WHERE id = ?1")
+            .bind(stale.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE bonds SET state = 'locked' WHERE order_id = ?1")
+            .bind(stale.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_waiting_maker_bond_order(&pool, &event, &stale, Some(1)).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        assert_eq!(
+            order_by_id(&pool, stale.id).await.status,
+            Status::Pending.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(&pool, stale.id)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1, "the locked maker bond must stay");
+        assert!(
+            queued_actions_for(maker).await.is_empty(),
+            "a lost cancel must not tell the maker the order is canceled"
+        );
+    }
+
+    /// The bond locked but the deferred publish has not moved the order to
+    /// `Pending` yet. Same rule as the #942 close: a locked maker bond wins,
+    /// so the order gets published instead of the payment being refunded.
+    #[tokio::test]
+    async fn waiting_maker_bond_cancel_refuses_a_locked_bond_before_publish() {
+        // Arrange
+        let pool = setup_pool().await;
+        let maker = Keys::generate().public_key();
+        let order = waiting_maker_bond_order(&pool, maker).await;
+        sqlx::query("UPDATE bonds SET state = 'locked' WHERE order_id = ?1")
+            .bind(order.id)
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(maker);
+
+        // Act
+        let result = cancel_waiting_maker_bond_order(&pool, &event, &order, Some(1)).await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+        assert_eq!(
+            order_by_id(&pool, order.id).await.status,
+            Status::WaitingMakerBond.to_string()
+        );
+        let active = crate::app::bond::db::find_active_bonds_for_order(&pool, order.id)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1, "the locked maker bond must stay");
+        assert!(
+            queued_actions_for(maker).await.is_empty(),
+            "a refused cancel must not tell the maker the order is canceled"
+        );
     }
 
     #[tokio::test]

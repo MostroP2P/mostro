@@ -91,6 +91,28 @@ pub async fn admin_settle_action(
     let bond_resolution = bond::extract_bond_resolution(&msg);
     bond::validate_bond_resolution(pool, &order, &bond_resolution).await?;
 
+    // Resolve the dispute initiator *before* the settle (#805, same class as
+    // the fix applied to `admin_cancel`). `settle_seller_hold_invoice` is
+    // irreversible: resolving the initiator afterwards meant a rejected
+    // request had already moved the escrow, and the early return then also
+    // skipped the `AdminSettled` fan-out and the bond resolution below.
+    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) => "seller",
+        (false, true) => "buyer",
+        (seller_dispute, buyer_dispute) => {
+            // Only reachable through a corrupted row — `dispute_action`
+            // gates on `Active`/`FiatSent`, so exactly one flag is set by
+            // the time an order reaches `Dispute`.
+            error!(
+                order_id = %order.id,
+                seller_dispute,
+                buyer_dispute,
+                "admin_settle: ambiguous dispute initiator flags; refusing before the escrow is settled"
+            );
+            return Err(MostroInternalErr(ServiceError::DisputeEventError));
+        }
+    };
+
     // Settle seller hold invoice
     settle_seller_hold_invoice(event, ln_client, Action::AdminSettled, true, &order)
         .await
@@ -130,13 +152,6 @@ pub async fn admin_settle_action(
         d.update(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        // Get the creator of the dispute
-        let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-            (true, false) => "seller",
-            (false, true) => "buyer",
-            (_, _) => return Err(MostroInternalErr(ServiceError::DisputeEventError)),
-        };
 
         // We create a tag to show status of the dispute
         let tags = create_dispute_event_tags(
@@ -524,6 +539,50 @@ mod handler_tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidOrderStatus))
         ));
+    }
+
+    /// Same invariant as `admin_cancel` (#805): with the initiator flags
+    /// unset, the request must be rejected *before* the irreversible
+    /// `settle_seller_hold_invoice`. Pre-fix the initiator was resolved
+    /// after the settle, so this order reached the settle seam and returned
+    /// `LnNodeError` — the escrow moved on a request that was then rejected,
+    /// skipping the `AdminSettled` fan-out and the bond resolution.
+    #[tokio::test]
+    async fn dispute_without_initiator_flag_errors_before_settling() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        // Neither side flagged as initiator; `preimage` is left as the
+        // dispute-order default so the settle seam is genuinely reachable.
+        let order = dispute_order(seller, buyer)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DisputeEventError))
+            ),
+            "expected the initiator check to reject before the settle, got {result:?}"
+        );
+
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, Status::Dispute.to_string());
     }
 
     /// A genuine dispute settle reaches `settle_seller_hold_invoice`, which

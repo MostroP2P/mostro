@@ -97,7 +97,10 @@ A sophisticated attacker can satisfy (1). They cannot cheaply satisfy (2).
 - Never publish payer details, payment hashes or history on Nostr.
 - Never expose a "same user?" oracle or any cross-trade linkage to
   counterparties (gist §12, §29).
-- Keep `mostrod` byte-for-byte behaviour-preserving while the flag is off.
+- Keep `mostrod` behaviour-preserving while the flag is off: no new action,
+  message, tag or history row is observable by users or relays. The few
+  pieces that run regardless of the flag, and why none of them is
+  observable, are listed in D-10.
 - Remain compatible with Full Privacy Mode (no crash, no leak, honest "no
   history available" signal — see §4 D-4).
 
@@ -124,7 +127,7 @@ File references are to this repository unless marked `$CORE`
 
 | Fact | Where |
 |---|---|
-| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/nip59.rs` (`UnwrappedMessage`), `handle_message_action_no_ln` in `src/app.rs` |
+| Every message carries a **trade key** (`event.sender`) and an **identity / master key** (`event.identity`). The master key is the only durable per-user handle the daemon has. | `$CORE/src/transport.rs` (`UnwrappedMessage`), `handle_message_action_no_ln` in `src/app.rs` |
 | `users.pubkey` (PRIMARY KEY) is the master key. A `users` row is created **only** when `identity != sender`. | `migrations/20231005195154_users.sql`, `handle_message_action_no_ln` in `src/app.rs` |
 | `orders.master_buyer_pubkey` / `master_seller_pubkey` hold the identity keys; `buyer_pubkey` / `seller_pubkey` the trade keys. | `migrations/20221222153301_orders.sql`, `Order` buyer/seller pubkey helpers in `src/util.rs` |
 | **Full Privacy Mode is structural, not a flag**: the client never sends the identity key, so `identity == sender` and `master_*_pubkey == *_pubkey`. No `users` row, no trade-index continuity, reputation reads as zero, rating a full-privacy counterpart is a silent no-op. | `Order` identity-key documentation in `$CORE/src/order.rs` (doc comment), `Order::is_full_privacy_order` usage in `src/util.rs`, `rate_user_action` in `src/app/rate_user.rs`, `Order::is_full_privacy_order` in `$CORE/src/order.rs` (`is_full_privacy_order`) |
@@ -300,9 +303,66 @@ variants, new `CantDoReason` variants. `SmallOrder` is **not** touched — it is
 so any new field would break every existing client. `FiatSentOk` keeps its
 `Payload::Peer` unchanged.
 
-**D-10 · Off by default, inert when off.** With `[payer_history]` absent or
-`enabled = false`: the new actions answer `cant-do invalid_action`, `fiat-sent`
-is untouched, no table is written, and no payer-history info tags are emitted.
+**D-10 · Off by default, inert when off.** The feature is opt-in: `enabled`
+defaults to `false`, and a missing `[payer_history]` section means disabled
+(§8.2). "Inert" has a precise meaning here. The flag gates everything the
+feature *does*. Three supporting pieces run regardless of it, on purpose.
+
+*What the flag gates.* With `[payer_history]` absent or `enabled = false`:
+
+- `declare-payer` and `payment-history` answer `cant-do invalid_action`;
+- `fiat-sent` is untouched: no `require_declaration` gate (even when
+  `require_declaration = true`, since `payer_declaration_required()` implies
+  `enabled`), and no `payer-declared` / `payment-history` push;
+- the success hook (§10.5) does not run, so no row is inserted or updated in
+  any of the four payer tables;
+- `payment_success` keeps today's ordering: it publishes the `Success`
+  revision, then runs the guarded `UPDATE`. The build → commit → publish
+  path (§10.5) is taken only when the feature is on. That path is not free:
+  a restart between commit and publish leaves the relays showing a stale
+  revision until NIP-40 expiration, because `PENDING_ORDERBOOK_REPUBLISH` is
+  process-local (open question 5). Today's ordering recovers from a restart
+  at the same point, because the order is still non-terminal and the
+  existing retry jobs pass over it again. A disabled node must not take on
+  that window for a feature it does not run;
+- the threshold recomputation (§10.7) does not run;
+- the info event carries no payer-history tags (§8.3).
+
+*What runs regardless of the flag, and why none of it is observable:*
+
+1. **The migration (§9) always applies.** It creates four empty tables and
+   the nullable `orders.success_at` column. `run_migrations` has no
+   conditional migrations, and a schema that depended on the flag would turn
+   enabling the feature into a schema change on a live node.
+2. **The `Success` CAS always stamps `orders.success_at` (§10.5),** as one
+   more bind on the guarded `UPDATE` in either ordering. Correctness
+   requires it. §10.7 reads `success_at IS NULL` as "succeeded before every
+   snapshot". If the stamp were gated, every order that succeeded after the
+   migration while the feature was off would carry `NULL`, and would be
+   counted into snapshots it actually postdates. That is the exact bug
+   `success_at` exists to prevent. The column is never sent anywhere (§9).
+3. **The prune job (§10.6) is spawned regardless of the flag.** It only
+   deletes, and it is what removes declarations stranded when an operator
+   turns the feature off mid-trade (below). Its `DELETE` is driven by
+   `order_payer_declarations`, not by `orders` (§10.6). So on a node that
+   never enabled the feature, each 60 s pass reads one empty table and never
+   scans `orders`.
+
+*Turning the feature off after it has been used:*
+
+- Stored history is kept as it is, and nothing reads it: `payment-history`
+  answers `invalid_action` and nothing is pushed. An operator who wants the
+  data gone deletes the rows by hand (an admin purge is §18).
+- A declaration for an order that is in flight when the flag goes off is
+  never consumed. If the order reaches `Success` while the flag is off, the
+  hook does not run and the trade does not count. The prune job deletes the
+  declaration once the order is terminal.
+- Trades completed while the feature is off never enter a buyer's payer
+  history, and there is no backfill when it is turned back on. They do count
+  toward seller qualification (D-7), which reads `orders`. That is why
+  item 2 above must not be gated.
+- Turning the feature back on resumes from the kept rows. If `(N, D)` changed
+  while it was off, §10.7 recomputes at that boot, as it does for any change.
 
 **D-11 · Mostro never blocks on history.** The only enforcement knob is
 `require_declaration` (default `false`), which rejects `fiat-sent` when no
@@ -593,6 +653,8 @@ seller that sender verification is unavailable (gist §34).
 # buyer's canonicalised payer details, keyed by the buyer's identity key.
 #
 # [payer_history]
+# # Turning this off later keeps the stored history but stops reading and
+# # writing it; trades completed while it is off never enter it (docs D-10).
 # enabled = false
 # # When true, `fiat-sent` is rejected with `payer_not_declared` unless the
 # # buyer sent `declare-payer` first. Leave false unless your market relies
@@ -615,7 +677,8 @@ seller that sender verification is unavailable (gist §34).
 
 ```rust
 /// Payment-account history (anti-triangulation). Opt-in; when `enabled`
-/// is false every code path added by this feature is inert.
+/// is false the feature is inert in the sense of D-10: no new action,
+/// message, tag or history row.
 /// See `docs/PAYER_HISTORY_ANTI_TRIANGULATION.md`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PayerHistorySettings {
@@ -794,6 +857,13 @@ Notes
   §18.
 - The existing migration reconciler (`run_migrations` in `src/db.rs`) only special-cases
   `ADD COLUMN`; plain `CREATE TABLE IF NOT EXISTS` needs nothing extra.
+- **The migration is unconditional** (D-10, item 1): it applies on every
+  node, whether `[payer_history]` is enabled or not. With the feature off,
+  nothing inserts or updates a row in the four payer tables, and the only
+  write this feature adds is `orders.success_at`. On a database that never
+  enabled the feature, the tables are therefore empty. On one that did, the
+  history and policy rows stay as they were, and the prune job (§10.6) may
+  delete declarations of terminal orders.
 
 ---
 
@@ -1062,7 +1132,9 @@ Called from `payment_success` in `src/app/release.rs` **only** on the
 `rows_affected() == 1` branch, inside the Success transaction before commit and
 before the `PurchaseCompleted` enqueue.
 
-**Wiring `payment_success`: build, commit, then publish.** Today
+**Wiring `payment_success` when the feature is on: build, commit, then
+publish.** With the feature off, `payment_success` keeps today's
+publish-then-update path, plus the `success_at` bind (D-10). Today
 `payment_success` calls `update_order_event(my_keys, Status::Success, order)`,
 which *builds and publishes* the kind-38383 revision, and only then runs the
 guarded `UPDATE`. Publishing before persisting is the house pattern and is
@@ -1228,6 +1300,14 @@ Why this is safe
   column-scoped write inside the CAS itself, like `status` and `event_id`) and
   is written exactly once, in the same statement that makes the order
   terminal.
+- `is_payer_history_enabled()` selects the path. When it is on, the
+  build → commit → publish ordering above runs, with `record_payer_success`
+  inside the transaction. When it is off, today's publish-then-update path
+  runs unchanged, so a disabled node does not take on the restart window of
+  open question 5 (D-10). The `success_at` bind is on the guarded `UPDATE`
+  in **both** paths (D-10, item 2). A disabled node must still stamp it, or
+  the trades it completes while the feature is off would read as
+  pre-migration (`NULL`) in a later §10.7 pass.
 - The `experienced` flag is monotone under a fixed threshold policy (D-7): the
   counterparty upsert keeps `experienced = MAX(experienced, excluded.experienced)`
   (§10.1), so a later success can upgrade 0→1 but nothing downgrades 1→0, and
@@ -1241,19 +1321,36 @@ Why this is safe
 
 ### 10.6 Pruning (`src/scheduler.rs`)
 
-A mode-agnostic job, `job_prune_payer_declarations`, every
-`expiration`-class interval (reuse the 60 s cadence of
-`job_process_dev_fee_payment`), running:
+A job, `job_prune_payer_declarations`, every `expiration`-class interval
+(reuse the 60 s cadence of `job_process_dev_fee_payment`). It is spawned
+unconditionally: outside the `!is_cashu_enabled()` block in
+`start_scheduler`, because declarations exist in both modes, and **not**
+behind `is_payer_history_enabled()` (D-10, item 3). It runs:
 
 ```sql
 DELETE FROM order_payer_declarations
- WHERE order_id IN (SELECT id FROM orders WHERE status IN (<TERMINAL_ORDER_STATUSES>))
+ WHERE EXISTS (SELECT 1 FROM orders o
+                WHERE o.id = order_payer_declarations.order_id
+                  AND o.status IN (<TERMINAL_ORDER_STATUSES>))
 ```
 
-`TERMINAL_ORDER_STATUSES` already exists at `TERMINAL_ORDER_STATUSES` in `src/db.rs`. Success rows are
-consumed in §10.5 before this job can see them, so the job only ever removes
-declarations from cancelled / expired / admin-cancelled orders. Range-order
-children are separate orders with separate declarations; nothing special.
+The query must be correlated, and must **not** be written as
+`order_id IN (SELECT id FROM orders WHERE status IN (...))`. `orders.status`
+has no index, so SQLite plans the `IN` form as a `SCAN orders` on every
+pass, whatever the size of the declarations table. Because this job also
+runs on nodes that never enabled the feature, that would be a full scan of
+`orders` every 60 s for nothing. The correlated form scans
+`order_payer_declarations` (empty, or a handful of in-flight rows) and looks
+up each order by its primary key.
+
+`TERMINAL_ORDER_STATUSES` already exists at `TERMINAL_ORDER_STATUSES` in `src/db.rs`. While the
+feature is on, Success rows are consumed in §10.5 before this job can see
+them, so the job removes declarations from cancelled / expired /
+admin-cancelled orders. While it is off, the hook never runs, so the job also
+removes the declaration of an order that reached `Success`. That declaration
+was made before the operator turned the feature off, and its trade does not
+count (D-10). Range-order children are separate orders with separate
+declarations; nothing special.
 
 ### 10.7 Threshold changes — full recomputation (**D-7**)
 
@@ -1577,6 +1674,28 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 **Scheduler**
 - prune deletes declarations of cancelled/expired orders and leaves active
   ones.
+- prune runs with the feature disabled: a declaration whose order reached
+  `Success` while the flag was off is deleted, and no history row is
+  written for it.
+- `EXPLAIN QUERY PLAN` for the prune `DELETE` does not contain
+  `SCAN orders`. This guards against rewriting it into the uncorrelated `IN`
+  form (§10.6).
+
+**Disabled mode** (D-10)
+- on a fresh database with `[payer_history]` absent, `payment_success` still
+  stamps `orders.success_at` and leaves all four payer tables empty (DB
+  asserted).
+- with the feature off, `payment_success` publishes the `Success` revision
+  before the guarded `UPDATE`, as on `main`. With it on, it publishes after
+  the commit (§10.5).
+- `require_declaration = true` with `enabled = false` does not gate
+  `fiat-sent`.
+- off after on: history rows written while the feature was on are still
+  present, untouched, after a success with the flag off; `payment-history`
+  answers `invalid_action`.
+- on → off → on: a success after re-enabling increments the kept row
+  (`successful_trades` goes from the pre-disable value to that value + 1);
+  the success completed while the flag was off is not counted.
 
 **Info event**
 - tags absent when disabled and present only when enabled (`src/nip33.rs` tests next to
@@ -1599,7 +1718,7 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 | **PH-1** | `mostrod` | Bump `mostro-core`; config section + helpers (§8.1–8.2); migration (four tables + `orders.success_at`) + `src/app/payer/db.rs` with unit tests (§9, §10.1). Nothing wired. | PH-0 |
 | **PH-2** | `mostrod` | `declare_payer_action` + dispatch arm + tests (§10.2). | PH-1 |
 | **PH-3** | `mostrod` | `fiat_sent` gate + push, `payment_history_action` + dispatch arm, `build_for_order` (§10.3–10.4). | PH-2 |
-| **PH-4** | `mostrod` | `build_order_event` / `publish_order_event` split in `src/util.rs` (no behaviour change), `record_payer_success` + commit-then-publish `payment_success` wiring + prune job (§10.5–10.6). | PH-1 (parallel with PH-2/3) |
+| **PH-4** | `mostrod` | `build_order_event` / `publish_order_event` split in `src/util.rs` (no behaviour change), `record_payer_success` + commit-then-publish `payment_success` wiring when enabled (today's path kept when disabled, plus the `success_at` bind) + prune job (§10.5–10.6). | PH-1 (parallel with PH-2/3) |
 | **PH-5** | `mostrod` | Info-event tags (§8.3), threshold-change recomputation at boot (§10.7), `docs/README.md` link, `ORDERS_AND_ACTIONS.md` row, Cashu boot warning (§13). | PH-1 |
 | **PH-6** | `protocol` | New chapter `payer_declaration.md` (§6.5 examples, §7 canonicalisation registry with AR/EU/BR/… entries), `SUMMARY.md`, `message_suggestions_for_actions.md` reasons, `other_events.md` info tags. | PH-0 |
 
@@ -1613,6 +1732,14 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
 
 - [ ] With `[payer_history]` absent, `cargo test` passes with no test edited,
       and `declare-payer` / `payment-history` answer `invalid_action`.
+- [ ] With `[payer_history]` absent, a full trade against a test node with a
+      fresh database shows the same client-visible messages, kind-38383 /
+      38385 tags and publish-then-update ordering as `main`. Afterwards the
+      four payer tables are empty and the order's `success_at` is set
+      (D-10).
+- [ ] Turning the feature off after a successful trade keeps that buyer's
+      history rows unchanged. Turning it back on, the next success
+      increments the same row (D-10).
 - [ ] With the feature on, the §5 flow works end-to-end against a test node:
       buyer declares, seller receives `payer-declared` and a `payment-history`
       push at `fiat-sent`, a second successful trade from the same account
@@ -1711,8 +1838,10 @@ On this codebase it maps to: three additive `mostro-core` variants, one
 migration with four private tables and one nullable `orders.success_at`
 stamp, one new handler module, a short hook on
 the single `Success` CAS, a prune job, four info-event tags and one protocol
-chapter — all behind a flag that is off by default and leaves the daemon
-byte-for-byte unchanged when disabled. A triangulation attacker can still make
+chapter. All of it sits behind a flag that is off by default. When the flag
+is off, nothing the feature adds can be seen by users or relays. The only
+things still running are the schema, the `success_at` stamp and the prune
+job (D-10). A triangulation attacker can still make
 the sender match; they cannot cheaply make `successful_trades = 47,
 distinct_counterparties = 29, experienced_counterparties = 11,
 first_success_at = nine months ago`.

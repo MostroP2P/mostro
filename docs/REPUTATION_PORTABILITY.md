@@ -75,7 +75,7 @@ What the design must still guarantee:
 | Only a trusted issuer can mint reputation | Attestation signed by the issuer key; destination keeps a trust list (section 5.3) |
 | Only the account holder can export | A Mostro issuer exports only for the identity the transport proved; lnp2pBot only for the Telegram account that asks (section 5.2) |
 | An attestation serves one destination identity | It names that identity; redemption requires the transport's identity proof to match (section 5.3) |
-| One source account seeds one destination identity | The issuer binds the source account to one destination identity, atomically, after the user confirms it (section 5.2) |
+| One source account is bound to one destination identity at a time | The issuer binds the source account to one destination identity, atomically, after the user confirms it (section 5.2). A rebind moves the binding but revokes nothing already issued, so across instances an account can end up seeding the old identity on some and the new one on others; on any one instance it seeds only one (next row) |
 | A mistaken binding can be undone by its owner | Rebinding needs a signature from the currently bound identity, or an audited admin action (section 5.2) |
 | A source account is counted once per destination | The destination records `(issuer, subject)` and refuses a second import (section 5.3) |
 | A seed never travels twice | A Mostro issuer exports native reputation only, and never imports its own attestations (sections 5.3, 7) |
@@ -223,6 +223,15 @@ Rebinding does not let one source account seed two identities on the same
 instance: the destination refuses a second import of the same
 `(issuer, subject)` regardless of the identity (section 5.3, step 7).
 
+A rebind does not revoke anything already issued. Imports the old identity
+made stay where they are, and an attestation issued to it stays redeemable
+until it expires, at most the destination's lifetime cap. An issuer cannot
+withdraw what it never sees redeemed, and destinations do not ask the issuer
+about the current binding, so after a rebind the same source account can seed
+the old identity on some instances and the new one on others. This is
+accepted: reputation is per instance, and the per-instance check above is what
+stops one account from backing several identities where it matters.
+
 Transport differs per issuer:
 
 - **lnp2pBot**: a Telegram deep link `t.me/lnp2pbot?start=rep_<pubkey>`,
@@ -291,13 +300,23 @@ destination lists as trusted (section 5.1).
 **Revoking an issuer.** Removing a key from the trust list stops new imports
 but does not unwind earlier ones. Because every import is kept as a row of
 `reputation_imports` with its figures (section 6), an operator who learns that
-an issuer key was compromised can list the imports it signed after a given
-date and reverse each one: subtract its `reviews` from `total_reviews` and
+an issuer key was compromised can list the imports whose attestation was
+signed after a given date and reverse each one. The row keeps the
+attestation's `created_at` for this: the import date says nothing about when
+the attestation was signed, and the attestation itself is on no relay. The
+reversal: subtract its `reviews` from `total_reviews` and
 `seeded_reviews`, take `rating × reviews` back out of the weighted average and
 of `seeded_rating_sum`, and recompute `created_at` as the minimum of
 `native_created_at` and the `since` of the imports that remain. Native ratings
 received in between are unaffected, because the running average is linear in
-each contribution.
+each contribution. `min_rating`, `max_rating` and `last_rating` are reset to
+`0` when no rating remains at all; otherwise they are left as they are. An
+import sets them only on a row with no rating (section 6), so reverting it
+right away restores them exactly, but once native ratings have arrived in
+between, a revoked import's value can survive in `max_rating` or `min_rating`.
+That is accepted: those fields are informational tags of the kind 38384 event,
+no decision reads them, and recomputing them would need a per-review history
+the daemon does not keep.
 
 ## 6. Merging on the destination
 
@@ -333,13 +352,18 @@ anchor effect.
 | `native_rating_sum` (new) | **unchanged**; incremented by `update_rating` on native reviews only, internal only |
 
 Each import is also kept as a row of `reputation_imports` (issuer, subject,
-identity, the three figures, the attestation id and the import date): it is
-what step 7 of section 5.3 checks, and it keeps every seed attributable.
+identity, the three figures, the attestation id, the attestation's
+`created_at` and the import date): it is what step 7 of section 5.3 checks, it
+keeps every seed attributable, and it is what revoking an issuer selects by
+signing time (section 5.3).
 
 `native_created_at` is set once, when the row is created, and no import ever
 moves it. Because the merge for age is a minimum, `created_at` alone cannot be
 undone; `native_created_at` is what an operator recomputes it from when
-reversing an import. Export does not read either column: the exported `since`
+reversing an import. It is the row's creation date on purpose, not the first
+completed trade: the daemon already publishes its native `since` from
+`created_at` (mostro#1016), and a reversal must give back exactly the date the
+user showed before the import, not a different one. Export does not read either column: the exported `since`
 comes from the instance's own order history (section 4), so an imported date
 can never be re-exported. Reviews and rating are kept apart by
 `seeded_reviews`, `seeded_rating_sum` and `native_rating_sum`.
@@ -514,6 +538,11 @@ event: a client sends them only to a node that advertises
 
 ### Phase 0: specification
 
+Phase 0 starts once open decisions 1-3 of section 10 are signed off: the kind
+number, the attestation lifetime and the lnp2pBot `subject` are written into
+the schema of 0.2 and the vectors of 0.4, and changing them afterwards means
+redoing both. Decision 4 does not block it.
+
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
 | 0.1 | protocol | Add `since` to the `rating` tag and to the kind 38384 event, day-truncated Unix timestamp. Mark `days` deprecated with a removal version. | Done (protocol#59). |
@@ -548,10 +577,10 @@ Independent of the migration and worth shipping first.
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
 | 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `issuers`, `max_lifetime`) with parsing, defaults and validation; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
-| 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, subject, identity_pubkey, reviews, rating, since, imported_at)` with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
+| 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, subject, identity_pubkey, reviews, rating, since, signed_at, imported_at)`, `signed_at` being the attestation's `created_at`, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
 | 3.3 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
 | 3.4 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
-| 3.5 | mostro | Admin RPC to revoke the imports of an issuer signed after a given date, through `User::revert_reputation_import`, republishing the rating events. Logged. | Revoking restores the rows exactly in an integration test. |
+| 3.5 | mostro | Admin RPC to revoke the imports of an issuer whose `signed_at` is after a given date, through `User::revert_reputation_import`, republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation signed before the cutoff but imported after it is left alone. |
 
 ### Phase 4: mostrod as issuer (export)
 

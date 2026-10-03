@@ -179,7 +179,10 @@ Lightning node is not on mainnet (networks: ["regtest"]); dev fee payments are d
 ```
 
 Dev fee amounts are still calculated and stored on orders as usual; they
-simply stay unpaid (`dev_fee_paid = 0`). The gate lives in
+simply stay unpaid (`dev_fee_paid = 0`). Since no cycle runs there to clean
+them up, startup also releases any `PENDING-…` claim marker an interrupted
+run left behind (`release_all_pending_claims`), before the node-identity
+guard would count it as an in-flight dev fee. The gate lives in
 `dev_fee_payments_enabled` (`src/app/dev_fee.rs`), checked by
 `job_process_dev_fee_payment` (`src/scheduler.rs`).
 

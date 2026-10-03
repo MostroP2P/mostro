@@ -111,6 +111,26 @@ pub async fn run_dev_fee_cycle(
 
 // ── Phase 1: Stale PENDING cleanup ──────────────────────────────────────
 
+/// Release every PENDING claim marker, whatever its age, and return how
+/// many were released.
+///
+/// Only for nodes where [`dev_fee_payments_enabled`] is false: the dev fee
+/// job never starts there, so nothing can be holding a claim, and a marker
+/// left by an interrupted run would otherwise never be cleared. The
+/// node-identity guard counts it as an in-flight dev fee and would block a
+/// node change (#1039). A PENDING marker means no payment reached LND yet
+/// (the real hash replaces it before sending), so releasing it is safe;
+/// real payment hashes need LND to be verified and are left alone.
+pub async fn release_all_pending_claims(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE orders SET dev_fee_payment_hash = NULL \
+         WHERE dev_fee_paid = 0 AND dev_fee_payment_hash LIKE 'PENDING-%'",
+    )
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+}
+
 /// Reset PENDING markers older than `CLEANUP_TTL_SECS` so those orders
 /// become eligible for a fresh payment attempt on the next cycle.
 async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
@@ -1130,8 +1150,8 @@ pub async fn send_dev_fee_payment(
 mod tests {
     use super::{
         cleanup_stale_pending_markers, dev_fee_payments_enabled, handle_payment_failure,
-        handle_payment_success, parse_pending_timestamp, release_pending_claim,
-        try_claim_order_for_dev_fee,
+        handle_payment_success, parse_pending_timestamp, release_all_pending_claims,
+        release_pending_claim, try_claim_order_for_dev_fee,
     };
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
@@ -1353,6 +1373,67 @@ mod tests {
             .as_secs();
         let marker = format!("PENDING-550e8400-e29b-41d4-a716-446655440000-{}", now);
         assert_eq!(parse_pending_timestamp(&marker), Some(now));
+    }
+
+    #[tokio::test]
+    async fn release_all_pending_claims_clears_every_pending_marker_only() {
+        // Off mainnet the dev fee job never runs, so a claim left by an
+        // interrupted run must be released at startup whatever its age, or
+        // the node-identity guard keeps counting it as in flight (#1039).
+        // Real payment hashes need LND to be verified and stay untouched.
+        let pool = setup_orders_db().await;
+        let fresh_pending = uuid::Uuid::new_v4();
+        let stale_pending = uuid::Uuid::new_v4();
+        let real_hash = uuid::Uuid::new_v4();
+        let paid = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            fresh_pending,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-9999999999"),
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            stale_pending,
+            "success",
+            100,
+            false,
+            Some("PENDING-550e8400-e29b-41d4-a716-446655440000-1"),
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            real_hash,
+            "success",
+            100,
+            false,
+            Some(VALID_HEX_HASH),
+        )
+        .await;
+        insert_test_order(&pool, paid, "success", 100, true, Some(VALID_HEX_HASH)).await;
+
+        let released = release_all_pending_claims(&pool).await.unwrap();
+
+        assert_eq!(released, 2);
+        let hash_of = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT dev_fee_payment_hash FROM orders WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(hash_of(fresh_pending).await, None);
+        assert_eq!(hash_of(stale_pending).await, None);
+        assert_eq!(hash_of(real_hash).await.as_deref(), Some(VALID_HEX_HASH));
+        assert_eq!(hash_of(paid).await.as_deref(), Some(VALID_HEX_HASH));
     }
 
     #[tokio::test]

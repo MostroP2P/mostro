@@ -14,13 +14,17 @@ UPDATE users SET native_created_at = created_at WHERE native_created_at IS NULL;
 -- an account to a second import; `issuer_key` is the key that signed, which
 -- revoking a compromised key selects by, with `imported_at`, the node's own
 -- clock (never the attestation's created_at, which the key holder chooses).
--- The figures are kept so an import can be reversed exactly.
+-- The figures are kept so an import can be reversed exactly, and
+-- `trade_pubkey`, the trade key that sent the import, which the node
+-- republishes the user's rating event under after an import and after its
+-- reversal.
 CREATE TABLE IF NOT EXISTS reputation_imports (
   attestation_id char(64) primary key not null,
   issuer text not null,
   issuer_key char(64) not null,
   subject text not null,
   identity_pubkey char(64) not null,
+  trade_pubkey char(64),
   reviews integer not null,
   rating_hundredths integer not null,
   since integer not null,

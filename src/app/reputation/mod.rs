@@ -65,6 +65,7 @@ mod tests {
             issuer_key: key.to_string(),
             subject: subject.to_string(),
             identity_pubkey: Keys::generate().public_key().to_hex(),
+            trade_pubkey: None,
             reviews: 5,
             rating_hundredths: 450,
             since: 1_696_204_800,

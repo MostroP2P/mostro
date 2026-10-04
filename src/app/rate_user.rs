@@ -257,6 +257,7 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            payer_history: None,
         });
     }
 

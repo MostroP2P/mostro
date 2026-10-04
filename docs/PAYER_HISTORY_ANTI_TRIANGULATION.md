@@ -760,12 +760,16 @@ When the feature is disabled or absent, `info_to_tags` emits no payer-history ta
 
 ## 9. Daemon — data model
 
-One migration, `migrations/2026MMDD120000_payer_history.sql`, in the house
-style (long `--` header explaining *why*, per-column comments). Four new tables;
-**no** change to `users`, and exactly one additive, nullable column on `orders`
-(`success_at`, justified in the block below — the `ADD COLUMN` path the
-migration reconciler in `src/db.rs` already special-cases, same shape as
-`payout_claimed_at`).
+Two migrations in the house style (long `--` header explaining *why*,
+per-column comments): `migrations/20261002120000_payer_history.sql` with the
+four new tables and an index on `orders(master_seller_pubkey)`, and
+`migrations/20261002120100_order_success_at.sql` with the one additive,
+nullable column on `orders` (`success_at`, justified in the block below). The
+column gets a file of its own because the migration reconciler in `src/db.rs`
+special-cases only migrations made purely of `ADD COLUMN` statements, the same
+shape as `payout_claimed_at`. **No** change to `users`. The index serves
+`seller_experience` (§10.1), which otherwise scans `orders` on every recorded
+success and once per snapshot in §10.7.
 
 ```sql
 -- Per-order commitment. Short-lived: consumed on success, pruned on any other
@@ -773,7 +777,9 @@ migration reconciler in `src/db.rs` already special-cases, same shape as
 CREATE TABLE IF NOT EXISTS order_payer_declarations (
   order_id        char(36)  PRIMARY KEY NOT NULL,  -- orders.id (uuid)
   payment_hash    char(64)  NOT NULL,              -- sha256 hex, lowercase
-  declared_at     integer   NOT NULL               -- unix secs of last upsert
+  declared_at     integer   NOT NULL,              -- unix secs of last upsert
+  buyer_pubkey    char(64),                        -- orders.buyer_pubkey when declared; a later buyer never inherits the row
+  history_snapshot text                            -- PaymentHistory JSON frozen at fiat-sent (§10.3); every later query returns it
 );
 
 -- Aggregate history. One row per (buyer identity key, payment hash).
@@ -812,7 +818,8 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   generation             integer NOT NULL,  -- bumped on every (N, D) change; stamped into policy_gen
   experienced_min_trades integer NOT NULL,
   experienced_min_days   integer NOT NULL,
-  evaluated_at           integer NOT NULL   -- unix secs of the last (re)evaluation
+  evaluated_at           integer NOT NULL,  -- unix secs of the last (re)evaluation
+  node_key_id            text               -- node_key_id() of the secret the counterparty ids were checked under; NULL until the first recompute
 );
 
 -- The ONE change to `orders`: an immutable "when did this order reach Success"
@@ -828,14 +835,16 @@ ALTER TABLE orders ADD COLUMN success_at integer;
 ```
 
 Notes
-- `distinct_counterparties` is `COUNT(*)` on the counterparty table and
+- `distinct_counterparties` is `COUNT(*) WHERE policy_gen <> -1` on the
+  counterparty table (`-1` marks a row §10.7 could not resolve) and
   `experienced_counterparties` is
   `COUNT(*) WHERE experienced = 1 AND policy_gen = <current generation>`; not
   denormalised (the counterparty write is an upsert keyed by the triple, so
   both counts are exact).
 - **`policy_gen` is what makes the advertised policy honest.** A row whose
-  generation is stale — one §10.7 could not re-evaluate — is still counted in
-  `distinct_counterparties` but **never** in `experienced_counterparties`. So a
+  generation is stale is still counted in `distinct_counterparties` but
+  **never** in `experienced_counterparties`; a row §10.7 could not resolve
+  (generation `-1`) is counted in neither. So a
   seller reading the info-event tags (§8.3) is never shown a count that mixes
   old-policy and new-policy values: an unresolvable row degrades the count
   downwards (less trust), which is the conservative direction this document
@@ -876,16 +885,26 @@ New module `src/app/payer/` (`mod.rs`, `db.rs`, `declare.rs`, `history.rs`,
 
 ### 10.1 Shared helpers (`src/app/payer/db.rs`)
 
+Functions that may run inside the Success CAS transaction take a
+`&mut SqliteConnection` (pass `&mut *tx`) rather than a generic
+`sqlx::Executor`, which is consumed by its first query.
+
 ```rust
 pub struct PayerDeclarationRow { pub order_id: Uuid, pub payment_hash: String,
                                  pub declared_at: i64 }
 
+// A take that rolls back to `pending` (taker timeout, taker cancel) voids
+// the declaration: `db::update_order_to_initial_state` deletes it in the same
+// transaction, so the next take starts with none even under the same trade
+// key. As a second guard, every declaration records the order's buyer trade
+// key when it was made, and reads ignore a row made by a previous buyer.
 pub async fn upsert_declaration(pool, order_id: Uuid, hash: &str, now: i64)
     -> Result<(), MostroError>;                         // INSERT … ON CONFLICT(order_id) DO UPDATE
-pub async fn find_declaration(pool, order_id: Uuid)
+pub async fn find_declaration(pool, order_id: Uuid)     // only the current buyer's row
     -> Result<Option<PayerDeclarationRow>, MostroError>;
-pub async fn take_declaration<'e, E: sqlx::Executor<'e>>(exec: E, order_id: Uuid)
-    -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING *  (idempotency token)
+pub async fn take_declaration(conn: &mut SqliteConnection, order_id: Uuid)
+    -> Result<Option<PayerDeclarationRow>, MostroError>; // DELETE … RETURNING (idempotency token);
+                                                         // a previous buyer's row is deleted, reads None
 
 pub struct HistoryCounters { pub successful_trades: u32,
                              pub distinct_counterparties: u32,
@@ -898,7 +917,7 @@ pub struct HistoryCounters { pub successful_trades: u32,
 /// live thresholds (§9, §10.7).
 pub async fn load_history(pool, user_pubkey: &str, hash: &str)
     -> Result<HistoryCounters, MostroError>;
-pub async fn bump_history<'e, E>(exec: E, user_pubkey, hash, counterparty_id,
+pub async fn bump_history(conn: &mut SqliteConnection, user_pubkey, hash, counterparty_id,
                                  experienced: bool, policy_gen: i64, now)
     -> Result<(), MostroError>;   // upsert payer_history + counterparty upsert (SQL below)
 
@@ -913,8 +932,8 @@ pub struct SellerExperience { pub qualifying_trades: u32,
 /// `as_of`: `None` on the live success path (§10.5); `Some(instant)` when
 /// re-evaluating a stored snapshot (§10.7), which must see only the trades
 /// that had already reached Success at that instant.
-pub async fn seller_experience<'e, E: sqlx::Executor<'e>>(exec: E,
-    seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Uuid,
+pub async fn seller_experience(conn: &mut SqliteConnection,
+    seller_master_pubkey: &str, buyer_pubkey: &str, current_order: Option<Uuid>,
     as_of: Option<i64>)
     -> Result<SellerExperience, MostroError>;
 pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroError>;
@@ -922,18 +941,24 @@ pub async fn prune_declarations_for_terminal_orders(pool) -> Result<u64, MostroE
 /// Threshold policy the stored `experienced` snapshots were evaluated under
 /// (D-7, §10.7). `None` when the feature has never run on this database.
 pub async fn load_experience_policy(pool) -> Result<Option<ExperiencePolicy>, MostroError>;
-pub struct ExperiencePolicy { pub generation: i64, pub min_trades: u32, pub min_days: u32 }
+pub struct ExperiencePolicy { pub generation: i64, pub min_trades: u32, pub min_days: u32,
+                              pub node_key_id: Option<String> }
 /// Bumps `generation` and returns the new value.
-pub async fn store_experience_policy<'e, E>(exec: E, min_trades: u32, min_days: u32, now: i64)
+pub async fn store_experience_policy(conn: &mut SqliteConnection, node_key_id: &str,
+                                     min_trades: u32, min_days: u32, now: i64)
     -> Result<i64, MostroError>;
 /// Generation to stamp into snapshots taken right now (§10.5). Seeds the
 /// policy row from the live config on first use so the success path never
-/// races the boot-time recompute.
-pub async fn current_policy_generation<'e, E>(exec: E) -> Result<i64, MostroError>;
+/// races the boot-time recompute. If the stored policy holds other
+/// thresholds (changed, not yet recomputed), returns
+/// `UNRECOMPUTED_POLICY_GENERATION` (0, never a real generation), so the
+/// snapshot stays out of every experienced count until §10.7 re-evaluates it.
+pub async fn current_policy_generation(conn: &mut SqliteConnection, thresholds: (u32, u32), now: i64)
+    -> Result<i64, MostroError>;
 /// Recompute the whole `experienced` column under `(min_trades, min_days)`.
 /// Runs in one transaction with `store_experience_policy`; see §10.7.
-pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32)
-    -> Result<u64, MostroError>;   // rows whose flag changed
+pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32, now: i64)
+    -> Result<RecomputeOutcome, MostroError>;   // { changed, unresolved } row counts
 ```
 
 `bump_history`'s counterparty write — under a fixed threshold policy the
@@ -946,7 +971,10 @@ INSERT INTO payer_history_counterparties
    experienced, policy_gen)
 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
 ON CONFLICT(user_pubkey, payment_hash, counterparty_id)
-DO UPDATE SET last_success_at = excluded.last_success_at,
+DO UPDATE SET -- MIN/MAX, not assignment: a success stamped earlier can
+              -- commit after a later one, and must not move either bound.
+              first_success_at = MIN(first_success_at, excluded.first_success_at),
+              last_success_at  = MAX(last_success_at, excluded.last_success_at),
               -- MAX() only when the stored value was evaluated under the SAME
               -- generation; a row left stale by §10.7 is overwritten outright,
               -- because the old-policy 1 must not survive into the new policy.
@@ -963,7 +991,7 @@ and starts counting again.
 `seller_experience`:
 
 ```sql
-SELECT COUNT(*) AS n, MIN(created_at) AS first_at
+SELECT COUNT(*) AS n, MIN(COALESCE(success_at, created_at)) AS first_at
   FROM orders
  WHERE master_seller_pubkey = ?1
    AND status = 'success'
@@ -975,10 +1003,19 @@ SELECT COUNT(*) AS n, MIN(created_at) AS first_at
    AND (?4 IS NULL OR success_at IS NULL OR success_at < ?4)
 ```
 
-`created_at` (order creation) is the only per-order timestamp available for the
-**age** term (`D`); it overstates a trade's age by the trade's own duration,
-which is acceptable for a days-granularity threshold and keeps the query to a
-single table.
+The `as_of` bound is strict. Stamps have second resolution, so a success
+stamped in the same second as the snapshot cannot be ordered against it: it
+may have committed just before the snapshot's trade or just after. Leaving
+it out means a recompute can under-count such a trade and lower a flag the
+live path set, but it can never raise a flag on a trade that came later,
+which is the direction that matters for an anti-Sybil signal.
+
+The **age** term (`D`) dates each trade from its `success_at`: dating it from
+`created_at` would credit an offer that sat in the book for weeks before
+completing with that whole wait. Orders that succeeded before the
+`success_at` migration have no stamp and fall back to `created_at`, which
+overstates their age by the trade's own duration; that only affects legacy
+rows and keeps the query to a single table.
 
 The `as_of` term is a different matter, and it is why `orders.success_at`
 exists (§9). `status = 'success'` is the order's *current* status, so
@@ -1235,13 +1272,18 @@ produces an externally visible `Success`** — not on the relays, not in the
 message queue.
 
 ```rust
+// `conn` is the Success CAS transaction (`&mut *tx`). `thresholds` comes from
+// the context's `[payer_history]` section, and `now` is the instant the CAS
+// stamped into `orders.success_at`, so both writes record the same moment.
 pub async fn record_payer_success(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conn: &mut SqliteConnection,
     node_keys: &Keys,
     order: &Order,
+    thresholds: (u32, u32),
+    now: i64,
 ) -> Result<(), MostroError> {
     // Idempotency token: the declaration row can be consumed exactly once.
-    let Some(decl) = db::take_declaration(&mut **tx, order.id).await? else {
+    let Some(decl) = db::take_declaration(conn, order.id).await? else {
         return Ok(());                                           // nothing to do / already done
     };
     if order.buyer_dispute || order.seller_dispute {                   // D-6
@@ -1259,17 +1301,14 @@ pub async fn record_payer_success(
     // explicitly: it never counts toward its own counterparty's qualification.
     // Only history that predates this trade — and only trades with OTHER
     // buyers — qualifies.
-    let exp = db::seller_experience(&mut **tx, &seller_master, &user, order.id, None).await?;
-    let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
-    let experienced = exp.qualifying_trades >= min_trades
-        && exp.first_qualifying_at
-               .is_some_and(|t| now() - t >= i64::from(min_days) * 86_400);
+    let exp = db::seller_experience(conn, &seller_master, &user, Some(order.id), None).await?;
+    // N trades AND first one at least D days before `now`.
+    let experienced = is_experienced(&exp, thresholds.0, thresholds.1, now);
     // The generation stamps WHICH policy this snapshot was taken under, so a
     // later threshold change can tell it apart from rows it could not
-    // re-evaluate (§9, §10.7).
-    let gen = db::current_policy_generation(&mut **tx).await?;
-    db::bump_history(&mut **tx, &user, &decl.payment_hash, &cp, experienced, gen, now()).await?;
-    Ok(())
+    // re-evaluate (§9, §10.7). Seeded from `thresholds` on first use.
+    let gen = db::current_policy_generation(conn, thresholds, now).await?;
+    db::bump_history(conn, &user, &decl.payment_hash, &cp, experienced, gen, now).await
 }
 
 pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
@@ -1356,7 +1395,13 @@ declarations; nothing special.
 
 `experienced` is a snapshot, so a change to `N` or `D` invalidates every stored
 snapshot at once. `mostrod` detects that at boot and rebuilds the column rather
-than leaving old-policy and new-policy rows side by side.
+than leaving old-policy and new-policy rows side by side. A change of node key
+does the same: `counterparty_id` is keyed by the node secret, so under a new
+key the stored ids resolve to no seller, and only the recompute moves them out
+of the counted generation. The policy row records `node_key_id`, a
+domain-separated hash of the node secret the last recompute ran under, for that
+reason; the public key would not do, since `s` and `n - s` share it while
+`counterparty_id` hashes the secret bytes.
 
 Called once from startup (`src/main.rs`, right after `run_migrations`), only
 when the feature is enabled:
@@ -1364,14 +1409,19 @@ when the feature is enabled:
 ```rust
 if Settings::is_payer_history_enabled() {
     let (min_trades, min_days) = Settings::payer_history_experience_thresholds();
+    let node_key_id = payer::node_key_id(&my_keys);   // hash of the secret, not its pubkey
     match db::load_experience_policy(&pool).await? {
-        Some(p) if (p.min_trades, p.min_days) == (min_trades, min_days) => {}   // unchanged: nothing to do
+        Some(p) if (p.min_trades, p.min_days) == (min_trades, min_days)
+            && p.node_key_id.as_deref() == Some(node_key_id.as_str()) => {}   // unchanged: nothing to do
         Some(_) | None => {
-            let changed = db::recompute_experienced(&pool, &my_keys, min_trades, min_days).await?;
+            let outcome =
+                db::recompute_experienced(&pool, &my_keys, min_trades, min_days, now).await?;
             tracing::info!(
-                "payer_history: experience thresholds now {min_trades}/{min_days}; \
-                 recomputed snapshots, {changed} row(s) changed"
+                "payer_history: experience policy {min_trades}/{min_days} under the current node key; \
+                 recomputed snapshots, {} row(s) changed",
+                outcome.changed
             );
+            // outcome.unresolved is logged at warn (count only), step 4 below.
         }
     }
 }
@@ -1380,9 +1430,8 @@ if Settings::is_payer_history_enabled() {
 `recompute_experienced` runs in a single transaction:
 
 1. `store_experience_policy` bumps `generation` and records the new `(N, D)`.
-   Every row re-evaluated below is stamped with that new generation; rows that
-   keep an older one are, by construction, the rows this pass could not
-   re-evaluate.
+   Every row re-evaluated below is stamped with that new generation; the rows
+   this pass cannot re-evaluate are stamped `-1` instead (step 4).
 2. Build the `counterparty_id → master_seller_pubkey` map. The stored ids are
    keyed hashes (D-7) and cannot be inverted, so the map is built *forward*:
    scan the distinct `master_seller_pubkey` values in `orders` and hash each
@@ -1402,19 +1451,32 @@ if Settings::is_payer_history_enabled() {
    way — including the rows whose value did not change, so that "resolved" and
    "current generation" stay the same set.
 4. A row whose `counterparty_id` is **not** in the map (a rotated node key, an
-   imported database) cannot be re-evaluated. It is left with its old
-   `experienced` value **and its old `policy_gen`**, which is what keeps it out
-   of every count taken under the new policy (§9): `load_history` counts
-   `experienced = 1 AND policy_gen = <current>`, so a stale row contributes to
-   `distinct_counterparties` and never to `experienced_counterparties`. The
-   count a seller sees is therefore always evaluated under exactly the
-   thresholds the info event advertises — a stale row can only understate it.
+   imported database) cannot be re-evaluated. It keeps its `experienced` value
+   and is stamped `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), which
+   keeps it out of every count taken under the new policy (§9): not in
+   `experienced_counterparties`, and not in `distinct_counterparties` either,
+   because a later trade with the same seller hashes to a new id under the new
+   key and would otherwise count that seller twice. Its trades still count in
+   `successful_trades`. The count a seller sees is therefore always evaluated
+   under exactly the thresholds the info event advertises — an unresolvable
+   row can only understate it.
    The pass logs the number of unresolvable rows at `warn` (never their
    contents), because on a healthy node that number is zero and anything else
    means the node key changed under a populated database.
-5. Such a row is not stranded forever: the next success with the same triple
-   re-evaluates it under the live policy and the `bump_history` upsert
-   overwrites both columns (§10.1), returning it to the current generation.
+5. Such a row is not repaired by later trades: under the new key the same
+   seller hashes to a different `counterparty_id`, so its next success with
+   this buyer and hash creates a new row, which counts normally, and the old
+   row stays at `-1`. Only if the node returns to the old secret does a later
+   recompute resolve it again. (A row that is merely *stale*, left at an old
+   generation with its id still resolvable, is repaired by the next success
+   with the same triple: the `bump_history` upsert overwrites both columns,
+   §10.1.)
+
+6. In the same transaction, every frozen payment-history snapshot
+   (`order_payer_declarations.history_snapshot`, §10.4) is discarded: it holds
+   an `experienced_counterparties` value taken under the previous policy. The
+   next `payment-history` query of a still-open order re-takes it under the
+   policy the info event now advertises.
 
 Properties this gives:
 
@@ -1630,14 +1692,17 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
   failure mid-recompute leaves both the old policy row and the old column
   values, so the next boot retries.
 - a `counterparty_id` with no matching `master_seller_pubkey` in `orders`
-  (simulated key rotation) keeps BOTH its old `experienced` value and its old
-  `policy_gen`, is logged, and is not zeroed.
-- such a stale row is counted in `distinct_counterparties` but **not** in
-  `experienced_counterparties`, including the case where its stored value is
-  `1`: `load_history` must never mix a value evaluated under the old
-  thresholds into a count advertised under the new ones.
-- a later success with that same triple re-stamps the row to the current
-  generation, and it starts counting again.
+  (simulated key rotation) keeps its `experienced` value, is stamped
+  `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), is logged, and is not
+  zeroed.
+- such an unresolved row is counted in **neither** `distinct_counterparties`
+  nor `experienced_counterparties`, including the case where its stored value
+  is `1`: `load_history` must never mix a value evaluated under the old
+  thresholds into a count advertised under the new ones, and a later trade
+  with the same seller under the new key must not count that seller twice.
+  Its trades still count in `successful_trades`.
+- a later success with the same seller under the new key creates a new
+  counterparty row that counts once, while the `-1` row stays excluded.
 - `as_of` correctness: a seller trade that reached `Success` **after** the
   snapshot's `last_success_at` does not count toward that snapshot, even though
   its current `status` is `'success'` — the recomputed flag must not depend on
@@ -1759,8 +1824,8 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
       no-op.
 - [ ] After a threshold change on a database holding a snapshot whose
       `counterparty_id` no longer resolves (node key rotated), that row keeps
-      its old value and old generation, is reported in the `warn` line, and is
-      excluded from `experienced_counterparties` while still counting toward
+      its value, is stamped `policy_gen = -1`, is reported in the `warn` line,
+      and is excluded from both `experienced_counterparties` and
       `distinct_counterparties`.
 - [ ] A full-privacy buyer yields `buyer_mode = full_privacy` and writes no
       history rows (DB asserted).

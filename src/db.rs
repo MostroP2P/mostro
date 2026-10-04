@@ -699,6 +699,17 @@ pub async fn find_dispute_by_order_id(
     Ok(dispute)
 }
 
+pub async fn find_optional_dispute_by_order_id(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> Result<Option<Dispute>, MostroError> {
+    sqlx::query_as::<_, Dispute>("SELECT * FROM disputes WHERE order_id = ?")
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 pub async fn update_order_to_initial_state(
     pool: &SqlitePool,
     order_id: Uuid,
@@ -6368,6 +6379,30 @@ mod migration_and_query_tests {
         assert!(find_dispute_by_order_id(&pool, Uuid::new_v4())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn find_optional_dispute_by_order_id_distinguishes_absence_from_failure() {
+        let pool = migrated_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_dispute(&pool, order_id, "initiated", None).await;
+        assert_eq!(
+            find_optional_dispute_by_order_id(&pool, order_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .order_id,
+            order_id
+        );
+        assert!(find_optional_dispute_by_order_id(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        pool.close().await;
+        assert!(matches!(
+            find_optional_dispute_by_order_id(&pool, order_id).await,
+            Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+        ));
     }
 
     #[tokio::test]

@@ -45,7 +45,8 @@ use cdk::{Amount, HttpClient};
 use crate::app::add_cashu_escrow::add_cashu_escrow_action;
 use crate::app::context::test_utils::{test_settings, TestContextBuilder};
 use crate::app::context::AppContext;
-use crate::cashu::{cashu_pubkey_from_xonly_hex, CashuClient};
+use crate::cashu::cashu_pubkey_from_xonly_hex;
+use crate::cashu::mints::CashuMints;
 use crate::config::types::CashuSettings;
 use chrono::Utc;
 use mostro_core::db::Crud;
@@ -257,7 +258,12 @@ async fn temp_pool() -> SqlitePool {
 /// A taken Cashu order parked in `WaitingPayment` — the state TA-2 will
 /// produce, seeded here by hand because `dispatch_cashu` still rejects
 /// `NewOrder`/`TakeSell` until TA-2 lands.
-async fn seed_waiting_payment_order(pool: &SqlitePool, keys: &EscrowKeys, amount: u64) -> Order {
+async fn seed_waiting_payment_order(
+    pool: &SqlitePool,
+    keys: &EscrowKeys,
+    amount: u64,
+    mint_url: &str,
+) -> Order {
     Order {
         id: uuid::Uuid::new_v4(),
         status: Status::WaitingPayment.to_string(),
@@ -271,6 +277,7 @@ async fn seed_waiting_payment_order(pool: &SqlitePool, keys: &EscrowKeys, amount
         amount: amount as i64,
         fee: 0,
         fiat_amount: 10,
+        cashu_mint_url: Some(mint_url.to_string()),
         ..Default::default()
     }
     .create(pool)
@@ -305,14 +312,16 @@ fn seller_event(keys: &EscrowKeys) -> UnwrappedMessage {
 }
 
 async fn build_ctx(pool: &SqlitePool, mint_url: &str) -> AppContext {
-    let client = CashuClient::connect(mint_url)
+    let mints = CashuMints::new(false);
+    mints
+        .client_for(mint_url)
         .await
         .expect("the mint must satisfy NUT-07/11/12 and expose an active sat keyset");
     TestContextBuilder::new()
         .with_pool(Arc::new(pool.clone()))
         .with_settings(test_settings())
         .build()
-        .with_cashu_client(Arc::new(client))
+        .with_cashu_mints(Arc::new(mints))
 }
 
 /// The full TA-1 happy path against a live mint, followed by the two
@@ -332,7 +341,7 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
     let mut settings = test_settings();
     settings.cashu = Some(CashuSettings {
         enabled: true,
-        mint_url: mint_url.clone(),
+        mint_urls: vec![mint_url.clone()],
         escrow_locktime_days: days as u32,
     });
     let _ = crate::config::settings::init_mostro_settings(settings);
@@ -351,7 +360,7 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
 
     let pool = temp_pool().await;
     let ctx = build_ctx(&pool, &mint_url).await;
-    let order = seed_waiting_payment_order(&pool, &keys, amount).await;
+    let order = seed_waiting_payment_order(&pool, &keys, amount, &mint_url).await;
     println!("  order {} seeded in WaitingPayment", order.id);
 
     // --- Happy path -------------------------------------------------------
@@ -380,7 +389,7 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
     println!("  ✓ replay re-notifies without rewriting state");
 
     // --- Cross-order reuse (step 6b, this PR) -----------------------------
-    let second = seed_waiting_payment_order(&pool, &keys, amount).await;
+    let second = seed_waiting_payment_order(&pool, &keys, amount, &mint_url).await;
     let msg = lock_message(second.id, &token, &mint_url, &keys);
     let reused = add_cashu_escrow_action(&ctx, msg, &seller_event(&keys), &keys.mostro).await;
     assert!(

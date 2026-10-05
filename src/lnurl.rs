@@ -6,7 +6,8 @@
 //!   (loopback/private unless the test-only allow flag is set, plus link-local,
 //!   CGNAT `100.64.0.0/10`, NAT64 `64:ff9b::/96`, multicast, etc.)
 //! - pins the request to a checked [`SocketAddr`] (no DNS rebinding) and
-//!   disables redirects
+//!   disables redirects and system proxies (a proxy would resolve the host
+//!   itself and bypass the pin)
 //! - bounds connect and request duration so a hanging host cannot stall the
 //!   serial message loop for long
 //!
@@ -228,6 +229,9 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
         .connect_timeout(LNURL_CONNECT_TIMEOUT)
         .user_agent(concat!("mostro/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::none())
+        // A system proxy (`HTTP_PROXY`, …) would resolve the host itself and
+        // bypass the pinned address.
+        .no_proxy()
         .resolve(&host, pinned)
         .build()
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;

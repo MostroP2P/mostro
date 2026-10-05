@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
-use crate::app::dev_fee::run_dev_fee_cycle;
+use crate::app::dev_fee::{dev_fee_payments_enabled, run_dev_fee_cycle};
 use crate::app::release::{do_payment, reconcile_inflight_payout};
 use crate::config;
 use crate::db::*;
@@ -54,7 +54,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
-    // Mode-agnostic jobs (the info event self-skips when LN status is absent).
+    // Mode-agnostic jobs.
     job_orderbook_reconciler(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
@@ -225,12 +225,17 @@ async fn job_info_event_send(ctx: AppContext) {
     let client = ctx.nostr_client().clone();
     let maintenance = ctx.maintenance().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
-    // The info event embeds LN node stats (`info_to_tags`). In Cashu mode there
-    // is no LND, so `LN_STATUS` is never set — skip the job rather than panic
-    // on `unwrap()`. A Cashu-aware info event is future work (CF-5).
-    let Some(ln_status) = LN_STATUS.get() else {
-        info!("Skipping mostro info event: no LN status (Cashu mode)");
-        return;
+    // A node runs exactly one escrow backend; the info event advertises it.
+    // Cashu mode has no LND, so it describes the mint instead of `LN_STATUS`.
+    let escrow = match Settings::get_cashu().filter(|cashu| cashu.enabled) {
+        Some(cashu) => crate::nip33::InfoEscrow::Cashu(cashu),
+        None => match LN_STATUS.get() {
+            Some(ln_status) => crate::nip33::InfoEscrow::Lightning(ln_status),
+            None => {
+                warn!("Skipping mostro info event: Lightning mode without LN status");
+                return;
+            }
+        },
     };
     tokio::spawn(async move {
         loop {
@@ -241,7 +246,7 @@ async fn job_info_event_send(ctx: AppContext) {
                 info!("Sending info about mostro");
             }
 
-            let tags = crate::nip33::info_to_tags(ln_status, in_maintenance);
+            let tags = crate::nip33::info_to_tags(escrow, in_maintenance);
             let id = mostro_keys.public_key().to_string();
 
             let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
@@ -1539,6 +1544,17 @@ async fn job_prune_payer_declarations(ctx: AppContext) {
 #[mutants::skip]
 async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
+
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        return info!(
+            "Lightning node is not on mainnet (networks: {:?}); dev fee payments are disabled",
+            networks
+        );
+    }
 
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client

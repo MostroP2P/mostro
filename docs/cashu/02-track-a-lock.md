@@ -88,7 +88,7 @@ this now — see §11).
 
 | Needs | From | Exact item |
 |-------|------|------------|
-| Mode + mint config | CF-1 | `Settings::is_cashu_enabled()`, `Settings::escrow_mode()`, `get_cashu().mint_url` |
+| Mode + mint config | CF-1, #1046 | `Settings::is_cashu_enabled()`, `Settings::escrow_mode()`, the order's `cashu_mint_url` |
 | Token validation | CF-2 | `CashuClient::verify_escrow_token(token, p_b, p_s, p_m, expected_amount, min_locktime)` (2-of-3 **plus** the `locktime`/`refund=[P_S]` seller-recovery path, §4B), `verify_2of3_condition`, `check_state`, `verify_token_dleq`, `cashu_pubkey_from_xonly_hex` |
 | Locktime floor | CF-1 | `get_cashu().escrow_locktime_days` (default 15) → `min_locktime = now + days` (§4B) |
 | Fee-token validation | CF-2 | `CashuClient::verify_fee_token(token, p_m, expected_fee)` (new, §4A) |
@@ -149,9 +149,12 @@ to `release_action` (compute/verify first, persist second, notify last).
 4. **Extract the proof.** `Payload::CashuLockProof(proof)`; absent ⇒
    `CantDo(InvalidCashuToken)`. (`MessageKind::verify()` already guarantees the
    payload shape, but the handler re-checks defensively.)
-5. **Bind the mint.** `proof.mint_url` MUST equal the node's configured
-   `get_cashu().mint_url` (normalised); else `CantDo(InvalidMintUrl)`. The node
-   only escrows on its own mint.
+5. **Bind the mint.** `proof.mint_url` MUST equal the order's
+   `cashu_mint_url` (both normalised); else `CantDo(InvalidMintUrl)`. The
+   escrow goes on the mint the maker chose and the node accepted at creation
+   (issue #1046), never another one, even one the node also allows. An order
+   without a mint is rejected the same way. The token is then validated with
+   that mint's client from `ctx.cashu_mints()`.
 6. **Bind the pubkeys to THIS order.** Convert each hex pubkey with
    `cashu_pubkey_from_xonly_hex`:
    - `proof.buyer_pubkey` MUST equal the order's **buyer trade pubkey**

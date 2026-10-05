@@ -35,6 +35,13 @@ pub fn ctx_with(pool: &SqlitePool, payer_history: Option<PayerHistorySettings>) 
         .build()
 }
 
+/// Node secret the payer-history rows are keyed with in tests; pass it to
+/// the action under test too, or its lookups will find nothing.
+pub fn node_keys() -> &'static Keys {
+    static NODE: std::sync::OnceLock<Keys> = std::sync::OnceLock::new();
+    NODE.get_or_init(Keys::generate)
+}
+
 pub fn hash(c: char) -> String {
     std::iter::repeat_n(c, 64).collect()
 }

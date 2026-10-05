@@ -20,7 +20,7 @@ pub async fn payment_history_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedMessage,
-    _my_keys: &Keys,
+    my_keys: &Keys,
 ) -> Result<(), MostroError> {
     if !PayerHistorySettings::enabled(ctx.settings().payer_history.as_ref()) {
         return Err(MostroCantDo(CantDoReason::InvalidAction)); // D-10
@@ -35,7 +35,7 @@ pub async fn payment_history_action(
         Status::Success => return Err(MostroCantDo(CantDoReason::NotFound)),
         _ => return Err(MostroCantDo(CantDoReason::NotAllowedByStatus)),
     }
-    let history = build_for_order(pool, &order)
+    let history = build_for_order(pool, my_keys, &order)
         .await?
         .ok_or(MostroCantDo(CantDoReason::NotFound))?; // buyer never declared
     enqueue_order_msg(
@@ -62,6 +62,7 @@ pub async fn payment_history_action(
 /// snapshot, the next query takes it.
 pub async fn build_for_order(
     pool: &Pool<Sqlite>,
+    node_keys: &Keys,
     order: &Order,
 ) -> Result<Option<PaymentHistory>, MostroError> {
     let Some(declaration) = db::find_declaration(pool, order.id).await? else {
@@ -70,7 +71,7 @@ pub async fn build_for_order(
     if let Some(frozen) = db::history_snapshot(pool, order.id).await? {
         return Ok(Some(frozen));
     }
-    let live = live_history(pool, order, declaration.payment_hash).await?;
+    let live = live_history(pool, node_keys, order, declaration.payment_hash).await?;
     Ok(Some(
         db::freeze_history_snapshot(pool, order.id, &live).await?,
     ))
@@ -79,6 +80,7 @@ pub async fn build_for_order(
 /// The aggregate as it stands now, for the snapshot.
 async fn live_history(
     pool: &Pool<Sqlite>,
+    node_keys: &Keys,
     order: &Order,
     payment_hash: String,
 ) -> Result<PaymentHistory, MostroError> {
@@ -86,7 +88,7 @@ async fn live_history(
     let Some(user) = normal_buyer_idkey else {
         return Ok(PaymentHistory::unavailable(payment_hash));
     };
-    let h = db::load_history(pool, &user, &payment_hash).await?;
+    let h = db::load_history(pool, node_keys, &user, &payment_hash).await?;
     Ok(PaymentHistory {
         payment_hash,
         buyer_mode: BuyerMode::Reputation,
@@ -110,30 +112,51 @@ mod tests {
     }
 
     async fn run(ctx: &AppContext, sender: PublicKey, msg: Message) -> Result<(), MostroError> {
-        payment_history_action(ctx, msg.clone(), &unwrapped(sender, msg), &Keys::generate()).await
+        payment_history_action(ctx, msg.clone(), &unwrapped(sender, msg), node_keys()).await
     }
 
     /// Two past successes of `buyer_master` from `h`, with two different
     /// sellers, one of them experienced.
     async fn seed_history(pool: &SqlitePool, buyer_master: &PublicKey, h: &str) {
         let mut conn = pool.acquire().await.unwrap();
-        let generation = current_policy_generation(&mut conn, (5, 30), 1)
+        let generation = current_policy_generation(&mut conn, node_keys(), (5, 30), 1)
             .await
             .unwrap();
         let user = buyer_master.to_string();
-        bump_history(&mut conn, &user, h, &hash('1'), false, generation, 1_000)
-            .await
-            .unwrap();
-        bump_history(&mut conn, &user, h, &hash('2'), true, generation, 2_000)
-            .await
-            .unwrap();
+        bump_history(
+            &mut conn,
+            node_keys(),
+            &user,
+            h,
+            &hash('1'),
+            false,
+            generation,
+            1_000,
+        )
+        .await
+        .unwrap();
+        bump_history(
+            &mut conn,
+            node_keys(),
+            &user,
+            h,
+            &hash('2'),
+            true,
+            generation,
+            2_000,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn build_for_order_is_none_without_a_declaration() {
         let pool = create_test_pool().await;
         let order = order_in(&pool, Status::FiatSent, Parties::reputation()).await;
-        assert!(build_for_order(&pool, &order).await.unwrap().is_none());
+        assert!(build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -144,7 +167,10 @@ mod tests {
             .await
             .unwrap();
 
-        let h = build_for_order(&pool, &order).await.unwrap().unwrap();
+        let h = build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(h.payment_hash, hash('a'));
         assert_eq!(h.buyer_mode, BuyerMode::Reputation);
         assert_eq!(
@@ -169,14 +195,18 @@ mod tests {
             .await
             .unwrap();
         seed_history(&pool, &parties.buyer_master, &hash('a')).await;
-        let pushed = build_for_order(&pool, &order).await.unwrap().unwrap();
+        let pushed = build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        let generation = current_policy_generation(&mut conn, (5, 30), 1)
+        let generation = current_policy_generation(&mut conn, node_keys(), (5, 30), 1)
             .await
             .unwrap();
         bump_history(
             &mut conn,
+            node_keys(),
             &parties.buyer_master.to_string(),
             &hash('a'),
             &hash('3'),
@@ -188,7 +218,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let queried = build_for_order(&pool, &order).await.unwrap().unwrap();
+        let queried = build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(queried, pushed, "same snapshot as the push");
     }
 
@@ -205,7 +238,10 @@ mod tests {
         // identity key (D-1).
         seed_history(&pool, &parties.buyer, &hash('b')).await;
 
-        let h = build_for_order(&pool, &order).await.unwrap().unwrap();
+        let h = build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(h.buyer_mode, BuyerMode::Reputation);
         assert_eq!(
             (
@@ -232,7 +268,10 @@ mod tests {
         // Even if rows existed under that key, they must not be shown (D-4).
         seed_history(&pool, &parties.buyer, &hash('a')).await;
 
-        let h = build_for_order(&pool, &order).await.unwrap().unwrap();
+        let h = build_for_order(&pool, node_keys(), &order)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(h, PaymentHistory::unavailable(hash('a')));
     }
 

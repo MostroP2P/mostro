@@ -16,6 +16,7 @@
 //! Fee collection (Option 2, §4A) is **not** handled here — it lands in TA-1f.
 
 use crate::app::context::AppContext;
+use crate::cashu::mint_policy::normalize_mint_url;
 use crate::cashu::{cashu_pubkey_from_xonly_hex, Error as CashuError};
 use crate::config::settings::Settings;
 use crate::db::{cashu_escrow_token_in_use, update_order_cashu_escrow};
@@ -196,17 +197,19 @@ pub async fn add_cashu_escrow_action(
         return Ok(());
     }
 
-    // 5. Bind the mint: the node only escrows on its own configured mint. This
+    // 5. Bind the mint: the escrow goes on the mint the maker chose and the
+    //    node accepted when the order was created (issue #1046), never on one
+    //    the seller picks now — even another mint the node allows. An order
+    //    keeps its mint if the operator later drops it from `mint_urls`. This
     //    is a cheap field pre-check; `verify_escrow_token` (step 7) enforces
-    //    the authoritative binding (the token's mint == the configured mint).
-    let configured_mint = Settings::get_cashu()
-        .map(|c| c.mint_url.clone())
-        .ok_or_else(|| {
-            MostroInternalErr(ServiceError::UnexpectedError(
-                "cashu mode without [cashu] settings".to_string(),
-            ))
-        })?;
-    if proof.mint_url.trim_end_matches('/') != configured_mint.trim_end_matches('/') {
+    //    the authoritative binding (the token's mint == the order's mint).
+    let order_mint = order
+        .cashu_mint_url
+        .clone()
+        .ok_or(MostroCantDo(CantDoReason::InvalidMintUrl))?;
+    let same_mint = normalize_mint_url(&proof.mint_url)
+        .is_ok_and(|proof_mint| normalize_mint_url(&order_mint).is_ok_and(|m| m == proof_mint));
+    if !same_mint {
         return Err(MostroCantDo(CantDoReason::InvalidMintUrl));
     }
 
@@ -257,11 +260,16 @@ pub async fn add_cashu_escrow_action(
     //    locktime floor + mint binding + amount + DLEQ (NUT-12) + unspent
     //    (NUT-07). The floor is `now + cashu.escrow_locktime_days`; the seller
     //    may set a longer locktime, never a shorter one (§4B).
-    let cashu_client = ctx.cashu_client().ok_or_else(|| {
-        MostroInternalErr(ServiceError::UnexpectedError(
-            "cashu client not connected".to_string(),
-        ))
-    })?;
+    let cashu_client = ctx
+        .cashu_mints()
+        .ok_or_else(|| {
+            MostroInternalErr(ServiceError::UnexpectedError(
+                "cashu mints not attached".to_string(),
+            ))
+        })?
+        .client_for(&order_mint)
+        .await
+        .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
     let now = Utc::now().timestamp();
     let locktime_days = Settings::get_cashu()
         .map(|c| c.escrow_locktime_days)
@@ -280,7 +288,7 @@ pub async fn add_cashu_escrow_action(
     let locked = update_order_cashu_escrow(
         pool,
         order.id,
-        &configured_mint,
+        &order_mint,
         &proof.token,
         now,
         Status::WaitingPayment,
@@ -519,6 +527,113 @@ mod tests {
         let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db.status, Status::WaitingPayment.to_string());
         assert!(db.cashu_escrow_token.is_none());
+    }
+
+    // ── Step 5: the escrow goes on the order's mint (issue #1046) ─────────
+
+    /// A `WaitingPayment` order on `mint`, with the proof's keys bound to it.
+    async fn order_on_mint(
+        pool: &SqlitePool,
+        mint: Option<&str>,
+    ) -> (Order, PublicKey, PublicKey, Keys) {
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = Order {
+            cashu_mint_url: mint.map(str::to_string),
+            ..waiting_payment_order(seller, buyer)
+        }
+        .create(pool)
+        .await
+        .unwrap();
+        (order, seller, buyer, Keys::generate())
+    }
+
+    fn proof_on_mint(
+        mint: &str,
+        buyer: PublicKey,
+        seller: PublicKey,
+        mostro: PublicKey,
+    ) -> Payload {
+        Payload::CashuLockProof(CashuLockProof::new(
+            "cashuBnotarealtoken".to_string(),
+            mint.to_string(),
+            buyer.to_string(),
+            seller.to_string(),
+            mostro.to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn rejects_a_proof_on_another_mint_than_the_orders() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (order, seller, buyer, my_keys) =
+            order_on_mint(&pool, Some("https://mint-a.example.com")).await;
+        let proof = proof_on_mint(
+            "https://mint-b.example.com",
+            buyer,
+            seller,
+            my_keys.public_key(),
+        );
+        let msg = lock_message(order.id, Some(proof));
+
+        let result = add_cashu_escrow_action(&ctx, msg, &unwrapped_from(seller), &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidMintUrl))
+        ));
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db.cashu_escrow_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_lock_on_an_order_without_a_mint() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, None).await;
+        let proof = proof_on_mint(
+            "https://mint-a.example.com",
+            buyer,
+            seller,
+            my_keys.public_key(),
+        );
+        let msg = lock_message(order.id, Some(proof));
+
+        let result = add_cashu_escrow_action(&ctx, msg, &unwrapped_from(seller), &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidMintUrl))
+        ));
+    }
+
+    #[tokio::test]
+    async fn validates_the_token_on_the_orders_mint() {
+        // A proof on the order's mint, spelled differently, passes step 5 and
+        // reaches token validation on that mint's client, which rejects the
+        // bogus token.
+        let pool = create_test_pool().await;
+        let mints = crate::cashu::mints::CashuMints::new(false);
+        mints
+            .insert(crate::cashu::CashuClient::offline(
+                "https://mint-a.example.com",
+            ))
+            .await;
+        let ctx = build_ctx(&pool).with_cashu_mints(Arc::new(mints));
+        let (order, seller, buyer, my_keys) =
+            order_on_mint(&pool, Some("https://mint-a.example.com")).await;
+        let proof = proof_on_mint(
+            "https://MINT-A.example.com/",
+            buyer,
+            seller,
+            my_keys.public_key(),
+        );
+        let msg = lock_message(order.id, Some(proof));
+
+        let result = add_cashu_escrow_action(&ctx, msg, &unwrapped_from(seller), &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
     }
 
     /// Step 3b: a seller retrying after the lock committed but the

@@ -45,9 +45,10 @@ pub async fn record_payer_success(
     let experience =
         db::seller_experience(conn, &seller_master, &user, Some(order.id), Some(now)).await?;
     let experienced = is_experienced(&experience, thresholds.0, thresholds.1, now);
-    let generation = db::current_policy_generation(conn, thresholds, now).await?;
+    let generation = db::current_policy_generation(conn, node_keys, thresholds, now).await?;
     db::bump_history(
         conn,
+        node_keys,
         &user,
         &declaration.payment_hash,
         &cp,
@@ -112,7 +113,7 @@ mod tests {
     }
 
     async fn history(pool: &SqlitePool, parties: Parties, h: &str) -> (u32, u32, u32) {
-        let c = load_history(pool, &parties.buyer_master.to_string(), h)
+        let c = load_history(pool, node_keys(), &parties.buyer_master.to_string(), h)
             .await
             .unwrap();
         (
@@ -132,16 +133,21 @@ mod tests {
     #[tokio::test]
     async fn first_success_creates_the_history_and_consumes_the_declaration() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
         record(&pool, &node, &order, NOW).await;
 
         assert_eq!(history(&pool, parties, &hash('a')).await, (1, 1, 0));
-        let c = load_history(&pool, &parties.buyer_master.to_string(), &hash('a'))
-            .await
-            .unwrap();
+        let c = load_history(
+            &pool,
+            node_keys(),
+            &parties.buyer_master.to_string(),
+            &hash('a'),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (c.first_success_at, c.last_success_at),
             (Some(NOW), Some(NOW))
@@ -163,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_call_for_the_same_order_is_a_no_op() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
@@ -177,14 +183,14 @@ mod tests {
     async fn without_a_declaration_nothing_is_recorded() {
         let pool = create_test_pool().await;
         let order = order_in(&pool, Status::Success, Parties::reputation()).await;
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
         assert_eq!(rows(&pool).await, 0);
     }
 
     #[tokio::test]
     async fn distinct_counterparties_count_sellers_not_trades() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
         let mut other_seller = Parties::reputation();
         other_seller.buyer = parties.buyer;
@@ -205,7 +211,7 @@ mod tests {
         let mut order = finished_trade(&pool, parties, &hash('a')).await;
         order.buyer_dispute = true;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(rows(&pool).await, 0, "D-6");
         assert!(
@@ -219,7 +225,7 @@ mod tests {
         let pool = create_test_pool().await;
         let order = finished_trade(&pool, Parties::full_privacy_buyer(), &hash('a')).await;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(rows(&pool).await, 0, "D-4");
         assert!(
@@ -236,7 +242,7 @@ mod tests {
         prior_success(&pool, parties.seller_master, NOW - 35 * ONE_DAY).await;
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(history(&pool, parties, &hash('a')).await, (1, 1, 1));
     }
@@ -260,7 +266,7 @@ mod tests {
         .unwrap();
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(
             history(&pool, parties, &hash('a')).await,
@@ -282,7 +288,7 @@ mod tests {
 
         for p in [few, young] {
             let order = finished_trade(&pool, p, &hash('a')).await;
-            record(&pool, &Keys::generate(), &order, NOW).await;
+            record(&pool, node_keys(), &order, NOW).await;
             assert_eq!(history(&pool, p, &hash('a')).await, (1, 1, 0));
         }
     }
@@ -295,7 +301,7 @@ mod tests {
         prior_success(&pool, parties.seller_master, NOW - 40 * ONE_DAY).await;
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(history(&pool, parties, &hash('a')).await, (1, 1, 0));
     }
@@ -303,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn trades_with_the_same_buyer_never_qualify_the_seller() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
         // Many old successes, all with this very buyer (two-key Sybil).
         for _ in 0..5 {
@@ -335,7 +341,7 @@ mod tests {
             .unwrap();
         let order = finished_trade(&pool, parties, &hash('a')).await;
 
-        record(&pool, &Keys::generate(), &order, NOW).await;
+        record(&pool, node_keys(), &order, NOW).await;
 
         assert_eq!(history(&pool, parties, &hash('a')).await, (1, 1, 0));
     }
@@ -343,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn the_flag_upgrades_on_a_later_success_and_never_downgrades() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
 
         // First trade: the seller is new.
@@ -381,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_seller_identity_key_the_trade_key_identifies_the_counterparty() {
         let pool = create_test_pool().await;
-        let node = Keys::generate();
+        let node = node_keys().clone();
         let parties = Parties::reputation();
         let mut order = finished_trade(&pool, parties, &hash('a')).await;
         order.master_seller_pubkey = None;

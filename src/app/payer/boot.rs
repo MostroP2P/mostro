@@ -9,10 +9,11 @@ use sqlx::{Pool, Sqlite};
 
 /// Re-evaluate every stored `experienced` snapshot when the configured
 /// thresholds differ from the ones they were evaluated under (§10.7), or
-/// when the node secret differs from the one their counterparty ids were
-/// resolved with (compared through [`super::node_key_id`], since the public
-/// key cannot tell `s` from `n - s`): ids are keyed by the node secret, and only the recompute
-/// moves rows a new key cannot resolve out of the counted generation.
+/// when the node secret differs from the one the history was keyed with
+/// (compared through [`super::node_key_id`], since the public key cannot
+/// tell `s` from `n - s`): every history row is keyed by that secret, so
+/// under a new one no declaration can reach it, and the recompute discards
+/// the history.
 ///
 /// Returns `None` when there was nothing to do: the feature is off (the
 /// recompute never runs then, whatever the config says, D-10) or the stored
@@ -42,9 +43,18 @@ pub async fn sync_experience_policy(
          recomputed snapshots, {} row(s) changed",
         outcome.changed
     );
+    if outcome.discarded > 0 {
+        // Expected once after a deliberate change of the node secret; a
+        // surprise otherwise, and the history does not come back.
+        tracing::warn!(
+            "payer_history: the node secret changed; discarded {} payer history row(s) \
+             keyed by the previous one, buyers' payment-account history starts over",
+            outcome.discarded
+        );
+    }
     if outcome.unresolved > 0 {
         // Never the rows themselves: on a healthy node this is zero, and
-        // anything else means the node key changed under a populated DB.
+        // anything else means an imported database.
         tracing::warn!(
             "payer_history: {} snapshot(s) could not be re-evaluated (unknown counterparty); \
              they no longer count as distinct or experienced counterparties",
@@ -71,8 +81,8 @@ pub fn cashu_conflict_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::payer::db::load_experience_policy;
-    use crate::app::payer::test_support::{create_test_pool, payer_settings};
+    use crate::app::payer::db::{bump_history, load_experience_policy};
+    use crate::app::payer::test_support::{create_test_pool, hash, payer_settings};
 
     fn with_thresholds(n: u32, d: u32) -> PayerHistorySettings {
         PayerHistorySettings {
@@ -153,21 +163,39 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_key_change_recomputes_even_with_unchanged_thresholds() {
-        // Counterparty ids are keyed by the node secret: under a new key the
-        // stored ones resolve to no seller, and only the recompute moves
-        // them out of the counted generation.
+        // History rows are keyed by the node secret: under a new key no
+        // declaration can reach them, so the recompute discards them.
         let pool = create_test_pool().await;
         let cfg = with_thresholds(5, 30);
-        sync_experience_policy(&pool, &Keys::generate(), Some(&cfg), 10)
+        let old_key = Keys::generate();
+        sync_experience_policy(&pool, &old_key, Some(&cfg), 10)
             .await
             .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        bump_history(
+            &mut conn,
+            &old_key,
+            &Keys::generate().public_key().to_string(),
+            &hash('a'),
+            "cp",
+            false,
+            1,
+            5,
+        )
+        .await
+        .unwrap();
+        drop(conn);
 
         let new_key = Keys::generate();
         let out = sync_experience_policy(&pool, &new_key, Some(&cfg), 20)
             .await
             .unwrap();
 
-        assert!(out.is_some(), "recomputed");
+        assert_eq!(
+            out.map(|o| o.discarded),
+            Some(1),
+            "recomputed, history discarded"
+        );
         let policy = load_experience_policy(&pool).await.unwrap().unwrap();
         assert_eq!(policy.generation, 2);
         assert_eq!(

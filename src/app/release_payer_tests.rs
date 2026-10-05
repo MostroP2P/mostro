@@ -7,7 +7,7 @@ use crate::app::payer::db::{
     find_declaration, load_history, prune_declarations_for_terminal_orders, upsert_declaration,
 };
 use crate::app::payer::test_support::{
-    create_test_pool, ctx_with, hash, order_in, payer_settings, queued_for, Parties,
+    create_test_pool, ctx_with, hash, node_keys, order_in, payer_settings, queued_for, Parties,
 };
 use crate::config::MOSTRO_CONFIG;
 use crate::util::{orderbook_publish_attempts, ORDERBOOK_QUEUE_TEST_LOCK};
@@ -40,7 +40,7 @@ async fn payer_rows(pool: &SqlitePool) -> i64 {
 }
 
 async fn finalize(ctx: &AppContext, order: &mut Order, parties: Parties) -> Result<bool> {
-    payment_success(ctx, order, parties.buyer, &Keys::generate(), None).await
+    payment_success(ctx, order, parties.buyer, node_keys(), None).await
 }
 
 async fn notified(order_id: uuid::Uuid) -> (bool, bool) {
@@ -102,9 +102,14 @@ async fn feature_on_records_history_in_the_success_transaction() {
 
     assert_eq!(status(&pool, order.id).await, Status::Success.to_string());
     let stamped = success_at(&pool, order.id).await.expect("stamped");
-    let h = load_history(&pool, &parties.buyer_master.to_string(), &hash('a'))
-        .await
-        .unwrap();
+    let h = load_history(
+        &pool,
+        node_keys(),
+        &parties.buyer_master.to_string(),
+        &hash('a'),
+    )
+    .await
+    .unwrap();
     assert_eq!((h.successful_trades, h.distinct_counterparties), (1, 1));
     assert_eq!(h.last_success_at, Some(stamped));
     assert!(
@@ -211,10 +216,15 @@ async fn a_second_finalization_does_not_move_the_stamp() {
         assert!(finalize(&ctx, &mut order, parties).await.unwrap());
 
         assert_eq!(success_at(&pool, order.id).await, first.map(|t| t - 10));
-        let trades = load_history(&pool, &parties.buyer_master.to_string(), &hash('a'))
-            .await
-            .unwrap()
-            .successful_trades;
+        let trades = load_history(
+            &pool,
+            node_keys(),
+            &parties.buyer_master.to_string(),
+            &hash('a'),
+        )
+        .await
+        .unwrap()
+        .successful_trades;
         assert!(trades <= 1, "at most one increment per order");
     }
 }

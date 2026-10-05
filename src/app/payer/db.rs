@@ -13,7 +13,7 @@ use nostr_sdk::prelude::Keys;
 use sqlx::{AssertSqlSafe, Pool, Row, Sqlite, SqliteConnection};
 use uuid::Uuid;
 
-use super::{counterparty_id, is_experienced, validate_payment_hash};
+use super::{counterparty_id, is_experienced, payer_key, validate_payment_hash};
 use crate::db::TERMINAL_ORDER_STATUSES;
 
 fn db_err(e: sqlx::Error) -> MostroError {
@@ -138,13 +138,14 @@ fn to_u32(n: i64) -> u32 {
     u32::try_from(n.max(0)).unwrap_or(u32::MAX)
 }
 
-/// Counters for `(user_pubkey, payment_hash)`; all zero when there is no
-/// history. A row whose `policy_gen` is stale counts toward
-/// `distinct_counterparties` but never toward `experienced_counterparties`,
+/// Counters for `(user_pubkey, payment_hash)`, looked up under the
+/// [`payer_key`] of `payment_hash`; all zero when there is no history. A
+/// row whose `policy_gen` is stale counts toward `distinct_counterparties` but never toward `experienced_counterparties`,
 /// so a count is always evaluated under the advertised thresholds (§10.7);
 /// one marked [`UNRESOLVED_POLICY_GENERATION`] counts toward neither.
 pub async fn load_history(
     pool: &Pool<Sqlite>,
+    node_keys: &Keys,
     user_pubkey: &str,
     payment_hash: &str,
 ) -> Result<HistoryCounters, MostroError> {
@@ -153,19 +154,19 @@ pub async fn load_history(
     let row = sqlx::query(
         "SELECT h.successful_trades, h.first_success_at, h.last_success_at, \
                 (SELECT COUNT(*) FROM payer_history_counterparties c \
-                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash \
+                  WHERE c.user_pubkey = h.user_pubkey AND c.payer_key = h.payer_key \
                     AND c.policy_gen <> ?3) \
                   AS distinct_cp, \
                 (SELECT COUNT(*) FROM payer_history_counterparties c \
-                  WHERE c.user_pubkey = h.user_pubkey AND c.payment_hash = h.payment_hash \
+                  WHERE c.user_pubkey = h.user_pubkey AND c.payer_key = h.payer_key \
                     AND c.experienced = 1 \
                     AND c.policy_gen = (SELECT generation FROM payer_history_policy WHERE id = 1)) \
                   AS experienced_cp \
            FROM payer_history h \
-          WHERE h.user_pubkey = ?1 AND h.payment_hash = ?2",
+          WHERE h.user_pubkey = ?1 AND h.payer_key = ?2",
     )
     .bind(user_pubkey)
-    .bind(payment_hash)
+    .bind(payer_key(node_keys, payment_hash))
     .bind(UNRESOLVED_POLICY_GENERATION)
     .fetch_optional(pool)
     .await
@@ -183,12 +184,17 @@ pub async fn load_history(
 }
 
 /// Record one successful trade for `(user_pubkey, payment_hash)` with the
-/// counterparty `counterparty_id`. Must run inside the Success CAS
+/// counterparty `counterparty_id`. Stores the [`payer_key`] of
+/// `payment_hash`, never the hash itself (D-2). Must run inside the Success CAS
 /// transaction. Under a fixed policy generation the counterparty's
 /// `experienced` flag only ever goes 0 → 1; a row left stale by §10.7 is
 /// overwritten outright and rejoins the current generation.
+// Every argument is a distinct column or key of the one upsert; a params
+// struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub async fn bump_history(
     conn: &mut SqliteConnection,
+    node_keys: &Keys,
     user_pubkey: &str,
     payment_hash: &str,
     counterparty_id: &str,
@@ -197,27 +203,28 @@ pub async fn bump_history(
     now: i64,
 ) -> Result<(), MostroError> {
     validate_payment_hash(payment_hash)?;
+    let key = payer_key(node_keys, payment_hash);
     sqlx::query(
         "INSERT INTO payer_history \
-           (user_pubkey, payment_hash, first_success_at, last_success_at, successful_trades) \
+           (user_pubkey, payer_key, first_success_at, last_success_at, successful_trades) \
          VALUES (?1, ?2, ?3, ?3, 1) \
-         ON CONFLICT(user_pubkey, payment_hash) \
+         ON CONFLICT(user_pubkey, payer_key) \
          DO UPDATE SET first_success_at = MIN(first_success_at, excluded.first_success_at), \
                        last_success_at = MAX(last_success_at, excluded.last_success_at), \
                        successful_trades = successful_trades + 1",
     )
     .bind(user_pubkey)
-    .bind(payment_hash)
+    .bind(&key)
     .bind(now)
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
     sqlx::query(
         "INSERT INTO payer_history_counterparties \
-           (user_pubkey, payment_hash, counterparty_id, first_success_at, last_success_at, \
+           (user_pubkey, payer_key, counterparty_id, first_success_at, last_success_at, \
             experienced, policy_gen) \
          VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6) \
-         ON CONFLICT(user_pubkey, payment_hash, counterparty_id) \
+         ON CONFLICT(user_pubkey, payer_key, counterparty_id) \
          DO UPDATE SET first_success_at = MIN(first_success_at, excluded.first_success_at), \
                        last_success_at = MAX(last_success_at, excluded.last_success_at), \
                        experienced = CASE WHEN policy_gen = excluded.policy_gen \
@@ -226,7 +233,7 @@ pub async fn bump_history(
                        policy_gen = excluded.policy_gen",
     )
     .bind(user_pubkey)
-    .bind(payment_hash)
+    .bind(&key)
     .bind(counterparty_id)
     .bind(now)
     .bind(i64::from(experienced))
@@ -374,8 +381,13 @@ pub const UNRECOMPUTED_POLICY_GENERATION: i64 = 0;
 /// thresholds (they changed and the recompute has not run), returns
 /// [`UNRECOMPUTED_POLICY_GENERATION`] instead of mixing the two policies
 /// under one generation.
+///
+/// The seed records the [`super::node_key_id`] of `node_keys`, the secret the
+/// rows written next are keyed with, so a later change of secret is always
+/// detected (§10.7) and never hides behind an unknown one.
 pub async fn current_policy_generation(
     conn: &mut SqliteConnection,
+    node_keys: &Keys,
     thresholds: (u32, u32),
     now: i64,
 ) -> Result<i64, MostroError> {
@@ -384,13 +396,15 @@ pub async fn current_policy_generation(
     // caller's transaction, which SQLite can refuse with SQLITE_BUSY.
     sqlx::query(
         "INSERT INTO payer_history_policy \
-           (id, generation, experienced_min_trades, experienced_min_days, evaluated_at) \
-         VALUES (1, 1, ?1, ?2, ?3) \
+           (id, generation, experienced_min_trades, experienced_min_days, evaluated_at, \
+            node_key_id) \
+         VALUES (1, 1, ?1, ?2, ?3, ?4) \
          ON CONFLICT(id) DO NOTHING",
     )
     .bind(i64::from(thresholds.0))
     .bind(i64::from(thresholds.1))
     .bind(now)
+    .bind(super::node_key_id(node_keys))
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -412,11 +426,15 @@ pub async fn current_policy_generation(
 pub struct RecomputeOutcome {
     /// Rows whose `experienced` flag changed.
     pub changed: u64,
-    /// Rows whose `counterparty_id` maps to no seller in `orders` (node key
-    /// rotated, imported database). They keep their value and are stamped
+    /// Rows whose `counterparty_id` maps to no seller in `orders` (an
+    /// imported database; a rotated node key discards the rows instead).
+    /// They keep their value and are stamped
     /// [`UNRESOLVED_POLICY_GENERATION`], which keeps them out of both the
     /// experienced and the distinct counts.
     pub unresolved: u64,
+    /// `payer_history` rows dropped because the stored policy was evaluated
+    /// under another node secret (§10.7). Zero unless the secret changed.
+    pub discarded: u64,
 }
 
 /// Re-evaluate the whole `experienced` column under `(min_trades, min_days)`
@@ -434,6 +452,7 @@ pub async fn recompute_experienced(
 ) -> Result<RecomputeOutcome, MostroError> {
     let mut tx = pool.begin().await.map_err(db_err)?;
     let node_key_id = super::node_key_id(node_keys);
+    let discarded = discard_history_of_another_node_key(&mut tx, &node_key_id).await?;
     let generation =
         store_experience_policy(&mut tx, &node_key_id, min_trades, min_days, now).await?;
 
@@ -454,24 +473,27 @@ pub async fn recompute_experienced(
         .collect();
 
     let rows = sqlx::query(
-        "SELECT user_pubkey, payment_hash, counterparty_id, last_success_at, experienced \
+        "SELECT user_pubkey, payer_key, counterparty_id, last_success_at, experienced \
            FROM payer_history_counterparties",
     )
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
 
-    let mut outcome = RecomputeOutcome::default();
+    let mut outcome = RecomputeOutcome {
+        discarded,
+        ..RecomputeOutcome::default()
+    };
     for row in rows {
         let user: String = row.get("user_pubkey");
-        let hash: String = row.get("payment_hash");
+        let hash: String = row.get("payer_key");
         let cp: String = row.get("counterparty_id");
         let at: i64 = row.get("last_success_at");
         let old = row.get::<i64, _>("experienced") == 1;
         let Some(seller) = by_id.get(&cp) else {
             sqlx::query(
                 "UPDATE payer_history_counterparties SET policy_gen = ?1 \
-                  WHERE user_pubkey = ?2 AND payment_hash = ?3 AND counterparty_id = ?4",
+                  WHERE user_pubkey = ?2 AND payer_key = ?3 AND counterparty_id = ?4",
             )
             .bind(UNRESOLVED_POLICY_GENERATION)
             .bind(&user)
@@ -487,7 +509,7 @@ pub async fn recompute_experienced(
         let new = is_experienced(&exp, min_trades, min_days, at);
         sqlx::query(
             "UPDATE payer_history_counterparties SET experienced = ?1, policy_gen = ?2 \
-              WHERE user_pubkey = ?3 AND payment_hash = ?4 AND counterparty_id = ?5",
+              WHERE user_pubkey = ?3 AND payer_key = ?4 AND counterparty_id = ?5",
         )
         .bind(i64::from(new))
         .bind(generation)
@@ -510,6 +532,39 @@ pub async fn recompute_experienced(
         .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
     Ok(outcome)
+}
+
+/// Drop every history row when the stored policy was evaluated under a node
+/// secret other than `node_key_id`. Rows are keyed by that secret
+/// ([`payer_key`]): under a new one no declaration can reach them again, and
+/// keeping them would only keep data nobody can use. Every seed records the
+/// key, so a policy row without one predates that and proves nothing either
+/// way; it keeps the rows. Returns the number of
+/// `payer_history` rows dropped.
+async fn discard_history_of_another_node_key(
+    conn: &mut SqliteConnection,
+    node_key_id: &str,
+) -> Result<u64, MostroError> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT node_key_id FROM payer_history_policy WHERE id = 1")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    let Some(Some(stored)) = stored else {
+        return Ok(0);
+    };
+    if stored == node_key_id {
+        return Ok(0);
+    }
+    sqlx::query("DELETE FROM payer_history_counterparties")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    let deleted = sqlx::query("DELETE FROM payer_history")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(deleted.rows_affected())
 }
 
 #[cfg(test)]

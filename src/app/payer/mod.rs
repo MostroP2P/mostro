@@ -15,7 +15,7 @@
 
 pub mod db;
 
-use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
 use mostro_core::error::{CantDoReason, MostroError, MostroError::MostroCantDo};
 use mostro_core::payer::is_valid_payment_hash;
 use nostr_sdk::prelude::Keys;
@@ -37,12 +37,34 @@ pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
     sha256::Hash::from_engine(eng).to_string()
 }
 
+/// Domain-separation tag for [`payer_key`] (D-2).
+const PAYER_KEY_DOMAIN: &[u8] = b"mostro-payer-history-key-v1";
+
+/// Key under which the history tables store a declared `payment_hash` (D-2).
+///
+/// `HMAC-SHA256(node_secret, "mostro-payer-history-key-v1" ‖ payment_hash)`
+/// as lowercase hex. The declared hash is an unkeyed SHA-256 of low-entropy
+/// account details that anyone can recompute from a candidate account, so
+/// stored raw next to the buyer's identity key it would let a leaked
+/// database be brute-forced back to "this npub pays from this account".
+/// Without the node secret, which never enters the database, a stored key
+/// cannot be tested against candidates. The wire still carries the raw
+/// hash: the seller compares it against the sender it sees.
+pub fn payer_key(node_keys: &Keys, payment_hash: &str) -> String {
+    let mut eng = hmac::HmacEngine::<sha256::Hash>::new(node_keys.secret_key().as_secret_bytes());
+    eng.input(PAYER_KEY_DOMAIN);
+    eng.input(payment_hash.as_bytes());
+    hmac::Hmac::<sha256::Hash>::from_engine(eng).to_string()
+}
+
 const NODE_KEY_ID_DOMAIN: &[u8] = b"mostro-payer-history-node-v1";
 
-/// Fingerprint of the node secret the counterparty ids are keyed with,
+/// Fingerprint of the node secret the history keys and counterparty ids are
+/// keyed with,
 /// `sha256("mostro-payer-history-node-v1" ‖ node_secret)` as lowercase hex.
 /// The policy row stores it so boot can tell that the secret changed (§10.7).
-/// It is the secret, not the public key, that `counterparty_id` hashes, and
+/// It is the secret, not the public key, that [`payer_key`] and
+/// [`counterparty_id`] hash, and
 /// the x-only public key cannot tell `s` from `n - s`.
 pub fn node_key_id(node_keys: &Keys) -> String {
     let mut eng = sha256::Hash::engine();
@@ -121,6 +143,25 @@ mod tests {
         assert_ne!(counterparty_id(&k1, &s1), counterparty_id(&k1, &s2));
         // Never the raw pubkey.
         assert_ne!(counterparty_id(&k1, &s1), s1);
+    }
+
+    #[test]
+    fn payer_key_is_deterministic_per_node_key() {
+        let keys = Keys::generate();
+        let h = "a".repeat(64);
+        assert_eq!(payer_key(&keys, &h), payer_key(&keys, &h));
+        assert_eq!(payer_key(&keys, &h).len(), 64);
+    }
+
+    #[test]
+    fn payer_key_differs_across_node_keys_and_hashes() {
+        let (k1, k2) = (Keys::generate(), Keys::generate());
+        let (h1, h2) = ("a".repeat(64), "b".repeat(64));
+        assert_ne!(payer_key(&k1, &h1), payer_key(&k2, &h1));
+        assert_ne!(payer_key(&k1, &h1), payer_key(&k1, &h2));
+        // Never the raw hash, and never a counterparty id of the same input.
+        assert_ne!(payer_key(&k1, &h1), h1);
+        assert_ne!(payer_key(&k1, &h1), counterparty_id(&k1, &h1));
     }
 
     #[test]

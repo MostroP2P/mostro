@@ -281,8 +281,11 @@ port = 50051
 # maker_bond_payment_timeout_seconds = 900
 
 # Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
-# Opt-in, disabled by default. Mostro only ever stores a SHA-256 of the
-# buyer's canonicalised payer details, keyed by the buyer's identity key.
+# Opt-in, disabled by default. Mostro never sees the buyer's payer details:
+# it stores an HMAC, keyed by this node's secret (`nsec_privkey`), of the hash
+# the buyer commits to, against the buyer's identity key. Keep the secret out
+# of database backups. Changing the node secret discards the stored history on
+# the next restart: rows keyed by the old secret can no longer be matched.
 #
 # [payer_history]
 # # Turning this off later keeps the stored history but stops reading and

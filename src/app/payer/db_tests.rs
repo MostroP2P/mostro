@@ -23,6 +23,12 @@ fn key() -> String {
     Keys::generate().public_key().to_string()
 }
 
+/// Node secret the history helpers key rows with in these tests.
+fn node_keys() -> &'static Keys {
+    static NODE: std::sync::OnceLock<Keys> = std::sync::OnceLock::new();
+    NODE.get_or_init(Keys::generate)
+}
+
 /// A finished order between `seller` and `buyer` (master keys), created at
 /// `created_at` and stamped `success_at` when given.
 struct Trade<'a> {
@@ -86,7 +92,7 @@ async fn bump(
     now: i64,
 ) {
     let mut conn = pool.acquire().await.unwrap();
-    bump_history(&mut conn, user, h, cp, exp, generation, now)
+    bump_history(&mut conn, node_keys(), user, h, cp, exp, generation, now)
         .await
         .unwrap();
 }
@@ -104,12 +110,16 @@ async fn experience(
         .unwrap()
 }
 
-/// Node key [`seed_policy`] records the policy under.
-const SEED_NODE: &str = "seed-node";
+/// Fingerprint of [`node_keys`], which [`seed_policy`] records the policy
+/// under: a recompute with the same node is a threshold change, not a key
+/// rotation.
+fn seed_node() -> String {
+    crate::app::payer::node_key_id(node_keys())
+}
 
 async fn seed_policy(pool: &SqlitePool, n: u32, d: u32) -> i64 {
     let mut conn = pool.acquire().await.unwrap();
-    store_experience_policy(&mut conn, SEED_NODE, n, d, NOW)
+    store_experience_policy(&mut conn, &seed_node(), n, d, NOW)
         .await
         .unwrap()
 }
@@ -288,7 +298,9 @@ async fn prune_query_never_scans_orders() {
 #[tokio::test]
 async fn load_history_is_zero_without_rows() {
     let pool = pool().await;
-    let h = load_history(&pool, &key(), &hash('d')).await.unwrap();
+    let h = load_history(&pool, node_keys(), &key(), &hash('d'))
+        .await
+        .unwrap();
     assert_eq!(h, HistoryCounters::default());
     assert_eq!((h.first_success_at, h.last_success_at), (None, None));
 }
@@ -303,7 +315,7 @@ async fn bump_history_counts_trades_and_distinct_counterparties() {
     bump(&pool, &user, &h, "cp-1", false, generation, 200).await;
     bump(&pool, &user, &h, "cp-2", true, generation, 300).await;
 
-    let got = load_history(&pool, &user, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &user, &h).await.unwrap();
     assert_eq!(got.successful_trades, 3);
     assert_eq!(
         got.distinct_counterparties, 2,
@@ -314,7 +326,7 @@ async fn bump_history_counts_trades_and_distinct_counterparties() {
     assert_eq!(got.last_success_at, Some(300));
     // Another hash of the same user is a separate history.
     assert_eq!(
-        load_history(&pool, &user, &hash('f'))
+        load_history(&pool, node_keys(), &user, &hash('f'))
             .await
             .unwrap()
             .successful_trades,
@@ -353,7 +365,7 @@ async fn stale_generation_rows_are_overwritten_and_not_counted() {
 
     let current = seed_policy(&pool, 3, 7).await;
     assert_eq!(current, old + 1);
-    let got = load_history(&pool, &user, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &user, &h).await.unwrap();
     assert_eq!(
         got.distinct_counterparties, 1,
         "stale row still counts as distinct"
@@ -375,7 +387,7 @@ async fn out_of_order_successes_keep_the_timestamp_extrema() {
     bump(&pool, &user, &h, "cp", false, generation, 200).await;
     bump(&pool, &user, &h, "cp", false, generation, 100).await;
 
-    let got = load_history(&pool, &user, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &user, &h).await.unwrap();
     assert_eq!(
         (got.first_success_at, got.last_success_at),
         (Some(100), Some(200))
@@ -395,7 +407,7 @@ async fn out_of_order_successes_keep_the_timestamp_extrema() {
 async fn bump_history_rejects_a_malformed_hash() {
     let pool = pool().await;
     let mut conn = pool.acquire().await.unwrap();
-    let err = bump_history(&mut conn, &key(), "NOT-HEX", "cp", false, 1, 1).await;
+    let err = bump_history(&mut conn, node_keys(), &key(), "NOT-HEX", "cp", false, 1, 1).await;
     assert!(matches!(
         err,
         Err(MostroError::MostroCantDo(
@@ -550,13 +562,13 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
 
     let mut conn = pool.acquire().await.unwrap();
     assert_eq!(
-        current_policy_generation(&mut conn, (5, 30), NOW)
+        current_policy_generation(&mut conn, node_keys(), (5, 30), NOW)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        current_policy_generation(&mut conn, (5, 30), NOW + 1)
+        current_policy_generation(&mut conn, node_keys(), (5, 30), NOW + 1)
             .await
             .unwrap(),
         1,
@@ -569,9 +581,9 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
             generation: 1,
             min_trades: 5,
             min_days: 30,
-            node_key_id: None,
+            node_key_id: Some(seed_node()),
         }),
-        "the success path seeds no node key"
+        "the success path seeds the key its rows are written under"
     );
 
     assert_eq!(seed_policy(&pool, 3, 7).await, 2);
@@ -581,7 +593,7 @@ async fn policy_generation_seeds_once_and_bumps_on_store() {
             generation: 2,
             min_trades: 3,
             min_days: 7,
-            node_key_id: Some(SEED_NODE.to_string()),
+            node_key_id: Some(seed_node()),
         })
     );
 }
@@ -597,14 +609,14 @@ async fn snapshots_under_unrecomputed_thresholds_are_never_counted() {
     bump(&pool, &user, &h, "cp-a", true, old, 100).await;
 
     let mut conn = pool.acquire().await.unwrap();
-    let stale = current_policy_generation(&mut conn, (3, 7), NOW)
+    let stale = current_policy_generation(&mut conn, node_keys(), (3, 7), NOW)
         .await
         .unwrap();
     drop(conn);
     assert_ne!(stale, old, "never the stored generation");
     bump(&pool, &user, &h, "cp-b", true, stale, 200).await;
 
-    let got = load_history(&pool, &user, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &user, &h).await.unwrap();
     assert_eq!(got.distinct_counterparties, 2);
     assert_eq!(
         got.experienced_counterparties, 1,
@@ -675,7 +687,7 @@ async fn recompute_on_empty_database_seeds_the_policy() {
 #[tokio::test]
 async fn recompute_upgrades_when_lowered_and_downgrades_when_raised() {
     let pool = pool().await;
-    let node = Keys::generate();
+    let node = node_keys().clone();
     let generation = seed_policy(&pool, 5, 30).await;
     // 3 prior trades, 40 days old: fails N=5, passes N=3.
     let buyer = seed_snapshot(&pool, &node, &key(), 3, 40, NOW, generation).await;
@@ -687,11 +699,12 @@ async fn recompute_upgrades_when_lowered_and_downgrades_when_raised() {
         lowered,
         RecomputeOutcome {
             changed: 1,
-            unresolved: 0
+            unresolved: 0,
+            discarded: 0,
         }
     );
     assert_eq!(
-        load_history(&pool, &buyer, &hash('9'))
+        load_history(&pool, node_keys(), &buyer, &hash('9'))
             .await
             .unwrap()
             .experienced_counterparties,
@@ -706,7 +719,7 @@ async fn recompute_upgrades_when_lowered_and_downgrades_when_raised() {
         "1 → 0 is only reachable through a recompute"
     );
     assert_eq!(
-        load_history(&pool, &buyer, &hash('9'))
+        load_history(&pool, node_keys(), &buyer, &hash('9'))
             .await
             .unwrap()
             .experienced_counterparties,
@@ -717,7 +730,7 @@ async fn recompute_upgrades_when_lowered_and_downgrades_when_raised() {
 #[tokio::test]
 async fn recompute_is_idempotent() {
     let pool = pool().await;
-    let node = Keys::generate();
+    let node = node_keys().clone();
     let generation = seed_policy(&pool, 5, 30).await;
     seed_snapshot(&pool, &node, &key(), 3, 40, NOW, generation).await;
 
@@ -740,7 +753,7 @@ async fn recompute_is_idempotent() {
 #[tokio::test]
 async fn recompute_evaluates_each_snapshot_at_its_own_instant() {
     let pool = pool().await;
-    let node = Keys::generate();
+    let node = node_keys().clone();
     let generation = seed_policy(&pool, 5, 30).await;
     let seller = key();
     let snapshot = NOW - 100 * ONE_DAY;
@@ -765,10 +778,11 @@ async fn recompute_evaluates_each_snapshot_at_its_own_instant() {
 #[tokio::test]
 async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
     let pool = pool().await;
-    let node = Keys::generate();
+    let node = node_keys().clone();
     let old = seed_policy(&pool, 5, 30).await;
     let (buyer, h) = (key(), hash('9'));
-    // A counterparty id no seller key in `orders` hashes to (rotated key).
+    // A counterparty id no seller key in `orders` hashes to (an imported
+    // database; a rotated node key discards the history instead).
     bump(&pool, &buyer, &h, &hash('7'), true, old, NOW).await;
 
     let out = recompute_experienced(&pool, &node, 1, 1, NOW)
@@ -778,7 +792,8 @@ async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
         out,
         RecomputeOutcome {
             changed: 0,
-            unresolved: 1
+            unresolved: 1,
+            discarded: 0,
         }
     );
     assert_eq!(
@@ -787,7 +802,7 @@ async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
         "value kept, marked unresolved"
     );
 
-    let got = load_history(&pool, &buyer, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &buyer, &h).await.unwrap();
     assert_eq!(got.successful_trades, 1, "the trade itself still happened");
     assert_eq!(
         (got.distinct_counterparties, got.experienced_counterparties),
@@ -807,7 +822,7 @@ async fn recompute_leaves_unresolvable_rows_stale_and_uncounted() {
         NOW + 1,
     )
     .await;
-    let got = load_history(&pool, &buyer, &h).await.unwrap();
+    let got = load_history(&pool, node_keys(), &buyer, &h).await.unwrap();
     assert_eq!(got.distinct_counterparties, 1);
 }
 
@@ -848,7 +863,7 @@ async fn recompute_rolls_back_with_the_policy_row() {
     // The policy bump and the column rewrite share one transaction: when the
     // pass fails, neither is applied, so the next boot retries.
     let pool = pool().await;
-    let node = Keys::generate();
+    let node = node_keys().clone();
     let generation = seed_policy(&pool, 5, 30).await;
     seed_snapshot(&pool, &node, &key(), 3, 40, NOW, generation).await;
     sqlx::query("DROP TABLE orders")
@@ -865,7 +880,7 @@ async fn recompute_rolls_back_with_the_policy_row() {
             generation,
             min_trades: 5,
             min_days: 30,
-            node_key_id: Some(SEED_NODE.to_string()),
+            node_key_id: Some(seed_node()),
         })
     );
 }
@@ -917,6 +932,21 @@ async fn history_never_stores_the_declared_hash() {
         !values.contains(&h),
         "the declared payment hash must not be stored in the history tables"
     );
+    // ... yet the same declaration finds it again under the same node secret,
+    // and under no other.
+    assert_eq!(
+        load_history(&pool, node_keys(), &user, &h)
+            .await
+            .unwrap()
+            .successful_trades,
+        1
+    );
+    assert_eq!(
+        load_history(&pool, &Keys::generate(), &user, &h)
+            .await
+            .unwrap(),
+        HistoryCounters::default()
+    );
 }
 
 #[tokio::test]
@@ -937,11 +967,108 @@ async fn recompute_after_a_node_key_change_discards_the_history() {
     seed_snapshot(&pool, &old_node, &key(), 3, 40, NOW, generation).await;
     assert!(!stored_history_values(&pool).await.is_empty());
 
-    recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW + 1)
+    let out = recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW + 1)
         .await
         .unwrap();
+    assert_eq!(out.discarded, 1);
     assert!(
         stored_history_values(&pool).await.is_empty(),
         "history keyed by the old node secret is discarded"
+    );
+}
+
+/// Store a policy row that predates recording the node key.
+async fn seed_policy_without_node_key(pool: &SqlitePool) -> i64 {
+    seed_policy(pool, 5, 30).await;
+    sqlx::query("UPDATE payer_history_policy SET node_key_id = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+    load_experience_policy(pool)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation
+}
+
+#[tokio::test]
+async fn recompute_under_the_same_node_key_discards_nothing() {
+    let pool = pool().await;
+    let generation = seed_policy(&pool, 5, 30).await;
+    seed_snapshot(&pool, node_keys(), &key(), 3, 40, NOW, generation).await;
+    let before = stored_history_values(&pool).await;
+
+    let out = recompute_experienced(&pool, node_keys(), 3, 30, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(out.discarded, 0);
+    assert_eq!(stored_history_values(&pool).await, before);
+}
+
+#[tokio::test]
+async fn recompute_keeps_history_under_a_policy_with_no_recorded_key() {
+    let pool = pool().await;
+    let generation = seed_policy_without_node_key(&pool).await;
+    seed_snapshot(&pool, node_keys(), &key(), 3, 40, NOW, generation).await;
+
+    let out = recompute_experienced(&pool, node_keys(), 5, 30, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(out.discarded, 0, "an unknown key proves no rotation");
+    assert!(!stored_history_values(&pool).await.is_empty());
+    assert_eq!(
+        load_experience_policy(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .node_key_id,
+        Some(seed_node()),
+        "the recompute records the key from now on"
+    );
+}
+
+#[tokio::test]
+async fn discard_counts_history_rows_not_counterparty_rows() {
+    let pool = pool().await;
+    let generation = seed_policy(&pool, 5, 30).await;
+    let (user, h) = (key(), hash('4'));
+    for cp in ["cp-1", "cp-2", "cp-3"] {
+        bump(&pool, &user, &h, cp, false, generation, NOW).await;
+    }
+    bump(&pool, &user, &hash('5'), "cp-1", false, generation, NOW).await;
+
+    let out = recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(out.discarded, 2, "two (buyer, account) histories");
+    assert!(stored_history_values(&pool).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_recompute_restores_discarded_history() {
+    // The discard shares the recompute transaction: if the pass fails after
+    // dropping the rows, they come back with the old policy row.
+    let pool = pool().await;
+    let generation = seed_policy(&pool, 5, 30).await;
+    seed_snapshot(&pool, node_keys(), &key(), 3, 40, NOW, generation).await;
+    let before = stored_history_values(&pool).await;
+    sqlx::query("DROP TABLE orders")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(stored_history_values(&pool).await, before);
+    assert_eq!(
+        load_experience_policy(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .node_key_id,
+        Some(seed_node())
     );
 }

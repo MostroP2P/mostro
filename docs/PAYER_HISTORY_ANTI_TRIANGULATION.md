@@ -199,6 +199,25 @@ This is stricter than gist §26 ("whenever possible store only the hash") and
 costs nothing because the client already has a direct channel to the
 counterparty.
 
+The hash itself is **not** stored either. It is an unkeyed SHA-256 of
+low-entropy account details (a CBU/CVU, an alias, a phone number), so anyone
+can recompute it from a candidate account; stored next to the buyer's
+identity key, a leaked or subpoenaed database would answer "does this npub pay
+from account X?" instantly, and enumerating a national account space is a
+matter of hours. The history tables therefore key every row by
+`payer_key = HMAC-SHA256(node_secret, "mostro-payer-history-key-v1" ‖ payment_hash)`
+(lowercase hex), with `node_secret` the node's Nostr secret key bytes, which
+never enter the database. The node computes `payer_key` from the raw hash it
+receives, so lookups need no extra input; without the node secret a stored
+row cannot be tested against candidates. The wire still carries the raw
+`payment_hash`, because the seller verifies it against the sender it sees.
+The cost: rotating the node secret makes every stored row unreachable, so the
+boot-time recompute discards the history when it detects a new secret
+(§10.7). The open declaration table (`order_payer_declarations`) keeps the
+raw hash, since the seller must receive it; it is short-lived and pruned
+(§10.6). This protects against a party holding the database only, not
+against the operator, who holds the secret.
+
 **D-3 · Hash consistency is enforced by the seller's client, assisted by
 Mostro.** Mostro forwards the buyer-committed `payment_hash` to the seller. The
 seller's client recomputes the hash from the plaintext it received off-band and
@@ -253,7 +272,7 @@ without that exclusion a two-key Sybil (a seller bot that only ever trades
 with the attacker's own buyer) qualifies at zero external cost; with it, the
 fake seller must build real history with third parties. Because qualification
 is therefore buyer-relative, the flag is stored on the
-`(user_pubkey, payment_hash, counterparty_id)` row (§9), which is buyer-scoped
+`(user_pubkey, payer_key, counterparty_id)` row (§9), which is buyer-scoped
 by construction. Full-privacy sellers never qualify: their master key is a
 fresh trade key, so their qualifying history is always zero — the same
 conservative direction as above.
@@ -782,15 +801,17 @@ CREATE TABLE IF NOT EXISTS order_payer_declarations (
   history_snapshot text                            -- PaymentHistory JSON frozen at fiat-sent (§10.3); every later query returns it
 );
 
--- Aggregate history. One row per (buyer identity key, payment hash).
--- Written ONLY from the Success CAS in release::payment_success.
+-- Aggregate history. One row per (buyer identity key, payment hash), keyed by
+-- payer_key = HMAC-SHA256(node secret, domain || payment_hash), never by the
+-- hash itself (D-2). Written ONLY from the Success CAS in
+-- release::payment_success.
 CREATE TABLE IF NOT EXISTS payer_history (
   user_pubkey        char(64) NOT NULL,  -- orders.master_buyer_pubkey (reputation mode only)
-  payment_hash       char(64) NOT NULL,
+  payer_key          char(64) NOT NULL,  -- payer_key(node secret, payment_hash), lowercase hex
   first_success_at   integer  NOT NULL,
   last_success_at    integer  NOT NULL,
   successful_trades  integer  NOT NULL DEFAULT 0,
-  PRIMARY KEY (user_pubkey, payment_hash)
+  PRIMARY KEY (user_pubkey, payer_key)
 );
 
 -- Distinct-counterparty set. counterparty_id is a keyed hash (D-7), never a pubkey.
@@ -800,13 +821,13 @@ CREATE TABLE IF NOT EXISTS payer_history (
 -- rewrites the whole column under the new policy (§10.7).
 CREATE TABLE IF NOT EXISTS payer_history_counterparties (
   user_pubkey        char(64) NOT NULL,
-  payment_hash       char(64) NOT NULL,
+  payer_key          char(64) NOT NULL,
   counterparty_id    char(64) NOT NULL,
   first_success_at   integer  NOT NULL,
   last_success_at    integer  NOT NULL,              -- newest success with this triple; the instant §10.7 re-evaluates at
   experienced        integer  NOT NULL DEFAULT 0,    -- 1 = counterparty qualified (D-7)
   policy_gen         integer  NOT NULL,              -- generation of (N, D) this row's `experienced` was evaluated under
-  PRIMARY KEY (user_pubkey, payment_hash, counterparty_id)
+  PRIMARY KEY (user_pubkey, payer_key, counterparty_id)
 );
 
 -- Threshold policy the `experienced` column was last evaluated under (D-7).
@@ -915,10 +936,11 @@ pub struct HistoryCounters { pub successful_trades: u32,
 /// `experienced_counterparties` counts only rows carrying the CURRENT policy
 /// generation, so a stale row can never inflate a count advertised under the
 /// live thresholds (§9, §10.7).
-pub async fn load_history(pool, user_pubkey: &str, hash: &str)
+/// Both take the raw declared hash and look rows up by its `payer_key` (D-2).
+pub async fn load_history(pool, node_keys: &Keys, user_pubkey: &str, hash: &str)
     -> Result<HistoryCounters, MostroError>;
-pub async fn bump_history(conn: &mut SqliteConnection, user_pubkey, hash, counterparty_id,
-                                 experienced: bool, policy_gen: i64, now)
+pub async fn bump_history(conn: &mut SqliteConnection, node_keys: &Keys, user_pubkey, hash,
+                                 counterparty_id, experienced: bool, policy_gen: i64, now)
     -> Result<(), MostroError>;   // upsert payer_history + counterparty upsert (SQL below)
 
 /// Counterparty qualification input (D-7). Reads `orders`, NOT the history
@@ -953,12 +975,13 @@ pub async fn store_experience_policy(conn: &mut SqliteConnection, node_key_id: &
 /// thresholds (changed, not yet recomputed), returns
 /// `UNRECOMPUTED_POLICY_GENERATION` (0, never a real generation), so the
 /// snapshot stays out of every experienced count until §10.7 re-evaluates it.
-pub async fn current_policy_generation(conn: &mut SqliteConnection, thresholds: (u32, u32), now: i64)
+pub async fn current_policy_generation(conn: &mut SqliteConnection, node_keys: &Keys,
+                                       thresholds: (u32, u32), now: i64)
     -> Result<i64, MostroError>;
 /// Recompute the whole `experienced` column under `(min_trades, min_days)`.
 /// Runs in one transaction with `store_experience_policy`; see §10.7.
 pub async fn recompute_experienced(pool, node_keys: &Keys, min_trades: u32, min_days: u32, now: i64)
-    -> Result<RecomputeOutcome, MostroError>;   // { changed, unresolved } row counts
+    -> Result<RecomputeOutcome, MostroError>;   // { changed, unresolved, discarded } row counts
 ```
 
 `bump_history`'s counterparty write — under a fixed threshold policy the
@@ -967,10 +990,10 @@ success, never back. Only the recomputation of §10.7 may lower it.
 
 ```sql
 INSERT INTO payer_history_counterparties
-  (user_pubkey, payment_hash, counterparty_id, first_success_at, last_success_at,
+  (user_pubkey, payer_key, counterparty_id, first_success_at, last_success_at,
    experienced, policy_gen)
 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
-ON CONFLICT(user_pubkey, payment_hash, counterparty_id)
+ON CONFLICT(user_pubkey, payer_key, counterparty_id)
 DO UPDATE SET -- MIN/MAX, not assignment: a success stamped earlier can
               -- commit after a later one, and must not move either bound.
               first_success_at = MIN(first_success_at, excluded.first_success_at),
@@ -1146,7 +1169,7 @@ pub async fn build_for_order(pool, node_keys: &Keys, order: &Order)
     let Some(user) = normal_buyer_idkey else {
         return Ok(Some(PaymentHistory::unavailable(decl.payment_hash)));   // D-4: all counters zero
     };
-    let h = db::load_history(pool, &user, &decl.payment_hash).await?;
+    let h = db::load_history(pool, node_keys, &user, &decl.payment_hash).await?;
     Ok(Some(PaymentHistory { payment_hash: decl.payment_hash, buyer_mode: BuyerMode::Reputation,
         successful_trades: h.successful_trades,
         distinct_counterparties: h.distinct_counterparties,
@@ -1307,8 +1330,8 @@ pub async fn record_payer_success(
     // The generation stamps WHICH policy this snapshot was taken under, so a
     // later threshold change can tell it apart from rows it could not
     // re-evaluate (§9, §10.7). Seeded from `thresholds` on first use.
-    let gen = db::current_policy_generation(conn, thresholds, now).await?;
-    db::bump_history(conn, &user, &decl.payment_hash, &cp, experienced, gen, now).await
+    let gen = db::current_policy_generation(conn, node_keys, thresholds, now).await?;
+    db::bump_history(conn, node_keys, &user, &decl.payment_hash, &cp, experienced, gen, now).await
 }
 
 pub fn counterparty_id(node_keys: &Keys, seller_master_pubkey: &str) -> String {
@@ -1396,9 +1419,11 @@ declarations; nothing special.
 `experienced` is a snapshot, so a change to `N` or `D` invalidates every stored
 snapshot at once. `mostrod` detects that at boot and rebuilds the column rather
 than leaving old-policy and new-policy rows side by side. A change of node key
-does the same: `counterparty_id` is keyed by the node secret, so under a new
-key the stored ids resolve to no seller, and only the recompute moves them out
-of the counted generation. The policy row records `node_key_id`, a
+triggers it too: every history row is keyed by the node secret (`payer_key`,
+D-2, and `counterparty_id`, D-7), so under a new secret no declaration can
+reach the stored rows again, and the recompute **discards both history
+tables** before re-evaluating. A buyer's history then starts over on that
+node. The policy row records `node_key_id`, a
 domain-separated hash of the node secret the last recompute ran under, for that
 reason; the public key would not do, since `s` and `n - s` share it while
 `counterparty_id` hashes the secret bytes.
@@ -1429,6 +1454,11 @@ if Settings::is_payer_history_enabled() {
 
 `recompute_experienced` runs in a single transaction:
 
+0. When the stored policy recorded a `node_key_id` other than the current
+   one, delete every row of `payer_history_counterparties` and
+   `payer_history`. Every seed records the key (`current_policy_generation`
+   included), so a row with none predates that, proves nothing either way and
+   keeps them.
 1. `store_experience_policy` bumps `generation` and records the new `(N, D)`.
    Every row re-evaluated below is stamped with that new generation; the rows
    this pass cannot re-evaluate are stamped `-1` instead (step 4).
@@ -1450,8 +1480,9 @@ if Settings::is_payer_history_enabled() {
    Write `experienced` **and** the new `policy_gen` for every row resolved this
    way — including the rows whose value did not change, so that "resolved" and
    "current generation" stay the same set.
-4. A row whose `counterparty_id` is **not** in the map (a rotated node key, an
-   imported database) cannot be re-evaluated. It keeps its `experienced` value
+4. A row whose `counterparty_id` is **not** in the map (an imported database;
+   a rotated node key already discarded the rows in step 0) cannot be
+   re-evaluated. It keeps its `experienced` value
    and is stamped `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), which
    keeps it out of every count taken under the new policy (§9): not in
    `experienced_counterparties`, and not in `distinct_counterparties` either,
@@ -1522,7 +1553,7 @@ MVP (the Cashu release path does not exist yet); see §13.
 |---|---|---|
 | Seller (via Mostro) | buyer's committed `payment_hash` for **this order**; aggregate counters for **this** (buyer, hash) pair — including how many of the buyer's past counterparties met the node's experience policy (D-7), as a bare count; whether the buyer is in full-privacy mode (already visible today through `Peer.reputation == None`) | buyer identity key, other trade keys, other order ids, which sellers were the counterparties, any single counterparty's qualification status, any hash other than the one the buyer chose to commit to this order |
 | Buyer | nothing new about the seller | — |
-| Mostro node | `(master_buyer_pubkey, payment_hash)` association + counters; keyed counterparty hashes; per-counterparty qualification snapshots (derived from `orders`, which the node already holds) | plaintext payer details (D-2) |
+| Mostro node | `(master_buyer_pubkey, payer_key)` association + counters, where `payer_key` is keyed by the node secret (D-2); the raw `payment_hash` of open orders only; keyed counterparty hashes; per-counterparty qualification snapshots (derived from `orders`, which the node already holds) | plaintext payer details (D-2) |
 | Public relays | nothing | everything in this feature |
 
 ### 11.2 Why there is no oracle
@@ -1538,8 +1569,11 @@ MVP (the Cashu release path does not exist yet); see §13.
   user used account X before" — they only see counters for the buyer they are
   *currently* trading with, which is exactly gist §29.
 - There is no `same_user(a, b)` primitive and none is introduced (gist §12).
-- Counterparty identities are keyed hashes (D-7); even an exported DB does not
-  list which sellers a buyer dealt with without the node secret.
+- History rows are keyed by `payer_key` (D-2), so an exported DB cannot be
+  brute-forced back to "this buyer pays from account X" without the node
+  secret.
+- Counterparty identities are keyed hashes (D-7) too. They protect less,
+  since `orders` already holds the master pubkeys in the clear.
 - The experienced count is computed from `orders` — data the node already
   holds — and is returned only as an aggregate, never per counterparty. The
   query takes no parameters, so a seller cannot turn it into an "is seller X
@@ -1550,7 +1584,8 @@ MVP (the Cashu release path does not exist yet); see §13.
 
 | Risk | Mitigation / status |
 |---|---|
-| Node DB compromise reveals `(identity key, payment_hash)` pairs. Hashes are brute-forceable by anyone who already knows the candidate account. | Same trust boundary as `master_*_pubkey` and `buyer_invoice` today. History is inherently a node-side function; a node that wants less retention can purge (§18). |
+| Node DB compromise. | History rows hold `payer_key`, which cannot be tested against candidate accounts without the node secret (D-2); only the raw hashes of currently open orders are exposed. A compromise of the node secret as well (same host, same backup) reopens the brute force: keep `settings.toml` / `MOSTRO_NSEC_PRIVKEY` out of database backups. History is inherently a node-side function; a node that wants less retention can purge (§18). |
+| Node operator. | Holds the secret and can brute-force its own history. Accepted: the operator is already trusted with `orders`. |
 | Buyer colludes with sellers to farm history. | Needs real successful trades with real sats, distinct counterparties and elapsed time (gist §32); tiers in §12 weight all four. Qualifying as an *experienced* counterparty additionally requires N prior successes with **other** buyers over D days (D-7), so a closed two-party Sybil ring no longer counts. |
 | Victim happens to be a Mostro user with history on the same account. | Only a problem under hash-only history (§18); D-1 keys on the *buyer's* identity, so the victim's history is not attributed to the attacker. |
 | Buyer declares a hash but sends different plaintext to the seller. | Seller's client recomputes and flags mismatch (D-3); treated like a sender mismatch — recommend dispute. |
@@ -1691,8 +1726,12 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 - `payer_history_policy` is written in the same transaction: an injected
   failure mid-recompute leaves both the old policy row and the old column
   values, so the next boot retries.
+- no history row stores the declared `payment_hash`; the same declaration
+  finds its row again under the same node secret, and nothing under another.
+- a recompute under a node secret other than the stored `node_key_id`
+  discards both history tables.
 - a `counterparty_id` with no matching `master_seller_pubkey` in `orders`
-  (simulated key rotation) keeps its `experienced` value, is stamped
+  (simulated imported database) keeps its `experienced` value, is stamped
   `policy_gen = -1` (`UNRESOLVED_POLICY_GENERATION`), is logged, and is not
   zeroed.
 - such an unresolved row is counted in **neither** `distinct_counterparties`
@@ -1822,8 +1861,10 @@ after PH-1 / PH-0. Each `mostrod` PR must keep the existing suite green
       log line reports the number of rows changed, `payer_history_policy`
       matches the config, and a second restart with the same values is a
       no-op.
+- [ ] After a node secret change, the first boot with the feature on discards
+      the payer history and logs it.
 - [ ] After a threshold change on a database holding a snapshot whose
-      `counterparty_id` no longer resolves (node key rotated), that row keeps
+      `counterparty_id` no longer resolves (imported database), that row keeps
       its value, is stamped `policy_gen = -1`, is reported in the `warn` line,
       and is excluded from both `experienced_counterparties` and
       `distinct_counterparties`.

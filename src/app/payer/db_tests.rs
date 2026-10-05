@@ -881,3 +881,67 @@ async fn success_at_column_exists_on_orders() {
         .unwrap();
     assert_eq!(stamped, Some(NOW));
 }
+
+/// Every text value stored in the two history tables.
+async fn stored_history_values(pool: &SqlitePool) -> Vec<String> {
+    let mut values = Vec::new();
+    for sql in [
+        "SELECT * FROM payer_history",
+        "SELECT * FROM payer_history_counterparties",
+    ] {
+        let rows = sqlx::query(sql).fetch_all(pool).await.unwrap();
+        for row in rows {
+            for i in 0..row.columns().len() {
+                if let Ok(v) = row.try_get::<String, _>(i) {
+                    values.push(v);
+                }
+            }
+        }
+    }
+    values
+}
+
+#[tokio::test]
+async fn history_never_stores_the_declared_hash() {
+    // D-2: the hash is a low-entropy commitment anyone can recompute from a
+    // candidate account; next to the buyer's identity key it would let a
+    // leaked database be brute-forced back to "this npub pays from X".
+    let pool = pool().await;
+    let generation = seed_policy(&pool, 5, 30).await;
+    let (user, h) = (key(), hash('c'));
+    bump(&pool, &user, &h, "cp-1", false, generation, NOW).await;
+
+    let values = stored_history_values(&pool).await;
+    assert!(!values.is_empty(), "the trade was recorded");
+    assert!(
+        !values.contains(&h),
+        "the declared payment hash must not be stored in the history tables"
+    );
+}
+
+#[tokio::test]
+async fn recompute_after_a_node_key_change_discards_the_history() {
+    // History rows are keyed by the node secret: under a new secret no
+    // declaration can reach them again, so they are dropped rather than kept
+    // as unreachable data.
+    let pool = pool().await;
+    let old_node = Keys::generate();
+    recompute_experienced(&pool, &old_node, 5, 30, NOW)
+        .await
+        .unwrap();
+    let generation = load_experience_policy(&pool)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+    seed_snapshot(&pool, &old_node, &key(), 3, 40, NOW, generation).await;
+    assert!(!stored_history_values(&pool).await.is_empty());
+
+    recompute_experienced(&pool, &Keys::generate(), 5, 30, NOW + 1)
+        .await
+        .unwrap();
+    assert!(
+        stored_history_values(&pool).await.is_empty(),
+        "history keyed by the old node secret is discarded"
+    );
+}

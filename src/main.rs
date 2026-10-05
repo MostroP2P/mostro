@@ -197,29 +197,29 @@ async fn main() -> Result<()> {
 
     // Cashu escrow mode (docs/cashu/, CF-5): run the daemon with NO Lightning
     // node. Skip `LndConnector::new()` and the LN status probe entirely,
-    // connect the configured mint instead (fail fast if unreachable, mirroring
-    // the LND-refusal behaviour), attach the client to the context, and hand
-    // off to the Cashu event loop. Every trade action is still rejected with
+    // connect the configured mints instead, attach them to the context, and
+    // hand off to the Cashu event loop. Makers choose a mint per order, so an
+    // unreachable mint is a warning, not a reason to refuse to boot: orders
+    // on it fail to lock until it is back (issue #1046). Every trade action is still rejected with
     // `CantDo(InvalidAction)` until the feature tracks land. The default
     // Lightning path below is left byte-for-byte unchanged.
     if Settings::is_cashu_enabled() {
-        // `mint_url` non-emptiness + scheme were validated at config load
-        // (CF-1); this expect is unreachable for a validated config.
-        let mint_url = Settings::get_cashu()
-            .map(|c| c.mint_url.clone())
+        // The `mint_urls` entries were validated at config load (CF-1); this
+        // expect is unreachable for a validated config.
+        let mint_urls = Settings::get_cashu()
+            .map(|c| c.mint_urls.clone())
             .expect("cashu enabled but [cashu] settings missing after validation");
-        tracing::info!(
-            "Starting in Cashu escrow mode — connecting mint {mint_url} (LND not initialised)"
-        );
-        let cashu_client = match cashu::CashuClient::connect(&mint_url).await {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
-                tracing::error!(
-                    "No connection to Cashu mint {mint_url} - shutting down Mostro! ({e})"
-                );
-                exit(1);
-            }
-        };
+        if mint_urls.is_empty() {
+            tracing::info!(
+                "Starting in Cashu escrow mode — any mint accepted (LND not initialised)"
+            );
+        } else {
+            tracing::info!(
+                "Starting in Cashu escrow mode — connecting mints {} (LND not initialised)",
+                mint_urls.join(", ")
+            );
+        }
+        let cashu_mints = Arc::new(cashu::mints::CashuMints::connect_configured(&mint_urls).await);
 
         // The admin gRPC server takes a Lightning client that Cashu mode never
         // initialises, so it is not started here. Warn (rather than silently
@@ -254,7 +254,7 @@ async fn main() -> Result<()> {
             MESSAGE_QUEUES.queue_order_msg.clone(),
             mostro_keys.clone(),
         )
-        .with_cashu_client(cashu_client)
+        .with_cashu_mints(cashu_mints)
         .with_maintenance(maintenance);
 
         start_scheduler(ctx.clone()).await;

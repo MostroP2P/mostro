@@ -130,13 +130,21 @@ impl CashuClient {
         Ok(cashu_client)
     }
 
-    /// The mint URL this client is bound to.
-    ///
-    /// Track A's lock handler reads this to persist the order's
-    /// `cashu_mint_url` and to assert the seller's token was minted by the
-    /// operator-configured mint.
+    /// The mint URL this client is bound to. Token validation asserts the
+    /// seller's token was minted by it.
     pub fn mint_url(&self) -> &MintUrl {
         &self.mint_url
+    }
+
+    /// A client bound to `mint_url` that skips [`Self::connect`]'s network
+    /// checks, for tests that never reach the mint.
+    #[cfg(test)]
+    pub(crate) fn offline(mint_url: &str) -> Self {
+        let url = MintUrl::from_str(mint_url).expect("valid mint url");
+        Self {
+            mint_url: url.clone(),
+            client: HttpClient::new(url, None),
+        }
     }
 
     /// Verify the escrow spending condition on every proof of a token
@@ -587,6 +595,9 @@ pub fn cashu_pubkey_from_xonly_hex(xonly_hex: &str) -> Result<PublicKey, Error> 
     PublicKey::from_hex(format!("02{xonly_hex}"))
         .map_err(|e| Error::Condition(format!("pubkey convert: {e}")))
 }
+
+pub mod mint_policy;
+pub mod mints;
 
 /// Mint-backed end-to-end harness for the TA-1 escrow lock — `#[ignore]`d and
 /// env-gated, so it never runs in a plain `cargo test`.

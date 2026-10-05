@@ -625,6 +625,7 @@ async fn prepare_new_order(
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_secs() as i64,
         expires_at: expiry_date,
+        cashu_mint_url: new_order.cashu_mint_url.clone(),
         ..Default::default()
     };
 

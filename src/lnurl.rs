@@ -120,12 +120,14 @@ fn ipv6_is_nat64_well_known(v6: std::net::Ipv6Addr) -> bool {
 }
 
 /// True for destinations the daemon must never fetch for LNURL (SSRF policy).
+/// Also applied to user-chosen Cashu mints on an open node
+/// (`cashu::mint_policy`).
 ///
 /// Always rejects link-local, CGNAT (RFC 6598 `100.64.0.0/10`), NAT64 well-known
 /// prefix (RFC 6052 `64:ff9b::/96`), unspecified, multicast, broadcast, and
 /// documentation ranges. Loopback and RFC1918 private are rejected unless
 /// the test-only allow flag is set (local mock servers).
-fn ip_is_forbidden(ip: IpAddr) -> bool {
+pub(crate) fn ip_is_forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             if ipv4_is_always_forbidden(v4) {

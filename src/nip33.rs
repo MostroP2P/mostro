@@ -560,6 +560,12 @@ pub fn order_to_tags(
         if let Some(source) = mostro_link {
             tags.insert(SOURCE_TAG_INDEX, Tag::custom("source", vec![source]));
         }
+        // Cashu orders name the mint the escrow will be locked on, so a taker
+        // sees it before taking the order (issue #1046). Appended after the
+        // positional inserts above.
+        if let Some(mint) = &order.cashu_mint_url {
+            tags.push(Tag::custom("cashu_mint_url", vec![mint.clone()]));
+        }
         Ok(Some(Tags::from_list(tags)))
     } else {
         Ok(None)
@@ -609,7 +615,7 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
 
 /// The escrow backend a node runs, as the info event describes it. A node
 /// runs exactly one: Lightning (LND hold invoices, described by the node's
-/// `LnStatus`) or Cashu (NUT-11 escrow on the one configured mint).
+/// `LnStatus`) or Cashu (NUT-11 escrow on the mint each order names).
 #[derive(Debug, Clone, Copy)]
 pub enum InfoEscrow<'a> {
     Lightning(&'a LnStatus),
@@ -724,8 +730,9 @@ fn build_info_tags(
 ///
 /// Lightning nodes add their LND node stats, the hold-invoice CLTV delta and
 /// both invoice windows. Cashu nodes have no LND and no invoices, so those
-/// are omitted; they add the mint escrow tokens must be locked on and the
-/// seller-recovery locktime floor a token must carry instead.
+/// are omitted; they add the mints a maker may choose (all of them when the
+/// tag is absent) and the seller-recovery locktime floor a token must carry
+/// instead.
 fn escrow_tags(escrow: InfoEscrow<'_>, ln_settings: &LightningSettings) -> Vec<Tag> {
     match escrow {
         InfoEscrow::Lightning(ln_status) => {
@@ -746,14 +753,19 @@ fn escrow_tags(escrow: InfoEscrow<'_>, ln_settings: &LightningSettings) -> Vec<T
             tags.extend(invoice_window_tags(ln_settings));
             tags
         }
-        InfoEscrow::Cashu(cashu) => vec![
-            Tag::custom("escrow_mode", vec!["cashu".to_string()]),
-            Tag::custom("cashu_mint_url", vec![cashu.mint_url.clone()]),
-            Tag::custom(
+        InfoEscrow::Cashu(cashu) => {
+            let mut tags = vec![Tag::custom("escrow_mode", vec!["cashu".to_string()])];
+            // Every mint a maker may choose, one per tag value. Omitted on an
+            // open node (`mint_urls = []`), which accepts any mint.
+            if !cashu.mint_urls.is_empty() {
+                tags.push(Tag::custom("cashu_mint_url", cashu.mint_urls.clone()));
+            }
+            tags.push(Tag::custom(
                 "cashu_escrow_locktime_days",
                 vec![cashu.escrow_locktime_days.to_string()],
-            ),
-        ],
+            ));
+            tags
+        }
     }
 }
 
@@ -1374,9 +1386,91 @@ mod tests {
     fn make_cashu_settings() -> crate::config::types::CashuSettings {
         crate::config::types::CashuSettings {
             enabled: true,
-            mint_url: "https://mint.example.com".to_string(),
+            mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 21,
         }
+    }
+
+    /// Every value of the first tag called `name`.
+    fn get_tag_values(tags: &Tags, name: &str) -> Option<Vec<String>> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            (vec.first().map(String::as_str) == Some(name)).then(|| vec[1..].to_vec())
+        })
+    }
+
+    #[test]
+    fn cashu_info_event_lists_every_allowed_mint() {
+        let settings = test_settings();
+        let mut cashu = make_cashu_settings();
+        cashu.mint_urls = vec![
+            "https://mint.example.com".to_string(),
+            "https://mint.example2.com".to_string(),
+        ];
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(
+            get_tag_values(&tags, "cashu_mint_url"),
+            Some(vec![
+                "https://mint.example.com".to_string(),
+                "https://mint.example2.com".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn open_cashu_node_omits_the_mint_tag() {
+        // An empty allow-list accepts any mint; the absent tag says so.
+        let settings = test_settings();
+        let mut cashu = make_cashu_settings();
+        cashu.mint_urls.clear();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "escrow_mode"), Some("cashu".into()));
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+        assert!(get_tag_value(&tags, "cashu_escrow_locktime_days").is_some());
+    }
+
+    #[test]
+    fn cashu_order_event_names_its_mint() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.cashu_mint_url = Some("https://mint.example2.com".to_string());
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        assert_eq!(
+            get_tag_value(&tags, "cashu_mint_url"),
+            Some("https://mint.example2.com".into())
+        );
+    }
+
+    #[test]
+    fn lightning_order_event_has_no_mint_tag() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
     }
 
     #[test]

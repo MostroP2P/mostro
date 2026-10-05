@@ -15,7 +15,7 @@
 //! returns, so `https://Mint.example.com:443/` and `https://mint.example.com`
 //! are the same mint.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use mostro_core::error::CantDoReason;
@@ -96,13 +96,20 @@ pub async fn resolve_order_mint(
 ///
 /// An unresolvable host is `InvalidMintUrl`; a resolver that times out is
 /// `CashuMintUnavailable`, which the maker can retry.
-///
-/// The check runs before mostrod first talks to the mint, but the HTTP client
-/// resolves the name again, so a name server that answers differently the
-/// second time (DNS rebinding) is not covered. Operators who need that
-/// guarantee list their mints in `mint_urls`. Redirects are not a way around
-/// the check: cdk's HTTP transport does not follow them.
 pub async fn ensure_public_mint_host(mint_url: &str) -> Result<(), CantDoReason> {
+    public_mint_addr(mint_url).await.map(|_| ())
+}
+
+/// The address to reach a mint at, once its host has passed
+/// [`ensure_public_mint_host`]'s check: every address the host resolves to
+/// must be public, and one of them (IPv4 preferred) is returned.
+///
+/// An open node connects to this exact address
+/// ([`super::CashuClient::connect_pinned`]), so a name server that answers
+/// differently on the next lookup (DNS rebinding) cannot steer mostrod to a
+/// private address. Redirects are not a way around the check either: the
+/// mint transport never follows them.
+pub async fn public_mint_addr(mint_url: &str) -> Result<SocketAddr, CantDoReason> {
     let url = Url::parse(mint_url).map_err(|_| CantDoReason::InvalidMintUrl)?;
     let port = url
         .port_or_known_default()
@@ -110,19 +117,26 @@ pub async fn ensure_public_mint_host(mint_url: &str) -> Result<(), CantDoReason>
     let host = url.host_str().ok_or(CantDoReason::InvalidMintUrl)?;
     // `host_str` keeps the brackets of an IPv6 literal (`[::1]`).
     let literal = host.trim_start_matches('[').trim_end_matches(']');
-    let ips: Vec<IpAddr> = match literal.parse::<IpAddr>() {
-        Ok(ip) => vec![ip],
+    let addrs: Vec<SocketAddr> = match literal.parse::<IpAddr>() {
+        Ok(ip) => vec![SocketAddr::new(ip, port)],
         Err(_) => tokio::time::timeout(MINT_DNS_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
             .map_err(|_| CantDoReason::CashuMintUnavailable)?
             .map_err(|_| CantDoReason::InvalidMintUrl)?
-            .map(|addr| addr.ip())
             .collect(),
     };
-    if ips.is_empty() || ips.into_iter().any(crate::lnurl::ip_is_forbidden) {
+    if addrs
+        .iter()
+        .any(|addr| crate::lnurl::ip_is_forbidden(addr.ip()))
+    {
         return Err(CantDoReason::InvalidMintUrl);
     }
-    Ok(())
+    addrs
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or(CantDoReason::InvalidMintUrl)
 }
 
 #[cfg(test)]
@@ -235,6 +249,14 @@ mod tests {
             let mint = resolve_order_mint(Some(raw), &allowed(&[])).await;
             assert_eq!(mint, Err(CantDoReason::InvalidMintUrl), "{raw}");
         }
+    }
+
+    #[tokio::test]
+    async fn public_mint_addr_returns_the_checked_address_with_the_url_port() {
+        let addr = public_mint_addr("https://8.8.8.8:3338").await;
+        assert_eq!(addr, Ok("8.8.8.8:3338".parse().unwrap()));
+        let default_port = public_mint_addr("https://8.8.8.8").await;
+        assert_eq!(default_port, Ok("8.8.8.8:443".parse().unwrap()));
     }
 
     #[tokio::test]

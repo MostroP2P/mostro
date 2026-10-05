@@ -11,7 +11,7 @@ use std::sync::Arc;
 use mostro_core::error::CantDoReason;
 use tokio::sync::RwLock;
 
-use super::mint_policy::{ensure_public_mint_host, normalize_mint_url};
+use super::mint_policy::{normalize_mint_url, public_mint_addr};
 use super::{CashuClient, Error};
 
 /// Most clients kept in the cache. On an open node makers choose the mints,
@@ -23,7 +23,8 @@ const MAX_CACHED_MINTS: usize = 64;
 pub struct CashuMints {
     /// `true` when `[cashu].mint_urls` is empty and any public mint is
     /// accepted. Uncached mints then get the host check again before mostrod
-    /// connects, since the order was accepted some time ago.
+    /// connects, since the order was accepted some time ago, and the
+    /// connection is pinned to the address that passed it.
     open: bool,
     clients: RwLock<HashMap<String, Arc<CashuClient>>>,
 }
@@ -59,8 +60,10 @@ impl CashuMints {
         if let Some(client) = self.clients.read().await.get(&key) {
             return Ok(client.clone());
         }
-        if self.open {
-            ensure_public_mint_host(&key)
+        let client = if self.open {
+            // A maker chose this mint: connect to the exact address that
+            // passed the host check, so DNS cannot be rebound in between.
+            let addr = public_mint_addr(&key)
                 .await
                 .map_err(|reason| match reason {
                     // A resolver timeout is transient: the seller can retry.
@@ -69,8 +72,11 @@ impl CashuMints {
                     }
                     _ => Error::InvalidMintUrl(format!("{key}: host is not public")),
                 })?;
-        }
-        let client = Arc::new(CashuClient::connect(&key).await?);
+            CashuClient::connect_pinned(&key, addr).await?
+        } else {
+            CashuClient::connect(&key).await?
+        };
+        let client = Arc::new(client);
         let mut clients = self.clients.write().await;
         if let Some(existing) = clients.get(&key) {
             return Ok(existing.clone());

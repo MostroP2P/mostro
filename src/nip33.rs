@@ -1304,6 +1304,99 @@ mod tests {
         assert_eq!(get_tag_value(&tags, "serbero"), Some(serbero.to_hex()));
     }
 
+    /// Tags that only describe an LND node or its invoices. A Cashu node has
+    /// neither, so none of them may appear in its info event.
+    const LIGHTNING_ONLY_TAGS: [&str; 10] = [
+        "lnd_version",
+        "lnd_node_pubkey",
+        "lnd_commit_hash",
+        "lnd_node_alias",
+        "lnd_chains",
+        "lnd_networks",
+        "lnd_uris",
+        "hold_invoice_cltv_delta",
+        "invoice_expiration_window",
+        "hold_invoice_expiration_window",
+    ];
+
+    fn make_cashu_settings() -> crate::config::types::CashuSettings {
+        crate::config::types::CashuSettings {
+            enabled: true,
+            mint_url: "https://mint.example.com".to_string(),
+            escrow_locktime_days: 21,
+        }
+    }
+
+    #[test]
+    fn cashu_info_event_advertises_escrow_mode_and_mint() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "escrow_mode"), Some("cashu".into()));
+        assert_eq!(
+            get_tag_value(&tags, "cashu_mint_url"),
+            Some("https://mint.example.com".into())
+        );
+        assert_eq!(
+            get_tag_value(&tags, "cashu_escrow_locktime_days"),
+            Some("21".into())
+        );
+        // The mode-agnostic tags clients need to talk to the node are kept.
+        for name in ["protocol_version", "pow_first_contact", "fee", "z"] {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn cashu_info_event_omits_lightning_only_tags() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        for name in LIGHTNING_ONLY_TAGS {
+            assert_eq!(get_tag_value(&tags, name), None, "unexpected {name}");
+        }
+    }
+
+    #[test]
+    fn lightning_info_event_advertises_escrow_mode_and_keeps_ln_tags() {
+        let settings = test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Lightning(&ln_status),
+            false,
+        );
+
+        assert_eq!(
+            get_tag_value(&tags, "escrow_mode"),
+            Some("lightning".into())
+        );
+        for name in LIGHTNING_ONLY_TAGS {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+        assert_eq!(get_tag_value(&tags, "cashu_escrow_locktime_days"), None);
+    }
+
     #[test]
     fn serbero_tag_is_absent_without_a_serbero() {
         use crate::config::types::MostroSettings;

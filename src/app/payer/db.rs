@@ -128,6 +128,50 @@ pub async fn find_declaration(
     .map_err(db_err)
 }
 
+/// The history snapshot frozen for `order_id`, if one was taken (§10.3).
+pub async fn history_snapshot(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+) -> Result<Option<mostro_core::payer::PaymentHistory>, MostroError> {
+    let raw: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT history_snapshot FROM order_payer_declarations WHERE order_id = ?1",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    raw.flatten()
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+        })
+        .transpose()
+}
+
+/// Freeze `history` as the snapshot of `order_id` unless one is already
+/// stored, and return the stored one: the first build wins, so concurrent
+/// builds still agree.
+pub async fn freeze_history_snapshot(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    history: &mostro_core::payer::PaymentHistory,
+) -> Result<mostro_core::payer::PaymentHistory, MostroError> {
+    let json = serde_json::to_string(history)
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    sqlx::query(
+        "UPDATE order_payer_declarations SET history_snapshot = ?2 \
+          WHERE order_id = ?1 AND history_snapshot IS NULL",
+    )
+    .bind(order_id)
+    .bind(json)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(history_snapshot(pool, order_id)
+        .await?
+        .unwrap_or_else(|| history.clone()))
+}
+
 /// Delete the declaration for `order_id` and return it when the order's
 /// current buyer made it. The row can be taken exactly once, which makes it
 /// the idempotency token of the success hook. A row left by a previous buyer

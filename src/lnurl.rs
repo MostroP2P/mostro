@@ -842,4 +842,65 @@ mod tests {
             "non-payRequest tag must be Err: {result:?}"
         );
     }
+
+    /// Env var that arms [`lnurl_get_reaches_the_pinned_host_in_a_proxied_env`]
+    /// in the child process spawned by
+    /// [`lnurl_get_ignores_system_proxies`].
+    const PROXY_PROBE_ENV: &str = "MOSTRO_LNURL_PROXY_PROBE";
+
+    /// Child half of [`lnurl_get_ignores_system_proxies`]: runs only in a
+    /// process whose proxy env vars point at a dead proxy. `lnurl_get` must
+    /// still reach the local server it pinned.
+    #[tokio::test]
+    #[ignore = "spawned by lnurl_get_ignores_system_proxies with a proxied env"]
+    async fn lnurl_get_reaches_the_pinned_host_in_a_proxied_env() {
+        if std::env::var(PROXY_PROBE_ENV).is_err() {
+            return;
+        }
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        let app = Router::new().route("/probe", get(|| async { StatusCode::OK }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = Url::parse(&format!("http://localhost:{port}/probe")).unwrap();
+        let response = lnurl_get(url)
+            .await
+            .expect("lnurl_get must ignore the proxy and reach the pinned host");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A system proxy resolves the host itself, which would bypass the
+    /// checked address `lnurl_get` pins (DNS rebinding). reqwest reads
+    /// `HTTP_PROXY` & co. when a client is built, so the check runs in a
+    /// child test process: setting them here would race with every other
+    /// test that builds a reqwest client.
+    #[test]
+    fn lnurl_get_ignores_system_proxies() {
+        let dead_proxy = "http://127.0.0.1:9";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "lnurl::tests::lnurl_get_reaches_the_pinned_host_in_a_proxied_env",
+            ])
+            .env(PROXY_PROBE_ENV, "1")
+            .env("HTTP_PROXY", dead_proxy)
+            .env("http_proxy", dead_proxy)
+            .env("HTTPS_PROXY", dead_proxy)
+            .env("ALL_PROXY", dead_proxy)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

@@ -305,14 +305,16 @@ port = 50051
 # # save.
 
 # Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
-# the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens
-# on the single mint configured below. Mutually exclusive with
-# [anti_abuse_bond] — enabling both is a startup error.
+# the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens.
+# The maker of each order chooses the mint; the taker accepts it by taking
+# the order. Mutually exclusive with [anti_abuse_bond] — enabling both is a
+# startup error.
 #
 # [cashu]
 # enabled = false
-# # The one mint this node escrows on (http/https). Required when enabled.
-# mint_url = "https://mint.example.com"
+# # Mints this node accepts for new orders (http/https). Orders on any other
+# # mint are rejected. Leave empty ([]) to accept any mint with a public host.
+# mint_urls = ["https://mint.example.com", "https://mint.example2.com"]
 # # Seller-recovery locktime floor in days: escrow tokens must carry
 # # locktime >= now + this. Sellers may set a longer locktime, never shorter.
 # escrow_locktime_days = 15

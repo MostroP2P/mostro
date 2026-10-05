@@ -202,16 +202,23 @@ impl Default for AntiAbuseBondSettings {
 /// default) every Cashu code path remains inert — the daemon behaves
 /// exactly as a Lightning node. Mutually exclusive with
 /// `[anti_abuse_bond]` (locked decision §4.5); enforced at startup.
+///
+/// Unknown keys are rejected. A misspelled key, or the pre-#1046
+/// `mint_url`, would otherwise be ignored and leave `mint_urls` empty,
+/// silently turning the node into one that accepts any mint.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CashuSettings {
     /// Master switch. When false, the node runs in Lightning mode.
     #[serde(default)]
     pub enabled: bool,
-    /// The one mint this node escrows on (locked decision §4.2:
-    /// node-configured, fixed — no per-order mint). Required (non-empty,
-    /// `http`/`https`) when `enabled = true`; validated at startup.
+    /// Mints this node accepts for new orders (issue #1046). The maker
+    /// chooses the mint per order; the node publishes the order only if the
+    /// mint is in this list. Empty means no restriction: any mint with a
+    /// public host is accepted. Every entry must be an `http`/`https` URL;
+    /// validated at startup.
     #[serde(default)]
-    pub mint_url: String,
+    pub mint_urls: Vec<String>,
     /// Seller-recovery locktime floor, in days (Track A §4B): escrow
     /// tokens must carry `locktime >= now + escrow_locktime_days`. The
     /// seller may set a longer locktime, never a shorter one. Must be
@@ -228,7 +235,7 @@ impl Default for CashuSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            mint_url: String::new(),
+            mint_urls: Vec::new(),
             escrow_locktime_days: default_escrow_locktime_days(),
         }
     }
@@ -1130,7 +1137,7 @@ mod cashu_settings_tests {
     fn defaults_are_off() {
         let cfg = CashuSettings::default();
         assert!(!cfg.enabled);
-        assert!(cfg.mint_url.is_empty());
+        assert!(cfg.mint_urls.is_empty());
         assert_eq!(cfg.escrow_locktime_days, 15);
     }
 
@@ -1147,29 +1154,57 @@ mod cashu_settings_tests {
         let parsed: Stub = toml::from_str("[cashu]\n").expect("minimal block");
         let cashu = parsed.cashu.expect("block present");
         assert!(!cashu.enabled);
-        assert!(cashu.mint_url.is_empty());
+        assert!(cashu.mint_urls.is_empty());
         assert_eq!(cashu.escrow_locktime_days, 15);
     }
 
     #[test]
     fn toml_disabled_block() {
-        let parsed: Stub =
-            toml::from_str("[cashu]\nenabled = false\nmint_url = \"https://mint.example.com\"\n")
-                .expect("disabled block");
+        let parsed: Stub = toml::from_str(
+            "[cashu]\nenabled = false\nmint_urls = [\"https://mint.example.com\"]\n",
+        )
+        .expect("disabled block");
         let cashu = parsed.cashu.expect("block present");
         assert!(!cashu.enabled);
-        assert_eq!(cashu.mint_url, "https://mint.example.com");
+        assert_eq!(cashu.mint_urls, vec!["https://mint.example.com"]);
     }
 
     #[test]
     fn toml_enabled_block_with_overrides() {
         let parsed: Stub = toml::from_str(
-            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"\nescrow_locktime_days = 30\n",
+            "[cashu]\nenabled = true\nmint_urls = [\"https://mint.example.com\"]\nescrow_locktime_days = 30\n",
         )
         .expect("enabled block");
         let cashu = parsed.cashu.expect("block present");
         assert!(cashu.enabled);
-        assert_eq!(cashu.mint_url, "https://mint.example.com");
+        assert_eq!(cashu.mint_urls, vec!["https://mint.example.com"]);
         assert_eq!(cashu.escrow_locktime_days, 30);
+    }
+
+    #[test]
+    fn toml_rejects_the_legacy_single_mint_key() {
+        // Ignoring `mint_url` would leave `mint_urls` empty: an open node.
+        let err = toml::from_str::<Stub>(
+            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"\n",
+        )
+        .err()
+        .expect("legacy key must be rejected");
+        assert!(err.to_string().contains("mint_url"), "{err}");
+    }
+
+    #[test]
+    fn toml_accepts_several_mints_or_none() {
+        let several: Stub = toml::from_str(
+            "[cashu]\nenabled = true\nmint_urls = [\"https://mint.example.com\", \"https://mint.example2.com\"]\n",
+        )
+        .expect("several mints");
+        assert_eq!(
+            several.cashu.expect("block present").mint_urls,
+            vec!["https://mint.example.com", "https://mint.example2.com"]
+        );
+
+        let none: Stub =
+            toml::from_str("[cashu]\nenabled = true\nmint_urls = []\n").expect("no mints");
+        assert!(none.cashu.expect("block present").mint_urls.is_empty());
     }
 }

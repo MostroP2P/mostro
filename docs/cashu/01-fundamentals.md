@@ -32,8 +32,8 @@ for the crypto model and motivation. This document assumes it.
 - `mostro-core` protocol changes — the 0.13.0 surface is treated as **frozen**
   (see §3). If a track later needs a new variant, that is a separate
   `mostro-core` release, not foundation work.
-- Per-order mint negotiation, multi-mint allow-lists, Cashu-native bonds, Cashu
-  fee collection — all future work.
+- Cashu-native bonds and Cashu fee collection — future work. (Multi-mint
+  allow-lists, once listed here, landed with issue #1046; see §4 #2.)
 
 ---
 
@@ -115,8 +115,13 @@ Carried from the architecture doc, restated as constraints:
 1. **Global mode switch, not per-order.** A node runs in exactly one escrow mode:
    `lightning` (default) **or** `cashu`, fixed in `settings.toml`. In `cashu`
    mode the LND connector is **not initialised** at boot.
-2. **Node-configured, fixed mint.** One `mint_url` per node; all Cashu trades use
-   it. No per-order mint.
+2. **The maker chooses the mint; the node gates it.** *(Revised by issue #1046;
+   the original decision was one fixed mint per node.)* Each order names its
+   mint (`SmallOrder.cashu_mint_url`), chosen by the maker in `new-order`. The
+   node publishes the order only if `[cashu].mint_urls` accepts that mint: a
+   non-empty list is an allow-list, an empty list accepts any mint with a
+   public host. The taker accepts the mint by taking the order, and the escrow
+   is locked on that mint and no other.
 3. **Coordinator, not wallet.** The daemon validates tokens, holds `P_M`, and
    signs only during dispute resolution. All wallet operations live in clients.
 4. **Trade keys for `P_B` / `P_S`.** The 2-of-3 condition embeds the per-order
@@ -232,16 +237,16 @@ validation — but wire it to **nothing** at runtime yet (only config validation
 reads it).
 
 **Files.**
-- `src/config/types.rs` — `struct CashuSettings { enabled: bool, mint_url: String,
-  escrow_locktime_days: u32 }` (all `#[serde(default)]`; `escrow_locktime_days`
+- `src/config/types.rs` — `struct CashuSettings { enabled: bool, mint_urls:
+  Vec<String>, escrow_locktime_days: u32 }` (all `#[serde(default)]`; `escrow_locktime_days`
   defaults to **15** and must be `>= 1` — it is the seller-recovery locktime floor,
   see Track A §4B); `enum EscrowMode { Lightning, Cashu }`.
 - `src/config/settings.rs` — `pub cashu: Option<CashuSettings>` on `Settings`
   (`#[serde(default)]`, mirroring `anti_abuse_bond`); `Settings::get_cashu()`,
   `Settings::is_cashu_enabled()`, `Settings::escrow_mode()`.
 - `src/config/util.rs` — validation in `validate_mostro_settings`: (a) reject
-  `cashu.enabled && anti_abuse_bond.enabled`; (b) when enabled, require non-empty
-  `mint_url` that parses as `http`/`https`.
+  `cashu.enabled && anti_abuse_bond.enabled`; (b) when enabled, every
+  `mint_urls` entry must be an `http`/`https` URL (an empty list is valid).
 - `src/config/wizard.rs` + `settings.tpl.toml` — a commented `[cashu]` block and
   an optional interactive prompt.
 
@@ -412,8 +417,10 @@ keeping it inert for real trades.
   - **Lightning (default):** unchanged path — `LndConnector::new()`, LN status
     probe, held-invoice resubscribe, `run(ctx, &mut ln_client)`.
   - **Cashu:** skip `LndConnector::new()` and the LN status probe entirely;
-    `CashuClient::connect(mint_url)` (fail fast with a clear error if the mint is
-    unreachable); attach the client to `ctx`; `return run_cashu(ctx).await`.
+    connect each configured mint into a `cashu::mints::CashuMints` registry
+    (an unreachable mint is a warning, not a boot failure: orders on it fail to
+    lock with `CashuMintUnavailable` until it is back); attach the registry to
+    `ctx`; `return run_cashu(ctx).await`.
 - `src/app.rs` — `run_cashu(ctx)`: mirrors `run()`'s event/decrypt/verify/
   trade-index pipeline (reuse the same `unwrap_incoming` transport path as `run`)
   but dispatches every trade action to `CantDo(InvalidAction)` for now. Factor the
@@ -421,7 +428,12 @@ keeping it inert for real trades.
   (anti-duplication; see Risks).
 - `src/scheduler.rs` — gate LN-only jobs (`find_held_invoices` resubscribe, bond
   jobs, payment retries) behind `!is_cashu_enabled()`; leave mode-agnostic jobs
-  (order expiry, rate publishing) running.
+  (order expiry, rate publishing) running. The info event (kind 38385) is
+  mode-agnostic too: in Cashu mode it advertises `escrow_mode = "cashu"`,
+  `cashu_mint_url` (every allowed mint as a tag value; omitted when any mint is
+  accepted) and `cashu_escrow_locktime_days`, and omits the `lnd_*`,
+  `hold_invoice_cltv_delta` and invoice-window tags (`nip33::escrow_tags`,
+  issue #1044).
 
 **Must NOT.** Implement any handler body. Change the Lightning boot path in any
 observable way. Start the mint connection in Lightning mode.
@@ -612,8 +624,8 @@ slowest of `CF-1`/`CF-2`, then `CF-5`.
 The foundation is complete when **all** hold:
 
 1. `CF-0`…`CF-5` are merged to `main`, each as its own PR.
-2. A node with `[cashu] enabled = true` and a reachable `mint_url` **boots**,
-   logs that it is in Cashu mode, connects to the mint, and runs `run_cashu`
+2. A node with `[cashu] enabled = true` **boots**, logs that it is in Cashu
+   mode, connects its configured mints, and runs `run_cashu`
    **without an LND node present**.
 3. In Cashu mode, every trade action returns a clear `CantDo(InvalidAction)`
    (or the appropriate `CantDoReason`) — no panics, no half-states.

@@ -421,7 +421,11 @@ keeping it inert for real trades.
   (anti-duplication; see Risks).
 - `src/scheduler.rs` — gate LN-only jobs (`find_held_invoices` resubscribe, bond
   jobs, payment retries) behind `!is_cashu_enabled()`; leave mode-agnostic jobs
-  (order expiry, rate publishing) running.
+  (order expiry, rate publishing) running. The info event (kind 38385) is
+  mode-agnostic too: in Cashu mode it advertises `escrow_mode = "cashu"`,
+  `cashu_mint_url` and `cashu_escrow_locktime_days`, and omits the `lnd_*`,
+  `hold_invoice_cltv_delta` and invoice-window tags (`nip33::escrow_tags`,
+  issue #1044).
 
 **Must NOT.** Implement any handler body. Change the Lightning boot path in any
 observable way. Start the mint connection in Lightning mode.

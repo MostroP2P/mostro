@@ -1,6 +1,8 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
-use crate::config::types::{AntiAbuseBondSettings, BondApplyTo, LightningSettings, MostroSettings};
+use crate::config::types::{
+    AntiAbuseBondSettings, BondApplyTo, CashuSettings, LightningSettings, MostroSettings,
+};
 use crate::lightning::LnStatus;
 use crate::util::{
     first_trade_since, get_expiration_timestamp_for_kind, get_keys,
@@ -605,19 +607,30 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
     ]
 }
 
+/// The escrow backend a node runs, as the info event describes it. A node
+/// runs exactly one: Lightning (LND hold invoices, described by the node's
+/// `LnStatus`) or Cashu (NUT-11 escrow on the one configured mint).
+#[derive(Debug, Clone, Copy)]
+pub enum InfoEscrow<'a> {
+    Lightning(&'a LnStatus),
+    Cashu(&'a CashuSettings),
+}
+
 /// Transform mostro info fields to tags
 ///
 /// # Arguments
 ///
 ///
+/// `escrow` selects the escrow-specific tags: LND node stats and invoice
+/// windows for Lightning, the mint and locktime floor for Cashu.
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
-pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
+pub fn info_to_tags(escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
     build_info_tags(
         Settings::get_mostro(),
         Settings::get_ln(),
         Settings::get_bond(),
-        ln_status,
+        escrow,
         maintenance,
     )
 }
@@ -629,7 +642,7 @@ fn build_info_tags(
     mostro_settings: &MostroSettings,
     ln_settings: &LightningSettings,
     bond_settings: Option<&AntiAbuseBondSettings>,
-    ln_status: &LnStatus,
+    escrow: InfoEscrow<'_>,
     maintenance: bool,
 ) -> Tags {
     let protocol_version = mostro_settings.transport.protocol_version();
@@ -688,24 +701,13 @@ fn build_info_tags(
         // See docs/TRANSPORT_V2_SPEC.md §3.1.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
-            "hold_invoice_cltv_delta",
-            vec![ln_settings.hold_invoice_cltv_delta.to_string()],
-        ),
-        Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
-        Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
-        Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
-        Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
-        Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
-        Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
-        Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
-        Tag::custom(
             "y",
             create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
         Tag::custom("z", vec!["info".to_string()]),
     ];
 
-    tags_vec.extend(invoice_window_tags(ln_settings));
+    tags_vec.extend(escrow_tags(escrow, ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
     tags_vec.extend(serbero_tags(mostro_settings));
     tags_vec.push(Tag::custom(
@@ -714,6 +716,45 @@ fn build_info_tags(
     ));
 
     Tags::from_list(tags_vec)
+}
+
+/// The escrow block of the info event. `escrow_mode` is always emitted so
+/// clients can tell the backend apart before starting a trade; daemons that
+/// predate the tag omit it, which clients treat as `"lightning"`.
+///
+/// Lightning nodes add their LND node stats, the hold-invoice CLTV delta and
+/// both invoice windows. Cashu nodes have no LND and no invoices, so those
+/// are omitted; they add the mint escrow tokens must be locked on and the
+/// seller-recovery locktime floor a token must carry instead.
+fn escrow_tags(escrow: InfoEscrow<'_>, ln_settings: &LightningSettings) -> Vec<Tag> {
+    match escrow {
+        InfoEscrow::Lightning(ln_status) => {
+            let mut tags = vec![
+                Tag::custom("escrow_mode", vec!["lightning".to_string()]),
+                Tag::custom(
+                    "hold_invoice_cltv_delta",
+                    vec![ln_settings.hold_invoice_cltv_delta.to_string()],
+                ),
+                Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
+                Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
+                Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
+                Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
+                Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
+                Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
+                Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
+            ];
+            tags.extend(invoice_window_tags(ln_settings));
+            tags
+        }
+        InfoEscrow::Cashu(cashu) => vec![
+            Tag::custom("escrow_mode", vec!["cashu".to_string()]),
+            Tag::custom("cashu_mint_url", vec![cashu.mint_url.clone()]),
+            Tag::custom(
+                "cashu_escrow_locktime_days",
+                vec![cashu.escrow_locktime_days.to_string()],
+            ),
+        ],
+    }
 }
 
 /// The `serbero` tag of the info event: the hex pubkey of the node's
@@ -1132,7 +1173,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         assert!(get_tag_value(&tags, "invoice_expiration_window").is_some());
         assert!(get_tag_value(&tags, "hold_invoice_expiration_window").is_some());
@@ -1143,7 +1184,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -1155,7 +1196,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -1176,7 +1217,7 @@ mod tests {
     fn info_to_tags_emits_maintenance_mode_false_by_default() {
         init_test_settings();
         let ln_status = make_ln_status();
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
         assert_eq!(
             tag_value(&tags, "maintenance_mode").as_deref(),
             Some("false")
@@ -1187,7 +1228,7 @@ mod tests {
     fn info_to_tags_emits_maintenance_mode_true_when_enabled() {
         init_test_settings();
         let ln_status = make_ln_status();
-        let tags = info_to_tags(&ln_status, true);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), true);
         assert_eq!(
             tag_value(&tags, "maintenance_mode").as_deref(),
             Some("true")
@@ -1202,9 +1243,20 @@ mod tests {
         let keys = Keys::generate();
         let id = keys.public_key().to_string();
         let ln_status = make_ln_status();
-        let first =
-            super::new_info_event(&keys, "", id.clone(), info_to_tags(&ln_status, false)).unwrap();
-        let second = super::new_info_event(&keys, "", id, info_to_tags(&ln_status, true)).unwrap();
+        let first = super::new_info_event(
+            &keys,
+            "",
+            id.clone(),
+            info_to_tags(super::InfoEscrow::Lightning(&ln_status), false),
+        )
+        .unwrap();
+        let second = super::new_info_event(
+            &keys,
+            "",
+            id,
+            info_to_tags(super::InfoEscrow::Lightning(&ln_status), true),
+        )
+        .unwrap();
         assert!(
             second.created_at > first.created_at,
             "{} !> {}",
@@ -1225,7 +1277,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         // Expectations come from the settings actually installed in
         // `MOSTRO_CONFIG`, never from this module's `test_settings()` copy:
@@ -1297,11 +1349,104 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
-            &make_ln_status(),
+            super::InfoEscrow::Lightning(&make_ln_status()),
             false,
         );
 
         assert_eq!(get_tag_value(&tags, "serbero"), Some(serbero.to_hex()));
+    }
+
+    /// Tags that only describe an LND node or its invoices. A Cashu node has
+    /// neither, so none of them may appear in its info event.
+    const LIGHTNING_ONLY_TAGS: [&str; 10] = [
+        "lnd_version",
+        "lnd_node_pubkey",
+        "lnd_commit_hash",
+        "lnd_node_alias",
+        "lnd_chains",
+        "lnd_networks",
+        "lnd_uris",
+        "hold_invoice_cltv_delta",
+        "invoice_expiration_window",
+        "hold_invoice_expiration_window",
+    ];
+
+    fn make_cashu_settings() -> crate::config::types::CashuSettings {
+        crate::config::types::CashuSettings {
+            enabled: true,
+            mint_url: "https://mint.example.com".to_string(),
+            escrow_locktime_days: 21,
+        }
+    }
+
+    #[test]
+    fn cashu_info_event_advertises_escrow_mode_and_mint() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "escrow_mode"), Some("cashu".into()));
+        assert_eq!(
+            get_tag_value(&tags, "cashu_mint_url"),
+            Some("https://mint.example.com".into())
+        );
+        assert_eq!(
+            get_tag_value(&tags, "cashu_escrow_locktime_days"),
+            Some("21".into())
+        );
+        // The mode-agnostic tags clients need to talk to the node are kept.
+        for name in ["protocol_version", "pow_first_contact", "fee", "z"] {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn cashu_info_event_omits_lightning_only_tags() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        for name in LIGHTNING_ONLY_TAGS {
+            assert_eq!(get_tag_value(&tags, name), None, "unexpected {name}");
+        }
+    }
+
+    #[test]
+    fn lightning_info_event_advertises_escrow_mode_and_keeps_ln_tags() {
+        let settings = test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            super::InfoEscrow::Lightning(&ln_status),
+            false,
+        );
+
+        assert_eq!(
+            get_tag_value(&tags, "escrow_mode"),
+            Some("lightning".into())
+        );
+        for name in LIGHTNING_ONLY_TAGS {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+        assert_eq!(get_tag_value(&tags, "cashu_escrow_locktime_days"), None);
     }
 
     #[test]
@@ -1384,7 +1529,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         assert_eq!(
             get_tag_value(&tags, "bond_enabled").as_deref(),

@@ -105,7 +105,7 @@ pub async fn fiat_sent_action(
     // lookup failure here is logged and must not fail `fiat-sent`; the
     // seller can still pull the history with `payment-history`.
     if PayerHistorySettings::enabled(payer_history) {
-        match payer::history::build_for_order(pool, &order_updated).await {
+        match payer::history::build_for_order(pool, my_keys, &order_updated).await {
             Ok(Some(history)) => {
                 enqueue_order_msg(
                     None,
@@ -352,8 +352,8 @@ mod tests {
         use super::*;
         use crate::app::payer::db::{bump_history, current_policy_generation, upsert_declaration};
         use crate::app::payer::test_support::{
-            assert_cant_do, ctx_with, hash, order_in, payer_settings, queued_for, unwrapped,
-            Parties,
+            assert_cant_do, ctx_with, hash, node_keys, order_in, payer_settings, queued_for,
+            unwrapped, Parties,
         };
 
         async fn send_fiat(
@@ -366,7 +366,7 @@ mod tests {
                 ctx,
                 msg.clone(),
                 &unwrapped(parties.buyer, msg),
-                &Keys::generate(),
+                node_keys(),
             )
             .await
         }
@@ -480,11 +480,12 @@ mod tests {
                 .await
                 .unwrap();
             let mut conn = pool.acquire().await.unwrap();
-            let generation = current_policy_generation(&mut conn, (5, 30), 1)
+            let generation = current_policy_generation(&mut conn, node_keys(), (5, 30), 1)
                 .await
                 .unwrap();
             bump_history(
                 &mut conn,
+                node_keys(),
                 &parties.buyer_master.to_string(),
                 &hash('a'),
                 &hash('1'),

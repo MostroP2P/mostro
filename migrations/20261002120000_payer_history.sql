@@ -22,15 +22,19 @@ CREATE TABLE IF NOT EXISTS order_payer_declarations (
   history_snapshot text                            -- PaymentHistory JSON frozen at fiat-sent (§10.3); every later query returns it
 );
 
--- Aggregate history. One row per (buyer identity key, payment hash).
--- Written ONLY from the Success CAS in release::payment_success.
+-- Aggregate history. One row per (buyer identity key, payment hash), keyed by
+-- payer_key = HMAC-SHA256(node secret, domain || payment_hash), never by the
+-- hash itself: the hash is cheap to recompute from a candidate account, so
+-- stored raw next to user_pubkey a leaked database would reveal which account
+-- a buyer pays from (D-2). Written ONLY from the Success CAS in
+-- release::payment_success.
 CREATE TABLE IF NOT EXISTS payer_history (
   user_pubkey        char(64) NOT NULL,  -- orders.master_buyer_pubkey (reputation mode only)
-  payment_hash       char(64) NOT NULL,
+  payer_key          char(64) NOT NULL,  -- payer_key(node secret, payment_hash), lowercase hex
   first_success_at   integer  NOT NULL,
   last_success_at    integer  NOT NULL,
   successful_trades  integer  NOT NULL DEFAULT 0,
-  PRIMARY KEY (user_pubkey, payment_hash)
+  PRIMARY KEY (user_pubkey, payer_key)
 );
 
 -- Distinct-counterparty set. counterparty_id is a keyed hash (D-7), never a
@@ -40,7 +44,7 @@ CREATE TABLE IF NOT EXISTS payer_history (
 -- to (N, D) rewrites the whole column under the new policy (§10.7).
 CREATE TABLE IF NOT EXISTS payer_history_counterparties (
   user_pubkey        char(64) NOT NULL,
-  payment_hash       char(64) NOT NULL,
+  payer_key          char(64) NOT NULL,
   counterparty_id    char(64) NOT NULL,
   first_success_at   integer  NOT NULL,
   -- Newest success with this triple: the instant §10.7 re-evaluates at.
@@ -49,7 +53,7 @@ CREATE TABLE IF NOT EXISTS payer_history_counterparties (
   -- Generation of (N, D) this row's `experienced` was evaluated under. Only
   -- rows of the current generation count toward experienced_counterparties.
   policy_gen         integer  NOT NULL,
-  PRIMARY KEY (user_pubkey, payment_hash, counterparty_id)
+  PRIMARY KEY (user_pubkey, payer_key, counterparty_id)
 );
 
 -- Threshold policy the `experienced` column was last evaluated under (D-7).
@@ -62,7 +66,7 @@ CREATE TABLE IF NOT EXISTS payer_history_policy (
   experienced_min_trades integer NOT NULL,
   experienced_min_days   integer NOT NULL,
   evaluated_at           integer NOT NULL,  -- unix secs of the last (re)evaluation
-  node_key_id            text               -- node_key_id() of the secret the counterparty ids were checked under; NULL until the first recompute
+  node_key_id            text               -- node_key_id() of the secret payer_key / counterparty_id were checked under; NULL until the first recompute; a change discards the history
 );
 
 -- D-7 qualification reads every undisputed success of one seller

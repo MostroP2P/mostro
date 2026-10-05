@@ -8,7 +8,12 @@
 //! the host is pinned to the address that passed the check, the same way
 //! `lnurl_get` pins LNURL requests. Redirects are never followed.
 //!
-//! Responses are handled exactly as cdk's own transport handles them: a
+//! System proxies (`HTTP_PROXY`, …) are ignored: a proxy would resolve the
+//! host itself and bypass the pin. Response bodies are capped at
+//! [`MAX_MINT_RESPONSE_BYTES`], so a maker-chosen mint cannot exhaust the
+//! node's memory before the request times out.
+//!
+//! Otherwise responses are handled as cdk's own transport handles them: a
 //! non-2xx body that parses as a Cashu `ErrorResponse` becomes that error,
 //! anything else an `HttpError` with the status.
 
@@ -23,7 +28,12 @@ use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// A no-redirect HTTP transport, optionally pinned to one checked address.
+/// Largest mint response body read, in bytes. The biggest legitimate reply,
+/// the full keyset listing, is a few KiB per keyset.
+pub const MAX_MINT_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// A no-redirect, no-proxy HTTP transport, optionally pinned to one checked
+/// address.
 #[derive(Debug, Clone)]
 pub struct MintTransport {
     inner: reqwest::Client,
@@ -47,6 +57,7 @@ impl MintTransport {
     fn build(pin: Option<(&str, SocketAddr)>) -> Result<Self, Error> {
         let mut builder = reqwest::Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .user_agent(concat!("mostro/", env!("CARGO_PKG_VERSION")));
         if let Some((host, addr)) = pin {
             builder = builder.resolve(host, addr);
@@ -70,10 +81,7 @@ impl MintTransport {
             .await
             .map_err(|e| Error::HttpError(None, e.to_string()))?;
         let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
+        let body = read_capped(response).await?;
 
         if !(200..300).contains(&status) {
             if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&body) {
@@ -86,6 +94,35 @@ impl MintTransport {
             Err(err) => err.into(),
         })
     }
+}
+
+/// The response body as UTF-8, refusing one longer than
+/// [`MAX_MINT_RESPONSE_BYTES`] — announced by `content-length` or not.
+async fn read_capped(mut response: reqwest::Response) -> Result<String, Error> {
+    let too_large = || {
+        Error::HttpError(
+            None,
+            format!("mint response exceeds {MAX_MINT_RESPONSE_BYTES} bytes"),
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_MINT_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::HttpError(None, e.to_string()))?
+    {
+        if body.len() + chunk.len() > MAX_MINT_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|e| Error::HttpError(None, e.to_string()))
 }
 
 #[async_trait]
@@ -129,14 +166,16 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// Serve one canned HTTP response on a loopback port; return its address.
-    async fn serve_once(response: &'static str) -> SocketAddr {
+    async fn serve_once(response: impl Into<Vec<u8>>) -> SocketAddr {
+        let response: Vec<u8> = response.into();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 2048];
             let _ = socket.read(&mut buf).await;
-            socket.write_all(response.as_bytes()).await.unwrap();
+            // The client may hang up early (an oversized body); that's fine.
+            let _ = socket.write_all(&response).await;
             let _ = socket.shutdown().await;
         });
         addr
@@ -184,6 +223,28 @@ mod tests {
             client.mint_url().to_string().trim_end_matches('/'),
             pinned_url
         );
+    }
+
+    #[tokio::test]
+    async fn transport_refuses_an_oversized_body() {
+        let body = "a".repeat(MAX_MINT_RESPONSE_BYTES + 1);
+        // Announced by content-length, and streamed without one.
+        for head in [
+            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len()),
+            "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string(),
+        ] {
+            let addr = serve_once(format!("{head}{body}")).await;
+            let url = reqwest::Url::parse(&format!("http://{addr}/v1/keys")).unwrap();
+
+            let err = MintTransport::default()
+                .http_get::<serde_json::Value>(url, None)
+                .await
+                .expect_err("an oversized body must be refused");
+            assert!(
+                matches!(&err, Error::HttpError(None, msg) if msg.contains("exceeds")),
+                "{head:?}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -632,13 +632,54 @@ pub enum InfoEscrow<'a> {
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
 pub fn info_to_tags(escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
-    build_info_tags(
+    let payer_history = payer_history_tags(Settings::get_payer_history(), &escrow);
+    let mut tags = build_info_tags(
         Settings::get_mostro(),
         Settings::get_ln(),
         Settings::get_bond(),
         escrow,
         maintenance,
     )
+    .to_vec();
+    tags.extend(payer_history);
+    Tags::from_list(tags)
+}
+
+/// Payer-history policy tags of the info event
+/// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md` §8.3). Emitted only when the
+/// feature is enabled; a node that does not run it keeps its info event
+/// unchanged, and clients read a missing `payer_history_enabled` as off.
+/// The thresholds let clients explain `experienced_counterparties` without
+/// hard-coding node policy (D-7).
+///
+/// Never emitted in Cashu mode: its dispatch answers `declare-payer` and
+/// `payment-history` with `invalid_action` (§13), so advertising the feature
+/// there would promise clients something the node refuses.
+fn payer_history_tags(
+    cfg: Option<&crate::config::payer_history::PayerHistorySettings>,
+    escrow: &InfoEscrow<'_>,
+) -> Vec<Tag> {
+    if matches!(escrow, InfoEscrow::Cashu(_)) {
+        return Vec::new();
+    }
+    let Some(cfg) = cfg.filter(|c| c.enabled) else {
+        return Vec::new();
+    };
+    vec![
+        Tag::custom("payer_history_enabled", vec!["true".to_string()]),
+        Tag::custom(
+            "payer_declaration_required",
+            vec![cfg.require_declaration.to_string()],
+        ),
+        Tag::custom(
+            "payer_history_experienced_min_trades",
+            vec![cfg.experienced_min_trades.to_string()],
+        ),
+        Tag::custom(
+            "payer_history_experienced_min_days",
+            vec![cfg.experienced_min_days.to_string()],
+        ),
+    ]
 }
 
 /// Body of [`info_to_tags`] with the settings passed in, so unit tests can
@@ -2375,5 +2416,64 @@ mod tests {
 
         assert_eq!(emit_p, emit_w);
         assert_eq!(status_p, status_w);
+    }
+
+    #[test]
+    fn payer_history_tags_are_absent_unless_enabled() {
+        use crate::config::payer_history::PayerHistorySettings;
+
+        // D-10: an absent or disabled section emits nothing, so the info
+        // event of a node that does not run the feature is unchanged.
+        let ln_status = make_ln_status();
+        let lightning = super::InfoEscrow::Lightning(&ln_status);
+        assert!(super::payer_history_tags(None, &lightning).is_empty());
+        let off = PayerHistorySettings {
+            require_declaration: true,
+            ..Default::default()
+        };
+        assert!(super::payer_history_tags(Some(&off), &lightning).is_empty());
+
+        let on = PayerHistorySettings {
+            enabled: true,
+            require_declaration: false,
+            experienced_min_trades: 7,
+            experienced_min_days: 45,
+        };
+        let tags: Vec<Vec<String>> = super::payer_history_tags(Some(&on), &lightning)
+            .into_iter()
+            .map(|t| t.to_vec())
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                vec!["payer_history_enabled".to_string(), "true".to_string()],
+                vec![
+                    "payer_declaration_required".to_string(),
+                    "false".to_string()
+                ],
+                vec![
+                    "payer_history_experienced_min_trades".to_string(),
+                    "7".to_string()
+                ],
+                vec![
+                    "payer_history_experienced_min_days".to_string(),
+                    "45".to_string()
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn payer_history_tags_are_absent_in_cashu_mode() {
+        use crate::config::payer_history::PayerHistorySettings;
+
+        // §13: Cashu dispatch refuses declare-payer, so an enabled section
+        // must not advertise the feature there.
+        let on = PayerHistorySettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let cashu = make_cashu_settings();
+        assert!(super::payer_history_tags(Some(&on), &super::InfoEscrow::Cashu(&cashu)).is_empty());
     }
 }

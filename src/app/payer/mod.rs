@@ -5,14 +5,13 @@
 //! (or, in handlers, `ctx.settings().payer_history`) says the feature is on.
 //! Callers must gate on that flag (D-10).
 //!
-//! PH-1 delivers only the storage layer ([`db`]); the handlers and the
-//! success hook are wired by PH-2 to PH-5.
+//! * [`declare`]: the `declare-payer` handler.
+//! * [`history`]: the `payment-history` push and query.
+//! * [`success`]: the hook in the Success CAS that records history.
+//! * [`boot`]: the threshold recompute and the Cashu warning at startup.
+//! * [`db`]: storage for all of the above.
 
-// The helpers are wired into the trade flow by PH-2 to PH-5; until then the
-// binary does not call them outside tests.
-// TODO(PH-5): remove this attribute once every helper has a caller.
-#![allow(dead_code)]
-
+pub mod boot;
 pub mod db;
 pub mod declare;
 pub mod history;

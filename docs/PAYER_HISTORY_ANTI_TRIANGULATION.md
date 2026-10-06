@@ -230,6 +230,13 @@ counters and **does not** write history rows (they could never be matched
 again and would only link a hash to a trade key in the DB). Clients must render
 this as *"history is unavailable for this buyer"*, not as *"new account"*.
 Hash-only (user-agnostic) history is explicitly deferred to §18.
+A full-privacy buyer's client declares the **order-bound** hash
+(`sha256("mostro-payer-order-v1|" + order_id + "|" + canonical)`,
+`mostro_core::payer::order_bound_payment_hash`), never the reusable one: the
+same account would otherwise give the same hash on every order and let the
+node link trade keys the mode keeps apart. The daemon cannot tell the two
+constructions apart and needs no change; the seller's client recomputes the
+order-bound form when the push reports `buyer_mode = "full_privacy"`.
 
 **D-5 · History increments in exactly one place: the `Success` CAS in
 `payment_success`.** The increment runs only when `rows_affected()==1`, inside
@@ -534,6 +541,12 @@ reused for everything else: `invalid_action` (feature off), `not_found` (order),
 `invalid_pubkey` (not the buyer), `invalid_peer` (not the seller),
 `not_allowed_by_status`, `invalid_payload`.
 
+In practice `invalid_payload` is unreachable for `declare-payer`:
+`MessageKind::verify()` (§6.4) already requires a `PayerDeclaration`
+payload, and the daemon drops a message that fails `verify()` without a
+reply. The handler keeps the check as a second line of defence. The
+`trade_index` field is not used by these actions; clients send `null`.
+
 ### 6.4 `MessageKind::verify()` matrix (`MessageKind::verify()` in `$CORE/src/message.rs`)
 
 The match is exhaustive on `Action`; add:
@@ -550,7 +563,7 @@ Buyer → Mostro:
 
 ```json
 [
-  {"order": {"version": 2, "request_id": 981231, "trade_index": 7,
+  {"order": {"version": 2, "request_id": 981231, "trade_index": null,
              "id": "4f1c…", "action": "declare-payer",
              "payload": {"payer_declaration": {
                "payment_hash": "9b0e…c1"}}}},
@@ -632,22 +645,33 @@ Summary of the contract:
    method, each field normalised as:
    - Unicode NFKC, then uppercase;
    - strip all whitespace, hyphens, dots and slashes from *identifier* fields
-     (IBAN, CBU/CVU, PIX key, account number, tax id);
+     (IBAN, CBU/CVU, account number, tax id);
    - collapse runs of whitespace to one space in *name* fields, trim;
+   - before NFKC, the input may only hold repertoire code points, whitespace
+     and combining marks U+0300–U+036F (NFKC can map an unassigned code point
+     into the repertoire in a newer Unicode version);
+   - "whitespace" is exactly the Unicode `White_Space` set, and after these
+     steps every code point must lie in U+0020–U+007E, U+00A0–U+017F or
+     U+0218–U+021B (stable NFKC and case mappings across Unicode versions);
+     anything else has no canonical form, so on a node requiring
+     declarations the buyer's client checks this before taking the order;
    - country codes ISO-3166 alpha-2, currency ISO-4217.
-2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`,
-   `BR|PIX`), so identical account numbers under different rails never
-   collide.
-3. **Hash** = `sha256("mostro-payer-v1|" + canonical)` (D-12), hex, lowercase.
-4. The hash MUST NOT include order id, trade key, timestamps or salt
-   (gist §9) — those would make it unique per trade and defeat history.
+2. **Method prefix** = `<COUNTRY>|<METHOD>` (e.g. `AR|CVU`, `EU|SEPA`), so
+   identical account numbers under different rails never collide.
+3. **Hash**, by buyer mode, hex, lowercase:
+   - reputation mode: `sha256("mostro-payer-v1|" + canonical)` (D-12);
+   - full-privacy mode: the order-bound
+     `sha256("mostro-payer-order-v1|" + order_id + "|" + canonical)` (D-4),
+     so the node cannot link the buyer's orders.
+4. Apart from that full-privacy exception, the hash MUST NOT include order id,
+   trade key, timestamps or salt (gist §9) — those would make it unique per
+   trade and defeat history.
 
 Examples (canonical → hashed):
 
 ```text
 AR|CVU|0000003100012345678901|27123456789
 EU|SEPA|DE89370400440532013000|ALICE SMITH
-BR|PIX|+5511999998888
 ```
 
 `DE89 3704 0044 0532 0130 00` and `DE89370400440532013000` canonicalise to the
@@ -661,6 +685,12 @@ why the node DB is the only place it lives.
 Methods that cannot expose a sender (cash, gift cards, vouchers) have no
 canonical form; clients MUST NOT declare a payer for them and SHOULD tell the
 seller that sender verification is unavailable (gist §34).
+
+PIX is deliberately not in the registry: a PIX key identifies the account that
+*receives* a transfer, so a buyer's own key is not sender data the seller can
+check, and a PIX receipt shows the payer only partly (name, institution, a
+masked CPF/CNPJ). It needs an entry built from payer fields the seller can
+read in full before clients may declare it.
 
 ---
 
@@ -775,7 +805,7 @@ pub fn payer_history_experience_thresholds() -> (u32, u32)   // (min_trades, min
 | `payer_history_experienced_min_trades` | decimal string, e.g. `"5"` (only when enabled) |
 | `payer_history_experienced_min_days` | decimal string, e.g. `"30"` (only when enabled) |
 
-When the feature is disabled or absent, `info_to_tags` emits no payer-history tags, preserving disabled-mode output byte-for-byte. Clients treat missing tags as disabled, and read the threshold tags to explain the `experienced_counterparties` metric (D-7) without hard-coding node policy.
+When the feature is disabled or absent, `info_to_tags` emits no payer-history tags, preserving disabled-mode output byte-for-byte. A node in Cashu mode emits none either, whatever `[payer_history]` says: its dispatch answers `declare-payer` and `payment-history` with `invalid_action` (§13), so advertising the feature would promise clients something the node refuses. Clients treat missing tags as disabled, and read the threshold tags to explain the `experienced_counterparties` metric (D-7) without hard-coding node policy.
 
 ---
 
@@ -1104,8 +1134,10 @@ pub async fn declare_payer_action(ctx: &AppContext, msg: Message,
 ```
 
 Design notes
-- Re-declaration overwrites. The seller receives every version; the client
-  keeps the last one. There is no partial-update path.
+- Re-declaration overwrites. The seller receives every version, but forwards
+  carry no sequence and relays may reorder them, so the last one received is
+  provisional; the hash `payment-history` echoes (frozen at `fiat-sent`) is
+  authoritative. There is no partial-update path.
 - The seller may not exist yet in `WaitingBuyerInvoice` for a maker-buyer
   order whose taker has not paid — `get_seller_pubkey()` failing is not an
   error; the seller will get the hash with the `payment-history` push later.
@@ -1582,6 +1614,7 @@ MVP (the Cashu release path does not exist yet); see §13.
 |---|---|---|
 | Seller (via Mostro) | buyer's committed `payment_hash` for **this order**; aggregate counters for **this** (buyer, hash) pair — including how many of the buyer's past counterparties met the node's experience policy (D-7), as a bare count; whether the buyer is in full-privacy mode (already visible today through `Peer.reputation == None`) | buyer identity key, other trade keys, other order ids, which sellers were the counterparties, any single counterparty's qualification status, any hash other than the one the buyer chose to commit to this order |
 | Buyer | nothing new about the seller | — |
+| Solver, in a dispute | the plaintext payer details, when a party discloses the chat's conversation key: they travel over the peer chat, which is the dispute transcript | the hash's history, unless shown the `payment-history` message |
 | Mostro node | `(master_buyer_pubkey, payer_key)` association + counters, where `payer_key` is keyed by the node secret (D-2); the raw `payment_hash` of open orders only; keyed counterparty hashes; per-counterparty qualification snapshots (derived from `orders`, which the node already holds) | plaintext payer details (D-2) |
 | Public relays | nothing | everything in this feature |
 
@@ -1591,7 +1624,9 @@ MVP (the Cashu release path does not exist yet); see §13.
   the order id. The `(user, hash)` pair is resolved server-side from the
   order. A seller cannot ask about a hash the buyer did not commit to this
   order, nor about a user who is not their counterparty in this order.
-- Repeating the query returns the same numbers; it leaks nothing further.
+- Repeating the query only returns a fresher snapshot of the same buyer and
+  hash (another success of that pair, or a restart with new thresholds, can
+  change it); it leaks nothing about anyone else.
 - The seller already possesses the plaintext (the buyer sent it); learning
   its hash is not new information.
 - The seller cannot distinguish "buyer B used account X before" from "some
@@ -1629,15 +1664,22 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
 **Buyer side**
 1. When the order is taken and `payer_history_enabled` is true, show a
    "payment sender" form for the method in use, explaining why (gist §21).
-2. Canonicalise, hash (§7), send `declare-payer`. Keep the plaintext locally.
-3. Send the plaintext to the seller over the peer channel (chat or DM).
-4. Before `fiat-sent`, confirm: *"Did you send the payment from the account
+2. Canonicalise, hash (§7; order-bound in full-privacy mode, D-4), send
+   `declare-payer`. Keep the plaintext locally. Wait for the `payer-declared`
+   ack with the request's `request_id` and re-send if it does not arrive: on a
+   node that does not require declarations, a `fiat-sent` that overtakes the
+   declaration closes the window and the late declaration is refused.
+3. Send the plaintext to the seller over the peer channel (chat or DM),
+   telling the buyer that a solver reads it if the trade goes to dispute.
+4. Send `fiat-sent` only after the ack of step 2. Before it, confirm: *"Did you send the payment from the account
    declared for this trade?"*
 5. If `fiat-sent` answers `payer_not_declared`, go back to step 1.
 
 **Seller side**
-1. On `payer-declared`, store the hash for the order. On receiving the
-   plaintext from the buyer, recompute; if it differs, show a hard warning.
+1. On `payer-declared`, store the hash for the order as provisional. On
+   receiving the plaintext from the buyer, recompute; once fiat is reported
+   sent, compare it with the hash `payment-history` echoes (query it if the
+   push has not arrived) and show a hard warning if it differs.
 2. On `payment-history` (push or reply), render two independent blocks:
    *Sender match* (manual confirmation) and *Payment-account history*.
 3. In the history block, render `experienced_counterparties` alongside the raw
@@ -1647,9 +1689,15 @@ Normative for clients that opt in (checked via the info-event tags, §8.3).
    hard-code them.
 4. Never auto-release; never auto-refuse. The release screen shows both blocks
    above `[Release]` / `[Dispute]` (gist §22).
-5. If no `payment-history` arrived by the time fiat is reported sent and the
-   node has the feature enabled, show *"Buyer did not declare a payment
-   sender"* as its own warning.
+5. The push is a separate message that can arrive late or not at all (a
+   relay can drop it; Mostro skips it when it cannot build the history). If
+   it has not arrived once fiat is reported sent, send the `payment-history`
+   query, and show *"Buyer did not declare a payment sender"* as its own
+   warning only when that query answers `not_found` while the order is still
+   `fiat-sent`.
+6. Operators must not set `require_declaration` while accepting payment
+   methods that have no canonical form (cash, gift cards): a buyer paying that
+   way could never report fiat as sent.
 
 **Suggested tiers** (client policy, not protocol):
 
@@ -1677,7 +1725,8 @@ scheduler watcher the **only** path to `Success`. When that lands it MUST call
 CAS success branch, and `dispatch_cashu` MUST add `DeclarePayer | PaymentHistory`
 to its routing once `FiatSent` is routed there. Until then the feature is
 Lightning-only; `Settings` validation SHOULD warn (not fail) at boot when both
-`[cashu].enabled` and `[payer_history].enabled` are set.
+`[cashu].enabled` and `[payer_history].enabled` are set, and the Cashu info
+event carries no payer-history tags (§8.3).
 
 ---
 

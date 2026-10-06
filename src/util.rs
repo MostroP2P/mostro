@@ -1356,6 +1356,70 @@ async fn update_order_event_stamped(
     order: &Order,
     policy: StampPolicy,
 ) -> Result<Option<Order>, MostroError> {
+    let Some((order_updated, pending)) =
+        build_order_event_stamped(keys, status, order, policy).await?
+    else {
+        return Ok(None);
+    };
+    if let Some(pending) = pending {
+        publish_order_event(pending).await;
+    }
+
+    info!(
+        "Order Id: {} updated Nostr new Status: {}",
+        order.id,
+        status.to_string()
+    );
+
+    Ok(Some(order_updated))
+}
+
+/// A kind-38383 revision that has been built and stamped but not published
+/// yet. Produced by [`build_order_event`] and consumed by
+/// [`publish_order_event`], so a caller can persist a transition before any
+/// relay learns about it (payer history, §10.5 of
+/// `docs/PAYER_HISTORY_ANTI_TRIANGULATION.md`).
+pub(crate) struct PendingOrderEvent {
+    event: Event,
+    order_id: Uuid,
+    status: Status,
+    stamp: OrderbookStamp,
+}
+
+impl PendingOrderEvent {
+    /// Publication generation of this revision, for
+    /// [`mark_orderbook_publish_failed_at`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.stamp.generation
+    }
+}
+
+/// Build and stamp the revision of `order` in `status` without publishing
+/// it. Returns the updated order (status and `event_id` set) and the pending
+/// event, which is `None` when the order has no orderbook tags.
+pub(crate) async fn build_order_event(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+) -> Result<(Order, Option<PendingOrderEvent>), MostroError> {
+    build_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::Always { created_at: None },
+    )
+    .await
+    .map(|built| built.expect("StampPolicy::Always always stamps"))
+}
+
+/// Build half of [`update_order_event_stamped`]. `Ok(None)` when the
+/// quiescence policy skipped the stamp.
+async fn build_order_event_stamped(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    policy: StampPolicy,
+) -> Result<Option<(Order, Option<PendingOrderEvent>)>, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
     order_updated.status = status.to_string();
@@ -1365,93 +1429,105 @@ async fn update_order_event_stamped(
 
     // We transform the order fields to tags to use in the event
     let mostro_pubkey = keys.public_key().to_hex();
-    if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
-        // Every revision of an order's kind-38383 event is stamped through
-        // the monotonic registry so two transitions in the same Unix second
-        // (create + instant take, create + maker cancel, …) never tie on
-        // `created_at` — NIP-01 breaks such ties by lowest event id, which
-        // can leave a dead `pending` revision as the winning state.
-        let stamp = match policy {
-            StampPolicy::Always { created_at } => {
-                stamp_orderbook_event(order.id, created_at.unwrap_or_else(Timestamp::now))
-            }
-            StampPolicy::IfQuiescent { quiet_secs } => {
-                match try_stamp_orderbook_event_quiescent(order.id, Timestamp::now(), quiet_secs) {
-                    Some(stamp) => stamp,
-                    None => return Ok(None),
-                }
-            }
-        };
-        let event_created_at = stamp.created_at;
-        // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
-        let event =
-            new_order_event_with_created_at(keys, "", order.id.to_string(), tags, event_created_at)
-                .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
-        info!("Sending replaceable event: {event:#?}");
-
-        // We update the order with the new event_id
-        order_updated.event_id = event.id.to_string();
-
-        // A failed (or impossible) publish must not stay invisible: the DB
-        // is about to advance while relays keep advertising the previous
-        // state. Queue the order so the scheduler's orderbook reconciler
-        // republishes the current DB state until the wire converges.
-        match get_nostr_client() {
-            // Resolves on the first relay's `OK`: the event loop awaits this
-            // inline, and a relay that never answers held it — and every
-            // request queued behind it — for the relay's whole timeout
-            // (#991). The per-relay verdict arrives in the callback, possibly
-            // after this function has returned; the reconciler bookkeeping is
-            // generation-guarded, so a verdict landing late cannot clear a
-            // newer publication's failure.
-            Ok(client) => {
-                let (order_id, generation) = (order.id, stamp.generation);
-                let status = status.to_string();
-                let published = crate::publish::send_event_first_ack(client, &event, move |report| {
-                    // Only failures recorded by publications stamped no later
-                    // than this one may be cleared: a newer concurrent
-                    // publication's failure must survive this older success.
-                    if report.failed.is_empty() && !report.success.is_empty() {
-                        clear_orderbook_publish_failure_up_to(order_id, generation);
-                        return;
-                    }
-                    // Any relay that did not take the event — a refusal, a
-                    // timeout, or no relay at all — leaves the book divergent
-                    // there, so the publish counts as failed and stays queued
-                    // until a republish converges it.
-                    tracing::warn!(
-                        "orderbook publish not accepted by {} relay(s) for order {} (status {}): {:?}; queued for republish",
-                        report.failed.len(),
-                        order_id,
-                        status,
-                        report.failed
-                    );
-                    mark_orderbook_publish_failed_at(order_id, generation);
-                })
-                .await;
-                if let Err(e) = published {
-                    tracing::warn!("orderbook publish failed for order {order_id}: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "orderbook publish skipped for order {} (status {}): no nostr client ({e}); queued for republish",
-                    order_updated.id,
-                    status
-                );
-                mark_orderbook_publish_failed_at(order.id, stamp.generation);
+    let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? else {
+        return Ok(Some((order_updated, None)));
+    };
+    // Every revision of an order's kind-38383 event is stamped through
+    // the monotonic registry so two transitions in the same Unix second
+    // (create + instant take, create + maker cancel, …) never tie on
+    // `created_at` — NIP-01 breaks such ties by lowest event id, which
+    // can leave a dead `pending` revision as the winning state.
+    let stamp = match policy {
+        StampPolicy::Always { created_at } => {
+            stamp_orderbook_event(order.id, created_at.unwrap_or_else(Timestamp::now))
+        }
+        StampPolicy::IfQuiescent { quiet_secs } => {
+            match try_stamp_orderbook_event_quiescent(order.id, Timestamp::now(), quiet_secs) {
+                Some(stamp) => stamp,
+                None => return Ok(None),
             }
         }
     };
+    let event_created_at = stamp.created_at;
+    // nip33 kind with order id as identifier and order fields as tags (kind 38383 for orders)
+    let event =
+        new_order_event_with_created_at(keys, "", order.id.to_string(), tags, event_created_at)
+            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    info!(
-        "Order Id: {} updated Nostr new Status: {}",
-        order.id,
-        status.to_string()
-    );
+    info!("Sending replaceable event: {event:#?}");
 
-    Ok(Some(order_updated))
+    // We update the order with the new event_id
+    order_updated.event_id = event.id.to_string();
+
+    Ok(Some((
+        order_updated,
+        Some(PendingOrderEvent {
+            event,
+            order_id: order.id,
+            status,
+            stamp,
+        }),
+    )))
+}
+
+/// Publish half of [`update_order_event_stamped`].
+pub(crate) async fn publish_order_event(pending: PendingOrderEvent) {
+    let PendingOrderEvent {
+        event,
+        order_id,
+        status,
+        stamp,
+    } = pending;
+    // A failed (or impossible) publish must not stay invisible: the DB
+    // is about to advance while relays keep advertising the previous
+    // state. Queue the order so the scheduler's orderbook reconciler
+    // republishes the current DB state until the wire converges.
+    match get_nostr_client() {
+        // Resolves on the first relay's `OK`: the event loop awaits this
+        // inline, and a relay that never answers held it — and every
+        // request queued behind it — for the relay's whole timeout
+        // (#991). The per-relay verdict arrives in the callback, possibly
+        // after this function has returned; the reconciler bookkeeping is
+        // generation-guarded, so a verdict landing late cannot clear a
+        // newer publication's failure.
+        Ok(client) => {
+            let generation = stamp.generation;
+            let status = status.to_string();
+            let published = crate::publish::send_event_first_ack(client, &event, move |report| {
+                // Only failures recorded by publications stamped no later
+                // than this one may be cleared: a newer concurrent
+                // publication's failure must survive this older success.
+                if report.failed.is_empty() && !report.success.is_empty() {
+                    clear_orderbook_publish_failure_up_to(order_id, generation);
+                    return;
+                }
+                // Any relay that did not take the event — a refusal, a
+                // timeout, or no relay at all — leaves the book divergent
+                // there, so the publish counts as failed and stays queued
+                // until a republish converges it.
+                tracing::warn!(
+                    "orderbook publish not accepted by {} relay(s) for order {} (status {}): {:?}; queued for republish",
+                    report.failed.len(),
+                    order_id,
+                    status,
+                    report.failed
+                );
+                mark_orderbook_publish_failed_at(order_id, generation);
+            })
+            .await;
+            if let Err(e) = published {
+                tracing::warn!("orderbook publish failed for order {order_id}: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "orderbook publish skipped for order {} (status {}): no nostr client ({e}); queued for republish",
+                order_id,
+                status
+            );
+            mark_orderbook_publish_failed_at(order_id, stamp.generation);
+        }
+    }
 }
 
 pub async fn connect_nostr() -> Result<Client, MostroError> {

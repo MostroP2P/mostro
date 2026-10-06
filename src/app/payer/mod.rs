@@ -16,6 +16,7 @@
 pub mod db;
 pub mod declare;
 pub mod history;
+pub mod success;
 #[cfg(test)]
 pub(crate) mod test_support;
 

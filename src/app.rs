@@ -21,6 +21,7 @@ pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
+pub mod payer; // Payer declaration + payment-account history (anti-triangulation)
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod restore_session; // Restore session action

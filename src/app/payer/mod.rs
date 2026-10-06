@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod db;
+pub mod declare;
 
 use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
 use mostro_core::error::{CantDoReason, MostroError, MostroError::MostroCantDo};
@@ -82,6 +83,19 @@ pub fn validate_payment_hash(hash: &str) -> Result<(), MostroError> {
     } else {
         Err(MostroCantDo(CantDoReason::InvalidPaymentHash))
     }
+}
+
+/// `true` when `message` carries a payer hash or a payment history. Such a
+/// payload must never reach a log above `debug`: the hash is guessable from
+/// a candidate account list, so it is an identifier that only ever travels
+/// encrypted between the parties and Mostro (protocol: "The hash is not a
+/// secret").
+pub fn carries_payer_data(message: &mostro_core::message::Message) -> bool {
+    use mostro_core::message::Payload;
+    matches!(
+        message.get_inner_message_kind().payload,
+        Some(Payload::PayerDeclaration(_)) | Some(Payload::PaymentHistory(_))
+    )
 }
 
 /// D-7 qualification predicate: a seller with `qualifying_trades` prior
@@ -204,5 +218,33 @@ mod tests {
         ));
         // No qualifying trade at all.
         assert!(!is_experienced(&exp(0, None), 0, 0, now));
+    }
+
+    #[test]
+    fn payer_payloads_are_flagged_for_log_redaction() {
+        use mostro_core::prelude::*;
+        let id = Some(uuid::Uuid::new_v4());
+        let hash = "a".repeat(64);
+        let declared = Message::new_order(
+            id,
+            None,
+            None,
+            Action::PayerDeclared,
+            Some(Payload::PayerDeclaration(PayerDeclaration::new(
+                hash.clone(),
+            ))),
+        );
+        let history = Message::new_order(
+            id,
+            None,
+            None,
+            Action::PaymentHistory,
+            Some(Payload::PaymentHistory(PaymentHistory::unavailable(hash))),
+        );
+        assert!(carries_payer_data(&declared));
+        assert!(carries_payer_data(&history));
+
+        let other = Message::new_order(id, None, None, Action::FiatSentOk, None);
+        assert!(!carries_payer_data(&other));
     }
 }

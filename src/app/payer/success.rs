@@ -8,8 +8,8 @@ use sqlx::SqliteConnection;
 
 /// Record `order`'s success in the payer history. Runs inside the Success
 /// CAS transaction of `release::payment_success`, only on the branch that
-/// performed the transition, so a failure here rolls the transition back
-/// and leaves the order retryable.
+/// performed the transition, in a savepoint of its own: a failure here
+/// undoes this function's writes and the Success still commits.
 ///
 /// The declaration row is the idempotency token: it is taken (deleted)
 /// first, so at most one increment can ever happen per order. Disputed

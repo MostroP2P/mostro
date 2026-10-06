@@ -123,40 +123,65 @@ async fn feature_on_records_history_in_the_success_transaction() {
     assert_eq!(orderbook_publish_attempts(order.id), Some(1));
 }
 
+/// Assert that `order` finalized without a history row: Success committed,
+/// stamped, published and notified, and the declaration left for the prune
+/// job (the savepoint rollback restores it).
+async fn assert_finalized_without_history(pool: &SqlitePool, order: &Order) {
+    assert_eq!(status(pool, order.id).await, Status::Success.to_string());
+    assert!(success_at(pool, order.id).await.is_some());
+    assert_eq!(payer_rows(pool).await, 0, "no partial history");
+    assert_eq!(notified(order.id).await, (true, true));
+    assert_eq!(orderbook_publish_attempts(order.id), Some(1));
+    assert_eq!(
+        prune_declarations_for_terminal_orders(pool).await.unwrap(),
+        1
+    );
+}
+
 #[tokio::test]
-async fn a_failing_history_write_leaves_no_visible_success() {
-    // §10.5 invariant: no failure before the commit produces an externally
-    // visible Success — not on the relays, not in the message queue.
+async fn a_failing_history_write_still_finalizes_the_paid_order() {
+    // §10.5: the buyer is already paid, so an optional bookkeeping write
+    // must not hold the order in settled-hold-invoice. A declaration
+    // bump_history refuses (not 64 lowercase hex) fails on every retry.
     init_global_config();
     let _queue = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
     let pool = create_test_pool().await;
     let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
     let parties = Parties::reputation();
     let mut order = order_in(&pool, Status::SettledHoldInvoice, parties).await;
-    // A row bump_history refuses (not 64 lowercase hex): the hook fails.
     upsert_declaration(&pool, order.id, "NOT-A-HASH", 1)
         .await
         .unwrap();
 
-    let finalized = finalize(&ctx, &mut order, parties).await.unwrap_or(false);
+    assert!(finalize(&ctx, &mut order, parties).await.unwrap());
 
-    assert!(!finalized, "the caller keeps its marker and retries");
-    assert_eq!(
-        status(&pool, order.id).await,
-        Status::SettledHoldInvoice.to_string()
-    );
-    assert_eq!(success_at(&pool, order.id).await, None);
-    assert_eq!(payer_rows(&pool).await, 0);
-    assert!(
-        find_declaration(&pool, order.id).await.unwrap().is_some(),
-        "still retryable"
-    );
-    assert_eq!(notified(order.id).await, (false, false));
-    assert_eq!(
-        orderbook_publish_attempts(order.id),
-        None,
-        "nothing published or armed"
-    );
+    assert_finalized_without_history(&pool, &order).await;
+}
+
+#[tokio::test]
+async fn a_history_write_failing_midway_leaves_no_partial_rows() {
+    // The payer_history row is written before the counterparty row fails:
+    // the savepoint must undo it while the Success commits.
+    init_global_config();
+    let _queue = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+    let pool = create_test_pool().await;
+    let ctx = ctx_with(&pool, Some(payer_settings(true, false)));
+    let parties = Parties::reputation();
+    let mut order = order_in(&pool, Status::SettledHoldInvoice, parties).await;
+    upsert_declaration(&pool, order.id, &hash('a'), 1)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_counterparty BEFORE INSERT ON payer_history_counterparties \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(finalize(&ctx, &mut order, parties).await.unwrap());
+
+    assert_finalized_without_history(&pool, &order).await;
 }
 
 #[tokio::test]

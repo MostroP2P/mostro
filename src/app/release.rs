@@ -25,7 +25,7 @@ use lnurl::lnurl::LnUrl;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
-use sqlx::{Pool, Sqlite};
+use sqlx::{Acquire, Pool, Sqlite};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use std::time::Duration;
@@ -1320,7 +1320,8 @@ fn warn_already_finalized(order_updated: &Order) {
 /// [`payment_success`] with `[payer_history]` enabled: build the Success
 /// revision, run the CAS and the payer-history write in one transaction, and
 /// only after the commit publish the revision and notify the buyer. No
-/// failure before the commit produces an externally visible Success.
+/// failure before the commit produces an externally visible Success, and a
+/// failing history write does not prevent it: the trade is just not recorded.
 async fn payment_success_with_payer_history(
     ctx: &AppContext,
     order: &mut Order,
@@ -1351,18 +1352,31 @@ async fn payment_success_with_payer_history(
     }
     let thresholds =
         PayerHistorySettings::experience_thresholds(ctx.settings().payer_history.as_ref());
-    // A failure drops `tx`, rolling the transition back: the order stays
-    // settled-hold-invoice and the declaration stays retryable. Logged at
-    // `error`: while it lasts the paid order cannot finalize.
-    if let Err(e) =
-        payer::success::record_payer_success(&mut tx, my_keys, &order_updated, thresholds, now)
-            .await
+    // The buyer is already paid: the history is optional bookkeeping and
+    // must not hold the order in settled-hold-invoice. The write runs in a
+    // savepoint, so a failure undoes only its own rows and the Success still
+    // commits. The declaration it restores is removed by the prune job.
+    let mut savepoint = tx.begin().await.map_err(db_err)?;
+    match payer::success::record_payer_success(
+        &mut savepoint,
+        my_keys,
+        &order_updated,
+        thresholds,
+        now,
+    )
+    .await
     {
-        tracing::error!(
-            "Order {}: payer history write failed, Success rolled back and left for retry: {e}",
-            order_updated.id
-        );
-        return Err(e.into());
+        Ok(()) => savepoint.commit().await.map_err(db_err)?,
+        Err(e) => {
+            // Logged first: if SQLite already rolled the whole transaction
+            // back (disk full, I/O error), the savepoint rollback fails and
+            // the `?` would otherwise hide the cause.
+            tracing::error!(
+                "Order {}: payer history write failed, trade not recorded: {e}",
+                order_updated.id
+            );
+            savepoint.rollback().await.map_err(db_err)?;
+        }
     }
 
     // From the commit on the DB is the truth and the relays are behind, so

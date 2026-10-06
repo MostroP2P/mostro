@@ -235,7 +235,9 @@ Hash-only (user-agnostic) history is explicitly deferred to §18.
 `payment_success`.** The increment runs only when `rows_affected()==1`, inside
 the same function, and is idempotent by construction (the declaration row is
 consumed atomically, §10.4). Any future success path (Cashu watcher, §13) must
-call the same helper.
+call the same helper. The write **fails open**: the buyer is already paid when
+it runs, so a failing history write never holds the order back from `Success`;
+that one trade is simply not recorded (§10.5).
 
 **D-6 · Disputed trades do not build history.** If `order.buyer_dispute` or
 `order.seller_dispute` is set when the order reaches `Success`, the
@@ -1241,7 +1243,16 @@ if result.rows_affected() == 0 {
 }
 
 if Settings::is_payer_history_enabled() {
-    payer::success::record_payer_success(&mut tx, ctx.keys(), &order_updated).await?;
+    // A savepoint: a failure undoes only the history rows, logs at `error`,
+    // and the Success below still commits (fail-open, D-5).
+    let mut savepoint = tx.begin().await.map_err(...)?;
+    match payer::success::record_payer_success(&mut savepoint, ctx.keys(), &order_updated).await {
+        Ok(()) => savepoint.commit().await.map_err(...)?,
+        Err(e) => {
+            savepoint.rollback().await.map_err(...)?;
+            tracing::error!("payer history write failed, trade not recorded: {e}");
+        }
+    }
 }
 
 // Arm the republish queue BEFORE the commit: from here on the DB is the
@@ -1361,11 +1372,16 @@ Why this is safe
 - `payment_success` may be reached twice (watcher + reconciler, §3.3). The
   CAS guarantees only one caller enters the `rows_affected()==1` branch, and
   `take_declaration` (DELETE … RETURNING) guarantees at most one increment
-  even if that invariant were ever broken. Because the history write shares the
-  CAS transaction, a database failure rolls back the success transition and the
-  declaration remains retryable by the existing payment-success retry paths —
-  and, because the publish now happens after the commit, such a rollback is
-  invisible to peers and relays.
+  even if that invariant were ever broken.
+- The history write fails open. When it runs, LND has already paid the buyer,
+  and the payout retry paths would retry a failed finalization forever: a
+  persistent error (a SQL bug, a corrupt row, schema drift) would hold a paid
+  order in `settled-hold-invoice`, unrateable and blocking the maintenance
+  drain. So the write runs in a savepoint of the CAS transaction: a failure
+  rolls back only the history rows, is logged at `error`, and the `Success`
+  commits without them. The declaration the rollback restores belongs to a
+  terminal order, so the prune job (§10.6) removes it. The cost is one trade
+  missing from one buyer's history, which only understates it.
 - The hook itself performs no write to `orders`; `seller_experience` only
   *reads* it, inside the same transaction. The single `orders` write is
   `success_at`, added as one more bind to the existing guarded `UPDATE` — it
@@ -1767,11 +1783,10 @@ All tests are in-file `#[cfg(test)]` modules using the existing scaffolding
 **`payment_success` wiring** (extend `src/app/release.rs` tests with the
 `PayoutStatusLookup` stub pattern, `payment_success` tests in `src/app/release.rs`)
 - history recorded in the same transaction as the CAS-success branch only; the
-  "already finalised" branch records nothing, and an injected history-write
-  failure leaves the order retryable rather than finalized without history.
-- commit-then-publish: with the history write forced to fail, **no** kind-38383
-  `Success` revision is published and **no** `PurchaseCompleted` / `Rate`
-  message is enqueued; the order is still `SettledHoldInvoice` in the DB.
+  "already finalised" branch records nothing.
+- fail-open: with the history write forced to fail, before or after its first
+  row, the order still reaches `Success`, is published and notified, and no
+  history row is kept; the restored declaration is pruned.
 - the happy path publishes exactly one `Success` revision, after the commit,
   and the existing `payment_success` tests pass unmodified.
 - the `build_order_event` / `publish_order_event` split leaves every other

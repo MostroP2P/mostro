@@ -124,7 +124,10 @@ uncovered = "the ortsom stack runs its own template (ci/regtest/mostro-settings.
 
 [[rule]]
 name = "session restore and key bookkeeping"
-paths = ["src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs"]
+paths = [
+  "src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs",
+  "src/app/user_info.rs",
+]
 uncovered = "no ortsom scenario yet"
 
 [[rule]]

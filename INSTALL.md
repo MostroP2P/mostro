@@ -236,6 +236,7 @@ In few minutes you should see a nostr event with Mostro settings:
       ["fee", "0.006"],
       ["hold_invoice_expiration_window", "900"],
       ["hold_invoice_cltv_delta", "298"],
+      ["escrow_deadline_margin_blocks", "24"],
       ["invoice_expiration_window", "900"],
       ["y", "mostrop2p"],
       ["z", "info"]

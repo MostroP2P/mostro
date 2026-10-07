@@ -728,8 +728,11 @@ fn build_info_tags(
 /// clients can tell the backend apart before starting a trade; daemons that
 /// predate the tag omit it, which clients treat as `"lightning"`.
 ///
-/// Lightning nodes add their LND node stats, the hold-invoice CLTV delta and
-/// both invoice windows. Cashu nodes have no LND and no invoices, so those
+/// Lightning nodes add their LND node stats, the hold-invoice CLTV delta, the
+/// escrow deadline margin and both invoice windows. The margin lets clients
+/// estimate when the escrow-deadline guardian acts on a trade: about
+/// `hold_invoice_cltv_delta - escrow_deadline_margin_blocks` blocks after the
+/// escrow is paid. Cashu nodes have no LND and no invoices, so those
 /// are omitted; they add the mints a maker may choose (all of them when the
 /// tag is absent) and the seller-recovery locktime floor a token must carry
 /// instead.
@@ -741,6 +744,10 @@ fn escrow_tags(escrow: InfoEscrow<'_>, ln_settings: &LightningSettings) -> Vec<T
                 Tag::custom(
                     "hold_invoice_cltv_delta",
                     vec![ln_settings.hold_invoice_cltv_delta.to_string()],
+                ),
+                Tag::custom(
+                    "escrow_deadline_margin_blocks",
+                    vec![ln_settings.escrow_deadline_margin_blocks.to_string()],
                 ),
                 Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
                 Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
@@ -1370,7 +1377,7 @@ mod tests {
 
     /// Tags that only describe an LND node or its invoices. A Cashu node has
     /// neither, so none of them may appear in its info event.
-    const LIGHTNING_ONLY_TAGS: [&str; 10] = [
+    const LIGHTNING_ONLY_TAGS: [&str; 11] = [
         "lnd_version",
         "lnd_node_pubkey",
         "lnd_commit_hash",
@@ -1379,6 +1386,7 @@ mod tests {
         "lnd_networks",
         "lnd_uris",
         "hold_invoice_cltv_delta",
+        "escrow_deadline_margin_blocks",
         "invoice_expiration_window",
         "hold_invoice_expiration_window",
     ];
@@ -1539,6 +1547,10 @@ mod tests {
         for name in LIGHTNING_ONLY_TAGS {
             assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
         }
+        assert_eq!(
+            get_tag_value(&tags, "escrow_deadline_margin_blocks"),
+            Some(settings.lightning.escrow_deadline_margin_blocks.to_string())
+        );
         assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
         assert_eq!(get_tag_value(&tags, "cashu_escrow_locktime_days"), None);
     }

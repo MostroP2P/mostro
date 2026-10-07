@@ -5,6 +5,25 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 /// Maximum development fee percentage (100% of Mostro fee)
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
+/// LND's default `invoices.holdexpirydelta`: LND auto-cancels an accepted
+/// hold invoice this many blocks before its HTLC expires, refunding the
+/// seller. `escrow_deadline_margin_blocks` must be above it, or LND refunds
+/// the escrow before the deadline guardian acts.
+pub const LND_DEFAULT_HOLD_EXPIRY_DELTA: u32 = 12;
+
+/// Blocks the escrow-deadline guardian keeps between its own action and
+/// LND's auto-cancel. The guardian ticks every 300 s, so with a single
+/// block of headroom LND wins the race about 1 in 5 times; the headroom
+/// also gives a solver time to settle a `fiat-sent` trade the guardian
+/// escalated to dispute.
+pub const MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS: u32 = 6;
+
+/// Smallest `escrow_deadline_margin_blocks` mostrod starts with. It assumes
+/// LND's default `holdexpirydelta`; mostrod cannot read the node's real
+/// value yet (#1058).
+pub const MIN_ESCROW_DEADLINE_MARGIN_BLOCKS: u32 =
+    LND_DEFAULT_HOLD_EXPIRY_DELTA + MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS;
+
 /// Official Mostro development Lightning Address.
 /// Self-custodial and served from a domain the project controls, so the
 /// backend behind it can change without a mostrod release.

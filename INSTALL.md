@@ -214,7 +214,7 @@ cargo install nostcat
 Now we connect with one of the relays we added to the `settings.toml` file:
 
 ```bash
-nostreq --kinds 38383 --limit 5 --authors your-mostro-pubkey | nostcat --stream wss://random.nostr.relay | jq
+nostreq --kinds 38385 --limit 5 --authors your-mostro-pubkey | nostcat --stream wss://random.nostr.relay | jq
 ```
 
 In few minutes you should see a nostr event with Mostro settings:
@@ -225,28 +225,42 @@ In few minutes you should see a nostr event with Mostro settings:
   "7005a443-d1ba-4f58-9046-70f9881c979d",
   {
     "tags": [
-      ["d", "info-your-mostro-pubkey"],
-      ["mostro_pubkey", "your-mostro-pubkey"],
-      ["mostro_version", "0.12.1"],
-      ["mostro_commit_id", "466ef06d2c113fb026e46491d7cb27955c41b531"],
-      ["max_order_amount", "20000"],
+      ["d", "your-mostro-pubkey"],
+      ["mostro_version", "0.19.2"],
+      ["mostro_commit_hash", "your-mostro-commit-hash"],
+      ["max_order_amount", "1000000"],
       ["min_order_amount", "100"],
       ["expiration_hours", "24"],
       ["expiration_seconds", "900"],
-      ["fee", "0.006"],
-      ["hold_invoice_expiration_window", "900"],
-      ["hold_invoice_cltv_delta", "298"],
+      ["fiat_currencies_accepted", "USD,EUR,ARS,CUP"],
+      ["max_orders_per_response", "10"],
+      ["fee", "0"],
+      ["pow", "0"],
+      ["pow_first_contact", "0"],
+      ["protocol_version", "2"],
+      ["y", "mostro"],
+      ["z", "info"],
+      ["escrow_mode", "lightning"],
+      ["hold_invoice_cltv_delta", "144"],
       ["escrow_deadline_margin_blocks", "24"],
-      ["invoice_expiration_window", "900"],
-      ["y", "mostrop2p"],
-      ["z", "info"]
+      ["lnd_version", "0.19.1-beta"],
+      ["lnd_node_pubkey", "your-lnd-node-pubkey"],
+      ["lnd_commit_hash", "your-lnd-commit-hash"],
+      ["lnd_node_alias", "your-lnd-alias"],
+      ["lnd_chains", "bitcoin"],
+      ["lnd_networks", "mainnet"],
+      ["lnd_uris", "your-lnd-node-pubkey@your-host:9735"],
+      ["invoice_expiration_window", "3600"],
+      ["hold_invoice_expiration_window", "300"],
+      ["bond_enabled", "false"],
+      ["maintenance_mode", "false"]
     ],
     "content": "",
     "sig": "7195fe1cdcd51e8947160d70b74a17f144924f5497aad4c5852e3f27177cc165360b04eb0243a4884772d3901e004f9213ca1d08c64f3284be9f1640aea1af5e",
     "id": "06df0bfbd4f30cfd8680f5ac6397f0b0bfdec38384f8c78f70a7fb70dcc53842",
     "pubkey": "your-mostro-pubkey",
     "created_at": 1718483696,
-    "kind": 38383
+    "kind": 38385
   }
 ]
 ```

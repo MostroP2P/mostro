@@ -7,7 +7,7 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::app::maintenance::MaintenanceState;
-use crate::cashu::CashuClient;
+use crate::cashu::mints::CashuMints;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
 use nostr_sdk::prelude::{Client, Keys, PublicKey};
@@ -40,11 +40,12 @@ pub struct AppContext {
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
     keys: Keys,
-    /// Connected Cashu mint client (docs/cashu/, CF-5). `Some` only in Cashu
-    /// mode, where `main.rs` connects the configured mint at boot and attaches
-    /// it here; `None` in the default Lightning mode. Track A's lock handler
-    /// reads it through [`AppContext::cashu_client`].
-    cashu_client: Option<Arc<CashuClient>>,
+    /// Cashu mint clients, one per mint (docs/cashu/, issue #1046). `Some`
+    /// only in Cashu mode, where `main.rs` connects the configured mints at
+    /// boot and attaches the registry here; `None` in the default Lightning
+    /// mode. Track A's lock handler reads it through
+    /// [`AppContext::cashu_mints`].
+    cashu_mints: Option<Arc<CashuMints>>,
     /// Maintenance (drain) mode flag. Defaults to a disabled, unpersisted
     /// flag; `main.rs` attaches the one loaded from `daemon_state` with
     /// [`AppContext::with_maintenance`].
@@ -54,8 +55,8 @@ pub struct AppContext {
 impl AppContext {
     /// Create a new application context.
     ///
-    /// The Cashu client defaults to `None` (Lightning mode). Cashu-mode boot
-    /// attaches a connected client with [`AppContext::with_cashu_client`].
+    /// The Cashu mints default to `None` (Lightning mode). Cashu-mode boot
+    /// attaches them with [`AppContext::with_cashu_mints`].
     pub fn new(
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Client,
@@ -69,7 +70,7 @@ impl AppContext {
             settings,
             order_msg_queue,
             keys,
-            cashu_client: None,
+            cashu_mints: None,
             maintenance: MaintenanceState::new(),
         }
     }
@@ -86,11 +87,10 @@ impl AppContext {
         &self.maintenance
     }
 
-    /// Attach a connected Cashu mint client (Cashu mode, CF-5). Returns a new
-    /// context; the Lightning path never calls this, so `cashu_client()` stays
-    /// `None` there.
-    pub fn with_cashu_client(mut self, cashu_client: Arc<CashuClient>) -> Self {
-        self.cashu_client = Some(cashu_client);
+    /// Attach the Cashu mint clients (Cashu mode). Returns a new context; the
+    /// Lightning path never calls this, so `cashu_mints()` stays `None` there.
+    pub fn with_cashu_mints(mut self, cashu_mints: Arc<CashuMints>) -> Self {
+        self.cashu_mints = Some(cashu_mints);
         self
     }
 
@@ -127,13 +127,13 @@ impl AppContext {
         &self.keys
     }
 
-    /// The connected Cashu mint client, if this node runs in Cashu mode.
+    /// The Cashu mint clients, if this node runs in Cashu mode.
     ///
-    /// `Some` only when `[cashu] enabled = true` and the mint connected at
-    /// boot (CF-5); `None` in Lightning mode. Track A's `add_cashu_escrow`
-    /// handler uses it to validate the seller's escrow token against the mint.
-    pub fn cashu_client(&self) -> Option<&Arc<CashuClient>> {
-        self.cashu_client.as_ref()
+    /// `Some` only when `[cashu] enabled = true`; `None` in Lightning mode.
+    /// Track A's `add_cashu_escrow` handler takes the client for the order's
+    /// mint from it to validate the seller's escrow token.
+    pub fn cashu_mints(&self) -> Option<&Arc<CashuMints>> {
+        self.cashu_mints.as_ref()
     }
 }
 
@@ -326,6 +326,7 @@ pub mod test_utils {
             cashu: None,
             price: None,
             reputation_import: None,
+            payer_history: None,
         }
     }
 }

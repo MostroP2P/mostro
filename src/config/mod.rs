@@ -1,5 +1,6 @@
 // Mostro module for configurataion settings
 pub mod constants;
+pub mod payer_history;
 pub mod secret;
 pub mod settings;
 /// This module provides functionality to manage and initialize settings for the Mostro application.

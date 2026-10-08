@@ -1,8 +1,8 @@
 [package]
 name = "mostro"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
 description = "Lightning Network peer-to-peer nostr platform"
 homepage = "https://mostro.network"
@@ -71,7 +71,7 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.16.0", features = ["sqlx"] }
+mostro-core = { version = "0.17.1", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

@@ -2,6 +2,7 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
+use crate::cashu::mint_policy::normalize_mint_url;
 use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
@@ -165,7 +166,9 @@ fn validate_serbero_pubkey(serbero_pubkey: Option<&str>) -> Result<(), MostroErr
 /// silently misbehave):
 /// - `cashu.enabled` and `anti_abuse_bond.enabled` are mutually exclusive
 ///   (locked decision §4.5).
-/// - When enabled, `mint_url` must be non-empty and parse as `http`/`https`.
+/// - When enabled, every `mint_urls` entry must be a usable `http`/`https`
+///   mint URL ([`normalize_mint_url`]). An empty list is valid: the node
+///   accepts any mint (issue #1046).
 /// - When enabled, `escrow_locktime_days >= 1` (the seller-recovery
 ///   locktime floor of Track A §4B cannot be zero).
 fn validate_cashu_settings(
@@ -187,17 +190,12 @@ fn validate_cashu_settings(
         )));
     }
 
-    let url = reqwest::Url::parse(&cashu.mint_url).map_err(|e| {
-        MostroInternalErr(ServiceError::IOError(format!(
-            "cashu.mint_url ({:?}) is not a valid URL: {e}",
-            cashu.mint_url
-        )))
-    })?;
-    if !crate::util::is_http_or_https(&url) {
-        return Err(MostroInternalErr(ServiceError::IOError(format!(
-            "cashu.mint_url must use http or https, got scheme {:?}",
-            url.scheme()
-        ))));
+    for mint_url in &cashu.mint_urls {
+        normalize_mint_url(mint_url).map_err(|reason| {
+            MostroInternalErr(ServiceError::IOError(format!(
+                "cashu.mint_urls entry {mint_url:?} {reason}"
+            )))
+        })?;
     }
 
     if cashu.escrow_locktime_days < 1 {
@@ -346,6 +344,7 @@ mod tests {
             cashu: None,
             price: None,
             reputation_import: None,
+            payer_history: None,
         }
     }
 
@@ -586,7 +585,7 @@ mod cashu_validation_tests {
     fn enabled(mint_url: &str, days: u32) -> CashuSettings {
         CashuSettings {
             enabled: true,
-            mint_url: mint_url.to_string(),
+            mint_urls: vec![mint_url.to_string()],
             escrow_locktime_days: days,
         }
     }
@@ -622,6 +621,43 @@ mod cashu_validation_tests {
     fn rejects_empty_or_malformed_mint_url() {
         assert!(validate_cashu_settings(Some(&enabled("", 15)), false).is_err());
         assert!(validate_cashu_settings(Some(&enabled("not a url", 15)), false).is_err());
+    }
+
+    #[test]
+    fn accepts_an_empty_mint_list() {
+        // No restriction: the node accepts any mint (issue #1046).
+        let cashu = CashuSettings {
+            enabled: true,
+            ..CashuSettings::default()
+        };
+        assert!(validate_cashu_settings(Some(&cashu), false).is_ok());
+    }
+
+    #[test]
+    fn accepts_several_valid_mints() {
+        let cashu = CashuSettings {
+            enabled: true,
+            mint_urls: vec![
+                "https://mint.example.com".to_string(),
+                "http://localhost:3338".to_string(),
+            ],
+            ..CashuSettings::default()
+        };
+        assert!(validate_cashu_settings(Some(&cashu), false).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_list_with_one_bad_entry() {
+        let cashu = CashuSettings {
+            enabled: true,
+            mint_urls: vec![
+                "https://mint.example.com".to_string(),
+                "ftp://mint.example.com".to_string(),
+            ],
+            ..CashuSettings::default()
+        };
+        let err = validate_cashu_settings(Some(&cashu), false).expect_err("bad entry");
+        assert!(err.to_string().contains("ftp://mint.example.com"));
     }
 
     #[test]
@@ -661,6 +697,7 @@ mod startup_validation_tests {
             cashu: None,
             price: None,
             reputation_import: None,
+            payer_history: None,
         }
     }
 
@@ -694,7 +731,7 @@ mod startup_validation_tests {
         });
         settings.cashu = Some(CashuSettings {
             enabled: true,
-            mint_url: "https://mint.example.com".to_string(),
+            mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 15,
         });
         assert!(validate_mostro_settings(&settings).is_err());

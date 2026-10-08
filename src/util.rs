@@ -625,6 +625,7 @@ async fn prepare_new_order(
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_secs() as i64,
         expires_at: expiry_date,
+        cashu_mint_url: new_order.cashu_mint_url.clone(),
         ..Default::default()
     };
 
@@ -719,11 +720,18 @@ pub async fn send_dm(
     )
     .await?;
 
+    // Payer hashes and histories are identifiers that must stay inside the
+    // encrypted channel; log the action only.
+    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
+        "<payer-history payload redacted>"
+    } else {
+        payload
+    };
     info!(
         "Sending message, Event ID: {} to {} with payload: {:#?}",
         event.id,
         receiver_pubkey.to_hex(),
-        payload
+        logged_payload
     );
 
     if let Ok(client) = get_nostr_client() {

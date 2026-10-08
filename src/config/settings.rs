@@ -1,4 +1,5 @@
 use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
+use crate::config::payer_history::PayerHistorySettings;
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
@@ -44,6 +45,11 @@ pub struct Settings {
     /// section ≡ disabled.
     #[serde(default)]
     pub reputation_import: Option<ReputationImportSettings>,
+    /// Payment-account history / anti-triangulation
+    /// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md`). Absent section ≡
+    /// disabled (D-10).
+    #[serde(default)]
+    pub payer_history: Option<PayerHistorySettings>,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
@@ -190,6 +196,35 @@ impl Settings {
     /// when settings haven't been initialized.
     pub fn is_cashu_enabled() -> bool {
         Self::get_cashu().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// Retrieve the `[payer_history]` configuration from the global
+    /// `MOSTRO_CONFIG`. Returns `None` when the block is absent (treated as
+    /// disabled) and also when the global settings haven't been initialized
+    /// yet, mirroring [`Settings::get_bond`]. Handlers that hold an
+    /// `AppContext` read `ctx.settings().payer_history` instead, so tests
+    /// can enable the feature per context.
+    pub fn get_payer_history() -> Option<&'static PayerHistorySettings> {
+        MOSTRO_CONFIG.get()?.payer_history.as_ref()
+    }
+
+    /// True when `[payer_history]` is present AND explicitly enabled. The
+    /// single gate every payer-history code path must check (D-10).
+    /// Returns `false` when settings haven't been initialized.
+    pub fn is_payer_history_enabled() -> bool {
+        PayerHistorySettings::enabled(Self::get_payer_history())
+    }
+
+    /// True when `fiat-sent` must be preceded by `declare-payer`. Implies
+    /// [`Settings::is_payer_history_enabled`].
+    pub fn payer_declaration_required() -> bool {
+        PayerHistorySettings::declaration_required(Self::get_payer_history())
+    }
+
+    /// `(experienced_min_trades, experienced_min_days)` (D-7), defaults
+    /// `(5, 30)` when the block is absent.
+    pub fn payer_history_experience_thresholds() -> (u32, u32) {
+        PayerHistorySettings::experience_thresholds(Self::get_payer_history())
     }
 
     /// The node-wide escrow mode (locked decision §4.1). `[cashu]` absent

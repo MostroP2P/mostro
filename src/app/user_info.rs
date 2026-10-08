@@ -1,5 +1,5 @@
 use crate::app::context::AppContext;
-use crate::db::is_user_present;
+use crate::db::find_user_by_pubkey;
 use crate::util::{peer_reputation, send_dm};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -21,9 +21,7 @@ pub async fn user_info(
         return Err(MostroCantDo(CantDoReason::ReputationIdentityRequired));
     }
 
-    let user = is_user_present(ctx.pool(), event.identity.to_string())
-        .await
-        .ok();
+    let user = find_user_by_pubkey(ctx.pool(), event.identity.to_string()).await?;
 
     let response = user_info_message(
         user.as_ref(),

@@ -1534,6 +1534,27 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<Us
     Ok(user)
 }
 
+/// Looks up a user by identity pubkey.
+///
+/// Returns `Ok(None)` when no row exists and propagates real database errors.
+pub async fn find_user_by_pubkey(
+    pool: &SqlitePool,
+    public_key: String,
+) -> Result<Option<User>, MostroError> {
+    sqlx::query_as::<_, User>(
+        r#"
+            SELECT *
+            FROM users
+            WHERE pubkey == ?1
+            LIMIT 1
+        "#,
+    )
+    .bind(public_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(

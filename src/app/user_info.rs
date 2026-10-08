@@ -1,6 +1,7 @@
 use crate::app::context::AppContext;
+use crate::config::MESSAGE_QUEUES;
 use crate::db::find_user_by_pubkey;
-use crate::util::{peer_reputation, send_dm};
+use crate::util::peer_reputation;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -8,24 +9,28 @@ use nostr_sdk::prelude::*;
 /// proven identity with a DM to the requesting trade key. Read-only, publishes
 /// nothing.
 ///
-/// An identity Mostro has no record of gets zeros and no `since`, not
-/// `not_found`. A request without an identity proof (full privacy, identity
-/// == trade key) gets `cant-do` `reputation_identity_required`.
+/// An identity with no `users` row (it never created or took an order here)
+/// gets zeros and no `since`, not `not_found`. A request without an identity
+/// proof (full privacy, identity == trade key) gets `cant-do`
+/// `reputation_identity_required`; one whose proof does not verify gets
+/// `invalid_signature` at intake (`accept_event`). A database failure is
+/// logged and gets no reply: the protocol has no reason for it, so the
+/// client's request times out and it may ask again.
+///
+/// The reply is queued for the scheduler rather than sent here, so a slow
+/// relay never holds the event loop (#991).
 pub async fn user_info(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedMessage,
-    my_keys: &Keys,
+    _my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    let response = build_user_info_reply(ctx, &msg, event).await?;
-    let message_json = response
-        .as_json()
-        .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
-
-    if let Err(e) = send_dm(event.sender, my_keys, &message_json, None).await {
-        tracing::error!("Error sending message with user info: {:?}", e);
-    }
-
+    let reply = build_user_info_reply(ctx, &msg, event).await?;
+    MESSAGE_QUEUES
+        .queue_restore_session_msg
+        .write()
+        .await
+        .push((reply, event.sender));
     Ok(())
 }
 
@@ -63,7 +68,7 @@ fn user_info_message(user: Option<&User>, request_id: Option<u64>, now: u64) -> 
 /// filter by destination.
 #[cfg(test)]
 pub(crate) async fn queued_replies_for(to: &PublicKey) -> Vec<Message> {
-    crate::config::MESSAGE_QUEUES
+    MESSAGE_QUEUES
         .queue_restore_session_msg
         .read()
         .await

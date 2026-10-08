@@ -41,6 +41,7 @@ Summary of order lifecycle and key handlers.
 | `admin-add-solver` | https://github.com/MostroP2P/mostro/blob/main/src/app/admin_add_solver.rs | Register dispute solver key. `admin-add-solver` accepts a bare pubkey (defaults to read-write), `pubkey:read`, `pubkey:write` (alias for read-write), or `pubkey:read-write`; see the parser in `admin_add_solver.rs` for the accepted forms |
 | `admin-take-dispute` | https://github.com/MostroP2P/mostro/blob/main/src/app/admin_take_dispute.rs | Assign or take ownership of dispute |
 | `last-trade-index` | https://github.com/MostroP2P/mostro/blob/main/src/app/last_trade_index.rs | Retrieve user's last trade index from database |
+| `user-info` | https://github.com/MostroP2P/mostro/blob/main/src/app/user_info.rs | Return the requester's own reputation (`user_info` payload) to the trade key; zeros for an unknown identity, `reputation_identity_required` without an identity proof |
 
 ## Typical Flow
 1) Maker posts New Order (kind-14 protocol message).

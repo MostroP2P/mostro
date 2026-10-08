@@ -532,7 +532,7 @@ an order"*:
 
 - **Allowed** (route through the existing `handle_message_action_no_ln(...)`;
   read-only / session, never touch escrow, LND, or order lifecycle):
-  **`Orders`**, **`LastTradeIndex`**, **`RestoreSession`**, **`TradePubkey`**.
+  **`Orders`**, **`LastTradeIndex`**, **`UserInfo`**, **`RestoreSession`**, **`TradePubkey`**.
   A Cashu-foundation node can therefore still serve the order book, restore
   sessions, and sync trade indexes — all zero-risk for funds.
 - **Blocked** → `Err(MostroCantDo(CantDoReason::InvalidAction))` — everything that

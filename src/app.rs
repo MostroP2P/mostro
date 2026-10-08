@@ -29,6 +29,7 @@ pub mod serbero; // Serbero, the dispute assistant: boot registration as a read-
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
+pub mod user_info; // Own reputation read
 
 // Import action handlers from submodules
 use crate::app::add_cashu_escrow::add_cashu_escrow_action;
@@ -52,6 +53,7 @@ use crate::app::restore_session::restore_session_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
+use crate::app::user_info::user_info;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
@@ -242,6 +244,9 @@ async fn handle_message_action_no_ln(
         Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
+        Action::UserInfo => user_info(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
 
         // Dispute and rating actions
         Action::Dispute => dispute_action(ctx, msg, event, my_keys)
@@ -397,15 +402,21 @@ async fn accept_event(
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!("Error unwrapping incoming message: {}", e);
+            if !is_stale(event.created_at) {
+                if let Some(request_id) = unverified_user_info_request(event, my_keys) {
+                    enqueue_cant_do_msg(
+                        request_id,
+                        None,
+                        CantDoReason::InvalidSignature,
+                        event.pubkey,
+                    )
+                    .await;
+                }
+            }
             return None;
         }
     };
-    // Discard events older than 10 seconds to prevent replay attacks
-    let since_time = chrono::Utc::now()
-        .checked_sub_signed(chrono::Duration::seconds(10))
-        .unwrap()
-        .timestamp() as u64;
-    if unwrapped.created_at.as_secs() < since_time {
+    if is_stale(unwrapped.created_at) {
         return None;
     }
     let message = unwrapped.message.clone();
@@ -420,6 +431,18 @@ async fn accept_event(
             unwrapped.identity,
             unwrapped.sender
         );
+        // `user_info.md`, Errors: an identity proof that does not verify is
+        // answered `invalid_signature`; other actions stay silent.
+        let kind = message.get_inner_message_kind();
+        if kind.action == Action::UserInfo {
+            enqueue_cant_do_msg(
+                kind.request_id,
+                None,
+                CantDoReason::InvalidSignature,
+                unwrapped.sender,
+            )
+            .await;
+        }
         return None;
     }
 
@@ -451,11 +474,39 @@ async fn accept_event(
         return None;
     }
 
-    if !inner_message.verify() {
+    if !message.verify() {
+        return None;
+    }
+    // Core's verify also admits the `user-info` reply shape; intake takes only the request.
+    if inner_message.action == Action::UserInfo && inner_message.payload.is_some() {
         return None;
     }
     let action = message.inner_action()?;
     Some((action, message, unwrapped))
+}
+
+/// Events older than 10 seconds are discarded to prevent replay attacks.
+fn is_stale(created_at: Timestamp) -> bool {
+    let since_time = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::seconds(10))
+        .unwrap()
+        .timestamp() as u64;
+    created_at.as_secs() < since_time
+}
+
+/// The `request_id` of a `user-info` request that `unwrap_incoming`
+/// refused, so it can be answered `cant-do` `invalid_signature`
+/// (`user_info.md`, Errors). Core returns no message on a failed proof, so
+/// the tuple is opened again here only far enough to read the action. The
+/// reply goes to the event author, so the event signature must verify;
+/// `None` for anything else, which keeps being dropped silently.
+fn unverified_user_info_request(event: &Event, my_keys: &Keys) -> Option<Option<u64>> {
+    event.verify().ok()?;
+    let plaintext = nip44::decrypt(my_keys.secret_key(), &event.pubkey, &event.content).ok()?;
+    let (message, _, _): (Message, serde_json::Value, serde_json::Value) =
+        serde_json::from_str(&plaintext).ok()?;
+    let kind = message.get_inner_message_kind();
+    (kind.action == Action::UserInfo).then_some(kind.request_id)
 }
 
 /// Actions that can tie the sender's trade key to an order (creator or taker)
@@ -627,7 +678,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 ///
 /// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
 ///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
-///   `RestoreSession`, `TradePubkey`.
+///   `UserInfo`, `RestoreSession`, `TradePubkey`.
 /// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
 ///   fills in). Frozen here so Track A edits only its own file (G-1).
 /// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
@@ -643,7 +694,11 @@ async fn dispatch_cashu(
 ) -> Result<()> {
     match action {
         // Escrow-independent, read-only / session actions — safe in Cashu mode.
-        Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
+        Action::Orders
+        | Action::LastTradeIndex
+        | Action::UserInfo
+        | Action::RestoreSession
+        | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -700,6 +755,22 @@ mod tests {
             .with_pool(pool)
             .with_settings(crate::app::context::test_utils::test_settings())
             .build()
+    }
+
+    /// The `CantDo` reasons queued for `to` (the queue is process-global,
+    /// so filter by destination).
+    async fn cant_do_reasons_for(to: &PublicKey) -> Vec<CantDoReason> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_cantdo
+            .read()
+            .await
+            .iter()
+            .filter(|(_, dest)| dest == to)
+            .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                Some(mostro_core::prelude::Payload::CantDo(Some(r))) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     // Helper function to create an UnwrappedMessage for testing. Identity and
@@ -1070,6 +1141,7 @@ mod tests {
             for action in [
                 Action::Orders,
                 Action::LastTradeIndex,
+                Action::UserInfo,
                 Action::RestoreSession,
                 Action::FiatSent,
             ] {
@@ -1146,9 +1218,7 @@ mod tests {
     /// persist nothing; everything else passes through unchanged.
     mod maintenance_gate_tests {
         use super::*;
-        use crate::config::MESSAGE_QUEUES;
         use crate::db::is_user_present;
-        use mostro_core::prelude::Payload;
         use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A kind-14 event in full-privacy mode (trade key doubles as
@@ -1184,22 +1254,6 @@ mod tests {
             .is_some()
         }
 
-        /// The `CantDo` reasons queued for `to` (the queue is process-global,
-        /// so filter by destination).
-        async fn cant_do_reasons_for(to: &PublicKey) -> Vec<CantDoReason> {
-            MESSAGE_QUEUES
-                .queue_order_cantdo
-                .read()
-                .await
-                .iter()
-                .filter(|(_, dest)| dest == to)
-                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
-                    Some(Payload::CantDo(Some(r))) => Some(r.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
-
         async fn enabled_ctx() -> AppContext {
             let ctx = create_migrated_ctx().await;
             ctx.maintenance()
@@ -1228,7 +1282,7 @@ mod tests {
             }
         }
 
-        /// Payload-less test messages only pass `inner_message.verify()` for
+        /// Payload-less test messages only pass `message.verify()` for
         /// some actions (`FiatSent` does), so the positive acceptance is
         /// pinned on that one and the rest are checked for the absence of a
         /// `CantDo` — which is all the gate can produce.
@@ -1255,6 +1309,7 @@ mod tests {
                 Action::RestoreSession,
                 Action::TradePubkey,
                 Action::LastTradeIndex,
+                Action::UserInfo,
                 Action::AdminCancel,
                 Action::AdminSettle,
             ] {
@@ -1335,6 +1390,225 @@ mod tests {
                 cant_do_reasons_for(&trade.public_key()).await,
                 vec![CantDoReason::MaintenanceMode]
             );
+        }
+    }
+
+    /// [`accept_event`] admits `user-info` only in its request form:
+    /// `restore` wrapper, no order id, no payload.
+    mod user_info_intake_tests {
+        use super::*;
+        use mostro_core::prelude::{MessageKind, Payload};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        fn kind(id: Option<uuid::Uuid>, payload: Option<Payload>) -> MessageKind {
+            MessageKind::new(id, Some(1), None, Action::UserInfo, payload)
+        }
+
+        async fn accepted(message: Message) -> bool {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+            let event = wrap_message_nip44(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event");
+            accept_event(
+                &ctx,
+                &event,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        #[tokio::test]
+        async fn request_in_restore_wrapper_is_accepted() {
+            assert!(accepted(Message::Restore(kind(None, None))).await);
+        }
+
+        /// The request the handler actually answers: a separate identity key
+        /// proving the request, plus the trade signature.
+        #[tokio::test]
+        async fn reputation_mode_request_is_accepted_with_its_identity() {
+            let ctx = create_migrated_ctx().await;
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let event = wrap_message_nip44(
+                &Message::Restore(kind(None, None)),
+                &identity,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event");
+
+            let (action, _, unwrapped) = accept_event(
+                &ctx,
+                &event,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .expect("a reputation-mode user-info request must be accepted");
+
+            assert_eq!(action, Action::UserInfo);
+            assert_eq!(unwrapped.identity, identity.public_key());
+            assert_eq!(unwrapped.sender, trade.public_key());
+        }
+
+        /// A kind-14 event whose tuple carries the given trade signature and
+        /// identity proof, built by hand so either can be wrong or missing.
+        fn raw_event(
+            message: &Message,
+            trade: &Keys,
+            mostro: &PublicKey,
+            trade_sig: Option<String>,
+            identity_proof: Option<(String, String)>,
+        ) -> nostr_sdk::prelude::Event {
+            use nostr_sdk::prelude::{nip44, EventBuilder, Kind, Tag};
+            let tuple = serde_json::to_string(&(message, trade_sig, identity_proof)).unwrap();
+            let content =
+                nip44::encrypt(trade.secret_key(), mostro, tuple, nip44::Version::default())
+                    .unwrap();
+            EventBuilder::new(Kind::PrivateDirectMessage, content)
+                .tags([Tag::public_key(*mostro)])
+                .finalize(trade)
+                .unwrap()
+        }
+
+        async fn accept_raw(event: &nostr_sdk::prelude::Event, mostro: &Keys) -> bool {
+            let ctx = create_migrated_ctx().await;
+            accept_event(
+                &ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        /// The identity's signature over the v2 proof payload
+        /// (`mostro-transport-v2-identity:<trade hex>:<message json>`).
+        fn identity_sig(message: &Message, trade: &Keys, signer: &Keys) -> String {
+            let payload = format!(
+                "mostro-transport-v2-identity:{}:{}",
+                trade.public_key().to_hex(),
+                message.as_json().unwrap()
+            );
+            Message::sign(payload, signer).to_string()
+        }
+
+        /// `user_info.md`, Errors: "`invalid_signature`: the identity proof
+        /// does not verify."
+        #[tokio::test]
+        async fn identity_proof_that_does_not_verify_gets_invalid_signature() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let trade_sig = Message::sign(message.as_json().unwrap(), &trade).to_string();
+            // Signed by another key than the identity it names.
+            let forged = identity_sig(&message, &trade, &create_test_keys());
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                Some(trade_sig),
+                Some((identity.public_key().to_hex(), forged)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidSignature]
+            );
+        }
+
+        #[tokio::test]
+        async fn identity_proof_without_trade_signature_gets_invalid_signature() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let proof = identity_sig(&message, &trade, &identity);
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                None,
+                Some((identity.public_key().to_hex(), proof)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidSignature]
+            );
+        }
+
+        /// The spec defines the answer for `user-info` only; every other
+        /// action with a bad proof is still dropped without a reply.
+        #[tokio::test]
+        async fn other_actions_with_a_bad_proof_get_no_reply() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(MessageKind::new(
+                None,
+                Some(1),
+                None,
+                Action::LastTradeIndex,
+                None,
+            ));
+            let trade_sig = Message::sign(message.as_json().unwrap(), &trade).to_string();
+            let forged = identity_sig(&message, &trade, &create_test_keys());
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                Some(trade_sig),
+                Some((identity.public_key().to_hex(), forged)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn user_info_outside_restore_wrapper_is_dropped() {
+            for message in [
+                Message::Order(kind(None, None)),
+                Message::Dispute(kind(None, None)),
+                Message::Dm(kind(None, None)),
+                Message::Rate(kind(None, None)),
+                Message::CantDo(kind(None, None)),
+            ] {
+                assert!(!accepted(message.clone()).await, "{message:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn user_info_with_an_order_id_is_dropped() {
+            let message = Message::Restore(kind(Some(uuid::Uuid::new_v4()), None));
+            assert!(!accepted(message).await);
+        }
+
+        #[tokio::test]
+        async fn reply_shaped_user_info_is_dropped() {
+            let reply = Payload::UserInfo(crate::util::peer_reputation(None, 0));
+            assert!(!accepted(Message::Restore(kind(None, Some(reply)))).await);
         }
     }
 
@@ -1553,6 +1827,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn routes_user_info_to_handler_and_returns_ok() {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let mut event = create_test_unwrapped_message();
+            // The only shape intake admits: `restore`, no order id, no payload.
+            let msg = Message::Restore(mostro_core::prelude::MessageKind::new(
+                None,
+                Some(7),
+                None,
+                Action::UserInfo,
+                None,
+            ));
+            event.message = msg.clone();
+
+            let result =
+                handle_message_action_no_ln(&Action::UserInfo, msg, &event, &my_keys, &ctx).await;
+
+            // An unknown identity is answered with zeros, not an error.
+            assert!(result.is_ok(), "UserInfo must succeed: {result:?}");
+            let replies = crate::app::user_info::queued_replies_for(&event.sender).await;
+            assert_eq!(replies.len(), 1, "one reply to the trade key: {replies:?}");
+            let kind = replies[0].get_inner_message_kind();
+            assert!(matches!(replies[0], Message::Restore(_)));
+            assert_eq!(kind.action, Action::UserInfo);
+            assert_eq!(kind.request_id, Some(7));
+        }
+
+        #[tokio::test]
         async fn routes_restore_session_to_handler_and_returns_ok() {
             let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
             sqlx::migrate!("./migrations")
@@ -1723,10 +2037,11 @@ mod tests {
             }
         }
 
-        /// The allow-list (`Orders`, `LastTradeIndex`, `RestoreSession`,
-        /// `TradePubkey`) is routed to `handle_message_action_no_ln`. We assert
-        /// routing by observing that `RestoreSession` reaches its handler and
-        /// returns `Ok` — proving it was NOT short-circuited to `InvalidAction`.
+        /// The allow-list (`Orders`, `LastTradeIndex`, `UserInfo`,
+        /// `RestoreSession`, `TradePubkey`) is routed to
+        /// `handle_message_action_no_ln`. We assert routing by observing that
+        /// `RestoreSession` reaches its handler and returns `Ok` — proving it
+        /// was NOT short-circuited to `InvalidAction`.
         #[tokio::test]
         async fn allows_restore_session_through_no_ln_router() {
             let ctx = create_migrated_ctx().await;

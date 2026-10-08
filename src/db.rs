@@ -1517,8 +1517,25 @@ pub async fn find_solver_pubkey(
     Ok(user)
 }
 
+/// Looks up a user that must exist: a missing row is an error, reported as
+/// sqlx's `RowNotFound` like any other database failure. Callers that need
+/// to tell the two apart use [`find_user_by_pubkey`].
 pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
-    let user = sqlx::query_as::<_, User>(
+    find_user_by_pubkey(pool, public_key).await?.ok_or_else(|| {
+        MostroInternalErr(ServiceError::DbAccessError(
+            sqlx::Error::RowNotFound.to_string(),
+        ))
+    })
+}
+
+/// Looks up a user by identity pubkey.
+///
+/// Returns `Ok(None)` when no row exists and propagates real database errors.
+pub async fn find_user_by_pubkey(
+    pool: &SqlitePool,
+    public_key: String,
+) -> Result<Option<User>, MostroError> {
+    sqlx::query_as::<_, User>(
         r#"
             SELECT *
             FROM users
@@ -1527,11 +1544,9 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<Us
         "#,
     )
     .bind(public_key)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    Ok(user)
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {

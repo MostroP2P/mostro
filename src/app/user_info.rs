@@ -17,17 +17,7 @@ pub async fn user_info(
     event: &UnwrappedMessage,
     my_keys: &Keys,
 ) -> Result<(), MostroError> {
-    if event.identity == event.sender {
-        return Err(MostroCantDo(CantDoReason::ReputationIdentityRequired));
-    }
-
-    let user = find_user_by_pubkey(ctx.pool(), event.identity.to_string()).await?;
-
-    let response = user_info_message(
-        user.as_ref(),
-        msg.get_inner_message_kind().request_id,
-        Timestamp::now().as_secs(),
-    );
+    let response = build_user_info_reply(ctx, &msg, event).await?;
     let message_json = response
         .as_json()
         .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?;
@@ -37,6 +27,25 @@ pub async fn user_info(
     }
 
     Ok(())
+}
+
+/// Builds the `user-info` reply for a validated request without publishing it.
+async fn build_user_info_reply(
+    ctx: &AppContext,
+    msg: &Message,
+    event: &UnwrappedMessage,
+) -> Result<Message, MostroError> {
+    if event.identity == event.sender {
+        return Err(MostroCantDo(CantDoReason::ReputationIdentityRequired));
+    }
+
+    let user = find_user_by_pubkey(ctx.pool(), event.identity.to_string()).await?;
+
+    Ok(user_info_message(
+        user.as_ref(),
+        msg.get_inner_message_kind().request_id,
+        Timestamp::now().as_secs(),
+    ))
 }
 
 /// The `user-info` reply: the same `UserInfo` a counterpart gets in `peer`.

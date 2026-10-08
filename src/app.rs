@@ -715,6 +715,22 @@ mod tests {
             .build()
     }
 
+    /// The `CantDo` reasons queued for `to` (the queue is process-global,
+    /// so filter by destination).
+    async fn cant_do_reasons_for(to: &PublicKey) -> Vec<CantDoReason> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_cantdo
+            .read()
+            .await
+            .iter()
+            .filter(|(_, dest)| dest == to)
+            .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                Some(mostro_core::prelude::Payload::CantDo(Some(r))) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     // Helper function to create an UnwrappedMessage for testing. Identity and
     // sender (trade key) are distinct to mirror the canonical Mostro flow.
     fn create_test_unwrapped_message() -> UnwrappedMessage {
@@ -1160,9 +1176,7 @@ mod tests {
     /// persist nothing; everything else passes through unchanged.
     mod maintenance_gate_tests {
         use super::*;
-        use crate::config::MESSAGE_QUEUES;
         use crate::db::is_user_present;
-        use mostro_core::prelude::Payload;
         use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
         /// A kind-14 event in full-privacy mode (trade key doubles as
@@ -1196,22 +1210,6 @@ mod tests {
             )
             .await
             .is_some()
-        }
-
-        /// The `CantDo` reasons queued for `to` (the queue is process-global,
-        /// so filter by destination).
-        async fn cant_do_reasons_for(to: &PublicKey) -> Vec<CantDoReason> {
-            MESSAGE_QUEUES
-                .queue_order_cantdo
-                .read()
-                .await
-                .iter()
-                .filter(|(_, dest)| dest == to)
-                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
-                    Some(Payload::CantDo(Some(r))) => Some(r.clone()),
-                    _ => None,
-                })
-                .collect()
         }
 
         async fn enabled_ctx() -> AppContext {
@@ -1392,6 +1390,158 @@ mod tests {
         #[tokio::test]
         async fn request_in_restore_wrapper_is_accepted() {
             assert!(accepted(Message::Restore(kind(None, None))).await);
+        }
+
+        /// The request the handler actually answers: a separate identity key
+        /// proving the request, plus the trade signature.
+        #[tokio::test]
+        async fn reputation_mode_request_is_accepted_with_its_identity() {
+            let ctx = create_migrated_ctx().await;
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let event = wrap_message_nip44(
+                &Message::Restore(kind(None, None)),
+                &identity,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event");
+
+            let (action, _, unwrapped) = accept_event(
+                &ctx,
+                &event,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .expect("a reputation-mode user-info request must be accepted");
+
+            assert_eq!(action, Action::UserInfo);
+            assert_eq!(unwrapped.identity, identity.public_key());
+            assert_eq!(unwrapped.sender, trade.public_key());
+        }
+
+        /// A kind-14 event whose tuple carries the given trade signature and
+        /// identity proof, built by hand so either can be wrong or missing.
+        fn raw_event(
+            message: &Message,
+            trade: &Keys,
+            mostro: &PublicKey,
+            trade_sig: Option<String>,
+            identity_proof: Option<(String, String)>,
+        ) -> nostr_sdk::prelude::Event {
+            use nostr_sdk::prelude::{nip44, EventBuilder, Kind, Tag};
+            let tuple = serde_json::to_string(&(message, trade_sig, identity_proof)).unwrap();
+            let content =
+                nip44::encrypt(trade.secret_key(), mostro, tuple, nip44::Version::default())
+                    .unwrap();
+            EventBuilder::new(Kind::PrivateDirectMessage, content)
+                .tags([Tag::public_key(*mostro)])
+                .finalize(trade)
+                .unwrap()
+        }
+
+        async fn accept_raw(event: &nostr_sdk::prelude::Event, mostro: &Keys) -> bool {
+            let ctx = create_migrated_ctx().await;
+            accept_event(
+                &ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        /// The identity's signature over the v2 proof payload
+        /// (`mostro-transport-v2-identity:<trade hex>:<message json>`).
+        fn identity_sig(message: &Message, trade: &Keys, signer: &Keys) -> String {
+            let payload = format!(
+                "mostro-transport-v2-identity:{}:{}",
+                trade.public_key().to_hex(),
+                message.as_json().unwrap()
+            );
+            Message::sign(payload, signer).to_string()
+        }
+
+        /// `user_info.md`, Errors: "`invalid_signature`: the identity proof
+        /// does not verify."
+        #[tokio::test]
+        async fn identity_proof_that_does_not_verify_gets_invalid_signature() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let trade_sig = Message::sign(message.as_json().unwrap(), &trade).to_string();
+            // Signed by another key than the identity it names.
+            let forged = identity_sig(&message, &trade, &create_test_keys());
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                Some(trade_sig),
+                Some((identity.public_key().to_hex(), forged)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidSignature]
+            );
+        }
+
+        #[tokio::test]
+        async fn identity_proof_without_trade_signature_gets_invalid_signature() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let proof = identity_sig(&message, &trade, &identity);
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                None,
+                Some((identity.public_key().to_hex(), proof)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidSignature]
+            );
+        }
+
+        /// The spec defines the answer for `user-info` only; every other
+        /// action with a bad proof is still dropped without a reply.
+        #[tokio::test]
+        async fn other_actions_with_a_bad_proof_get_no_reply() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(MessageKind::new(
+                None,
+                Some(1),
+                None,
+                Action::LastTradeIndex,
+                None,
+            ));
+            let trade_sig = Message::sign(message.as_json().unwrap(), &trade).to_string();
+            let forged = identity_sig(&message, &trade, &create_test_keys());
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                Some(trade_sig),
+                Some((identity.public_key().to_hex(), forged)),
+            );
+
+            assert!(!accept_raw(&event, &mostro).await);
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
         }
 
         #[tokio::test]
@@ -1650,14 +1800,28 @@ mod tests {
                 .build();
 
             let my_keys = create_test_keys();
-            let event = create_test_unwrapped_message();
-            let msg = create_test_message(Action::UserInfo, None);
+            let mut event = create_test_unwrapped_message();
+            // The only shape intake admits: `restore`, no order id, no payload.
+            let msg = Message::Restore(mostro_core::prelude::MessageKind::new(
+                None,
+                Some(7),
+                None,
+                Action::UserInfo,
+                None,
+            ));
+            event.message = msg.clone();
 
             let result =
                 handle_message_action_no_ln(&Action::UserInfo, msg, &event, &my_keys, &ctx).await;
 
             // An unknown identity is answered with zeros, not an error.
             assert!(result.is_ok(), "UserInfo must succeed: {result:?}");
+            let replies = crate::app::user_info::queued_replies_for(&event.sender).await;
+            assert_eq!(replies.len(), 1, "one reply to the trade key: {replies:?}");
+            let kind = replies[0].get_inner_message_kind();
+            assert!(matches!(replies[0], Message::Restore(_)));
+            assert_eq!(kind.action, Action::UserInfo);
+            assert_eq!(kind.request_id, Some(7));
         }
 
         #[tokio::test]

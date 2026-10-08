@@ -59,6 +59,20 @@ fn user_info_message(user: Option<&User>, request_id: Option<u64>, now: u64) -> 
     ))
 }
 
+/// The `user-info` replies queued for `to`. The queue is process-global, so
+/// filter by destination.
+#[cfg(test)]
+pub(crate) async fn queued_replies_for(to: &PublicKey) -> Vec<Message> {
+    crate::config::MESSAGE_QUEUES
+        .queue_restore_session_msg
+        .read()
+        .await
+        .iter()
+        .filter(|(m, dest)| dest == to && m.get_inner_message_kind().action == Action::UserInfo)
+        .map(|(m, _)| m.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +98,24 @@ mod tests {
             identity: identity.public_key(),
             created_at: Timestamp::now(),
         }
+    }
+
+    /// The reply is queued for the scheduler, addressed to the trade key
+    /// that sent the request, not sent inline on the event loop.
+    #[tokio::test]
+    async fn reply_is_queued_for_the_trade_key() {
+        let ctx = test_ctx(setup_test_db().await);
+        let (identity, trade) = (create_test_keys(), create_test_keys());
+        let event = create_test_unwrapped_message(&identity, &trade);
+
+        user_info(&ctx, event.message.clone(), &event, &create_test_keys())
+            .await
+            .expect("unknown identity must be answered");
+
+        let replies = queued_replies_for(&trade.public_key()).await;
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].get_inner_message_kind().action, Action::UserInfo);
+        assert!(queued_replies_for(&identity.public_key()).await.is_empty());
     }
 
     fn reply_info(msg: &Message) -> UserInfo {

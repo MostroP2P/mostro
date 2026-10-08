@@ -250,7 +250,8 @@ impl Default for CashuSettings {
 /// import. Never rename an entry.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ReputationIssuer {
-    /// Stable local name of the issuer, e.g. `"lnp2pbot"`.
+    /// Stable local name of the issuer, e.g. `"lnp2pbot"`, without leading
+    /// or trailing spaces.
     pub name: String,
     /// The issuer's signing keys, npub or hex: its current key, and during a
     /// planned rotation the previous one until its attestations expire.
@@ -278,7 +279,8 @@ pub struct ReputationImportSettings {
     #[serde(default)]
     pub enabled: bool,
     /// Longest an attestation may live (`expiration - created_at`), in
-    /// seconds. Caps a faulty or compromised issuer. Must be > 0.
+    /// seconds. Caps a faulty or compromised issuer. Must be > 0 and at most
+    /// `MAX_REPUTATION_LIFETIME_SECONDS` (30 days).
     #[serde(default = "default_reputation_max_lifetime_seconds")]
     pub max_lifetime_seconds: u64,
     /// The trusted issuers. Names are unique, and a key belongs to one entry

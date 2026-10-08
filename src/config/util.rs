@@ -3,7 +3,9 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::cashu::mint_policy::normalize_mint_url;
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::constants::{
+    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MAX_REPUTATION_LIFETIME_SECONDS, MIN_DEV_FEE_PERCENTAGE,
+};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
 use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
@@ -114,6 +116,12 @@ fn validate_reputation_import(
     if import.max_lifetime_seconds == 0 {
         return fail("max_lifetime_seconds must be greater than 0".to_string());
     }
+    if import.max_lifetime_seconds > MAX_REPUTATION_LIFETIME_SECONDS {
+        return fail(format!(
+            "max_lifetime_seconds ({}) exceeds the maximum ({MAX_REPUTATION_LIFETIME_SECONDS}, 30 days)",
+            import.max_lifetime_seconds
+        ));
+    }
     let mut names = std::collections::HashSet::new();
     let mut owners: std::collections::HashMap<nostr_sdk::prelude::PublicKey, &str> =
         std::collections::HashMap::new();
@@ -121,6 +129,14 @@ fn validate_reputation_import(
         let name = issuer.name.trim();
         if name.is_empty() {
             return fail("an issuer has an empty name".to_string());
+        }
+        // The name is the deduplication key and is recorded as written, so
+        // it must not differ from its trimmed form.
+        if name != issuer.name {
+            return fail(format!(
+                "issuer name `{}` has leading or trailing spaces",
+                issuer.name
+            ));
         }
         if !names.insert(name) {
             return fail(format!("issuer name `{name}` is used twice"));
@@ -582,7 +598,7 @@ mod reputation_import_validation_tests {
     /// 7-day default (70 days) must not load silently.
     #[test]
     fn the_lifetime_cap_is_at_most_thirty_days() {
-        let thirty_days = 30 * 24 * 60 * 60;
+        let thirty_days = MAX_REPUTATION_LIFETIME_SECONDS;
         let cap = |max_lifetime_seconds| ReputationImportSettings {
             max_lifetime_seconds,
             ..Default::default()

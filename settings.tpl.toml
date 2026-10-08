@@ -334,6 +334,7 @@ port = 50051
 # [reputation_import]
 # enabled = false
 # # Longest an attestation may live (expiration - created_at), in seconds.
+# # At most 2592000 (30 days).
 # max_lifetime_seconds = 604800
 #
 # [[reputation_import.issuers]]

@@ -534,6 +534,29 @@ mod reputation_import_validation_tests {
         .contains("used twice"));
     }
 
+    /// The name is what imports are deduplicated on, so it is kept exactly as
+    /// written: a padded name would be recorded padded and later clash with
+    /// the trimmed one at the boot check.
+    #[test]
+    fn a_name_with_surrounding_spaces_is_refused() {
+        let key = || vec![Keys::generate().public_key().to_hex()];
+        for name in [" lnp2pbot", "lnp2pbot ", "\tlnp2pbot"] {
+            assert!(
+                reason(validate_reputation_import(&import(vec![(name, key())]))).contains("spaces"),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_with_surrounding_spaces_is_read_trimmed() {
+        let key = Keys::generate().public_key();
+        let settings = import(vec![("lnp2pbot", vec![format!(" {} ", key.to_hex())])]);
+        assert!(validate_reputation_import(&settings).is_ok());
+        assert_eq!(settings.trusted_keys(), vec![key]);
+        assert_eq!(settings.issuer_for(&key), Some(&settings.issuers[0]));
+    }
+
     #[test]
     fn keys_must_be_present_and_parse() {
         assert!(
@@ -553,6 +576,35 @@ mod reputation_import_validation_tests {
             ..Default::default()
         };
         assert!(reason(validate_reputation_import(&settings)).contains("max_lifetime_seconds"));
+    }
+
+    /// A cap of years would defeat its purpose; an extra digit on the
+    /// 7-day default (70 days) must not load silently.
+    #[test]
+    fn the_lifetime_cap_is_at_most_thirty_days() {
+        let thirty_days = 30 * 24 * 60 * 60;
+        let cap = |max_lifetime_seconds| ReputationImportSettings {
+            max_lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_import(&cap(thirty_days)).is_ok());
+        for too_long in [thirty_days + 1, 6_048_000, u64::MAX] {
+            assert!(
+                reason(validate_reputation_import(&cap(too_long))).contains("max_lifetime_seconds"),
+                "{too_long} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_section_is_disabled() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            reputation_import: ReputationImportSettings,
+        }
+        let stub: Stub = toml::from_str("[reputation_import]\n").unwrap();
+        assert_eq!(stub.reputation_import, ReputationImportSettings::default());
+        assert!(!stub.reputation_import.enabled);
     }
 
     #[test]
@@ -704,6 +756,27 @@ mod startup_validation_tests {
     #[test]
     fn default_settings_pass_validation() {
         assert!(validate_mostro_settings(&base_settings()).is_ok());
+    }
+
+    /// Goes through `validate_mostro_settings`, as the daemon does, so
+    /// dropping the `[reputation_import]` check from startup is caught.
+    #[test]
+    fn a_key_listed_under_two_issuers_stops_the_load() {
+        use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+        let key = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let issuer = |name: &str| ReputationIssuer {
+            name: name.to_string(),
+            keys: vec![key.clone()],
+        };
+        let mut settings = base_settings();
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![issuer("lnp2pbot"), issuer("renamed")],
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings)
+            .expect_err("a key under two issuers must stop the load");
+        assert!(err.to_string().contains("one issuer only"));
     }
 
     #[test]

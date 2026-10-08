@@ -202,6 +202,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn users_lookup_error_is_propagated_not_answered_as_unknown() {
+        let pool = setup_test_db().await;
+        let identity = create_test_keys();
+        let event = create_test_unwrapped_message(&identity, &create_test_keys());
+        let ctx = test_ctx(pool.clone());
+        pool.close().await;
+
+        let result = user_info(&ctx, event.message.clone(), &event, &identity).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+            ),
+            "a database failure must not be answered as an unknown identity: {result:?}"
+        );
+    }
+
     #[test]
     fn reply_carries_the_peer_reputation_and_echoes_request_id() {
         let created_at = 1_700_000_000 + 3600;

@@ -1282,7 +1282,7 @@ mod tests {
             }
         }
 
-        /// Payload-less test messages only pass `inner_message.verify()` for
+        /// Payload-less test messages only pass `message.verify()` for
         /// some actions (`FiatSent` does), so the positive acceptance is
         /// pinned on that one and the rest are checked for the absence of a
         /// `CantDo` — which is all the gate can produce.

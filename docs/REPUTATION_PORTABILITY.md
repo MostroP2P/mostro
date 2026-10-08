@@ -431,15 +431,16 @@ Day precision carries exactly the information `days` carries today.
 Clients compute the age at display time. The merge rule in section 6 becomes
 `since = min(since_local, since_imported)`.
 
-The day count is exposed in **three** places today, and all three change:
+The day count is exposed in **four** places today, and all four change:
 
 | Site | Today | Owner |
 |---|---|---|
 | `rating` tag on order events | `days` inside the JSON built by `create_rating_tag` | mostro |
 | kind 38384 rating event | `days` tag pushed by `rate_user` next to `Rating::to_tags()` | mostro; `Rating` itself has no date field |
 | `Peer` payload sent to the counterparty | `UserInfo.operating_days`, filled in `util.rs` | mostro-core type, mostro fills it |
+| `user-info` reply to the user's own request | `UserInfo.operating_days`, the same `peer_reputation` in `util.rs` | mostro-core type, mostro fills it |
 
-The daemon publishes both `days` and `since` at all three sites, and drops
+The daemon publishes both `days` and `since` at all four sites, and drops
 `days` only as the very last step of the rollout (section 9, phase 7). The
 window is not counted in releases: an operator decides when a daemon updates,
 but nobody decides when users update their apps, and a client that predates

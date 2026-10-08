@@ -18,6 +18,7 @@ pub mod cancel; // User order cancellation
 pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
+pub mod get_user_info;
 pub mod last_trade_index;
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
@@ -42,6 +43,7 @@ use crate::app::cancel::cancel_action;
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
+use crate::app::get_user_info::get_user_info;
 use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
 use crate::app::orders::orders_action;
@@ -240,6 +242,9 @@ async fn handle_message_action_no_ln(
             .map_err(|e| e.into()),
         Action::PayInvoice => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
         Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
+        Action::GetUserInfo => get_user_info(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
@@ -627,7 +632,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 ///
 /// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
 ///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
-///   `RestoreSession`, `TradePubkey`.
+///   `GetUserInfo`, `RestoreSession`, `TradePubkey`.
 /// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
 ///   fills in). Frozen here so Track A edits only its own file (G-1).
 /// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
@@ -643,7 +648,11 @@ async fn dispatch_cashu(
 ) -> Result<()> {
     match action {
         // Escrow-independent, read-only / session actions — safe in Cashu mode.
-        Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
+        Action::Orders
+        | Action::LastTradeIndex
+        | Action::GetUserInfo
+        | Action::RestoreSession
+        | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -1070,6 +1079,7 @@ mod tests {
             for action in [
                 Action::Orders,
                 Action::LastTradeIndex,
+                Action::GetUserInfo,
                 Action::RestoreSession,
                 Action::FiatSent,
             ] {
@@ -1255,6 +1265,7 @@ mod tests {
                 Action::RestoreSession,
                 Action::TradePubkey,
                 Action::LastTradeIndex,
+                Action::GetUserInfo,
                 Action::AdminCancel,
                 Action::AdminSettle,
             ] {
@@ -1553,6 +1564,33 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn routes_get_user_info_to_handler_and_returns_ok() {
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+            let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(test_settings())
+                .build();
+
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+            let msg = create_test_message(Action::GetUserInfo, None);
+
+            let result =
+                handle_message_action_no_ln(&Action::GetUserInfo, msg, &event, &my_keys, &ctx)
+                    .await;
+
+            // Unknown identity replies with payload None and Ok (optional UserInfo).
+            assert!(result.is_ok(), "GetUserInfo must succeed: {result:?}");
+        }
+
+        #[tokio::test]
         async fn routes_restore_session_to_handler_and_returns_ok() {
             let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
             sqlx::migrate!("./migrations")
@@ -1723,10 +1761,11 @@ mod tests {
             }
         }
 
-        /// The allow-list (`Orders`, `LastTradeIndex`, `RestoreSession`,
-        /// `TradePubkey`) is routed to `handle_message_action_no_ln`. We assert
-        /// routing by observing that `RestoreSession` reaches its handler and
-        /// returns `Ok` — proving it was NOT short-circuited to `InvalidAction`.
+        /// The allow-list (`Orders`, `LastTradeIndex`, `GetUserInfo`,
+        /// `RestoreSession`, `TradePubkey`) is routed to
+        /// `handle_message_action_no_ln`. We assert routing by observing that
+        /// `RestoreSession` reaches its handler and returns `Ok` — proving it
+        /// was NOT short-circuited to `InvalidAction`.
         #[tokio::test]
         async fn allows_restore_session_through_no_ln_router() {
             let ctx = create_migrated_ctx().await;

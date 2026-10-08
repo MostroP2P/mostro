@@ -71,7 +71,8 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.17.1", features = ["sqlx"] }
+# TEMPORARY: until GetUserInfo ships in a mostro-core crates.io release.
+mostro-core = { git = "https://github.com/MostroP2P/mostro-core", branch = "feat/get-user-info", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

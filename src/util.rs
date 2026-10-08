@@ -2282,7 +2282,7 @@ pub fn first_trade_since(created_at: i64) -> Option<u64> {
 /// Reputation sent to the counterparty in the `Peer` payload; zeroed for a
 /// user Mostro does not know. `operating_days` stays next to `since` for the
 /// deprecation window.
-fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
+pub(crate) fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
     match user {
         Some(user) => UserInfo {
             rating: user.total_rating,

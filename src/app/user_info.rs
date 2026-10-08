@@ -62,8 +62,8 @@ fn user_info_message(user: Option<&User>, request_id: Option<u64>, now: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::first_trade_since;
     use nostr_sdk::prelude::{Keys, Timestamp};
-    use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
 
     fn create_test_keys() -> Keys {
@@ -94,35 +94,8 @@ mod tests {
     }
 
     async fn setup_test_db() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS users (
-                pubkey CHAR(64) PRIMARY KEY NOT NULL,
-                is_admin INTEGER NOT NULL DEFAULT 0,
-                admin_password CHAR(64),
-                is_solver INTEGER NOT NULL DEFAULT 0,
-                is_banned INTEGER NOT NULL DEFAULT 0,
-                category INTEGER NOT NULL DEFAULT 0,
-                last_trade_index INTEGER NOT NULL DEFAULT 0,
-                total_reviews INTEGER NOT NULL DEFAULT 0,
-                total_rating REAL NOT NULL DEFAULT 0.0,
-                last_rating INTEGER NOT NULL DEFAULT 0,
-                max_rating INTEGER NOT NULL DEFAULT 0,
-                min_rating INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
     }
 
@@ -177,12 +150,20 @@ mod tests {
         let identity = create_test_keys();
         let event = create_test_unwrapped_message(&identity, &create_test_keys());
 
-        let result = user_info(&ctx, event.message.clone(), &event, &identity).await;
+        let reply = build_user_info_reply(&ctx, &event.message, &event)
+            .await
+            .expect("unknown identity must not be an error");
 
-        assert!(
-            result.is_ok(),
-            "unknown identity must not be an error: {result:?}"
-        );
+        assert!(reply.verify());
+        let kind = reply.get_inner_message_kind();
+        assert_eq!(kind.action, Action::UserInfo);
+        assert_eq!(kind.request_id, Some(1));
+        assert!(kind.id.is_none());
+        let info = reply_info(&reply);
+        assert_eq!(info.rating, 0.0);
+        assert_eq!(info.reviews, 0);
+        assert_eq!(info.operating_days, 0);
+        assert!(info.since.is_none());
     }
 
     #[tokio::test]
@@ -201,12 +182,20 @@ mod tests {
         let ctx = test_ctx(pool);
         let event = create_test_unwrapped_message(&identity, &create_test_keys());
 
-        let result = user_info(&ctx, event.message.clone(), &event, &identity).await;
+        let reply = build_user_info_reply(&ctx, &event.message, &event)
+            .await
+            .expect("known identity must be answered");
 
-        assert!(
-            result.is_ok(),
-            "known identity must be answered: {result:?}"
-        );
+        assert!(reply.verify());
+        let kind = reply.get_inner_message_kind();
+        assert_eq!(kind.action, Action::UserInfo);
+        assert_eq!(kind.request_id, Some(1));
+        assert!(kind.id.is_none());
+        let info = reply_info(&reply);
+        assert_eq!(info.rating, 4.5);
+        assert_eq!(info.reviews, 12);
+        assert_eq!(info.operating_days, 10);
+        assert_eq!(info.since, first_trade_since(created_at));
     }
 
     #[tokio::test]

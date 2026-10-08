@@ -402,15 +402,21 @@ async fn accept_event(
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!("Error unwrapping incoming message: {}", e);
+            if !is_stale(event.created_at) {
+                if let Some(request_id) = unverified_user_info_request(event, my_keys) {
+                    enqueue_cant_do_msg(
+                        request_id,
+                        None,
+                        CantDoReason::InvalidSignature,
+                        event.pubkey,
+                    )
+                    .await;
+                }
+            }
             return None;
         }
     };
-    // Discard events older than 10 seconds to prevent replay attacks
-    let since_time = chrono::Utc::now()
-        .checked_sub_signed(chrono::Duration::seconds(10))
-        .unwrap()
-        .timestamp() as u64;
-    if unwrapped.created_at.as_secs() < since_time {
+    if is_stale(unwrapped.created_at) {
         return None;
     }
     let message = unwrapped.message.clone();
@@ -425,6 +431,18 @@ async fn accept_event(
             unwrapped.identity,
             unwrapped.sender
         );
+        // `user_info.md`, Errors: an identity proof that does not verify is
+        // answered `invalid_signature`; other actions stay silent.
+        let kind = message.get_inner_message_kind();
+        if kind.action == Action::UserInfo {
+            enqueue_cant_do_msg(
+                kind.request_id,
+                None,
+                CantDoReason::InvalidSignature,
+                unwrapped.sender,
+            )
+            .await;
+        }
         return None;
     }
 
@@ -465,6 +483,30 @@ async fn accept_event(
     }
     let action = message.inner_action()?;
     Some((action, message, unwrapped))
+}
+
+/// Events older than 10 seconds are discarded to prevent replay attacks.
+fn is_stale(created_at: Timestamp) -> bool {
+    let since_time = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::seconds(10))
+        .unwrap()
+        .timestamp() as u64;
+    created_at.as_secs() < since_time
+}
+
+/// The `request_id` of a `user-info` request that `unwrap_incoming`
+/// refused, so it can be answered `cant-do` `invalid_signature`
+/// (`user_info.md`, Errors). Core returns no message on a failed proof, so
+/// the tuple is opened again here only far enough to read the action. The
+/// reply goes to the event author, so the event signature must verify;
+/// `None` for anything else, which keeps being dropped silently.
+fn unverified_user_info_request(event: &Event, my_keys: &Keys) -> Option<Option<u64>> {
+    event.verify().ok()?;
+    let plaintext = nip44::decrypt(my_keys.secret_key(), &event.pubkey, &event.content).ok()?;
+    let (message, _, _): (Message, serde_json::Value, serde_json::Value) =
+        serde_json::from_str(&plaintext).ok()?;
+    let kind = message.get_inner_message_kind();
+    (kind.action == Action::UserInfo).then_some(kind.request_id)
 }
 
 /// Actions that can tie the sender's trade key to an order (creator or taker)

@@ -762,7 +762,7 @@ files (`take_*`, `release`, `cancel`, `admin_*`). Those files are **track-owned*
 reintroduce the very cross-track overlap this fix avoids. Instead, each track adds
 its **own** handler's cashu branch and wires that handler into `dispatch_cashu`
 when it implements it — replacing the default `InvalidAction` for exactly the
-actions it owns. The §6 allow-list (`Orders`, `LastTradeIndex`, `GetUserInfo`, `RestoreSession`,
+actions it owns. The §6 allow-list (`Orders`, `LastTradeIndex`, `UserInfo`, `RestoreSession`,
 `TradePubkey` → `no_ln`) is unaffected — only the *mechanism* for the
 blocked/escrow actions changes. The complete **action→owner matrix** now lives
 in fundamentals §6 (CF-5): no blocked action may be left without an owner or an

@@ -18,7 +18,6 @@ pub mod cancel; // User order cancellation
 pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
-pub mod get_user_info;
 pub mod last_trade_index;
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
@@ -30,6 +29,7 @@ pub mod serbero; // Serbero, the dispute assistant: boot registration as a read-
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
 pub mod trade_pubkey; // Trade pubkey action // Sync user trade index action
+pub mod user_info; // Own reputation read
 
 // Import action handlers from submodules
 use crate::app::add_cashu_escrow::add_cashu_escrow_action;
@@ -43,7 +43,6 @@ use crate::app::cancel::cancel_action;
 use crate::app::context::AppContext;
 use crate::app::dispute::dispute_action;
 use crate::app::fiat_sent::fiat_sent_action;
-use crate::app::get_user_info::get_user_info;
 use crate::app::last_trade_index::last_trade_index;
 use crate::app::order::order_action;
 use crate::app::orders::orders_action;
@@ -54,6 +53,7 @@ use crate::app::restore_session::restore_session_action;
 use crate::app::take_buy::take_buy_action;
 use crate::app::take_sell::take_sell_action;
 use crate::app::trade_pubkey::trade_pubkey_action;
+use crate::app::user_info::user_info;
 // Core functionality imports
 use crate::db::add_new_user;
 use crate::db::is_user_present;
@@ -244,7 +244,7 @@ async fn handle_message_action_no_ln(
         Action::LastTradeIndex => last_trade_index(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
-        Action::GetUserInfo => get_user_info(ctx, msg, event, my_keys)
+        Action::UserInfo => user_info(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
@@ -456,7 +456,11 @@ async fn accept_event(
         return None;
     }
 
-    if !inner_message.verify() {
+    if !message.verify() {
+        return None;
+    }
+    // Core's verify also admits the `user-info` reply shape; intake takes only the request.
+    if inner_message.action == Action::UserInfo && inner_message.payload.is_some() {
         return None;
     }
     let action = message.inner_action()?;
@@ -632,7 +636,7 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 ///
 /// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
 ///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
-///   `GetUserInfo`, `RestoreSession`, `TradePubkey`.
+///   `UserInfo`, `RestoreSession`, `TradePubkey`.
 /// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
 ///   fills in). Frozen here so Track A edits only its own file (G-1).
 /// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
@@ -650,7 +654,7 @@ async fn dispatch_cashu(
         // Escrow-independent, read-only / session actions — safe in Cashu mode.
         Action::Orders
         | Action::LastTradeIndex
-        | Action::GetUserInfo
+        | Action::UserInfo
         | Action::RestoreSession
         | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
@@ -1079,7 +1083,7 @@ mod tests {
             for action in [
                 Action::Orders,
                 Action::LastTradeIndex,
-                Action::GetUserInfo,
+                Action::UserInfo,
                 Action::RestoreSession,
                 Action::FiatSent,
             ] {
@@ -1265,7 +1269,7 @@ mod tests {
                 Action::RestoreSession,
                 Action::TradePubkey,
                 Action::LastTradeIndex,
-                Action::GetUserInfo,
+                Action::UserInfo,
                 Action::AdminCancel,
                 Action::AdminSettle,
             ] {
@@ -1346,6 +1350,73 @@ mod tests {
                 cant_do_reasons_for(&trade.public_key()).await,
                 vec![CantDoReason::MaintenanceMode]
             );
+        }
+    }
+
+    /// [`accept_event`] admits `user-info` only in its request form:
+    /// `restore` wrapper, no order id, no payload.
+    mod user_info_intake_tests {
+        use super::*;
+        use mostro_core::prelude::{MessageKind, Payload};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        fn kind(id: Option<uuid::Uuid>, payload: Option<Payload>) -> MessageKind {
+            MessageKind::new(id, Some(1), None, Action::UserInfo, payload)
+        }
+
+        async fn accepted(message: Message) -> bool {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+            let event = wrap_message_nip44(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event");
+            accept_event(
+                &ctx,
+                &event,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        #[tokio::test]
+        async fn request_in_restore_wrapper_is_accepted() {
+            assert!(accepted(Message::Restore(kind(None, None))).await);
+        }
+
+        #[tokio::test]
+        async fn user_info_outside_restore_wrapper_is_dropped() {
+            for message in [
+                Message::Order(kind(None, None)),
+                Message::Dispute(kind(None, None)),
+                Message::Dm(kind(None, None)),
+                Message::Rate(kind(None, None)),
+                Message::CantDo(kind(None, None)),
+            ] {
+                assert!(!accepted(message.clone()).await, "{message:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn user_info_with_an_order_id_is_dropped() {
+            let message = Message::Restore(kind(Some(uuid::Uuid::new_v4()), None));
+            assert!(!accepted(message).await);
+        }
+
+        #[tokio::test]
+        async fn reply_shaped_user_info_is_dropped() {
+            let reply = Payload::UserInfo(crate::util::peer_reputation(None, 0));
+            assert!(!accepted(Message::Restore(kind(None, Some(reply)))).await);
         }
     }
 
@@ -1564,7 +1635,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn routes_get_user_info_to_handler_and_returns_ok() {
+        async fn routes_user_info_to_handler_and_returns_ok() {
             let _ =
                 crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
             let pool = Arc::new(SqlitePool::connect("sqlite::memory:").await.unwrap());
@@ -1580,14 +1651,13 @@ mod tests {
 
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
-            let msg = create_test_message(Action::GetUserInfo, None);
+            let msg = create_test_message(Action::UserInfo, None);
 
             let result =
-                handle_message_action_no_ln(&Action::GetUserInfo, msg, &event, &my_keys, &ctx)
-                    .await;
+                handle_message_action_no_ln(&Action::UserInfo, msg, &event, &my_keys, &ctx).await;
 
-            // Unknown identity replies with payload None and Ok (optional UserInfo).
-            assert!(result.is_ok(), "GetUserInfo must succeed: {result:?}");
+            // An unknown identity is answered with zeros, not an error.
+            assert!(result.is_ok(), "UserInfo must succeed: {result:?}");
         }
 
         #[tokio::test]
@@ -1761,7 +1831,7 @@ mod tests {
             }
         }
 
-        /// The allow-list (`Orders`, `LastTradeIndex`, `GetUserInfo`,
+        /// The allow-list (`Orders`, `LastTradeIndex`, `UserInfo`,
         /// `RestoreSession`, `TradePubkey`) is routed to
         /// `handle_message_action_no_ln`. We assert routing by observing that
         /// `RestoreSession` reaches its handler and returns `Ok` — proving it

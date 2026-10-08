@@ -546,7 +546,7 @@ mod tests {
             Action::RestoreSession,
             Action::TradePubkey,
             Action::LastTradeIndex,
-            Action::GetUserInfo,
+            Action::UserInfo,
             Action::AddCashuEscrow,
         ] {
             assert!(!state.blocks(&a), "{a:?} must stay allowed");

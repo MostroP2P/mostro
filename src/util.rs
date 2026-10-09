@@ -2270,10 +2270,12 @@ pub fn first_trade_since(created_at: i64) -> Option<u64> {
     (created_at > 0).then(|| day_truncate(created_at))
 }
 
-/// Reputation sent to the counterparty in the `Peer` payload; zeroed for a
+/// Reputation as a `UserInfo`: sent to the counterparty in the `Peer`
+/// payload, and to the user themself in the `user-info` reply. Zeroed for a
 /// user Mostro does not know. `operating_days` stays next to `since` for the
-/// deprecation window.
-fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
+/// deprecation window; both emitters are listed in
+/// `docs/REPUTATION_PORTABILITY.md` §6.1 for its removal.
+pub(crate) fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
     match user {
         Some(user) => UserInfo {
             rating: user.total_rating,

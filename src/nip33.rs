@@ -2,6 +2,7 @@ use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
 use crate::config::types::{
     AntiAbuseBondSettings, BondApplyTo, CashuSettings, LightningSettings, MostroSettings,
+    ReputationImportSettings,
 };
 use crate::lightning::LnStatus;
 use crate::util::{
@@ -636,9 +637,29 @@ pub fn info_to_tags(escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
         Settings::get_mostro(),
         Settings::get_ln(),
         Settings::get_bond(),
+        Settings::get_reputation_import(),
         escrow,
         maintenance,
     )
+}
+
+/// The `reputation_import_issuers` tag of the info event: every key of every
+/// trust-list entry, one value per key, when reputation import is enabled.
+/// Clients send `import-reputation` only to a node that advertises it, so the
+/// tag is present (possibly with no values) exactly when the node imports.
+/// `import` is `None` when the section is absent or disabled.
+fn reputation_import_tags(import: Option<&ReputationImportSettings>) -> Vec<Tag> {
+    import
+        .map(|import| {
+            let keys: Vec<String> = import
+                .trusted_keys()
+                .iter()
+                .map(PublicKey::to_hex)
+                .collect();
+            Tag::custom("reputation_import_issuers", keys)
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Body of [`info_to_tags`] with the settings passed in, so unit tests can
@@ -648,6 +669,7 @@ fn build_info_tags(
     mostro_settings: &MostroSettings,
     ln_settings: &LightningSettings,
     bond_settings: Option<&AntiAbuseBondSettings>,
+    reputation_import: Option<&ReputationImportSettings>,
     escrow: InfoEscrow<'_>,
     maintenance: bool,
 ) -> Tags {
@@ -716,6 +738,7 @@ fn build_info_tags(
     tags_vec.extend(escrow_tags(escrow, ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
     tags_vec.extend(serbero_tags(mostro_settings));
+    tags_vec.extend(reputation_import_tags(reputation_import));
     tags_vec.push(Tag::custom(
         "maintenance_mode",
         vec![maintenance.to_string()],
@@ -851,6 +874,7 @@ mod tests {
     use super::create_status_tags;
     use super::{info_to_tags, order_to_tags};
     use crate::app::context::test_utils::test_settings;
+    use crate::config::types::ReputationImportSettings;
     use crate::config::MOSTRO_CONFIG;
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
@@ -1368,11 +1392,26 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Lightning(&make_ln_status()),
             false,
         );
 
         assert_eq!(get_tag_value(&tags, "serbero"), Some(serbero.to_hex()));
+    }
+
+    fn trust_list(entries: &[(&str, Vec<String>)]) -> ReputationImportSettings {
+        ReputationImportSettings {
+            enabled: true,
+            issuers: entries
+                .iter()
+                .map(|(name, keys)| crate::config::types::ReputationIssuer {
+                    name: name.to_string(),
+                    keys: keys.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     /// Tags that only describe an LND node or its invoices. A Cashu node has
@@ -1420,6 +1459,7 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Cashu(&cashu),
             false,
         );
@@ -1444,6 +1484,7 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Cashu(&cashu),
             false,
         );
@@ -1490,6 +1531,7 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Cashu(&cashu),
             false,
         );
@@ -1510,6 +1552,67 @@ mod tests {
     }
 
     #[test]
+    fn reputation_import_tag_lists_every_trusted_key_in_hex() {
+        let (a, b, c) = (
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+        );
+        let import = trust_list(&[
+            ("lnp2pbot", vec![a.to_bech32().unwrap()]),
+            ("other-mostro", vec![b.to_hex(), c.to_bech32().unwrap()]),
+        ]);
+        let tags = super::reputation_import_tags(Some(&import));
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags[0].clone().to_vec(),
+            vec![
+                "reputation_import_issuers".to_string(),
+                a.to_hex(),
+                b.to_hex(),
+                c.to_hex()
+            ]
+        );
+    }
+
+    #[test]
+    fn reputation_import_tag_is_present_but_empty_with_an_empty_trust_list() {
+        let tags = super::reputation_import_tags(Some(&trust_list(&[])));
+        assert_eq!(
+            tags[0].clone().to_vec(),
+            vec!["reputation_import_issuers".to_string()]
+        );
+    }
+
+    /// The info event itself carries the tag when import is enabled, and
+    /// leaves it out otherwise; `info_to_tags` passes only an enabled
+    /// section (`Settings::get_reputation_import`).
+    #[test]
+    fn info_event_advertises_reputation_import_only_when_enabled() {
+        let settings = test_settings();
+        let key = Keys::generate().public_key();
+        let import = trust_list(&[("lnp2pbot", vec![key.to_hex()])]);
+        let build = |import| {
+            super::build_info_tags(
+                &settings.mostro,
+                &settings.lightning,
+                settings.anti_abuse_bond.as_ref(),
+                import,
+                super::InfoEscrow::Lightning(&make_ln_status()),
+                false,
+            )
+        };
+        assert_eq!(
+            get_tag_value(&build(Some(&import)), "reputation_import_issuers"),
+            Some(key.to_hex())
+        );
+        assert_eq!(
+            get_tag_value(&build(None), "reputation_import_issuers"),
+            None
+        );
+    }
+
+    #[test]
     fn cashu_info_event_omits_lightning_only_tags() {
         let settings = test_settings();
         let cashu = make_cashu_settings();
@@ -1518,6 +1621,7 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Cashu(&cashu),
             false,
         );
@@ -1536,6 +1640,7 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
+            None,
             super::InfoEscrow::Lightning(&ln_status),
             false,
         );

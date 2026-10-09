@@ -327,3 +327,22 @@ port = 50051
 # # Seller-recovery locktime floor in days: escrow tokens must carry
 # # locktime >= now + this. Sellers may set a longer locktime, never shorter.
 # escrow_locktime_days = 15
+
+# Reputation import (docs/REPUTATION_PORTABILITY.md). Opt-in, disabled by
+# default. Lets users bring reputation earned elsewhere (another Mostro, or
+# lnp2pBot) by importing an attestation signed by an issuer listed here.
+# Each issuer is a stable local `name` — the key imports are deduplicated on,
+# so never rename an entry — with one or more signing keys (npub or hex). To
+# follow an issuer's key rotation, add its new key to the same entry and
+# remove the old one once its attestations have expired. A key belongs to
+# one entry only. The node advertises the keys in its info event.
+#
+# [reputation_import]
+# enabled = false
+# # Longest an attestation may live (expiration - created_at), in seconds.
+# # At most 2592000 (30 days).
+# max_lifetime_seconds = 604800
+#
+# [[reputation_import.issuers]]
+# name = "lnp2pbot"
+# keys = ["<lnp2pBot's reputation issuer pubkey>"]

@@ -5,6 +5,12 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 /// Maximum development fee percentage (100% of Mostro fee)
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
+/// Ceiling on `[reputation_import] max_lifetime_seconds` (30 days). The cap
+/// keeps a faulty or compromised issuer from minting attestations that live
+/// for years, so a value above this (e.g. a digit too many on the 7-day
+/// default) stops the load instead of loading silently.
+pub const MAX_REPUTATION_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 /// Official Mostro development Lightning Address.
 /// Self-custodial and served from a domain the project controls, so the
 /// backend behind it can change without a mostrod release.

@@ -3,7 +3,7 @@ use crate::config::payer_history::PayerHistorySettings;
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
-    LightningSettings, MostroSettings, NostrSettings, RpcSettings,
+    LightningSettings, MostroSettings, NostrSettings, ReputationImportSettings, RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
@@ -41,6 +41,10 @@ pub struct Settings {
     /// Phase 1's migration).
     #[serde(default)]
     pub price: Option<PriceSettings>,
+    /// Reputation import (docs/REPUTATION_PORTABILITY.md, phase 3). Absent
+    /// section ≡ disabled.
+    #[serde(default)]
+    pub reputation_import: Option<ReputationImportSettings>,
     /// Payment-account history / anti-triangulation
     /// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md`). Absent section ≡
     /// disabled (D-10).
@@ -127,6 +131,25 @@ impl Settings {
     /// configuration.
     pub fn get_bond() -> Option<&'static AntiAbuseBondSettings> {
         MOSTRO_CONFIG.get()?.anti_abuse_bond.as_ref()
+    }
+
+    /// The reputation import settings, only when import is enabled. Like
+    /// [`Settings::get_bond`], never panics before the configuration is
+    /// initialised.
+    pub fn get_reputation_import() -> Option<&'static ReputationImportSettings> {
+        Self::reputation_import_if_enabled(MOSTRO_CONFIG.get())
+    }
+
+    /// Selection logic behind [`Settings::get_reputation_import`], split out
+    /// so the `enabled` gate is unit-testable without touching the
+    /// process-wide `MOSTRO_CONFIG`.
+    fn reputation_import_if_enabled(
+        settings: Option<&Settings>,
+    ) -> Option<&ReputationImportSettings> {
+        settings?
+            .reputation_import
+            .as_ref()
+            .filter(|import| import.enabled)
     }
 
     /// Wire transport for protocol messages. Falls back to the daemon
@@ -272,6 +295,27 @@ mod tests {
     #[test]
     fn transport_falls_back_to_nip44_when_uninitialized() {
         assert_eq!(Settings::transport_or_default(None), Transport::Nip44Direct);
+    }
+
+    /// A disabled section is never handed out, so the node stops
+    /// advertising its trust list as soon as import is turned off.
+    #[test]
+    fn reputation_import_is_handed_out_only_while_enabled() {
+        let with = |enabled| Settings {
+            reputation_import: Some(ReputationImportSettings {
+                enabled,
+                ..Default::default()
+            }),
+            ..test_settings()
+        };
+        assert!(Settings::reputation_import_if_enabled(None).is_none());
+        assert!(Settings::reputation_import_if_enabled(Some(&test_settings())).is_none());
+        assert!(Settings::reputation_import_if_enabled(Some(&with(false))).is_none());
+        let enabled = with(true);
+        assert_eq!(
+            Settings::reputation_import_if_enabled(Some(&enabled)),
+            enabled.reputation_import.as_ref()
+        );
     }
 
     #[test]

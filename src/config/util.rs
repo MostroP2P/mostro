@@ -3,7 +3,9 @@
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::cashu::mint_policy::normalize_mint_url;
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::config::constants::{
+    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MAX_REPUTATION_LIFETIME_SECONDS, MIN_DEV_FEE_PERCENTAGE,
+};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
 use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
@@ -91,6 +93,68 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
 
     validate_serbero_pubkey(settings.mostro.serbero_pubkey.as_deref())?;
 
+    if let Some(import) = settings.reputation_import.as_ref() {
+        validate_reputation_import(import)?;
+    }
+
+    Ok(())
+}
+
+/// `[reputation_import]`: every issuer has a non-empty, unique name and at
+/// least one key; every key parses (npub or hex) and belongs to one entry
+/// only; the lifetime cap is positive. Checked even while disabled, so
+/// turning the section on cannot surface a typo later. A key in two entries
+/// would let one source account be imported twice, once under each name.
+fn validate_reputation_import(
+    import: &crate::config::types::ReputationImportSettings,
+) -> Result<(), MostroError> {
+    let fail = |reason: String| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_import] {reason}"
+        ))))
+    };
+    if import.max_lifetime_seconds == 0 {
+        return fail("max_lifetime_seconds must be greater than 0".to_string());
+    }
+    if import.max_lifetime_seconds > MAX_REPUTATION_LIFETIME_SECONDS {
+        return fail(format!(
+            "max_lifetime_seconds ({}) exceeds the maximum ({MAX_REPUTATION_LIFETIME_SECONDS}, 30 days)",
+            import.max_lifetime_seconds
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut owners: std::collections::HashMap<nostr_sdk::prelude::PublicKey, &str> =
+        std::collections::HashMap::new();
+    for issuer in &import.issuers {
+        let name = issuer.name.trim();
+        if name.is_empty() {
+            return fail("an issuer has an empty name".to_string());
+        }
+        // The name is the deduplication key and is recorded as written, so
+        // it must not differ from its trimmed form.
+        if name != issuer.name {
+            return fail(format!(
+                "issuer name `{}` has leading or trailing spaces",
+                issuer.name
+            ));
+        }
+        if !names.insert(name) {
+            return fail(format!("issuer name `{name}` is used twice"));
+        }
+        if issuer.keys.is_empty() {
+            return fail(format!("issuer `{name}` has no keys"));
+        }
+        for key in &issuer.keys {
+            let Ok(parsed) = nostr_sdk::prelude::PublicKey::parse(key.trim()) else {
+                return fail(format!("issuer `{name}` has an invalid key `{key}`"));
+            };
+            if let Some(other) = owners.insert(parsed, name) {
+                return fail(format!(
+                    "key `{key}` belongs to both `{other}` and `{name}`; a key belongs to one issuer only"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -295,6 +359,7 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
             payer_history: None,
         }
     }
@@ -422,6 +487,165 @@ mod tests {
 }
 
 #[cfg(test)]
+mod reputation_import_validation_tests {
+    use super::*;
+    use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+    use nostr_sdk::prelude::{Keys, PublicKey, ToBech32};
+
+    fn import(issuers: Vec<(&str, Vec<String>)>) -> ReputationImportSettings {
+        ReputationImportSettings {
+            enabled: true,
+            issuers: issuers
+                .into_iter()
+                .map(|(name, keys)| ReputationIssuer {
+                    name: name.to_string(),
+                    keys,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn reason(result: Result<(), MostroError>) -> String {
+        match result {
+            Err(MostroInternalErr(ServiceError::IOError(reason))) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_issuers_with_npub_or_hex_keys_are_valid() {
+        let (a, b, c) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let settings = import(vec![
+            ("lnp2pbot", vec![a.public_key().to_bech32().unwrap()]),
+            (
+                "other-mostro",
+                vec![b.public_key().to_hex(), c.public_key().to_hex()],
+            ),
+        ]);
+        assert!(validate_reputation_import(&settings).is_ok());
+        assert!(validate_reputation_import(&ReputationImportSettings::default()).is_ok());
+    }
+
+    #[test]
+    fn a_key_in_two_entries_is_refused_even_spelled_differently() {
+        let key = Keys::generate().public_key();
+        let settings = import(vec![
+            ("lnp2pbot", vec![key.to_hex()]),
+            ("renamed", vec![key.to_bech32().unwrap()]),
+        ]);
+        assert!(reason(validate_reputation_import(&settings)).contains("one issuer only"));
+    }
+
+    #[test]
+    fn names_must_be_present_and_unique() {
+        let key = || vec![Keys::generate().public_key().to_hex()];
+        assert!(
+            reason(validate_reputation_import(&import(vec![(" ", key())]))).contains("empty name")
+        );
+        assert!(reason(validate_reputation_import(&import(vec![
+            ("lnp2pbot", key()),
+            ("lnp2pbot", key()),
+        ])))
+        .contains("used twice"));
+    }
+
+    /// The name is what imports are deduplicated on, so it is kept exactly as
+    /// written: a padded name would be recorded padded and later clash with
+    /// the trimmed one at the boot check.
+    #[test]
+    fn a_name_with_surrounding_spaces_is_refused() {
+        let key = || vec![Keys::generate().public_key().to_hex()];
+        for name in [" lnp2pbot", "lnp2pbot ", "\tlnp2pbot"] {
+            assert!(
+                reason(validate_reputation_import(&import(vec![(name, key())]))).contains("spaces"),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_with_surrounding_spaces_is_read_trimmed() {
+        let key = Keys::generate().public_key();
+        let settings = import(vec![("lnp2pbot", vec![format!(" {} ", key.to_hex())])]);
+        assert!(validate_reputation_import(&settings).is_ok());
+        assert_eq!(settings.trusted_keys(), vec![key]);
+        assert_eq!(settings.issuer_for(&key), Some(&settings.issuers[0]));
+    }
+
+    #[test]
+    fn keys_must_be_present_and_parse() {
+        assert!(
+            reason(validate_reputation_import(&import(vec![("a", vec![])]))).contains("no keys")
+        );
+        assert!(reason(validate_reputation_import(&import(vec![(
+            "a",
+            vec!["npub1nope".to_string()]
+        )])))
+        .contains("invalid key"));
+    }
+
+    #[test]
+    fn the_lifetime_cap_must_be_positive_even_while_disabled() {
+        let settings = ReputationImportSettings {
+            max_lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_import(&settings)).contains("max_lifetime_seconds"));
+    }
+
+    /// A cap of years would defeat its purpose; an extra digit on the
+    /// 7-day default (70 days) must not load silently.
+    #[test]
+    fn the_lifetime_cap_is_at_most_thirty_days() {
+        let thirty_days = MAX_REPUTATION_LIFETIME_SECONDS;
+        let cap = |max_lifetime_seconds| ReputationImportSettings {
+            max_lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_import(&cap(thirty_days)).is_ok());
+        for too_long in [thirty_days + 1, 6_048_000, u64::MAX] {
+            assert!(
+                reason(validate_reputation_import(&cap(too_long))).contains("max_lifetime_seconds"),
+                "{too_long} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_section_is_disabled() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            reputation_import: ReputationImportSettings,
+        }
+        let stub: Stub = toml::from_str("[reputation_import]\n").unwrap();
+        assert_eq!(stub.reputation_import, ReputationImportSettings::default());
+        assert!(!stub.reputation_import.enabled);
+    }
+
+    #[test]
+    fn the_section_parses_from_toml_with_its_defaults() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            reputation_import: ReputationImportSettings,
+        }
+        let key = Keys::generate().public_key().to_hex();
+        let stub: Stub = toml::from_str(&format!(
+            "[reputation_import]\nenabled = true\n\n[[reputation_import.issuers]]\nname = \"lnp2pbot\"\nkeys = [\"{key}\"]\n"
+        ))
+        .unwrap();
+        assert!(stub.reputation_import.enabled);
+        assert_eq!(stub.reputation_import.max_lifetime_seconds, 604_800);
+        assert_eq!(stub.reputation_import.issuers[0].name, "lnp2pbot");
+        assert_eq!(
+            stub.reputation_import
+                .issuer_for(&PublicKey::from_hex(&key).unwrap()),
+            Some(&stub.reputation_import.issuers[0])
+        );
+    }
+}
+
+#[cfg(test)]
 mod cashu_validation_tests {
     use super::*;
     use crate::config::types::CashuSettings;
@@ -540,6 +764,7 @@ mod startup_validation_tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
             payer_history: None,
         }
     }
@@ -547,6 +772,27 @@ mod startup_validation_tests {
     #[test]
     fn default_settings_pass_validation() {
         assert!(validate_mostro_settings(&base_settings()).is_ok());
+    }
+
+    /// Goes through `validate_mostro_settings`, as the daemon does, so
+    /// dropping the `[reputation_import]` check from startup is caught.
+    #[test]
+    fn a_key_listed_under_two_issuers_stops_the_load() {
+        use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+        let key = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let issuer = |name: &str| ReputationIssuer {
+            name: name.to_string(),
+            keys: vec![key.clone()],
+        };
+        let mut settings = base_settings();
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![issuer("lnp2pbot"), issuer("renamed")],
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings)
+            .expect_err("a key under two issuers must stop the load");
+        assert!(err.to_string().contains("one issuer only"));
     }
 
     #[test]

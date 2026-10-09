@@ -117,6 +117,36 @@ mod tests {
         );
     }
 
+    /// A planned rotation adds the new key, which boots under the entry's
+    /// name before it signs anything; once the old key leaves, renaming the
+    /// entry must still be caught although the new key has no imports.
+    #[tokio::test]
+    async fn renaming_after_rotating_to_a_key_without_imports_is_a_conflict() {
+        let pool = pool().await;
+        let old = Keys::generate().public_key().to_hex();
+        let new = Keys::generate().public_key().to_hex();
+        insert_reputation_import(&pool, &row("lnp2pbot", &old, "a"))
+            .await
+            .unwrap();
+        let rotating = settings("lnp2pbot", vec![old, new.clone()]);
+        assert!(issuer_name_conflicts(&pool, &rotating)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let conflicts = issuer_name_conflicts(&pool, &settings("bot", vec![new.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            conflicts,
+            vec![IssuerNameConflict {
+                key: new,
+                configured: "bot".to_string(),
+                recorded: vec!["lnp2pbot".to_string()],
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn a_second_import_of_the_same_source_or_identity_is_refused() {
         let pool = pool().await;

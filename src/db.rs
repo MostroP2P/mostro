@@ -1918,18 +1918,42 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// The trust-list names imports were recorded under for `issuer_key`.
+/// The trust-list names `issuer_key` is known under: the names its imports
+/// were recorded under and the name it was first configured under.
 pub async fn reputation_issuer_names_for_key(
     pool: &SqlitePool,
     issuer_key: &str,
 ) -> Result<Vec<String>, MostroError> {
     sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT issuer FROM reputation_imports WHERE issuer_key = ?1 ORDER BY issuer",
+        "SELECT issuer FROM reputation_imports WHERE issuer_key = ?1 \
+         UNION SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1 \
+         ORDER BY issuer",
     )
     .bind(issuer_key)
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Bind `issuer_key` to the trust-list name `issuer` unless it is bound
+/// already; the first name a key is configured under is the one it keeps.
+pub async fn record_reputation_issuer_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+    issuer: &str,
+    seen_at: i64,
+) -> Result<(), MostroError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO reputation_issuer_keys (issuer_key, issuer, first_seen_at) \
+         VALUES (?1, ?2, ?3)",
+    )
+    .bind(issuer_key)
+    .bind(issuer)
+    .bind(seen_at)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(())
 }
 
 /// Returns true only when the given `solver_pubkey` is assigned to the dispute

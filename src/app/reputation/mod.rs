@@ -2,8 +2,9 @@
 //! attestation another issuer signed, and issuing one.
 
 use crate::config::types::ReputationImportSettings;
-use crate::db::reputation_issuer_names_for_key;
+use crate::db::{record_reputation_issuer_key, reputation_issuer_names_for_key};
 use mostro_core::error::MostroError;
+use nostr_sdk::prelude::Timestamp;
 use sqlx::SqlitePool;
 
 /// A configured trust-list key that already has imports recorded under a
@@ -15,11 +16,14 @@ pub struct IssuerNameConflict {
     pub recorded: Vec<String>,
 }
 
-/// Boot check: every configured key's past imports were recorded under the
-/// name its entry has now. Imports are deduplicated on that name, so
-/// renaming an entry, or moving a key to another entry, would let every
-/// account it imported import again. Returns the conflicts; the caller
-/// refuses to start on any.
+/// Boot check: every configured key is known only under the name its entry
+/// has now, whether by its past imports or by an earlier boot that
+/// configured it. Imports are deduplicated on that name, so renaming an
+/// entry, or moving a key to another entry, would let every account it
+/// imported import again. A planned rotation adds the new key to the entry
+/// first, so binding each key to its name at boot also catches a rename
+/// made after the old key has left. Returns the conflicts; the caller
+/// refuses to start on any. With none, binds the keys not yet bound.
 pub async fn issuer_name_conflicts(
     pool: &SqlitePool,
     import: &ReputationImportSettings,
@@ -39,6 +43,14 @@ pub async fn issuer_name_conflicts(
                     configured: issuer.name.trim().to_string(),
                     recorded,
                 });
+            }
+        }
+    }
+    if conflicts.is_empty() {
+        let now = Timestamp::now().as_secs() as i64;
+        for issuer in &import.issuers {
+            for key in issuer.public_keys() {
+                record_reputation_issuer_key(pool, &key.to_hex(), issuer.name.trim(), now).await?;
             }
         }
     }

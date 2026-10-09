@@ -122,16 +122,17 @@ async fn main() -> Result<()> {
     }
 
     // Reputation import deduplicates on the trust-list name: a configured key
-    // whose imports were recorded under another name means an entry was
-    // renamed or a key moved, which would let those accounts import again.
+    // known under another name, by its imports or an earlier boot, means an
+    // entry was renamed or a key moved, which would let those accounts import
+    // again.
     if let Some(import) = Settings::get_reputation_import() {
         let conflicts =
             app::reputation::issuer_name_conflicts(get_db_pool().as_ref(), import).await?;
         for conflict in &conflicts {
             tracing::error!(
-                "REFUSING TO START: [reputation_import] key {} is in the entry `{}`, but its \
-                 imports were recorded under {:?}. Give the entry its original name back, \
-                 or move the key back to it.",
+                "REFUSING TO START: [reputation_import] key {} is in the entry `{}`, but it is \
+                 recorded under {:?}. Give the entry its original name back, or move the \
+                 key back to it.",
                 conflict.key,
                 conflict.configured,
                 conflict.recorded

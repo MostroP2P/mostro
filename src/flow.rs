@@ -835,8 +835,9 @@ mod tests {
         )
         .await;
         // The escrow was observed long enough ago that the guardian's
-        // action deadline is behind us (test settings clamp the window,
-        // so any past timestamp qualifies).
+        // action deadline is behind us (test settings have a zero CLTV
+        // delta, so the guard window is zero and any past timestamp
+        // qualifies).
         crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
             .await
             .unwrap();
@@ -872,10 +873,10 @@ mod tests {
             None,
         )
         .await;
-        // The action deadline is still ahead (test settings clamp the
-        // guard window to zero, so only a future held_at lands inside the
-        // window): an intentional cooperative/admin cancel in flight must
-        // not be misread as an evaporation.
+        // The action deadline is still ahead (test settings have a zero
+        // CLTV delta, so the guard window is zero and only a future
+        // held_at lands inside it): an intentional cooperative/admin
+        // cancel in flight must not be misread as an evaporation.
         let future = Timestamp::now().as_secs() as i64 + 86_400;
         crate::db::update_order_invoice_held_at_time(&pool, order.id, future)
             .await

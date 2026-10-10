@@ -47,7 +47,11 @@ impl YadioProvider {
             .btc
             .into_iter()
             .filter_map(|(code, value)| match value {
-                Some(v) if v.is_finite() && v > 0.0 => Some((code, Quote::PerBtc(v))),
+                Some(v) if v.is_finite() && v > 0.0 => {
+                    // Yadio ships uppercase codes today; canonicalise anyway so
+                    // the adapter honours §6.6 even if the API drifts.
+                    Some((code.to_uppercase(), Quote::PerBtc(v)))
+                }
                 _ => None,
             })
             .collect())
@@ -109,6 +113,19 @@ mod tests {
         let quotes = YadioProvider::parse(body).unwrap();
         assert_eq!(quotes.len(), 1, "only GBP is a usable rate");
         assert_eq!(quotes.get("GBP"), Some(&Quote::PerBtc(50_000.0)));
+    }
+
+    #[test]
+    fn canonicalises_lowercase_currency_codes() {
+        let body = r#"{"BTC": {"usd": 75000.0, "Eur": 65000.0}}"#;
+        let quotes = YadioProvider::parse(body).unwrap();
+        assert_eq!(quotes.len(), 2, "only the two canonical keys survive");
+        assert_eq!(quotes.get("USD"), Some(&Quote::PerBtc(75_000.0)));
+        assert_eq!(quotes.get("EUR"), Some(&Quote::PerBtc(65_000.0)));
+        assert!(
+            !quotes.contains_key("usd"),
+            "raw lowercase key must not survive"
+        );
     }
 
     #[test]

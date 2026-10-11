@@ -1,6 +1,8 @@
 //! Reputation portability (docs/REPUTATION_PORTABILITY.md): importing an
 //! attestation another issuer signed, and issuing one.
 
+pub mod import;
+
 use crate::config::types::ReputationImportSettings;
 use crate::db::{record_reputation_issuer_key, reputation_issuer_names_for_key};
 use mostro_core::error::MostroError;

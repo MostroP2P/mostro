@@ -196,7 +196,7 @@ pub async fn update_user_reputation_action(
 /// Tags of the kind 38384 rating event for `user`: core's `Rating` tags, with
 /// `since` when the user has a first-trade date, plus the deprecated `days`
 /// count kept for the deprecation window.
-fn rating_event_tags(user: &User) -> Tags {
+pub(crate) fn rating_event_tags(user: &User) -> Tags {
     let rating = Rating::new(
         user.total_reviews as u64,
         user.total_rating,

@@ -327,6 +327,7 @@ pub mod test_utils {
             price: None,
             reputation_import: None,
             payer_history: None,
+            reputation_export: None,
         }
     }
 }

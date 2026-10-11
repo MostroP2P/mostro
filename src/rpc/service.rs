@@ -11,8 +11,9 @@ use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
     CancelOrderResponse, DrainCounters, GetMaintenanceStatusRequest, GetMaintenanceStatusResponse,
-    SetMaintenanceModeRequest, SetMaintenanceModeResponse, SettleOrderRequest, SettleOrderResponse,
-    TakeDisputeRequest, TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
+    RevokeReputationImportsRequest, RevokeReputationImportsResponse, SetMaintenanceModeRequest,
+    SetMaintenanceModeResponse, SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest,
+    TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::transport::UnwrappedMessage;
@@ -538,6 +539,55 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
+    async fn revoke_reputation_imports(
+        &self,
+        request: Request<RevokeReputationImportsRequest>,
+    ) -> Result<Response<RevokeReputationImportsResponse>, Status> {
+        let ip = Self::require_loopback(&request)?;
+        self.require_auth(&request, "RevokeReputationImports")?;
+        let req = request.into_inner();
+        info!(
+            "Received RevokeReputationImports(key={}, imported_after={:?}) from {ip}, request_id: {:?}",
+            req.issuer_key, req.imported_after, req.request_id
+        );
+        let failure = |message: String| {
+            Ok(Response::new(RevokeReputationImportsResponse {
+                success: false,
+                error_message: Some(message),
+                revoked: 0,
+            }))
+        };
+        let Ok(key) = nostr_sdk::prelude::PublicKey::parse(req.issuer_key.trim()) else {
+            return failure(format!("invalid issuer key: {}", req.issuer_key));
+        };
+        match crate::app::reputation::revoke::revoke_imports(
+            &self.pool,
+            &key,
+            req.imported_after,
+            &self.keys,
+        )
+        .await
+        {
+            Ok(rows) => {
+                warn!(
+                    "Revoked {} reputation imports signed by {} (reason: {})",
+                    rows.len(),
+                    key.to_hex(),
+                    req.reason.as_deref().unwrap_or("none given")
+                );
+                Ok(Response::new(RevokeReputationImportsResponse {
+                    success: true,
+                    error_message: None,
+                    revoked: rows.len() as u32,
+                }))
+            }
+            Err(e) => {
+                error!("RevokeReputationImports failed: {e}");
+                failure(e.to_string())
+            }
+        }
+    }
+
     async fn get_maintenance_status(
         &self,
         request: Request<GetMaintenanceStatusRequest>,
@@ -985,6 +1035,8 @@ mod tests {
                 .code(),
             deny
         );
+        // RevokeReputationImports also requires a loopback peer, so it gets
+        // its own test (revoke_reputation_imports_needs_loopback_and_the_token).
         // Read-only calls stay open.
         assert!(service
             .get_maintenance_status(Request::new(GetMaintenanceStatusRequest {
@@ -992,6 +1044,97 @@ mod tests {
             }))
             .await
             .is_ok());
+    }
+
+    fn revoke_req(issuer_key: &str) -> RevokeReputationImportsRequest {
+        RevokeReputationImportsRequest {
+            issuer_key: issuer_key.to_string(),
+            imported_after: None,
+            reason: Some("key leaked".to_string()),
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_needs_loopback_and_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key().to_hex();
+        let no_addr = service
+            .revoke_reputation_imports(Request::new(revoke_req(&key)))
+            .await
+            .unwrap_err();
+        assert_eq!(no_addr.code(), tonic::Code::Internal);
+        let no_token = service
+            .revoke_reputation_imports(request_with_addr(revoke_req(&key), 1))
+            .await
+            .unwrap_err();
+        assert_eq!(no_token.code(), tonic::Code::PermissionDenied);
+        let ok = service
+            .revoke_reputation_imports(bearer(request_with_addr(revoke_req(&key), 1), "s3cret"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ok.success);
+        assert_eq!(ok.revoked, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_refuses_an_invalid_key_and_reverses_the_imports() {
+        use crate::db::{insert_reputation_import, ReputationImportRow};
+        use nostr_sdk::prelude::ToBech32;
+        let service = offline_service().await;
+        let bad = service
+            .revoke_reputation_imports(request_with_addr(revoke_req("npub1nope"), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad.success);
+        assert!(bad.error_message.unwrap().contains("invalid issuer key"));
+
+        let key = Keys::generate().public_key();
+        let identity = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, total_reviews, total_rating, created_at, native_created_at, \
+             seeded_reviews, seeded_rating_sum, min_rating, max_rating, last_rating) \
+             VALUES (?1, 5, 4.5, 1696204800, 1790000000, 5, 22.5, 5, 5, 5)",
+        )
+        .bind(&identity)
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        insert_reputation_import(
+            service.pool.as_ref(),
+            &ReputationImportRow {
+                attestation_id: "a".repeat(64),
+                issuer: "lnp2pbot".to_string(),
+                issuer_key: key.to_hex(),
+                subject: "acct-1".to_string(),
+                identity_pubkey: identity.clone(),
+                trade_pubkey: None,
+                reviews: 5,
+                rating_hundredths: 450,
+                since: 1_696_204_800,
+                imported_at: 1_790_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        let done = service
+            .revoke_reputation_imports(request_with_addr(revoke_req(&key.to_bech32().unwrap()), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(done.success);
+        assert_eq!(done.revoked, 1);
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!((user.total_reviews, user.seeded_reviews), (0, 0));
+        assert_eq!(user.created_at, 1_790_000_000);
+        assert_eq!(
+            (user.min_rating, user.max_rating, user.last_rating),
+            (0, 0, 0)
+        );
     }
 
     #[test]

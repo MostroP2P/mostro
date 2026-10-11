@@ -4,8 +4,8 @@ Design proposal for letting a user carry reputation earned in one trading venue
 (lnp2pBot, or another Mostro instance) into a Mostro instance, as the
 figures they earned there.
 
-Status: **proposal**. Values marked *open decision* are defaults to be
-confirmed before implementation.
+Status: **implemented, pending release** (see section 11). The open
+decisions were closed on 2026-10-03 with their defaults (section 10).
 
 ## 1. Goals
 
@@ -504,7 +504,7 @@ as long as both fields are published.
 ```toml
 [reputation_import]
 enabled = true
-max_lifetime = "7d"
+max_lifetime_seconds = 604800
 
 [[reputation_import.issuers]]
 name = "lnp2pbot"            # dedup key; never renamed
@@ -520,7 +520,7 @@ keys = [
 [reputation_export]
 enabled = true
 issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
-lifetime = "7d"
+lifetime_seconds = 604800
 ```
 
 ## 8. Multi-destination, Sybil and re-issuance
@@ -671,10 +671,12 @@ Runs in parallel with phase 5; shares the UI copy and the localized strings.
 
 ## 10. Open decisions
 
-1. Attestation kind number (default `38388`, to be reserved in protocol PR 0.2).
-2. Attestation lifetime (default 7 days, and the destination's cap on it).
-3. lnp2pBot `subject`: internal user id or Telegram id (default internal id).
-4. Refreshing an earlier import with newer figures: in v1 or later (default later).
+None left open. Closed on 2026-10-03, with the defaults:
+
+1. Attestation kind number: `38388`, reserved in MostroP2P/protocol#74.
+2. Attestation lifetime: 7 days, which is also a destination's default cap.
+3. lnp2pBot `subject`: its internal user id, never the Telegram id.
+4. Refreshing an earlier import with newer figures: later, not in v1.
 
 Closed during review:
 
@@ -721,3 +723,108 @@ Closed during review:
   controls.
 - **Action naming.** `reputation-exported` is the wire name for the export
   response, everywhere.
+
+## 11. Operating it
+
+### Importing reputation
+
+1. Add the issuers you trust to `settings.toml`, then enable the section:
+
+   ```toml
+   [reputation_import]
+   enabled = true
+   max_lifetime_seconds = 604800
+
+   [[reputation_import.issuers]]
+   name = "lnp2pbot"
+   keys = ["<lnp2pBot's reputation issuer pubkey>"]
+   ```
+
+   Ask each issuer for its key: a Mostro announces it in the
+   `reputation_issuer` tag of its info event. The `name` is what imports are
+   deduplicated on, so never rename an entry; mostrod refuses to start if a key
+   has imports recorded under another name. A key belongs to one entry only.
+2. Restart mostrod. The info event now carries `reputation_import_issuers`,
+   and clients offer the import.
+3. **Key rotation.** When an issuer rotates its key, add the new key to the
+   same entry, and remove the old one once its attestations have expired
+   (seven days).
+4. **Compromised issuer key.** Remove the key from its entry and restart, then
+   reverse the imports made with it:
+
+   ```bash
+   grpcurl -plaintext -d '{"issuer_key":"<npub or hex>","imported_after":<unix>,"reason":"key leaked"}' \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/RevokeReputationImports
+   ```
+
+   Leave `imported_after` out to reverse every import made with the key. The
+   selection uses this node's import time, never the attestation's date. Each
+   reversed user can import again with an attestation from the new key. See
+   `docs/RPC.md`.
+
+### Exporting reputation
+
+1. Generate a key dedicated to issuing, never the node's own key, and put it in
+   the environment, for example in `<settings dir>/.env`:
+
+   ```bash
+   MOSTRO_REPUTATION_ISSUER_SK=<nsec or hex>
+   ```
+
+2. Enable the section:
+
+   ```toml
+   [reputation_export]
+   enabled = true
+   issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
+   lifetime_seconds = 604800
+   ```
+
+   mostrod refuses to start when the variable is missing or invalid, holds the
+   node's own key, or holds a key that is also in `[reputation_import]`.
+3. Restart mostrod. The info event carries `reputation_issuer`; publish that
+   key so other operators can trust it.
+4. **A user lost the identity their export is bound to** and cannot sign a
+   rebind authorisation: rebind it by hand, with a reason, which is logged.
+
+   ```bash
+   grpcurl -plaintext -d '{"identity":"<account>","new_identity":"<npub>","reason":"support ticket"}' \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/RebindReputationExport
+   ```
+
+### Implementation status
+
+| Phase | Pull requests |
+|---|---|
+| 0, spec | MostroP2P/protocol#74 (attestation), #75 (actions), #76 (test vectors); #72 (`days` kept to the end) |
+| 1, `since` | done: core 0.15.0, mostro#1016, mobile#740, app#664 |
+| 2, core | MostroP2P/mostro-core#177–#181, to be released together as the next minor (the plan's "0.15.0" became 0.17.0, since 0.16.0 already shipped) |
+| 3, import | #1028 (3.1), #1029 (3.2), #1030 (3.3), #1031 (3.4), #1032 (3.5) |
+| 4, export | #1033 (4.1), #1034 (4.2), #1035 (4.3) |
+| 5, mobile | MostroP2P/mobile#742–#745 |
+| 5b, app | MostroP2P/app#675–#677 |
+| 6, lnp2pBot | lnp2pBot/bot#932–#934 |
+
+The daemon side was run end to end on two local mostrods (#1027). Where the
+code departs from the text above:
+
+- **Settings names.** The settings take seconds (`max_lifetime_seconds`,
+  `lifetime_seconds`), like every other duration in `settings.toml`, instead
+  of `"7d"`.
+- **Telegram hand-off.** lnp2pBot sends the attestation as a message to
+  paste, not as a button. Telegram URL buttons cannot open an app scheme, so
+  pasting is the hand-off on every platform.
+- **`trade_pubkey` column.** `reputation_imports` also keeps the trade key
+  that imported, which is what the rating event is republished under after an
+  import and after its reversal.
+
+### Rollout
+
+Phase 7 runs as listed in section 9:
+
+1. Release core.
+2. Switch the downstream pull requests from the core branch to the release.
+3. Deploy and ship.
+
+PR 1.4, which stops publishing `days`, comes last.
+

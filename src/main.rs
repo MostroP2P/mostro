@@ -121,6 +121,28 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Reputation import deduplicates on the trust-list name: a configured key
+    // known under another name, by its imports or an earlier boot, means an
+    // entry was renamed or a key moved, which would let those accounts import
+    // again.
+    if let Some(import) = Settings::get_reputation_import() {
+        let conflicts =
+            app::reputation::issuer_name_conflicts(get_db_pool().as_ref(), import).await?;
+        for conflict in &conflicts {
+            tracing::error!(
+                "REFUSING TO START: [reputation_import] key {} is in the entry `{}`, but it is \
+                 recorded under {:?}. Give the entry its original name back, or move the \
+                 key back to it.",
+                conflict.key,
+                conflict.configured,
+                conflict.recorded
+            );
+        }
+        if !conflicts.is_empty() {
+            exit(1);
+        }
+    }
+
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
         tracing::error!("No connection to nostr relay - closing Mostro!");

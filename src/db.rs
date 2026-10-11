@@ -1962,6 +1962,31 @@ pub async fn bind_reputation_export(
     Ok(result.rows_affected() > 0)
 }
 
+/// Move an account's reputation binding from `from` (`None`: unbound) to
+/// `to`, as a compare-and-set on the current value, recording the day.
+/// Returns whether it moved: a replay, or a concurrent move, finds the
+/// binding already changed and does nothing.
+pub async fn move_reputation_binding(
+    pool: &SqlitePool,
+    identity: &str,
+    from: Option<&str>,
+    to: &str,
+    day: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE users SET reputation_exported_to = ?3, reputation_exported_at = ?4 \
+         WHERE pubkey = ?1 AND reputation_exported_to IS ?2",
+    )
+    .bind(identity)
+    .bind(from)
+    .bind(to)
+    .bind(day)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// The trust-list names `issuer_key` is known under: the names its imports
 /// were recorded under and the name it was first configured under.
 pub async fn reputation_issuer_names_for_key(

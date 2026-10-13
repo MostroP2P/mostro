@@ -1308,6 +1308,52 @@ pub(crate) fn is_order_take_window_closed(order: &Order, now: i64) -> bool {
 pub(crate) static ORDERBOOK_QUEUE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Test-only capture of everything the test binary logs through `tracing`, so
+/// a test can assert on the text of a log line. A `println!` never reaches it.
+///
+/// One process-wide subscriber, not one per test: `tracing` caches each
+/// callsite's interest globally, so a per-thread subscriber misses a line
+/// another test thread reached first. Tests share the buffer and must look
+/// only for values they generated themselves.
+#[cfg(test)]
+pub(crate) struct LogCapture;
+
+#[cfg(test)]
+static CAPTURED_LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOGS.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl LogCapture {
+    /// Idempotent. Call it before the code under test.
+    pub(crate) fn start() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            // ponytail: unbounded buffer; it lives as long as the test binary.
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(|| LogCapture)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the test binary");
+        });
+    }
+
+    pub(crate) fn text() -> String {
+        String::from_utf8_lossy(&CAPTURED_LOGS.lock().unwrap()).into_owned()
+    }
+}
+
 /// Test-only visibility into the republish queue.
 #[cfg(test)]
 pub(crate) fn is_orderbook_publish_queued(order_id: Uuid) -> bool {
@@ -2882,6 +2928,47 @@ mod tests {
         // now just make it ok and then will make a better test
         let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
         assert!(result.is_err());
+    }
+
+    /// #836: the receiver can be an identity key and a `Peer` payload names
+    /// the counterparty, so neither may reach the log.
+    #[tokio::test]
+    async fn send_dm_logs_no_party_keys() {
+        init_globals();
+        LogCapture::start();
+        let receiver = Keys::generate().public_key();
+        let peer = Keys::generate().public_key();
+        let order_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::FiatSentOk,
+            Some(Payload::Peer(Peer {
+                pubkey: peer.to_string(),
+                reputation: None,
+            })),
+        ));
+
+        let _ = send_dm(
+            receiver,
+            &Keys::generate(),
+            &message.as_json().unwrap(),
+            None,
+        )
+        .await;
+
+        let logs = LogCapture::text();
+        assert!(logs.contains(&order_id.to_string()), "order id not logged");
+        assert!(!logs.contains(&receiver.to_hex()), "receiver key logged");
+        assert!(!logs.contains(&peer.to_hex()), "peer key logged");
+        // What stays for diagnosis: the join key to the relay copy and the action.
+        assert!(
+            logs.lines().any(|l| l.contains(&order_id.to_string())
+                && l.contains("event_id=")
+                && l.contains("FiatSentOk")),
+            "routing fields not logged"
+        );
     }
 
     #[tokio::test]

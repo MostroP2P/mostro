@@ -2884,6 +2884,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// #836: the receiver can be an identity key and a `Peer` payload names
+    /// the counterparty, so neither may reach the log.
+    #[tokio::test]
+    async fn send_dm_logs_no_party_keys() {
+        init_globals();
+        let receiver = Keys::generate().public_key();
+        let peer = Keys::generate().public_key();
+        let order_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::FiatSentOk,
+            Some(Payload::Peer(Peer {
+                pubkey: peer.to_string(),
+                reputation: None,
+            })),
+        ));
+
+        let (_, logs) = crate::app::context::test_utils::logged_on_this_thread(send_dm(
+            receiver,
+            &Keys::generate(),
+            &message.as_json().unwrap(),
+            None,
+        ))
+        .await;
+        assert!(logs.contains(&order_id.to_string()), "order id not logged");
+        assert!(!logs.contains(&receiver.to_hex()), "receiver key logged");
+        assert!(!logs.contains(&peer.to_hex()), "peer key logged");
+        // What stays for diagnosis: the join key to the relay copy and the action.
+        assert!(
+            logs.lines().any(|l| l.contains(&order_id.to_string())
+                && l.contains("event_id=")
+                && l.contains("FiatSentOk")),
+            "routing fields not logged"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_fiat_amount_requested() {
         initialize();

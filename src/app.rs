@@ -1743,6 +1743,38 @@ mod tests {
             );
         }
 
+        /// #836: the rejection may name the trade key, never beside the
+        /// identity it claimed.
+        #[tokio::test]
+        async fn missing_trade_signature_logs_no_identity_key() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let proof = identity_sig(&message, &trade, &identity);
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                None,
+                Some((identity.public_key().to_hex(), proof)),
+            );
+
+            let (accepted, logs) =
+                crate::app::context::test_utils::logged_on_this_thread(accept_raw(&event, &mostro))
+                    .await;
+            assert!(!accepted);
+            let trade_hex = trade.public_key().to_hex();
+            assert!(
+                logs.lines()
+                    .any(|l| l.contains("inner signature") && l.contains(&trade_hex)),
+                "rejection not logged with the trade key"
+            );
+            assert!(
+                !logs.contains(&identity.public_key().to_hex()),
+                "identity key logged"
+            );
+        }
+
         /// The spec defines the answer for `user-info` only; every other
         /// action with a bad proof is still dropped without a reply.
         #[tokio::test]

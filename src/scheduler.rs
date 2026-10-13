@@ -2138,6 +2138,26 @@ mod tests {
         assert!(actions.iter().all(|a| *a == Action::Canceled));
     }
 
+    /// #836: maker and taker in one line pairs the two counterparties.
+    #[tokio::test]
+    async fn notify_cancel_logs_no_party_keys() {
+        init_test_settings();
+        let order = order_for_cancel(Kind::Sell, true);
+        let ((), logs) = crate::app::context::test_utils::logged_on_this_thread(
+            notify_users_canceled_order(&order, &order, Some(Action::Canceled)),
+        )
+        .await;
+        let id = order.id.to_string();
+        assert!(
+            logs.lines()
+                .any(|l| l.to_lowercase().contains("notifying maker") && l.contains(&id)),
+            "cancel notice not reached"
+        );
+        for key in [&order.creator_pubkey, order.buyer_pubkey.as_ref().unwrap()] {
+            assert!(!logs.contains(key.as_str()), "party key logged");
+        }
+    }
+
     #[tokio::test]
     async fn notify_cancel_bails_out_on_unparseable_kind() {
         init_test_settings();

@@ -605,7 +605,11 @@ pub struct LightningSettings {
     /// Safety margin, in blocks, before the hold invoice's CLTV horizon at
     /// which the daemon cancels/escalates trades whose escrow is about to
     /// be auto-refunded by LND. Must exceed the node's
-    /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
+    /// `invoices.holdexpirydelta` (LND default:
+    /// [`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+    /// with room to spare. Startup fails unless it is at least
+    /// [`MIN_ESCROW_DEADLINE_MARGIN_BLOCKS`](crate::config::constants::MIN_ESCROW_DEADLINE_MARGIN_BLOCKS)
+    /// and below `hold_invoice_cltv_delta` (Lightning mode only).
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
     /// Ceiling on how many payments the node may have in flight before a new
@@ -701,9 +705,11 @@ fn default_max_inflight_payouts_per_destination() -> u32 {
     10
 }
 
-/// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
-/// `holdexpirydelta` (12) plus slack for block-time variance and the
-/// guardian job's tick.
+/// 24 blocks ≈ 4 hours at the nominal 10 min/block: LND's default
+/// `holdexpirydelta`
+/// ([`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+/// plus 12 blocks of slack for block-time variance, the guardian job's tick
+/// and the solver of a disputed trade, twice the minimum headroom.
 fn default_escrow_deadline_margin_blocks() -> u32 {
     24
 }

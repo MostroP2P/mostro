@@ -51,9 +51,11 @@ pub async fn import_reputation_action(
     }
 
     record_import(ctx, &issuer.name, &attestation, event).await?;
+    // Name the trade key, as the reply's log line does: the identity key
+    // would tie a long-lived identity to its import in the logs.
     tracing::info!(
-        "reputation: {} imported {} ratings from `{}` (attestation {})",
-        event.identity,
+        "reputation: trade key {} imported {} ratings from `{}` (attestation {})",
+        event.sender,
         attestation.reviews,
         issuer.name,
         attestation.id

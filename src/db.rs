@@ -5297,6 +5297,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_user_rating_rejects_invalid_native_rating_sum() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let result =
+                super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, bad)
+                    .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(mostro_core::error::MostroError::MostroCantDo(
+                        mostro_core::error::CantDoReason::InvalidRating
+                    ))
+                ),
+                "Should reject native_rating_sum {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_update_user_rating_out_of_range() {
         let pool = setup_users_db().await.unwrap();
         insert_test_user(&pool, VALID_PUBKEY).await;
@@ -6901,5 +6922,144 @@ mod migration_and_query_tests {
         if stray.exists() {
             let _ = std::fs::remove_file(stray);
         }
+    }
+
+    // ── reputation imports ───────────────────────────────────────────────
+
+    fn import_row(
+        n: &str,
+        issuer: &str,
+        issuer_key: &str,
+        identity: &str,
+        imported_at: i64,
+    ) -> ReputationImportRow {
+        ReputationImportRow {
+            attestation_id: format!("{n:0>64}"),
+            issuer: issuer.to_string(),
+            issuer_key: issuer_key.to_string(),
+            subject: format!("subject-{n}"),
+            identity_pubkey: identity.to_string(),
+            trade_pubkey: None,
+            reviews: 5,
+            rating_hundredths: 450,
+            since: 1_696_204_800,
+            imported_at,
+        }
+    }
+
+    fn subjects(rows: &[ReputationImportRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.subject.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn imports_by_key_selects_that_key_from_the_cutoff_on() {
+        let pool = migrated_pool().await;
+        let (key, other_key) = ("e".repeat(64), "f".repeat(64));
+        for row in [
+            import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100),
+            import_row("2", "lnp2pbot", &key, HEX_KEY_B, 200),
+            import_row("3", "lnp2pbot", &key, &"c".repeat(64), 300),
+            import_row("4", "other-mostro", &other_key, HEX_KEY_A, 200),
+        ] {
+            insert_reputation_import(&pool, &row).await.unwrap();
+        }
+
+        let all = reputation_imports_by_key(&pool, &key, None).await.unwrap();
+        assert_eq!(subjects(&all), ["subject-1", "subject-2", "subject-3"]);
+        // The cutoff is inclusive: the import recorded at exactly 200 is selected.
+        let from_200 = reputation_imports_by_key(&pool, &key, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&from_200), ["subject-2", "subject-3"]);
+        let other = reputation_imports_by_key(&pool, &other_key, None)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&other), ["subject-4"]);
+    }
+
+    #[tokio::test]
+    async fn imports_for_identity_lists_only_that_identity() {
+        let pool = migrated_pool().await;
+        let key = "e".repeat(64);
+        for row in [
+            import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100),
+            import_row("2", "other-mostro", &key, HEX_KEY_A, 200),
+            import_row("3", "lnp2pbot", &key, HEX_KEY_B, 300),
+        ] {
+            insert_reputation_import(&pool, &row).await.unwrap();
+        }
+
+        let of_a = reputation_imports_for_identity(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&of_a), ["subject-1", "subject-2"]);
+        let of_b = reputation_imports_for_identity(&pool, HEX_KEY_B)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&of_b), ["subject-3"]);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_import_removes_only_that_row() {
+        let pool = migrated_pool().await;
+        let key = "e".repeat(64);
+        let first = import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100);
+        let second = import_row("2", "lnp2pbot", &key, HEX_KEY_B, 200);
+        insert_reputation_import(&pool, &first).await.unwrap();
+        insert_reputation_import(&pool, &second).await.unwrap();
+
+        assert!(delete_reputation_import(&pool, &first.attestation_id)
+            .await
+            .unwrap());
+        assert!(!delete_reputation_import(&pool, &first.attestation_id)
+            .await
+            .unwrap());
+        let left = reputation_imports_by_key(&pool, &key, None).await.unwrap();
+        assert_eq!(left, vec![second]);
+    }
+
+    #[test]
+    fn an_import_row_hands_core_the_figures_it_stored() {
+        let row = import_row("1", "lnp2pbot", &"e".repeat(64), HEX_KEY_A, 100);
+        let figures = row.figures();
+        assert_eq!(figures.reviews, 5);
+        assert_eq!(figures.rating_hundredths, 450);
+        assert_eq!(figures.since, 1_696_204_800);
+    }
+
+    #[tokio::test]
+    async fn update_user_reputation_persists_an_import_and_its_reversal() {
+        let pool = migrated_pool().await;
+        // A row whose native date is not stored yet: the import pins it.
+        sqlx::query("INSERT INTO users (pubkey, created_at) VALUES (?1, 1700000000)")
+            .bind(HEX_KEY_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut user = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(user.native_created_at, None);
+
+        let import = ReputationImport {
+            reviews: 5,
+            rating_hundredths: 450,
+            since: 1_600_000_000,
+        };
+        user.apply_reputation_import(&import);
+        assert!(update_user_reputation(&pool, &user).await.unwrap());
+        let stored = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(stored.total_reviews, 5);
+        assert_eq!(stored.total_rating, 4.5);
+        assert_eq!(stored.created_at, 1_600_000_000);
+        assert_eq!(stored.native_created_at, Some(1_700_000_000));
+        assert_eq!(stored.seeded_reviews, 5);
+        assert_eq!(stored.seeded_rating_sum, 22.5);
+
+        user.revert_reputation_import(&import, None);
+        assert!(update_user_reputation(&pool, &user).await.unwrap());
+        let reverted = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(reverted.total_reviews, 0);
+        assert_eq!(reverted.created_at, 1_700_000_000);
+        assert_eq!(reverted.seeded_reviews, 0);
+        assert_eq!(reverted.seeded_rating_sum, 0.0);
     }
 }

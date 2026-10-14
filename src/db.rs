@@ -1918,15 +1918,18 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// The trust-list names `issuer_key` is known under: the names its imports
-/// were recorded under and the name it was first configured under.
+/// The trust-list names that hold `issuer_key`: the names its imports were
+/// recorded under, and the name it is bound to while an import is recorded
+/// under that name. A name no import uses has nothing to deduplicate, so it
+/// holds no key.
 pub async fn reputation_issuer_names_for_key(
     pool: &SqlitePool,
     issuer_key: &str,
 ) -> Result<Vec<String>, MostroError> {
     sqlx::query_scalar::<_, String>(
         "SELECT issuer FROM reputation_imports WHERE issuer_key = ?1 \
-         UNION SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1 \
+         UNION SELECT k.issuer FROM reputation_issuer_keys k WHERE k.issuer_key = ?1 \
+         AND EXISTS (SELECT 1 FROM reputation_imports i WHERE i.issuer = k.issuer) \
          ORDER BY issuer",
     )
     .bind(issuer_key)
@@ -1935,25 +1938,41 @@ pub async fn reputation_issuer_names_for_key(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
-/// Bind `issuer_key` to the trust-list name `issuer` unless it is bound
-/// already; the first name a key is configured under is the one it keeps.
+/// Bind `issuer_key` to the trust-list name `issuer`. A key bound to a name
+/// an import is recorded under keeps that name and its date; one bound to a
+/// name no import uses moves to `issuer`, so a name mistyped before the
+/// first import can be corrected. Returns the name the key left, if it moved.
 pub async fn record_reputation_issuer_key(
     pool: &SqlitePool,
     issuer_key: &str,
     issuer: &str,
     seen_at: i64,
-) -> Result<(), MostroError> {
-    sqlx::query(
-        "INSERT OR IGNORE INTO reputation_issuer_keys (issuer_key, issuer, first_seen_at) \
-         VALUES (?1, ?2, ?3)",
+) -> Result<Option<String>, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let bound: Option<String> =
+        sqlx::query_scalar("SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1")
+            .bind(issuer_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let written = sqlx::query(
+        "INSERT INTO reputation_issuer_keys (issuer_key, issuer, first_seen_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT (issuer_key) DO UPDATE \
+         SET issuer = excluded.issuer, first_seen_at = excluded.first_seen_at \
+         WHERE reputation_issuer_keys.issuer <> excluded.issuer AND NOT EXISTS \
+         (SELECT 1 FROM reputation_imports i WHERE i.issuer = reputation_issuer_keys.issuer)",
     )
     .bind(issuer_key)
     .bind(issuer)
     .bind(seen_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(())
+    .map_err(db_err)?
+    .rows_affected();
+    tx.commit().await.map_err(db_err)?;
+    Ok(bound.filter(|_| written > 0))
 }
 
 /// Returns true only when the given `solver_pubkey` is assigned to the dispute

@@ -7,8 +7,8 @@ use mostro_core::error::MostroError;
 use nostr_sdk::prelude::Timestamp;
 use sqlx::SqlitePool;
 
-/// A configured trust-list key that already has imports recorded under a
-/// different issuer name.
+/// A configured trust-list key held by a different issuer name, one that
+/// imports are recorded under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuerNameConflict {
     pub key: String,
@@ -16,14 +16,15 @@ pub struct IssuerNameConflict {
     pub recorded: Vec<String>,
 }
 
-/// Boot check: every configured key is known only under the name its entry
-/// has now, whether by its past imports or by an earlier boot that
-/// configured it. Imports are deduplicated on that name, so renaming an
-/// entry, or moving a key to another entry, would let every account it
-/// imported import again. A planned rotation adds the new key to the entry
-/// first, so binding each key to its name at boot also catches a rename
-/// made after the old key has left. Returns the conflicts; the caller
-/// refuses to start on any. With none, binds the keys not yet bound.
+/// Boot check: no configured key is held by a name other than its entry's,
+/// whether by its past imports or by the name an earlier boot bound it to.
+/// Imports are deduplicated on that name, so renaming an entry, or moving a
+/// key to another entry, would let every account it imported import again.
+/// A planned rotation adds the new key to the entry first, so binding each
+/// key to its name at boot also catches a rename made after the old key has
+/// left. A bound name no import is recorded under holds nothing, so the
+/// binding follows the entry and the move is logged. Returns the conflicts;
+/// the caller refuses to start on any. With none, binds every key.
 pub async fn issuer_name_conflicts(
     pool: &SqlitePool,
     import: &ReputationImportSettings,
@@ -50,7 +51,14 @@ pub async fn issuer_name_conflicts(
         let now = Timestamp::now().as_secs() as i64;
         for issuer in &import.issuers {
             for key in issuer.public_keys() {
-                record_reputation_issuer_key(pool, &key.to_hex(), issuer.name.trim(), now).await?;
+                let key = key.to_hex();
+                let name = issuer.name.trim();
+                if let Some(left) = record_reputation_issuer_key(pool, &key, name, now).await? {
+                    tracing::warn!(
+                        "[reputation_import] key {key} moved from the entry `{left}` to `{name}`; \
+                         no import was recorded under `{left}`"
+                    );
+                }
             }
         }
     }
@@ -216,12 +224,36 @@ mod tests {
         record_reputation_issuer_key(&pool, &key, "lnp2pbot", 100)
             .await
             .unwrap();
-        record_reputation_issuer_key(&pool, &key, "renamed", 200)
+        let left = record_reputation_issuer_key(&pool, &key, "renamed", 200)
             .await
             .unwrap();
+        assert_eq!(left, None);
         assert_eq!(
             binding(&pool, &key).await,
             Some(("lnp2pbot".to_string(), 100))
+        );
+    }
+
+    /// A binding no import uses moves, and says which name it left.
+    #[tokio::test]
+    async fn a_binding_no_import_uses_reports_the_name_it_left() {
+        let pool = pool().await;
+        let key = Keys::generate().public_key().to_hex();
+        let first = record_reputation_issuer_key(&pool, &key, "lnp2pot", 100)
+            .await
+            .unwrap();
+        assert_eq!(first, None);
+        let again = record_reputation_issuer_key(&pool, &key, "lnp2pot", 150)
+            .await
+            .unwrap();
+        assert_eq!(again, None);
+        let left = record_reputation_issuer_key(&pool, &key, "lnp2pbot", 200)
+            .await
+            .unwrap();
+        assert_eq!(left.as_deref(), Some("lnp2pot"));
+        assert_eq!(
+            binding(&pool, &key).await,
+            Some(("lnp2pbot".to_string(), 200))
         );
     }
 

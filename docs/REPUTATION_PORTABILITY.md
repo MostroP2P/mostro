@@ -313,12 +313,16 @@ one. Rotation is therefore done by adding the new key to the existing entry:
   below.
 
 A key belongs to one entry only. The daemon binds every configured key to
-its entry's name the first time it boots with it (`reputation_issuer_keys`),
-and refuses to start if a configured key has imports recorded, or a binding,
-under a different name, so renaming an entry or moving a key cannot reset the
+its entry's name at boot (`reputation_issuer_keys`), and refuses to start if
+a configured key is held by a different name: one its imports are recorded
+under, or the name it is bound to while an import is recorded under that
+name. Renaming an entry or moving a key therefore cannot reset the
 deduplication, even after a planned rotation has replaced every key that
-signed an import. A key added and an entry renamed in the same edit cannot be
-linked to the old name, so an entry is never renamed. The issuer
+signed an import. A name no import is recorded under has nothing to
+deduplicate, so a binding to it follows the entry, and the daemon logs the
+move: a name mistyped before the first import can be corrected. A key added
+and an entry renamed in the same edit cannot be linked to the old name, so an
+entry with imports is never renamed. The issuer
 announces its current key in its own info event (`reputation_issuer`,
 section 5.2); operators learn of a rotation through it, and through the
 issuer's own channels.

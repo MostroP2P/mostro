@@ -159,6 +159,72 @@ mod tests {
         );
     }
 
+    async fn binding(pool: &SqlitePool, key: &str) -> Option<(String, i64)> {
+        sqlx::query_as(
+            "SELECT issuer, first_seen_at FROM reputation_issuer_keys WHERE issuer_key = ?1",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A name no import is recorded under has nothing to deduplicate, so an
+    /// entry booted with a mistyped name can be corrected before its first
+    /// import: its keys' binding follows the entry. Once an import is
+    /// recorded under the corrected name, that name holds the keys.
+    #[tokio::test]
+    async fn correcting_a_name_no_import_uses_rebinds_its_keys() {
+        let pool = pool().await;
+        let key = Keys::generate().public_key().to_hex();
+        assert!(
+            issuer_name_conflicts(&pool, &settings("lnp2pot", vec![key.clone()]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let corrected = settings("lnp2pbot", vec![key.clone()]);
+        assert!(issuer_name_conflicts(&pool, &corrected)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            binding(&pool, &key).await.map(|(name, _)| name).as_deref(),
+            Some("lnp2pbot")
+        );
+
+        insert_reputation_import(&pool, &row("lnp2pbot", &key, "a"))
+            .await
+            .unwrap();
+        let conflicts = issuer_name_conflicts(&pool, &settings("lnp2pot", vec![key]))
+            .await
+            .unwrap();
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    /// A key bound to a name an import is recorded under keeps it and its
+    /// date, whichever key signed that import.
+    #[tokio::test]
+    async fn a_key_keeps_a_name_imports_are_recorded_under() {
+        let pool = pool().await;
+        let signer = Keys::generate().public_key().to_hex();
+        let key = Keys::generate().public_key().to_hex();
+        insert_reputation_import(&pool, &row("lnp2pbot", &signer, "a"))
+            .await
+            .unwrap();
+        record_reputation_issuer_key(&pool, &key, "lnp2pbot", 100)
+            .await
+            .unwrap();
+        record_reputation_issuer_key(&pool, &key, "renamed", 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding(&pool, &key).await,
+            Some(("lnp2pbot".to_string(), 100))
+        );
+    }
+
     /// A refused boot leaves no trace: the keys of the entries that were fine
     /// are not bound, so fixing the conflict and booting again starts clean.
     #[tokio::test]

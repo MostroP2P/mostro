@@ -830,11 +830,13 @@ async fn job_cancel_orders(ctx: AppContext) {
 /// Guardian for the trade escrow's CLTV lifetime.
 ///
 /// A trade's escrow is a hold invoice whose HTLC LND auto-cancels
-/// `invoices.holdexpirydelta` blocks (default 12) before its CLTV expiry,
+/// `invoices.holdexpirydelta` blocks (default
+/// [`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+/// before its CLTV expiry,
 /// refunding the seller — while the order still reads `active` /
 /// `fiat-sent` and the buyer may still send (or already sent) the fiat
 /// leg. No other job covers those states, so without this pass the escrow
-/// silently evaporates ~`hold_invoice_cltv_delta - 12` blocks after the
+/// silently evaporates ~`hold_invoice_cltv_delta - holdexpirydelta` blocks after the
 /// seller paid (~22 h on defaults) and the trade can no longer settle:
 /// the buyer loses the fiat and the seller keeps both the fiat and the
 /// refunded sats.

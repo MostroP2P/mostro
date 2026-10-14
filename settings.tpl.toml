@@ -33,7 +33,13 @@ max_final_cltv_expiry_delta = 144
 # HTLC's expiry height (nominal 10-minute-block clock as fallback when
 # LND cannot answer), mostrod cancels the trade (Active) or opens a
 # dispute (FiatSent) while the escrow still exists. Must comfortably
-# exceed your node's holdexpirydelta.
+# exceed your node's holdexpirydelta. The buyer gets roughly
+# hold_invoice_cltv_delta - escrow_deadline_margin_blocks blocks to send
+# the fiat. mostrod refuses to start unless this value is at least 18
+# (LND's default holdexpirydelta of 12 plus 6 blocks of headroom) and
+# below hold_invoice_cltv_delta. The check assumes LND's default: if you
+# raised invoices.holdexpirydelta, keep this margin at least 6 blocks
+# above it yourself, since mostrod cannot read it yet (#1058).
 escrow_deadline_margin_blocks = 24
 # Ceiling on how many payments the node may have in flight before a new payout
 # waits its turn instead of adding another unresolved HTLC. A payee that never

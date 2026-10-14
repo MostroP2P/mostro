@@ -2011,21 +2011,12 @@ pub async fn settle_seller_hold_invoice(
 const SECS_PER_BLOCK: i64 = 600;
 
 /// Seconds between the escrow payment and the moment the deadline
-/// guardian acts: `(cltv_delta - margin)` blocks. A misconfigured margin
-/// `>= cltv_delta` would make the guardian fire on brand-new escrows, so
-/// it is clamped to half the window (loudly) instead of being honored.
+/// guardian acts: `(cltv_delta - margin)` blocks. The margin is used as
+/// configured, the same value the chain-height check compares against;
+/// startup validation guarantees `margin < cltv_delta`. Saturates at 0
+/// for settings built without that validation.
 pub fn escrow_guard_window_secs(cltv_delta_blocks: u32, margin_blocks: u32) -> i64 {
-    let effective_margin = if margin_blocks >= cltv_delta_blocks {
-        tracing::error!(
-            "escrow_deadline_margin_blocks ({margin_blocks}) must be below \
-             hold_invoice_cltv_delta ({cltv_delta_blocks}); clamping to half \
-             the window"
-        );
-        cltv_delta_blocks / 2
-    } else {
-        margin_blocks
-    };
-    i64::from(cltv_delta_blocks - effective_margin) * SECS_PER_BLOCK
+    i64::from(cltv_delta_blocks.saturating_sub(margin_blocks)) * SECS_PER_BLOCK
 }
 
 /// Unix timestamp from which the escrow-deadline guardian acts on an
@@ -4126,10 +4117,12 @@ mod tests {
     fn escrow_deadline_math_matches_the_cltv_horizon() {
         // 10-minute blocks: (144 - 24) * 600.
         assert_eq!(escrow_guard_window_secs(144, 24), 72_000);
-        // A margin at/above the window clamps to half — never negative,
-        // never firing on brand-new escrows.
-        assert_eq!(escrow_guard_window_secs(144, 144), 43_200);
-        assert_eq!(escrow_guard_window_secs(144, 1_000), 43_200);
+        // The margin is not clamped: the window matches the chain-height
+        // check. Startup validation rejects these values; unvalidated
+        // settings saturate at 0 instead of underflowing.
+        assert_eq!(escrow_guard_window_secs(144, 143), 600);
+        assert_eq!(escrow_guard_window_secs(144, 144), 0);
+        assert_eq!(escrow_guard_window_secs(144, 1_000), 0);
         assert_eq!(escrow_action_deadline_unix(0, 144, 24), None);
         assert_eq!(
             escrow_action_deadline_unix(1_000, 144, 24),

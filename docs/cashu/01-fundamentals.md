@@ -432,7 +432,8 @@ keeping it inert for real trades.
   mode-agnostic too: in Cashu mode it advertises `escrow_mode = "cashu"`,
   `cashu_mint_url` (every allowed mint as a tag value; omitted when any mint is
   accepted) and `cashu_escrow_locktime_days`, and omits the `lnd_*`,
-  `hold_invoice_cltv_delta` and invoice-window tags (`nip33::escrow_tags`,
+  `hold_invoice_cltv_delta`, `escrow_deadline_margin_blocks` and
+  invoice-window tags (`nip33::escrow_tags`,
   issue #1044).
 
 **Must NOT.** Implement any handler body. Change the Lightning boot path in any

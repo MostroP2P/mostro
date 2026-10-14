@@ -4,14 +4,12 @@ In order to verify the release, you'll need to have gpg or gpg2 installed on you
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/arkanoider.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/catrya.asc | gpg --import
-curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/andreadiazcorreia.asc | gpg --import
 ```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya, manifest.txt.sig.andreadiazcorreia and manifest.txt are in the current directory) with:
+Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya and manifest.txt are in the current directory) with:
 ```bash
 gpg --verify manifest.txt.sig.negrunch manifest.txt
 gpg --verify manifest.txt.sig.arkanoider manifest.txt
 gpg --verify manifest.txt.sig.catrya manifest.txt
-gpg --verify manifest.txt.sig.andreadiazcorreia manifest.txt
 
 gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 1E41631D137BA2ADE55344F73852B843679AD6F0
@@ -25,41 +23,38 @@ gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 9A718444050F091D3D24CF6CE15E232F243D73E6
 gpg: Good signature from "Catrya (github) <140891948+Catrya@users.noreply.github.com>" [ultimate]
 
-gpg: Signature made fri 10 oct 2025 11:28:03 -03
-gpg:                using EDDSA key 57376B6467F41F565ADDC65B1ED8B40E3A46E21D
-gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [ultimate]
-
 ```
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.19.2
+## What's Changed in 0.19.3
 
 ### 🚀 Features
 
 
-* feat: publish since next to the deprecated days by [@grunch](https://github.com/grunch) in [#1016](https://github.com/MostroP2P/mostro/pull/1016)
+* feat(reputation): add the import trust list by [@grunch](https://github.com/grunch) in [#1028](https://github.com/MostroP2P/mostro/pull/1028)
+* feat: answer user-info with own reputation by [@arkanoider](https://github.com/arkanoider) in [#1052](https://github.com/MostroP2P/mostro/pull/1052)
+* feat: handle declare-payer by [@grunch](https://github.com/grunch) in [#1023](https://github.com/MostroP2P/mostro/pull/1023)
+* feat: add payer history config and storage by [@grunch](https://github.com/grunch) in [#1022](https://github.com/MostroP2P/mostro/pull/1022)
+* feat: let the maker choose the Cashu mint by [@grunch](https://github.com/grunch) in [#1047](https://github.com/MostroP2P/mostro/pull/1047)
+* feat: publish the info event in Cashu mode by [@grunch](https://github.com/grunch) in [#1045](https://github.com/MostroP2P/mostro/pull/1045)
 
 ### 🐛 Bug Fixes
 
 
-* fix: only pay dev fees when LND is on mainnet by [@grunch](https://github.com/grunch) in [#1040](https://github.com/MostroP2P/mostro/pull/1040)
-* fix: send dev fees to dev@pay.mostro.foundation by [@grunch](https://github.com/grunch) in [#1038](https://github.com/MostroP2P/mostro/pull/1038)
-
-### 📚 Documentation
-
-
-* docs: define payer history disabled mode by [@grunch](https://github.com/grunch) in [#1020](https://github.com/MostroP2P/mostro/pull/1020)
-* docs(reputation): import exact figures instead of bands by [@grunch](https://github.com/grunch) in [#1019](https://github.com/MostroP2P/mostro/pull/1019)
+* fix: ignore system proxies in LNURL fetches by [@grunch](https://github.com/grunch) in [#1049](https://github.com/MostroP2P/mostro/pull/1049)
 
 ### ⚙️ Miscellaneous Tasks
 
 
-* chore: relicense project under GPLv3 or later by [@grunch](https://github.com/grunch) in [#957](https://github.com/MostroP2P/mostro/pull/957)
+* ci: map user_info.rs in the ortsom gate by [@arkanoider](https://github.com/arkanoider) in [#1056](https://github.com/MostroP2P/mostro/pull/1056)
+* ci: map the payer release tests in the gate map by [@grunch](https://github.com/grunch) in [#1051](https://github.com/MostroP2P/mostro/pull/1051)
+* ci: build Docker images natively and cache deps by [@grunch](https://github.com/grunch) in [#1042](https://github.com/MostroP2P/mostro/pull/1042)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#957](https://github.com/MostroP2P/mostro/pull/957)
+* [@grunch](https://github.com/grunch) made their contribution in [#1028](https://github.com/MostroP2P/mostro/pull/1028)
+* [@arkanoider](https://github.com/arkanoider) made their contribution in [#1052](https://github.com/MostroP2P/mostro/pull/1052)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.19.1...0.19.2
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.19.2...0.19.3
 
 <!-- generated by git-cliff -->

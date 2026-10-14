@@ -4,7 +4,9 @@
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
 use crate::cashu::mint_policy::normalize_mint_url;
 use crate::config::constants::{
-    ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MAX_REPUTATION_LIFETIME_SECONDS, MIN_DEV_FEE_PERCENTAGE,
+    ENV_FILENAME, LND_DEFAULT_HOLD_EXPIRY_DELTA, MAX_DEV_FEE_PERCENTAGE,
+    MAX_REPUTATION_LIFETIME_SECONDS, MIN_DEV_FEE_PERCENTAGE, MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS,
+    MIN_ESCROW_DEADLINE_MARGIN_BLOCKS,
 };
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
@@ -93,8 +95,57 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
 
     validate_serbero_pubkey(settings.mostro.serbero_pubkey.as_deref())?;
 
+    validate_escrow_deadline_margin(
+        &settings.lightning,
+        settings.cashu.as_ref().is_some_and(|cashu| cashu.enabled),
+    )?;
+
     if let Some(import) = settings.reputation_import.as_ref() {
         validate_reputation_import(import)?;
+    }
+
+    Ok(())
+}
+
+/// `escrow_deadline_margin_blocks` must be at least
+/// [`MIN_ESCROW_DEADLINE_MARGIN_BLOCKS`] (LND's default `holdexpirydelta`
+/// plus headroom) and below `hold_invoice_cltv_delta`. Below the minimum,
+/// LND can refund the seller before the escrow-deadline guardian acts; at
+/// or above the CLTV delta, the guardian acts within a few blocks of the
+/// escrow being paid. Neither fails at runtime, so both stop the daemon at
+/// load. The minimum assumes LND's default `holdexpirydelta`: a node that
+/// raised it needs a larger margin, which mostrod cannot check yet (#1058).
+/// Skipped in Cashu mode, which runs no guardian and has no hold invoice.
+fn validate_escrow_deadline_margin(
+    lightning: &crate::config::types::LightningSettings,
+    cashu_enabled: bool,
+) -> Result<(), MostroError> {
+    if cashu_enabled {
+        return Ok(());
+    }
+
+    let margin = lightning.escrow_deadline_margin_blocks;
+    let cltv_delta = lightning.hold_invoice_cltv_delta;
+
+    if margin < MIN_ESCROW_DEADLINE_MARGIN_BLOCKS {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "escrow_deadline_margin_blocks ({margin}) must be at least \
+             {MIN_ESCROW_DEADLINE_MARGIN_BLOCKS} (LND's default \
+             invoices.holdexpirydelta {LND_DEFAULT_HOLD_EXPIRY_DELTA} plus \
+             {MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS} blocks of headroom): below it \
+             LND can refund the escrow before mostrod acts. If LND runs with a \
+             higher holdexpirydelta, the margin must exceed that value by the \
+             same headroom; mostrod does not check it"
+        ))));
+    }
+
+    if margin >= cltv_delta {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "escrow_deadline_margin_blocks ({margin}) must be below \
+             hold_invoice_cltv_delta ({cltv_delta}): at or above it mostrod \
+             acts on a trade within a few blocks of the escrow being paid, \
+             leaving the buyer no time to send the fiat"
+        ))));
     }
 
     Ok(())
@@ -747,7 +798,10 @@ mod cashu_validation_tests {
 #[cfg(test)]
 mod startup_validation_tests {
     use super::*;
-    use crate::config::constants::{MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+    use crate::config::constants::{
+        LND_DEFAULT_HOLD_EXPIRY_DELTA, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
+        MIN_ESCROW_DEADLINE_MARGIN_BLOCKS,
+    };
     use crate::config::types::{
         AntiAbuseBondSettings, CashuSettings, DatabaseSettings, LightningSettings, MostroSettings,
         NostrSettings, RpcSettings,
@@ -756,7 +810,12 @@ mod startup_validation_tests {
     fn base_settings() -> Settings {
         Settings {
             database: DatabaseSettings::default(),
-            lightning: LightningSettings::default(),
+            // The shipped CLTV delta: `LightningSettings::default()` leaves it
+            // at 0, below any valid escrow deadline margin.
+            lightning: LightningSettings {
+                hold_invoice_cltv_delta: 144,
+                ..Default::default()
+            },
             nostr: NostrSettings::default(),
             mostro: MostroSettings::default(),
             rpc: RpcSettings::default(),
@@ -767,6 +826,96 @@ mod startup_validation_tests {
             reputation_import: None,
             payer_history: None,
         }
+    }
+
+    fn lightning(cltv_delta: u32, margin: u32) -> LightningSettings {
+        LightningSettings {
+            hold_invoice_cltv_delta: cltv_delta,
+            escrow_deadline_margin_blocks: margin,
+            ..Default::default()
+        }
+    }
+
+    fn enabled_cashu() -> CashuSettings {
+        CashuSettings {
+            enabled: true,
+            mint_urls: vec!["https://mint.example.com".to_string()],
+            escrow_locktime_days: 15,
+        }
+    }
+
+    #[test]
+    fn escrow_deadline_margin_inside_the_window_is_accepted() {
+        for margin in [MIN_ESCROW_DEADLINE_MARGIN_BLOCKS, 24, 143] {
+            assert!(
+                validate_escrow_deadline_margin(&lightning(144, margin), false).is_ok(),
+                "margin {margin} with cltv delta 144 must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn escrow_deadline_margin_at_or_above_cltv_delta_is_rejected() {
+        for margin in [144, 1_000] {
+            let err = validate_escrow_deadline_margin(&lightning(144, margin), false)
+                .expect_err("margin >= cltv delta must fail");
+            assert!(err
+                .to_string()
+                .contains("must be below hold_invoice_cltv_delta"));
+        }
+    }
+
+    #[test]
+    fn escrow_deadline_margin_below_the_minimum_is_rejected() {
+        // 13 clears LND's default holdexpirydelta by one block only, so the
+        // guardian would race LND for the escrow.
+        for margin in [
+            0,
+            LND_DEFAULT_HOLD_EXPIRY_DELTA,
+            LND_DEFAULT_HOLD_EXPIRY_DELTA + 1,
+            MIN_ESCROW_DEADLINE_MARGIN_BLOCKS - 1,
+        ] {
+            let err = validate_escrow_deadline_margin(&lightning(144, margin), false)
+                .expect_err("margin below the minimum must fail");
+            assert!(err.to_string().contains(&format!(
+                "must be at least {MIN_ESCROW_DEADLINE_MARGIN_BLOCKS}"
+            )));
+        }
+    }
+
+    #[test]
+    fn zero_cltv_delta_is_rejected_in_lightning_mode() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(0, 24);
+        let err = validate_mostro_settings(&settings).expect_err("cltv delta 0 must fail");
+        assert!(err
+            .to_string()
+            .contains("must be below hold_invoice_cltv_delta"));
+    }
+
+    #[test]
+    fn disabled_cashu_section_still_validates_the_lightning_margin() {
+        // `[cashu]` present but `enabled = false` is a Lightning node: its
+        // margin is checked like any other.
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, LND_DEFAULT_HOLD_EXPIRY_DELTA);
+        settings.cashu = Some(CashuSettings {
+            enabled: false,
+            ..enabled_cashu()
+        });
+        let err =
+            validate_mostro_settings(&settings).expect_err("lightning margin must be checked");
+        assert!(err.to_string().contains("must be at least"));
+    }
+
+    #[test]
+    fn cashu_mode_skips_escrow_deadline_margin_validation() {
+        // A Cashu node has no hold invoice, so its unused `[lightning]`
+        // values must not stop it from starting.
+        let mut settings = base_settings();
+        settings.lightning = LightningSettings::default();
+        settings.cashu = Some(enabled_cashu());
+        assert!(validate_mostro_settings(&settings).is_ok());
     }
 
     #[test]
@@ -818,11 +967,7 @@ mod startup_validation_tests {
             enabled: true,
             ..Default::default()
         });
-        settings.cashu = Some(CashuSettings {
-            enabled: true,
-            mint_urls: vec!["https://mint.example.com".to_string()],
-            escrow_locktime_days: 15,
-        });
+        settings.cashu = Some(enabled_cashu());
         assert!(validate_mostro_settings(&settings).is_err());
     }
 }

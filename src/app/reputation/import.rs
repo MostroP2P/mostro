@@ -266,6 +266,66 @@ mod tests {
         assert!(reply.payload.is_none());
     }
 
+    /// The row an import leaves is what a revocation later selects and
+    /// reverses with, so its figures and its clock are pinned here.
+    #[tokio::test]
+    async fn the_import_row_keeps_what_a_reversal_needs() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let mut user = User::new(identity.to_hex(), 0, 0, 0, 0, 1);
+        user.update_rating(4);
+        user.update_rating(5);
+        add_new_user(f.ctx.pool(), user).await.unwrap();
+        let before = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+
+        let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
+        let at = Timestamp::now().as_secs() as i64;
+        import_reputation_action(&f.ctx, msg, &event).await.unwrap();
+
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        let row = &rows[0];
+        assert_eq!(
+            (row.reviews, row.rating_hundredths, row.since),
+            (214, 487, SINCE as i64)
+        );
+        assert!(
+            (row.imported_at - at).abs() <= 5,
+            "imported_at is the node's own clock"
+        );
+
+        // The stored figures undo the merge exactly.
+        let mut after = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        after.revert_reputation_import(&row.figures().unwrap(), None);
+        assert_eq!(after.total_reviews, before.total_reviews);
+        assert!((after.total_rating - before.total_rating).abs() < 1e-9);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.seeded_reviews, 0);
+    }
+
+    /// The row an import creates for a new identity dates it from the import,
+    /// which is the date a reversal restores.
+    #[tokio::test]
+    async fn a_new_identitys_native_date_is_when_its_row_was_made() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let at = Timestamp::now().as_secs() as i64;
+        import(&f, &identity, &attestation(&f.issuer, &identity, "acct-1"))
+            .await
+            .unwrap();
+        let user = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(user.created_at, SINCE as i64);
+        let native = user.native_created_at.expect("the row has a native date");
+        assert!((native - at).abs() <= 5);
+    }
+
     #[tokio::test]
     async fn an_identity_that_never_traded_here_gets_a_row() {
         let f = fixture().await;

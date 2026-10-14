@@ -159,6 +159,34 @@ mod tests {
         );
     }
 
+    /// A refused boot leaves no trace: the keys of the entries that were fine
+    /// are not bound, so fixing the conflict and booting again starts clean.
+    #[tokio::test]
+    async fn a_refused_boot_binds_none_of_the_other_keys() {
+        let pool = pool().await;
+        let moved = Keys::generate().public_key().to_hex();
+        let fresh = Keys::generate().public_key().to_hex();
+        insert_reputation_import(&pool, &row("lnp2pbot", &moved, "a"))
+            .await
+            .unwrap();
+
+        let entry = |name: &str, key: &String| ReputationIssuer {
+            name: name.to_string(),
+            keys: vec![key.clone()],
+        };
+        let two_entries = ReputationImportSettings {
+            enabled: true,
+            issuers: vec![entry("other-mostro", &moved), entry("new-entry", &fresh)],
+            ..Default::default()
+        };
+        let conflicts = issuer_name_conflicts(&pool, &two_entries).await.unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(reputation_issuer_names_for_key(&pool, &fresh)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn a_second_import_of_the_same_source_or_identity_is_refused() {
         let pool = pool().await;

@@ -24,6 +24,7 @@ pub mod orders; // Orders action
 pub mod payer; // Payer declaration + payment-account history (anti-triangulation)
 pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
+pub mod reputation; // Reputation portability: import and export of attestations
 pub mod restore_session; // Restore session action
 pub mod serbero; // Serbero, the dispute assistant: boot registration as a read-only solver
 pub mod take_buy; // Taking buy orders

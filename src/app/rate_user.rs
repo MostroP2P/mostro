@@ -163,6 +163,7 @@ pub async fn update_user_reputation_action(
         user_to_vote.max_rating,
         user_to_vote.total_reviews,
         user_to_vote.total_rating,
+        user_to_vote.native_rating_sum,
     )
     .await?;
 
@@ -438,6 +439,8 @@ mod tests {
         assert_eq!(seller_user.max_rating, 5);
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((seller_user.total_rating - 2.5).abs() < f64::EPSILON);
+        // The raw rating is kept undamped next to the average
+        assert!((seller_user.native_rating_sum - 5.0).abs() < f64::EPSILON);
 
         // Order buyer_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)
@@ -547,6 +550,8 @@ mod tests {
         assert_eq!(buyer_user.max_rating, 4);
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((buyer_user.total_rating - 2.0).abs() < f64::EPSILON);
+        // The raw rating is kept undamped next to the average
+        assert!((buyer_user.native_rating_sum - 4.0).abs() < f64::EPSILON);
 
         // Order seller_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)

@@ -103,6 +103,11 @@ paths = ["src/rpc/**", "proto/**"]
 uncovered = "ortsom has no gRPC client; admin actions it exercises go over Nostr (see the dispute rule)"
 
 [[rule]]
+name = "reputation portability"
+paths = ["src/app/reputation/**"]
+uncovered = "ortsom has no reputation scenario; covered by unit tests and the two-daemon run in #1027"
+
+[[rule]]
 name = "cashu"
 paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
 uncovered = "covered by cashu.yml, not by ortsom"

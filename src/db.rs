@@ -1787,12 +1787,20 @@ pub struct ReputationImportRow {
 
 impl ReputationImportRow {
     /// The figures the import merged, as core's merge and reversal take them.
-    pub fn figures(&self) -> ReputationImport {
-        ReputationImport {
-            reviews: u32::try_from(self.reviews).unwrap_or(0),
-            rating_hundredths: u16::try_from(self.rating_hundredths).unwrap_or(0),
-            since: u64::try_from(self.since).unwrap_or(0),
-        }
+    /// A row whose figures do not fit them was not written by an import, so
+    /// it is an error, never a reversal that subtracts nothing.
+    pub fn figures(&self) -> Result<ReputationImport, MostroError> {
+        let out_of_range = || {
+            MostroInternalErr(ServiceError::DbAccessError(format!(
+                "reputation import {} has out-of-range figures",
+                self.attestation_id
+            )))
+        };
+        Ok(ReputationImport {
+            reviews: u32::try_from(self.reviews).map_err(|_| out_of_range())?,
+            rating_hundredths: u16::try_from(self.rating_hundredths).map_err(|_| out_of_range())?,
+            since: u64::try_from(self.since).map_err(|_| out_of_range())?,
+        })
     }
 }
 
@@ -7040,10 +7048,40 @@ mod migration_and_query_tests {
     #[test]
     fn an_import_row_hands_core_the_figures_it_stored() {
         let row = import_row("1", "lnp2pbot", &"e".repeat(64), HEX_KEY_A, 100);
-        let figures = row.figures();
+        let figures = row.figures().unwrap();
         assert_eq!(figures.reviews, 5);
         assert_eq!(figures.rating_hundredths, 450);
         assert_eq!(figures.since, 1_696_204_800);
+    }
+
+    /// A row no import could have written is refused, not read as zeros
+    /// that a reversal would then subtract.
+    #[test]
+    fn an_import_row_out_of_range_has_no_figures() {
+        let row = import_row("1", "lnp2pbot", &"e".repeat(64), HEX_KEY_A, 100);
+        for bad in [
+            ReputationImportRow {
+                reviews: -5,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                reviews: 5_000_000_000,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                rating_hundredths: 70_000,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                since: -1,
+                ..row.clone()
+            },
+        ] {
+            assert!(
+                matches!(bad.figures(), Err(MostroError::MostroInternalErr(_))),
+                "{bad:?}"
+            );
+        }
     }
 
     #[tokio::test]

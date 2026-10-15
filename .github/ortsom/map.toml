@@ -51,6 +51,15 @@ name = "maintenance mode"
 paths = ["src/app/maintenance.rs", "src/app/daemon_state.rs"]
 tags = ["happy-path", "cancellation"]
 
+# The e2e regtest LND is always synced to chain, so these tags exercise the
+# sync gate's "synced, don't defer" path and the buyer payout and dev fee
+# paths it guards. The unsynced/deferral path and the automatic maintenance
+# have no e2e scenario; unit tests cover them.
+[[rule]]
+name = "health and LND sync gate"
+paths = ["src/app/health/**"]
+tags = ["happy-path", "payment-failure"]
+
 [[rule]]
 name = "cancellation"
 paths = ["src/app/cancel.rs"]

@@ -306,7 +306,7 @@ async fn verify_confirmed_orders(
                 unverifiable.insert(order_id);
                 not_on_this_node += 1;
             }
-            DevFeePaymentState::Failed => {
+            DevFeePaymentState::Failed { .. } => {
                 // Do NOT reset orders with real payment hashes. LND may report
                 // "Failed" for payments that haven't been fully indexed yet.
                 // Resetting prematurely causes duplicate payments because LNURL
@@ -449,12 +449,12 @@ async fn recover_partial_payments(
                     }
                 }
             }
-            DevFeePaymentState::Failed => {
+            DevFeePaymentState::Failed { resolved_at } => {
                 info!(
                     "Order {} existing payment failed (hash {}), clearing for retry",
                     order_id, existing_hash
                 );
-                clear_failed_payment_hash(pool, order_id, &existing_hash).await;
+                clear_failed_payment_hash(pool, order_id, &existing_hash, resolved_at).await;
             }
             DevFeePaymentState::InFlight => {
                 info!(
@@ -800,7 +800,7 @@ async fn handle_payment_timeout(
                 order_id
             );
         }
-        DevFeePaymentState::Failed => {
+        DevFeePaymentState::Failed { resolved_at } => {
             info!(
                 "Payment confirmed failed for order {}, clearing hash for retry",
                 order_id
@@ -809,6 +809,7 @@ async fn handle_payment_timeout(
                 pool,
                 order_id,
                 order.dev_fee_payment_hash.as_deref().unwrap_or_default(),
+                resolved_at,
             )
             .await;
         }
@@ -865,9 +866,24 @@ pub(crate) async fn record_dev_fee_failure(
     order_id: uuid::Uuid,
     payment_hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    record_dev_fee_failure_at(pool, order_id, payment_hash, Utc::now().timestamp()).await
+}
+
+/// [`record_dev_fee_failure`] for a failure that happened at `failed_at`:
+/// a failure recovered from LND's record (Phase 3, or a send that timed out
+/// and failed later) is counted for the health event at the time LND failed
+/// it, not when it was recovered, so a failure hours old does not enter the
+/// last-hour window on recovery (Codex review on #1066). The backoff is
+/// still computed from now.
+pub(crate) async fn record_dev_fee_failure_at(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    payment_hash: Option<&str>,
+    failed_at: i64,
+) -> Result<(), sqlx::Error> {
     match count_dev_fee_failure(pool, order_id, payment_hash).await {
         Ok(Some((failed_attempts, delay))) => {
-            crate::app::health::stats::record_dev_fee_failure(Utc::now().timestamp());
+            crate::app::health::stats::record_dev_fee_failure(failed_at);
             info!(
                 "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
                 order_id, failed_attempts, delay
@@ -930,8 +946,17 @@ async fn count_dev_fee_failure(
 /// The backoff is stored **before** the hash is cleared: while the hash is
 /// set no cycle can claim the order, so there is no moment when it is
 /// claimable without its deadline.
-async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, existing_hash: &str) {
-    if record_dev_fee_failure(pool, order_id, Some(existing_hash))
+///
+/// `failed_at` is when LND resolved the payment, when its record says; the
+/// failure is counted for the health event at that time.
+async fn clear_failed_payment_hash(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    existing_hash: &str,
+    failed_at: Option<i64>,
+) {
+    let failed_at = failed_at.unwrap_or_else(|| Utc::now().timestamp());
+    if record_dev_fee_failure_at(pool, order_id, Some(existing_hash), failed_at)
         .await
         .is_err()
     {
@@ -1071,8 +1096,9 @@ enum DevFeePaymentState {
     Succeeded,
     /// Payment is still in-flight on the LN network.
     InFlight,
-    /// Payment definitively failed — safe to retry.
-    Failed,
+    /// Payment definitively failed — safe to retry. `resolved_at` is when
+    /// LND's record says it failed (`PaymentLookup::resolved_at`).
+    Failed { resolved_at: Option<i64> },
     /// The connected node has no record of this payment hash (gRPC
     /// `NotFound`, or an empty track stream). Asking again will not change
     /// the answer:
@@ -1116,19 +1142,21 @@ async fn check_dev_fee_payment_status(
         }
     };
 
-    // `lookup_payment_status` folds both ways LND says "never seen this
-    // hash" — a gRPC `NotFound` and a track stream that ends without a
-    // payment — into `Ok(None)`; only transport / gRPC failures are `Err`.
+    // `lookup_payment` folds both ways LND says "never seen this hash" — a
+    // gRPC `NotFound` and a track stream that ends without a payment — into
+    // `Ok(None)`; only transport / gRPC failures are `Err`.
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        ln_client.lookup_payment_status(&payment_hash_bytes),
+        ln_client.lookup_payment(&payment_hash_bytes),
     )
     .await
     {
-        Ok(Ok(Some(status))) => match status {
+        Ok(Ok(Some(found))) => match found.status {
             PaymentStatus::Succeeded => DevFeePaymentState::Succeeded,
             PaymentStatus::InFlight | PaymentStatus::Initiated => DevFeePaymentState::InFlight,
-            PaymentStatus::Failed => DevFeePaymentState::Failed,
+            PaymentStatus::Failed => DevFeePaymentState::Failed {
+                resolved_at: found.resolved_at,
+            },
             _ => DevFeePaymentState::Unknown,
         },
         Ok(Ok(None)) => {
@@ -1959,7 +1987,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
 
-        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH).await;
+        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH, None).await;
 
         let (hash, attempts, next_at): (Option<String>, i64, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_payment_hash, dev_fee_failed_attempts, dev_fee_next_attempt_at \
@@ -2064,6 +2092,41 @@ mod tests {
         );
     }
 
+    /// Codex review on #1066: a failure recovered from LND's record is
+    /// counted for the health event at the time LND failed it, so one that
+    /// is hours old does not enter the last-hour window on recovery.
+    #[tokio::test]
+    async fn a_recovered_dev_fee_failure_is_counted_at_lnds_time() {
+        use crate::app::health::stats::dev_fee_failures_1h;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        // A time far from every other test's `now`, so the global window is
+        // ours alone around it.
+        let recovered_at: i64 = 3_000_000_000;
+        let failed_at = recovered_at - 2 * 3_600;
+
+        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH, Some(failed_at)).await;
+
+        assert_eq!(
+            dev_fee_failures_1h(failed_at + 1),
+            1,
+            "counted when it failed"
+        );
+        assert_eq!(
+            dev_fee_failures_1h(recovered_at),
+            0,
+            "not in the window at recovery"
+        );
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "the backoff bookkeeping is unchanged");
+    }
+
     /// Codex review on #1064 (round 3): the backoff must already be stored
     /// when a failed attempt gives the order back, on every failure path.
     #[tokio::test]
@@ -2089,7 +2152,7 @@ mod tests {
         // hash is cleared.
         let failed = uuid::Uuid::new_v4();
         insert_test_order(&pool, failed, "success", 100, false, Some(VALID_HEX_HASH)).await;
-        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH).await;
+        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH, None).await;
 
         let deadlines = deadlines_at_release(&pool).await;
         assert_eq!(deadlines.len(), 2, "both orders were given back");
@@ -2181,7 +2244,7 @@ mod tests {
         insert_test_order(&pool, failed, "success", 100, false, Some(VALID_HEX_HASH)).await;
 
         super::release_failed_claim(&pool, unresolved, "PENDING-x-1").await;
-        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH).await;
+        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH, None).await;
 
         let hash = |id: uuid::Uuid| {
             sqlx::query_scalar::<_, Option<String>>(
@@ -2217,7 +2280,7 @@ mod tests {
 
         // The send fails, then the next cycle's recovery sees the same hash.
         handle_payment_failure(order, &pool, id, &err).await;
-        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH).await;
+        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH, None).await;
 
         let attempts: i64 =
             sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")

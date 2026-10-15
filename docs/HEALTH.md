@@ -60,7 +60,7 @@ Computed from the sync state above; it is what turns automatic maintenance on (`
 
 ## The health event (kind 38389)
 
-The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). mostrod publishes it from `job_health_event_send` (`src/scheduler.rs`), implemented in `src/app/health/publisher.rs`, in both Lightning and Cashu mode, unless `[health].enabled = false`.
+The spec is `health_event.md` in the protocol book (MostroP2P/protocol#84). mostrod publishes it from `job_health_event_send` (`src/scheduler.rs`), implemented in `src/app/health/publisher.rs`, in both Lightning and Cashu mode, unless `[health].enabled = false`.
 
 **Cadence.** The checks are evaluated every 15 seconds and whenever maintenance mode changes; every database read is skipped once the `SELECT 1` probe fails, and the probe and all the reads share one 5 s budget, so a stuck database is reported in time. The event is published every `[health].interval` seconds (60 by default), and at once when `status`, a check state, `maintenance_mode` or the maintenance reason changes (a reason that could not be read is no change), but never twice within 10 seconds. It goes to the same relays as the info event. A send no relay accepts does not count as a publication and is retried at the next evaluation.
 

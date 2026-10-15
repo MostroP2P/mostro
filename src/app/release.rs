@@ -1240,11 +1240,14 @@ async fn dispatch_payout(
                 .await
                 .unwrap_or(false)
                 {
-                    if let Some(failed) = failed_lookup {
+                    // Counted only with LND's own time, as in reconciliation:
+                    // a record with no resolution time is not placed in the
+                    // window at an invented moment.
+                    if let Some((failed, at)) =
+                        failed_lookup.and_then(|failed| failed.resolved_at.map(|at| (failed, at)))
+                    {
                         ctx.health_stats().record_payout_failure(
-                            failed
-                                .resolved_at
-                                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                            at,
                             crate::app::health::stats::failure_reason_key(failed.failure_reason),
                         );
                     }

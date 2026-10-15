@@ -116,6 +116,13 @@ pub struct LndSyncSnapshot {
     pub deferral_ended_at: Option<i64>,
 }
 
+/// Whether at least `threshold` seconds passed between `since` and `now`,
+/// compared as `u64` so a threshold above `i64::MAX` can never wrap to a
+/// negative number and be met at once.
+fn elapsed_at_least(since: i64, now: i64, threshold: u64) -> bool {
+    u64::try_from(now.saturating_sub(since)).is_ok_and(|elapsed| elapsed >= threshold)
+}
+
 impl LndSyncSnapshot {
     fn observe(&mut self, observation: LndObservation, now: i64) -> Option<SyncTransition> {
         let was_reachable = self.observed_at.is_none() || self.last.is_some();
@@ -172,9 +179,7 @@ impl LndSyncSnapshot {
         match (&self.last, self.unsynced_since) {
             (None, _) => CheckState::Unknown,
             (Some(last), _) if last.synced_to_chain => CheckState::Ok,
-            (Some(_), Some(since)) if now.saturating_sub(since) >= fail_after as i64 => {
-                CheckState::Fail
-            }
+            (Some(_), Some(since)) if elapsed_at_least(since, now, fail_after) => CheckState::Fail,
             (Some(_), _) => CheckState::Warn,
         }
     }
@@ -330,9 +335,9 @@ pub fn auto_maintenance_decision(
         return AutoMaintenance::Enable;
     }
     if maintenance_enabled
-        && snapshot
-            .synced_for(now)
-            .is_some_and(|secs| secs >= settings.lnd_resynced_clear_after as i64)
+        && snapshot.synced_for(now).is_some_and(|secs| {
+            u64::try_from(secs).is_ok_and(|secs| secs >= settings.lnd_resynced_clear_after)
+        })
     {
         return AutoMaintenance::Disable;
     }

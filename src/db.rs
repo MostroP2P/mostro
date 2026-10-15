@@ -1436,9 +1436,11 @@ pub async fn fail_order_payout(
 /// without counting a payment attempt: sets `failed_payment` (what that job
 /// selects on) and leaves `payment_attempts` alone. Used while our own LND
 /// cannot pay (#1063). Only touches a `settled-hold-invoice` order with no
-/// payout in flight, so it can never orphan a claimed payout.
-pub async fn mark_payout_deferred(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
-    sqlx::query(
+/// payout in flight, so it can never orphan a claimed payout. Returns whether
+/// a row was marked; `false` means the order is not in that state and the
+/// caller should say so, since nothing is left for the retry job.
+pub async fn mark_payout_deferred(pool: &SqlitePool, order_id: Uuid) -> Result<bool, MostroError> {
+    let result = sqlx::query(
         "UPDATE orders SET failed_payment = true \
          WHERE id = ?1 AND status = ?2 AND payout_payment_hash IS NULL",
     )
@@ -1447,7 +1449,7 @@ pub async fn mark_payout_deferred(pool: &SqlitePool, order_id: Uuid) -> Result<(
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Orders with a buyer payout in flight (marker set) that are old enough to

@@ -1249,7 +1249,10 @@ async fn defer_payout_durably(
     order_id: uuid::Uuid,
 ) -> Result<(), MostroError> {
     let mut last_error = match crate::db::mark_payout_deferred(pool, order_id).await {
-        Ok(()) => return Ok(()),
+        Ok(marked) => {
+            warn_if_nothing_deferred(order_id, marked);
+            return Ok(());
+        }
         Err(e) => e,
     };
     for delay in DEFER_PAYOUT_RETRY_DELAYS {
@@ -1258,7 +1261,10 @@ async fn defer_payout_durably(
         );
         tokio::time::sleep(delay).await;
         match crate::db::mark_payout_deferred(pool, order_id).await {
-            Ok(()) => return Ok(()),
+            Ok(marked) => {
+                warn_if_nothing_deferred(order_id, marked);
+                return Ok(());
+            }
             Err(e) => last_error = e,
         }
     }
@@ -1268,6 +1274,19 @@ async fn defer_payout_durably(
         DEFER_PAYOUT_RETRY_DELAYS.len() + 1
     );
     Err(last_error)
+}
+
+/// The mark found nothing to mark: the order is not `settled-hold-invoice`
+/// with no payout in flight. Not an error for the caller (the order is not
+/// ours to pay in that state), but said out loud, since no recovery job will
+/// look at it.
+fn warn_if_nothing_deferred(order_id: uuid::Uuid, marked: bool) {
+    if !marked {
+        warn!(
+            "Order id {order_id}: nothing to defer, the order is not settled-hold-invoice \
+             without a payout in flight"
+        );
+    }
 }
 
 /// After the slot gate and the dispatch semaphore, whose waits can be long:
@@ -2121,10 +2140,11 @@ mod tests {
             .unwrap()
             .expect("claimed");
 
-        crate::db::mark_payout_deferred(&pool, order.id)
+        let marked = crate::db::mark_payout_deferred(&pool, order.id)
             .await
             .unwrap();
 
+        assert!(!marked, "the caller is told nothing was marked");
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert!(!db_order.failed_payment);
     }

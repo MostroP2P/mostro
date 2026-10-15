@@ -104,6 +104,42 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
         validate_reputation_import(import)?;
     }
 
+    validate_health_settings(&settings.health)?;
+
+    Ok(())
+}
+
+/// `[health]`: `lnd_unsynced_fail_after` must exceed the 60 s after which
+/// outgoing payments already wait (`PAYMENT_DEFER_AFTER_SECS`). LND reports
+/// `synced_to_chain = false` for a few seconds whenever a block arrives, so a
+/// shorter threshold would turn maintenance on at every block, and each time
+/// it would stay on for `lnd_resynced_clear_after` seconds. That one must be
+/// positive, otherwise a single synced poll would lift maintenance.
+fn validate_health_settings(
+    health: &crate::config::types::HealthSettings,
+) -> Result<(), MostroError> {
+    use crate::app::health::lnd_sync::PAYMENT_DEFER_AFTER_SECS;
+
+    let fail_after = health.lnd_unsynced_fail_after;
+    if i64::try_from(fail_after).map_or(true, |secs| secs <= PAYMENT_DEFER_AFTER_SECS) {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "health.lnd_unsynced_fail_after ({fail_after}) must be greater than \
+             {PAYMENT_DEFER_AFTER_SECS}: LND reports synced_to_chain = false for a \
+             few seconds at every block, and outgoing payments already wait after \
+             {PAYMENT_DEFER_AFTER_SECS}s; a shorter threshold would enter maintenance \
+             mode at every block"
+        ))));
+    }
+
+    let clear_after = health.lnd_resynced_clear_after;
+    if clear_after == 0 || i64::try_from(clear_after).is_err() {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "health.lnd_resynced_clear_after ({clear_after}) must be between 1 and {}: with 0 \
+             a single synced poll lifts the automatic maintenance",
+            i64::MAX
+        ))));
+    }
+
     Ok(())
 }
 
@@ -844,6 +880,50 @@ mod startup_validation_tests {
             mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 15,
         }
+    }
+
+    #[test]
+    fn health_defaults_are_accepted() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        validate_mostro_settings(&settings).expect("defaults must load");
+    }
+
+    #[test]
+    fn health_fail_after_must_exceed_the_payment_deferral_threshold() {
+        use crate::app::health::lnd_sync::PAYMENT_DEFER_AFTER_SECS;
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+
+        settings.health.lnd_unsynced_fail_after = 0;
+        let err = validate_mostro_settings(&settings).expect_err("0 must be refused");
+        assert!(err.to_string().contains("lnd_unsynced_fail_after"));
+
+        settings.health.lnd_unsynced_fail_after = PAYMENT_DEFER_AFTER_SECS as u64;
+        assert!(
+            validate_mostro_settings(&settings).is_err(),
+            "equal to the deferral threshold must be refused"
+        );
+
+        settings.health.lnd_unsynced_fail_after = PAYMENT_DEFER_AFTER_SECS as u64 + 1;
+        validate_mostro_settings(&settings).expect("just above it is accepted");
+    }
+
+    #[test]
+    fn health_clear_after_must_be_positive() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.health.lnd_resynced_clear_after = 0;
+        let err = validate_mostro_settings(&settings).expect_err("0 must be refused");
+        assert!(err.to_string().contains("lnd_resynced_clear_after"));
+
+        // Codex review on #1065: a value above i64::MAX used to wrap negative.
+        settings.health.lnd_resynced_clear_after = u64::MAX;
+        assert!(validate_mostro_settings(&settings).is_err());
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.health.lnd_unsynced_fail_after = u64::MAX;
+        assert!(validate_mostro_settings(&settings).is_err());
     }
 
     #[test]

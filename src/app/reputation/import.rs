@@ -174,6 +174,17 @@ mod tests {
     }
 
     fn attestation(issuer: &Keys, destination: &PublicKey, subject: &str) -> String {
+        attestation_at(issuer, destination, subject, Timestamp::now())
+    }
+
+    /// An event id hashes `created_at` to the second, so two attestations of
+    /// one account signed in the same second are the same attestation.
+    fn attestation_at(
+        issuer: &Keys,
+        destination: &PublicKey,
+        subject: &str,
+        created_at: Timestamp,
+    ) -> String {
         ReputationAttestation::build(
             issuer,
             destination,
@@ -181,11 +192,23 @@ mod tests {
             214,
             4.87,
             SINCE,
-            Timestamp::now(),
+            created_at,
             ATTESTATION_LIFETIME_SECS,
         )
         .unwrap()
         .as_json()
+    }
+
+    /// The replies queued for `sender`.
+    async fn replies_to(sender: PublicKey) -> Vec<Message> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(_, pk)| *pk == sender)
+            .map(|(m, _)| m.clone())
+            .collect()
     }
 
     /// An import request from `identity`'s proof, sent by a fresh trade key.
@@ -253,14 +276,7 @@ mod tests {
         assert_eq!(rows[0].issuer_key, f.issuer.public_key().to_hex());
         assert_eq!(rows[0].trade_pubkey, Some(event.sender.to_hex()));
 
-        let replies: Vec<Message> = crate::config::MESSAGE_QUEUES
-            .queue_order_msg
-            .read()
-            .await
-            .iter()
-            .filter(|(_, pk)| *pk == event.sender)
-            .map(|(m, _)| m.clone())
-            .collect();
+        let replies = replies_to(event.sender).await;
         assert_eq!(replies.len(), 1);
         let reply = replies[0].get_inner_message_kind();
         assert_eq!(reply.action, Action::ReputationImported);
@@ -354,9 +370,11 @@ mod tests {
         import(&f, &a, &attestation(&f.issuer, &a, "acct-1"))
             .await
             .unwrap();
-        // The same identity again, and the same account for another identity.
+        // The same identity again with another attestation of the account,
+        // and the same account for another identity.
+        let earlier = Timestamp::from(Timestamp::now().as_secs() - 60);
         assert_eq!(
-            refused(import(&f, &a, &attestation(&f.issuer, &a, "acct-1")).await),
+            refused(import(&f, &a, &attestation_at(&f.issuer, &a, "acct-1", earlier)).await),
             CantDoReason::ReputationAlreadyImported
         );
         assert_eq!(
@@ -370,6 +388,37 @@ mod tests {
         );
         let user = is_user_present(f.ctx.pool(), a.to_hex()).await.unwrap();
         assert_eq!(user.total_reviews, 214, "only the first import merged");
+    }
+
+    /// The reply queue lives in memory, so a confirmation can be lost after
+    /// the import committed. Sending the same attestation again must confirm
+    /// it again, not refuse it as a second import, and must merge nothing.
+    #[tokio::test]
+    async fn a_resent_attestation_is_confirmed_again_and_merges_once() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = attestation(&f.issuer, &identity, "acct-1");
+        let (msg, first) = request(&identity, &json);
+        import_reputation_action(&f.ctx, msg, &first).await.unwrap();
+
+        // The retry may come from another trade key.
+        let (msg, retry) = request(&identity, &json);
+        import_reputation_action(&f.ctx, msg, &retry).await.unwrap();
+
+        let replies = replies_to(retry.sender).await;
+        assert_eq!(replies.len(), 1);
+        let reply = replies[0].get_inner_message_kind();
+        assert_eq!(reply.action, Action::ReputationImported);
+        assert_eq!(reply.request_id, Some(7));
+        let user = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(user.total_reviews, 214, "the retry merged nothing");
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trade_pubkey, Some(first.sender.to_hex()));
     }
 
     #[tokio::test]

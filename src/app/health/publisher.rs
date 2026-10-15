@@ -101,21 +101,8 @@ pub async fn payout_rows(
     payment_attempts: i64,
     now: i64,
 ) -> Result<PayoutRows, MostroError> {
-    // "Waiting on the buyer": attempts used up and no payout in flight, the
-    // state in which `check_failure_retries` has sent `add-invoice`.
-    const AWAITING: &str = "SELECT COUNT(*) FROM orders WHERE status = ?1 \
-         AND failed_payment = 1 AND payout_payment_hash IS NULL AND payment_attempts >= ?2";
-    const UNPAID: &str = "SELECT COUNT(*), MIN(COALESCE(hold_settled_at, invoice_held_at)) \
-         FROM orders WHERE status = ?1 \
-         AND NOT (failed_payment = 1 AND payout_payment_hash IS NULL AND payment_attempts >= ?2)";
     let settled = Status::SettledHoldInvoice.to_string();
-    let awaiting: i64 = sqlx::query_scalar(AWAITING)
-        .bind(&settled)
-        .bind(payment_attempts)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?;
-    let (unpaid, oldest): (i64, Option<i64>) = sqlx::query_as(UNPAID)
+    let (awaiting, unpaid, oldest): (i64, i64, Option<i64>) = sqlx::query_as(PAYOUT_ROWS_QUERY)
         .bind(&settled)
         .bind(payment_attempts)
         .fetch_one(pool)
@@ -130,16 +117,32 @@ pub async fn payout_rows(
     })
 }
 
+/// Settled orders, in one pass over `idx_orders_status`: those waiting on
+/// the buyer for a new invoice (attempts used up and no payout in flight, the
+/// state in which `check_failure_retries` sent `add-invoice`), the others
+/// (the daemon is still paying them), and when the oldest of those was
+/// settled.
+const PAYOUT_ROWS_QUERY: &str = "SELECT \
+       COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
+                          AND payment_attempts >= ?2 THEN 1 ELSE 0 END), 0), \
+       COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
+                          AND payment_attempts >= ?2 THEN 0 ELSE 1 END), 0), \
+       MIN(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
+                     AND payment_attempts >= ?2 THEN NULL \
+                ELSE COALESCE(hold_settled_at, invoice_held_at) END) \
+     FROM orders WHERE status = ?1";
+
+/// Completed orders whose dev fee is not paid yet, from the partial index
+/// `idx_orders_unpaid_dev_fee`.
+const DEV_FEE_PENDING_QUERY: &str = "SELECT COUNT(*) FROM orders \
+     WHERE status IN ('settled-hold-invoice', 'success') AND dev_fee > 0 AND dev_fee_paid = 0";
+
 /// Completed orders whose dev fee is not paid yet.
 pub async fn dev_fee_pending(pool: &SqlitePool) -> Result<u64, MostroError> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM orders \
-         WHERE (status = 'settled-hold-invoice' OR status = 'success') \
-           AND dev_fee > 0 AND dev_fee_paid = 0",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(db_error)?;
+    let count: i64 = sqlx::query_scalar(DEV_FEE_PENDING_QUERY)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
     Ok(count.max(0) as u64)
 }
 
@@ -151,10 +154,31 @@ async fn database_answers(pool: &SqlitePool, deadline: Duration) -> bool {
     )
 }
 
+/// The database time one evaluation may spend, shared by the probe and
+/// every read and write after it: each gets what is left, so a slow
+/// database costs the evaluation at most one budget, not one per query.
+#[derive(Clone, Copy, Debug)]
+struct DbBudget {
+    until: Instant,
+}
+
+impl DbBudget {
+    fn new(total: Duration) -> Self {
+        Self {
+            until: Instant::now() + total,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.until.saturating_duration_since(Instant::now())
+    }
+}
+
 /// Run one database operation for the health event: `None` when the probe
 /// already failed (the read is skipped, so a stuck pool cannot hold the
-/// evaluation back for every query's own timeout), when it does not finish
-/// within `deadline`, or when it fails.
+/// evaluation back for every query's own timeout), when the shared budget is
+/// spent, when it does not finish within what is left of it (`deadline`),
+/// or when it fails.
 async fn bounded_db<T, F>(
     database_ok: bool,
     deadline: Duration,
@@ -165,6 +189,10 @@ where
     F: std::future::Future<Output = Result<T, MostroError>>,
 {
     if !database_ok {
+        return None;
+    }
+    if deadline.is_zero() {
+        warn!("Health event: {what} skipped, the database time budget is spent");
         return None;
     }
     match tokio::time::timeout(deadline, operation).await {
@@ -353,6 +381,7 @@ impl Publisher {
         &mut self,
         pool: &SqlitePool,
         database_ok: bool,
+        deadline: Duration,
         connected: usize,
         now: i64,
     ) {
@@ -367,12 +396,9 @@ impl Publisher {
             self.outage_unpublished = true;
         }
         if let Some(outage) = self.pending_outage {
-            if bounded_db(
-                database_ok,
-                self.db_timeout,
-                "saving the relay outage",
-                async { save_relay_outage(pool, outage).await },
-            )
+            if bounded_db(database_ok, deadline, "saving the relay outage", async {
+                save_relay_outage(pool, outage).await
+            })
             .await
             .is_some()
             {
@@ -407,16 +433,21 @@ impl Publisher {
             .count();
 
         // Database: probed first, and every later read is skipped if it did
-        // not answer, so the evaluation stays within one probe's timeout.
-        let database_ok = database_answers(pool, self.db_timeout).await;
-        let deadline = self.db_timeout;
-        self.observe_relays(pool, database_ok, connected, now).await;
+        // not answer. The probe and all the reads share one time budget, so
+        // the evaluation spends at most `db_timeout` on the database.
+        let budget = DbBudget::new(self.db_timeout);
+        let database_ok = database_answers(pool, budget.remaining()).await;
+        self.observe_relays(pool, database_ok, budget.remaining(), connected, now)
+            .await;
 
         // Maintenance.
         let maintenance_enabled = ctx.maintenance().is_enabled();
-        let maintenance_reason = bounded_db(database_ok, deadline, "maintenance reason", async {
-            ctx.maintenance().reason(pool).await
-        })
+        let maintenance_reason = bounded_db(
+            database_ok,
+            budget.remaining(),
+            "maintenance reason",
+            async { ctx.maintenance().reason(pool).await },
+        )
         .await
         .flatten();
 
@@ -444,22 +475,28 @@ impl Publisher {
             checks.push((CheckName::LndSync, snapshot.sync_check(now, fail_after)));
 
             let window = ctx.health_stats().payout_window(now);
-            let rows = bounded_db(database_ok, deadline, "payout query", async {
+            let rows = bounded_db(database_ok, budget.remaining(), "payout query", async {
                 payout_rows(pool, i64::from(settings.lightning.payment_attempts), now).await
             })
             .await;
             // A success whose write failed is still known in memory; retry
             // persisting it, and report the newer of the two.
             if database_ok
-                && tokio::time::timeout(deadline, ctx.health_stats().persist_last_success(pool))
-                    .await
-                    .is_err()
+                && tokio::time::timeout(
+                    budget.remaining(),
+                    ctx.health_stats().persist_last_success(pool),
+                )
+                .await
+                .is_err()
             {
                 warn!("Health event: saving the last payout time did not finish in time");
             }
-            let last_success = bounded_db(database_ok, deadline, "last payout query", async {
-                last_payout_success_at(pool).await
-            })
+            let last_success = bounded_db(
+                database_ok,
+                budget.remaining(),
+                "last payout query",
+                async { last_payout_success_at(pool).await },
+            )
             .await
             .map(|stored| stored.max(ctx.health_stats().last_success_in_memory()));
             let facts = match (rows, last_success) {
@@ -488,7 +525,7 @@ impl Publisher {
                 && networks.as_deref().is_some_and(dev_fee_payments_enabled);
             if pays_dev_fee {
                 dev_fee_content = Some(DevFeeContent {
-                    pending: bounded_db(database_ok, deadline, "dev fee query", async {
+                    pending: bounded_db(database_ok, budget.remaining(), "dev fee query", async {
                         dev_fee_pending(pool).await
                     })
                     .await,
@@ -833,6 +870,37 @@ mod tests {
                 awaiting_buyer_invoice: 1,
             }
         );
+    }
+
+    /// Codex review on #1066: the queries the health event runs every 15 s
+    /// use an index instead of scanning every order.
+    #[tokio::test]
+    async fn health_queries_use_an_index() {
+        let pool = pool().await;
+        for (query, binds) in [(PAYOUT_ROWS_QUERY, 2), (DEV_FEE_PENDING_QUERY, 0)] {
+            let mut explain = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
+                format!("EXPLAIN QUERY PLAN {query}"),
+            ));
+            if binds == 2 {
+                explain = explain.bind("settled-hold-invoice").bind(3_i64);
+            }
+            let plan: Vec<String> = explain
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("USING INDEX") || d.contains("USING COVERING INDEX")),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN orders")),
+                "{query}: {plan:?}"
+            );
+        }
     }
 
     #[tokio::test]

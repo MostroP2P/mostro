@@ -49,7 +49,7 @@ Set `[health].auto_maintenance_on_lnd_unsynced = false` to opt out.
 
 ## The `lnd_sync` check
 
-Computed from the sync state above; it is what turns automatic maintenance on (`fail`). It uses the definition of the `lnd_sync` check of the health event (kind 38389, protocol `health_event.md`); publishing that event is not part of this change.
+Computed from the sync state above; it is what turns automatic maintenance on (`fail`). It is the `lnd_sync` check of the health event (kind 38389, protocol `health_event.md`), which publishes it (see [The health event](#the-health-event-kind-38389)).
 
 | State | When |
 |---|---|
@@ -62,7 +62,7 @@ Computed from the sync state above; it is what turns automatic maintenance on (`
 
 The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). mostrod publishes it from `job_health_event_send` (`src/scheduler.rs`), implemented in `src/app/health/publisher.rs`, in both Lightning and Cashu mode, unless `[health].enabled = false`.
 
-**Cadence.** The checks are evaluated every 15 seconds; every database read is skipped once the `SELECT 1` probe fails and bounded at 5 s otherwise, so a stuck database is reported in time and whenever maintenance mode changes. The event is published every `[health].interval` seconds (60 by default), and at once when `status`, a check state or `maintenance_mode` changes, but never twice within 10 seconds. It goes to the same relays as the info event. A send no relay accepts does not count as a publication and is retried at the next evaluation.
+**Cadence.** The checks are evaluated every 15 seconds; every database read is skipped once the `SELECT 1` probe fails, and the probe and all the reads share one 5 s budget, so a stuck database is reported in time and whenever maintenance mode changes. The event is published every `[health].interval` seconds (60 by default), and at once when `status`, a check state or `maintenance_mode` changes, but never twice within 10 seconds. It goes to the same relays as the info event. A send no relay accepts does not count as a publication and is retried at the next evaluation.
 
 **Public tags** (`src/app/health/event.rs`): `d` = the Mostro pubkey, `y`, `z` = `health`, `status`, one `check` per check with the time it entered its state, `escrow_mode`, `lnd_block_height` / `lnd_synced_to_chain` / `lnd_network` (Lightning, when LND answered), `maintenance_mode`, `mostro_version`, `interval`, `seq`, `p` (only with a watchdog key) and `expiration` = `created_at` + 3 × `interval`. No tag is ever repeated.
 

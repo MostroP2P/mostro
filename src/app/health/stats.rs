@@ -209,11 +209,13 @@ impl HealthStats {
     pub fn payout_window(&self, now: i64) -> PayoutWindow {
         let mut guard = lock(&self.payouts);
         let mut window = PayoutWindow::default();
+        let mut failed_orders = std::collections::BTreeSet::new();
         for outcome in guard.recent(now) {
             match outcome {
                 PayoutOutcome::Succeeded => window.succeeded += 1,
-                PayoutOutcome::Failed(_, reason) => {
+                PayoutOutcome::Failed(order_id, reason) => {
                     window.failed += 1;
+                    failed_orders.insert(*order_id);
                     *window
                         .failure_reasons
                         .entry((*reason).to_string())
@@ -221,6 +223,7 @@ impl HealthStats {
                 }
             }
         }
+        window.failed_orders = failed_orders.len() as u64;
         window
     }
 }

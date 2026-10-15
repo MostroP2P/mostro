@@ -116,8 +116,9 @@ pub fn payouts_check(facts: Option<&PayoutFacts>, now: i64) -> CheckState {
         .is_none_or(|at| now.saturating_sub(at) > PAYOUTS_STUCK_FAIL_SECS);
     let stuck = oldest > PAYOUTS_STUCK_FAIL_SECS && no_recent_success;
     let attempts = facts.succeeded_1h + facts.failed_1h;
-    let mostly_failing =
-        attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE && facts.failed_1h * 2 > attempts;
+    let mostly_failing = attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE
+        && facts.failed_orders_1h >= PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE
+        && facts.failed_1h * 2 > attempts;
     if stuck || mostly_failing {
         CheckState::Fail
     } else if oldest > PAYOUTS_STUCK_WARN_SECS {

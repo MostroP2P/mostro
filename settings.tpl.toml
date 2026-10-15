@@ -191,6 +191,19 @@ port = 50051
 # bind.
 # auth_token = ""
 
+# Health monitoring (docs/HEALTH.md). Absent section ≡ these defaults.
+[health]
+# Seconds LND may report synced_to_chain = false without interruption before
+# it counts as a failure. Outgoing payments (buyer payouts, dev fees, bond
+# payouts) already wait after 60s, without consuming the buyer's attempts.
+lnd_unsynced_fail_after = 600
+# Fail closed: past that threshold, enter maintenance mode with reason
+# "lnd_unsynced" (no new orders or takes; open trades can finish), and leave
+# it again once LND has been synced for `lnd_resynced_clear_after` seconds.
+# Maintenance an operator set with any other reason is never lifted.
+auto_maintenance_on_lnd_unsynced = true
+lnd_resynced_clear_after = 300
+
 # Multi-source price providers (see docs/PRICE_PROVIDERS.md).
 # Absent section ≡ legacy single-source behaviour synthesised from
 # `[mostro].bitcoin_price_api_url` + `exchange_rates_update_interval_seconds`

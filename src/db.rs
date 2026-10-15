@@ -1432,6 +1432,24 @@ pub async fn fail_order_payout(
     Ok(result.rows_affected() > 0)
 }
 
+/// Leave a settled order's buyer payout for `job_retry_failed_payments`
+/// without counting a payment attempt: sets `failed_payment` (what that job
+/// selects on) and leaves `payment_attempts` alone. Used while our own LND
+/// cannot pay (#1063). Only touches a `settled-hold-invoice` order with no
+/// payout in flight, so it can never orphan a claimed payout.
+pub async fn mark_payout_deferred(pool: &SqlitePool, order_id: Uuid) -> Result<(), MostroError> {
+    sqlx::query(
+        "UPDATE orders SET failed_payment = true \
+         WHERE id = ?1 AND status = ?2 AND payout_payment_hash IS NULL",
+    )
+    .bind(order_id)
+    .bind(Status::SettledHoldInvoice.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(())
+}
+
 /// Orders with a buyer payout in flight (marker set) that are old enough to
 /// reconcile: only those claimed at or before `claimed_before` (unix seconds)
 /// are returned, so a payout still inside its grace window — where LND may not

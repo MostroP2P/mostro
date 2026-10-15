@@ -362,6 +362,15 @@ does not ask for it.
 | Daemon restart | flag reloaded from `daemon_state`; still enabled |
 | RPC `GetMaintenanceStatus` | live counters |
 
+### 3.8 Automatic maintenance while LND is unsynced
+
+Besides the operator's `SetMaintenanceMode`, the daemon turns maintenance on by itself when its Lightning node has reported `synced_to_chain = false` for `[health].lnd_unsynced_fail_after` seconds (600 by default): it stores the reserved reason `lnd_unsynced` (`REASON_LND_UNSYNCED` in `src/app/maintenance.rs`). It turns maintenance off again once LND has been synced for `[health].lnd_resynced_clear_after` seconds (300 by default), **only if the stored reason is still `lnd_unsynced`**. The reason is compared under the same write lock `SetMaintenanceMode` uses, so:
+
+- maintenance an operator already set is never overwritten (the daemon does not enable it a second time, so the operator's reason stays);
+- an operator who re-enables maintenance with their own reason while the automatic one is on takes it over, and the daemon will not lift it.
+
+`GetMaintenanceStatus` and the info event show it like any other maintenance. `[health].auto_maintenance_on_lnd_unsynced = false` turns the behaviour off. Details in [HEALTH.md](HEALTH.md).
+
 ---
 
 ## 4. Phases

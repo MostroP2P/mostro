@@ -1339,6 +1339,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         });
     }
 

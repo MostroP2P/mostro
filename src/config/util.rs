@@ -412,6 +412,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         }
     }
 
@@ -825,6 +826,7 @@ mod startup_validation_tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         }
     }
 

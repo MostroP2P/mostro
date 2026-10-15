@@ -10,7 +10,7 @@ use crate::app::context::AppContext;
 use crate::app::dev_fee::dev_fee_payments_enabled;
 use crate::app::health::check::{
     database_check, derive_status, payouts_check, relays_check, CheckName, CheckState,
-    CheckTracker, HealthStatus, PayoutFacts,
+    CheckTracker, HealthStatus, PayoutFacts, PAYOUTS_STALE_SECS,
 };
 use crate::app::health::content::{
     nearest_htlc_expiry_blocks, ChannelFacts, DevFeeContent, HealthContent, LndContent,
@@ -86,6 +86,10 @@ pub fn resolve_recipient(configured: &str) -> Option<PublicKey> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayoutRows {
     pub settled_unpaid: u64,
+    /// Among `settled_unpaid`, those settled over [`PAYOUTS_STALE_SECS`]
+    /// ago. They are not what the `payouts` check watches.
+    pub stale_settled_unpaid: u64,
+    /// Age of the oldest settled unpaid order that is not stale.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
     pub awaiting_buyer_invoice: u64,
 }
@@ -111,6 +115,7 @@ pub async fn payout_rows(
         .map_err(db_error)?;
     Ok(PayoutRows {
         settled_unpaid: unpaid.max(0) as u64,
+        stale_settled_unpaid: 0,
         oldest_settled_unpaid_age_secs: oldest
             .filter(|_| unpaid > 0)
             .map(|at| now.saturating_sub(at).max(0)),
@@ -533,6 +538,7 @@ impl Publisher {
                 (Some(rows), Some(last_success_at)) => Some(PayoutFacts {
                     succeeded_1h: window.succeeded,
                     failed_1h: window.failed,
+                    failed_orders_1h: window.failed_orders,
                     last_success_at,
                     oldest_settled_unpaid_age_secs: rows.oldest_settled_unpaid_age_secs,
                 }),
@@ -543,9 +549,11 @@ impl Publisher {
                 window_secs: WINDOW_SECS,
                 payouts_succeeded_1h: window.succeeded,
                 payouts_failed_1h: window.failed,
+                payouts_failed_orders_1h: window.failed_orders,
                 failure_reasons_1h: window.failure_reasons,
                 last_payout_success_at: last_success.flatten(),
                 settled_unpaid_orders: rows.map(|r| r.settled_unpaid),
+                stale_settled_unpaid_orders: rows.map(|r| r.stale_settled_unpaid),
                 oldest_settled_unpaid_order_age_secs: rows
                     .and_then(|r| r.oldest_settled_unpaid_age_secs),
                 awaiting_buyer_invoice_orders: rows.map(|r| r.awaiting_buyer_invoice),
@@ -927,6 +935,7 @@ mod tests {
             rows,
             PayoutRows {
                 settled_unpaid: 2,
+                stale_settled_unpaid: 0,
                 oldest_settled_unpaid_age_secs: Some(5_000),
                 awaiting_buyer_invoice: 1,
             }
@@ -962,6 +971,46 @@ mod tests {
                 "{query}: {plan:?}"
             );
         }
+    }
+
+    /// Staging, 2026-10-15: four orders settled months earlier on a previous
+    /// node sat in `settled-hold-invoice` with no attempt recorded. They
+    /// made the oldest settled unpaid order months old at every evaluation,
+    /// so `payouts` never left `warn` and failed on any quiet two hours.
+    #[tokio::test]
+    async fn payout_rows_leave_stale_settled_orders_out_of_the_oldest_age() {
+        let pool = pool().await;
+        insert(
+            &pool,
+            "settled-hold-invoice",
+            false,
+            0,
+            NOW - PAYOUTS_STALE_SECS - 1,
+        )
+        .await;
+        insert(&pool, "settled-hold-invoice", false, 0, NOW - 1_000).await;
+
+        let rows = payout_rows(&pool, 3, NOW).await.unwrap();
+        assert_eq!(
+            rows,
+            PayoutRows {
+                settled_unpaid: 2,
+                stale_settled_unpaid: 1,
+                oldest_settled_unpaid_age_secs: Some(1_000),
+                awaiting_buyer_invoice: 0,
+            }
+        );
+
+        // Only residue left: nothing for the check to watch.
+        sqlx::query("DELETE FROM orders WHERE hold_settled_at = ?")
+            .bind(NOW - 1_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = payout_rows(&pool, 3, NOW).await.unwrap();
+        assert_eq!(rows.settled_unpaid, 1);
+        assert_eq!(rows.stale_settled_unpaid, 1);
+        assert_eq!(rows.oldest_settled_unpaid_age_secs, None);
     }
 
     #[tokio::test]

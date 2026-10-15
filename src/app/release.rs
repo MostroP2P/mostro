@@ -1162,6 +1162,7 @@ async fn dispatch_payout(
                                     // guarded re-arm.
                                     ctx.health_stats().record_payout_failure(
                                         chrono::Utc::now().timestamp(),
+                                        order.id,
                                         crate::app::health::stats::failure_reason_key(
                                             msg.payment.failure_reason,
                                         ),
@@ -1248,6 +1249,7 @@ async fn dispatch_payout(
                     {
                         ctx.health_stats().record_payout_failure(
                             at,
+                            order.id,
                             crate::app::health::stats::failure_reason_key(failed.failure_reason),
                         );
                     }
@@ -1680,6 +1682,7 @@ pub async fn reconcile_inflight_payout(
                 {
                     ctx.health_stats().record_payout_failure(
                         at,
+                        order_id,
                         crate::app::health::stats::failure_reason_key(failure_reason),
                     );
                 }

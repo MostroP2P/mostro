@@ -1608,6 +1608,10 @@ pub async fn reconcile_inflight_payout(
     // When LND says the payment reached its final state: an outcome
     // recovered here may be hours old, so the health metrics count it at
     // that time, or not at all when LND gives none.
+    let failure_reason = match &lookup {
+        Ok(Some(found)) => found.failure_reason,
+        _ => 0,
+    };
     let resolved_at = match &lookup {
         Ok(Some(found)) => found.resolved_at,
         _ => None,
@@ -1664,8 +1668,10 @@ pub async fn reconcile_inflight_payout(
                 if let Some(at) =
                     resolved_at.filter(|_| matches!(lookup, Ok(Some(PaymentStatus::Failed))))
                 {
-                    ctx.health_stats()
-                        .record_payout_failure(at, crate::app::health::stats::REASON_OTHER);
+                    ctx.health_stats().record_payout_failure(
+                        at,
+                        crate::app::health::stats::failure_reason_key(failure_reason),
+                    );
                 }
                 if let Some(order) = pre {
                     // The claim is stamped before the send, so it bounds it.
@@ -3416,6 +3422,11 @@ mod tests {
         resolved_at: Option<i64>,
     }
 
+    /// LND's reason for every `Failed` the stub reports: `no_route`, so a
+    /// test can tell a mapped reason from the `other` fallback.
+    const STUB_FAILURE_REASON: i32 =
+        fedimint_tonic_lnd::lnrpc::PaymentFailureReason::FailureReasonNoRoute as i32;
+
     impl PayoutStatusLookup for StubLnClient {
         fn lookup_payment<'a>(
             &'a mut self,
@@ -3439,6 +3450,10 @@ mod tests {
                     Ok(status.map(|status| PaymentLookup {
                         status,
                         resolved_at,
+                        failure_reason: match status {
+                            PaymentStatus::Failed => STUB_FAILURE_REASON,
+                            _ => 0,
+                        },
                     }))
                 }
             })
@@ -3626,6 +3641,10 @@ mod tests {
         let window = ctx.health_stats().payout_window(now);
         assert_eq!(window.failed, 1);
         assert_eq!(window.succeeded, 0);
+        // Codex review on #1066: a reconciled failure keeps LND's reason
+        // instead of falling back to `other`.
+        assert_eq!(window.failure_reasons.get("no_route"), Some(&1));
+        assert_eq!(window.failure_reasons.get("other"), None);
     }
 
     /// Codex review on #1066: a success is counted when the order is

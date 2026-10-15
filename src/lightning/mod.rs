@@ -951,6 +951,7 @@ impl LndConnector {
                 Ok(Some(PaymentLookup {
                     status,
                     resolved_at: payment_resolved_at(&payment),
+                    failure_reason: payment.failure_reason,
                 }))
             }
             Ok(None) => Ok(None),
@@ -1090,6 +1091,10 @@ pub struct PaymentLookup {
     pub status: payment::PaymentStatus,
     /// Unix seconds; see [`payment_resolved_at`].
     pub resolved_at: Option<i64>,
+    /// LND's `PaymentFailureReason` as sent on the wire (`FAILURE_REASON_NONE`
+    /// unless the payment failed); the health event maps it with
+    /// `failure_reason_key`, as the live watcher does.
+    pub failure_reason: i32,
 }
 
 /// When `payment` reached its final state, from LND's record: for a success

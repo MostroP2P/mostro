@@ -54,6 +54,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // Mode-agnostic jobs.
     job_orderbook_reconciler(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
+    job_health_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
@@ -336,6 +337,13 @@ async fn job_lnd_sync_monitor(ctx: AppContext) {
             tokio::time::sleep(tokio::time::Duration::from_secs(LND_SYNC_POLL_SECS)).await;
         }
     });
+}
+
+/// Publish the health event (kind 38389) every `[health].interval`, and at
+/// once on a state change. See [`crate::app::health::publisher`].
+#[mutants::skip]
+async fn job_health_event_send(ctx: AppContext) {
+    tokio::spawn(crate::app::health::publisher::run_health_publisher(ctx));
 }
 
 async fn job_retry_failed_payments(ctx: AppContext) {

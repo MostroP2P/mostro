@@ -48,6 +48,10 @@ pub struct MaintenanceState {
     /// full `publish_mostro_info_interval`. One consumer, so `notify_one`
     /// (which stores a permit) is used rather than `notify_waiters`.
     changed: Arc<Notify>,
+    /// Same signal for the health-event job, which also republishes at once
+    /// when maintenance changes. A separate `Notify` because each one stores
+    /// a single permit for a single consumer.
+    health_changed: Arc<Notify>,
 }
 
 impl MaintenanceState {
@@ -67,6 +71,7 @@ impl MaintenanceState {
             enabled: Arc::new(AtomicBool::new(enabled)),
             write_lock: Arc::default(),
             changed: Arc::default(),
+            health_changed: Arc::default(),
         })
     }
 
@@ -209,6 +214,7 @@ impl MaintenanceState {
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         self.enabled.store(enabled, Ordering::Release);
         self.changed.notify_one();
+        self.health_changed.notify_one();
         Ok(())
     }
 
@@ -216,6 +222,11 @@ impl MaintenanceState {
     /// happened since the last call). Used by the info-event job.
     pub async fn changed(&self) {
         self.changed.notified().await
+    }
+
+    /// Like [`MaintenanceState::changed`], for the health-event job.
+    pub async fn health_changed(&self) {
+        self.health_changed.notified().await
     }
 }
 

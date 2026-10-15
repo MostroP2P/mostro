@@ -321,12 +321,24 @@ impl ReputationImportSettings {
     }
 }
 
-/// Health monitoring (`[health]`, issue #1063): how long LND may report
-/// `synced_to_chain = false` before it counts as a failure, and whether the
-/// daemon then fails closed by entering maintenance on its own. An absent
-/// section means the defaults.
+/// Health monitoring (`[health]`, issue #1063): the health event (kind
+/// 38389), how long LND may report `synced_to_chain = false` before it counts
+/// as a failure, and whether the daemon then fails closed by entering
+/// maintenance on its own. An absent section means the defaults.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct HealthSettings {
+    /// Publish the health event (docs/HEALTH.md).
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    /// Seconds between two publications of the health event, 30 to 3600.
+    /// The event's NIP-40 expiration is three times this.
+    #[serde(default = "default_health_interval")]
+    pub interval: u64,
+    /// Hex or npub pubkey of the operator's watchdog. When set, the detailed
+    /// metrics are NIP-44 encrypted to it in the event's `content`; when
+    /// empty, `content` is empty and only the public tags are published.
+    #[serde(default)]
+    pub watchdog_pubkey: String,
     /// Seconds LND may report `synced_to_chain = false` without interruption
     /// before the `lnd_sync` check turns from `warn` to `fail`.
     #[serde(default = "default_lnd_unsynced_fail_after")]
@@ -340,6 +352,19 @@ pub struct HealthSettings {
     /// Seconds LND must stay synced before automatic maintenance is lifted.
     #[serde(default = "default_lnd_resynced_clear_after")]
     pub lnd_resynced_clear_after: u64,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+/// Default seconds between health event publications.
+pub const DEFAULT_HEALTH_INTERVAL: u64 = 60;
+/// Allowed range of `[health].interval`, in seconds (protocol: 30 to 3600).
+pub const HEALTH_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 30..=3600;
+
+fn default_health_interval() -> u64 {
+    DEFAULT_HEALTH_INTERVAL
 }
 
 fn default_lnd_unsynced_fail_after() -> u64 {
@@ -357,6 +382,9 @@ fn default_lnd_resynced_clear_after() -> u64 {
 impl Default for HealthSettings {
     fn default() -> Self {
         Self {
+            enabled: default_health_enabled(),
+            interval: default_health_interval(),
+            watchdog_pubkey: String::new(),
             lnd_unsynced_fail_after: default_lnd_unsynced_fail_after(),
             auto_maintenance_on_lnd_unsynced: default_auto_maintenance_on_lnd_unsynced(),
             lnd_resynced_clear_after: default_lnd_resynced_clear_after(),

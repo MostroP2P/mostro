@@ -7,6 +7,7 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::app::health::lnd_sync::LndSyncState;
+use crate::app::health::stats::HealthStats;
 use crate::app::maintenance::MaintenanceState;
 use crate::cashu::mints::CashuMints;
 use crate::config::settings::Settings;
@@ -55,6 +56,8 @@ pub struct AppContext {
     /// `job_lnd_sync_monitor`. Defaults to a state that knows nothing and
     /// defers nothing (tests, Cashu mode).
     lnd_sync: LndSyncState,
+    /// Buyer payout outcomes over the last hour, for the health event.
+    health_stats: HealthStats,
 }
 
 impl AppContext {
@@ -78,6 +81,7 @@ impl AppContext {
             cashu_mints: None,
             maintenance: MaintenanceState::new(),
             lnd_sync: LndSyncState::new(),
+            health_stats: HealthStats::new(),
         }
     }
 
@@ -102,6 +106,11 @@ impl AppContext {
     /// Whether the Lightning node is synced to chain and reachable.
     pub fn lnd_sync(&self) -> &LndSyncState {
         &self.lnd_sync
+    }
+
+    /// Buyer payout outcomes, recorded where payouts finish.
+    pub fn health_stats(&self) -> &HealthStats {
+        &self.health_stats
     }
 
     /// Attach the Cashu mint clients (Cashu mode). Returns a new context; the

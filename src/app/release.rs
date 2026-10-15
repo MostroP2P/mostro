@@ -1127,24 +1127,13 @@ async fn dispatch_payout(
                                 .await
                                 .unwrap_or(false)
                                 {
-                                    // Counted once, by whoever clears the claim
-                                    // (this watcher or a reconcile tick).
-                                    if crate::db::clear_order_payout(
+                                    let _ = clear_payout_marker_durably(
                                         ctx.pool(),
                                         order.id,
                                         &payout_hash,
                                         Some(payout_claimed_at),
                                     )
-                                    .await
-                                    .unwrap_or(false)
-                                    {
-                                        ctx.health_stats()
-                                            .record_payout_success(
-                                                ctx.pool(),
-                                                chrono::Utc::now().timestamp(),
-                                            )
-                                            .await;
-                                    }
+                                    .await;
                                 }
                             }
                             PaymentStatus::Failed => {
@@ -1259,6 +1248,37 @@ async fn dispatch_payout(
     });
 
     Ok(())
+}
+
+/// [`crate::db::clear_order_payout`] after a finalized payout, retried with
+/// the same short backoff as [`defer_payout_durably`]. Once the order is
+/// `success`, `find_inflight_payouts` never revisits it, so a marker left by
+/// a single failed write would stay forever (inert, but misleading).
+async fn clear_payout_marker_durably(
+    pool: &Pool<Sqlite>,
+    order_id: uuid::Uuid,
+    payout_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<bool, MostroError> {
+    let mut last_error =
+        match crate::db::clear_order_payout(pool, order_id, payout_hash, claimed_at).await {
+            Ok(cleared) => return Ok(cleared),
+            Err(e) => e,
+        };
+    for delay in DEFER_PAYOUT_RETRY_DELAYS {
+        warn!(
+            "Order {order_id}: could not clear the payout marker ({last_error}); retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        match crate::db::clear_order_payout(pool, order_id, payout_hash, claimed_at).await {
+            Ok(cleared) => return Ok(cleared),
+            Err(e) => last_error = e,
+        }
+    }
+    tracing::error!(
+        "Order {order_id}: could not clear the payout marker of a finalized payout ({last_error})"
+    );
+    Err(last_error)
 }
 
 /// Pauses between the attempts of [`defer_payout_durably`].
@@ -1464,6 +1484,14 @@ async fn payment_success(
         return Ok(true);
     }
 
+    // Committed by us: the payout is counted for the health event here,
+    // atomically with finalization in effect (only the task that wins this
+    // status CAS gets here), so it is counted once and never lost to a
+    // later cleanup failure.
+    ctx.health_stats()
+        .record_payout_success(pool, chrono::Utc::now().timestamp())
+        .await;
+
     // Committed by us — notify the buyer now.
     enqueue_order_msg(
         None,
@@ -1584,19 +1612,9 @@ pub async fn reconcile_inflight_payout(
                 }
                 _ => false,
             };
-            if finalized
-                && crate::db::clear_order_payout(
-                    pool,
-                    order_id,
-                    payout_payment_hash,
-                    payout_claimed_at,
-                )
-                .await?
-            {
-                // Counted once, by whoever clears the claim.
-                ctx.health_stats()
-                    .record_payout_success(pool, chrono::Utc::now().timestamp())
-                    .await;
+            if finalized {
+                clear_payout_marker_durably(pool, order_id, payout_payment_hash, payout_claimed_at)
+                    .await?;
             }
         }
         lookup
@@ -3557,6 +3575,49 @@ mod tests {
         let window = ctx.health_stats().payout_window(now);
         assert_eq!(window.failed, 1);
         assert_eq!(window.succeeded, 0);
+    }
+
+    /// Codex review on #1066: a success is counted when the order is
+    /// finalized, not when the marker is cleared, so a failing cleanup can
+    /// neither lose it nor count it twice; the cleanup is retried.
+    #[tokio::test]
+    async fn a_paid_payout_is_counted_even_if_the_marker_cleanup_fails() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        sqlx::query(
+            "CREATE TRIGGER busy_marker BEFORE UPDATE OF payout_payment_hash ON orders \
+             WHEN NEW.payout_payment_hash IS NULL BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unblock = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sqlx::query("DROP TRIGGER busy_marker")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        };
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        unblock.await.unwrap();
+
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 1);
+        assert!(marker_of(&pool, id).await.is_none(), "cleanup retried");
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
     }
 
     #[tokio::test]

@@ -277,6 +277,9 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
+        Action::ImportReputation => reputation::import::import_reputation_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -476,6 +479,27 @@ async fn accept_event(
     }
 
     if !message.verify() {
+        // Core rejects missing/wrong import payloads before dispatch, but the
+        // protocol requires a cant-do for these authenticated requests. Keep
+        // the handler's disabled-before-payload precedence, and leave other
+        // invalid message shapes on the ordinary drop path.
+        if inner_message.action == Action::ImportReputation
+            && matches!(&message, Message::Order(_))
+            && inner_message.id.is_none()
+        {
+            let reason = if reputation::import::import_settings(ctx).is_some() {
+                CantDoReason::InvalidPayload
+            } else {
+                CantDoReason::InvalidAction
+            };
+            manage_errors(
+                MostroError::MostroCantDo(reason),
+                message.clone(),
+                unwrapped.clone(),
+                &inner_message.action,
+            )
+            .await;
+        }
         return None;
     }
     // Core's verify also admits the `user-info` reply shape; intake takes only the request.
@@ -700,6 +724,10 @@ async fn dispatch_cashu(
         | Action::UserInfo
         | Action::RestoreSession
         | Action::TradePubkey => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Reputation import touches no escrow either.
+        Action::ImportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -970,6 +998,103 @@ mod tests {
             )
             .await;
             assert!(accepted.is_none());
+        }
+    }
+
+    mod reputation_import_intake_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use crate::config::types::ReputationImportSettings;
+        use mostro_core::prelude::Payload;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        async fn context(enabled: bool) -> AppContext {
+            let ctx = create_migrated_ctx().await;
+            let mut settings = test_settings();
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled,
+                ..Default::default()
+            });
+            TestContextBuilder::new()
+                .with_pool(std::sync::Arc::new(ctx.pool().clone()))
+                .with_settings(settings)
+                .build()
+        }
+
+        fn event(mostro: &Keys, trade: &Keys, payload: Option<Payload>) -> Event {
+            let message =
+                Message::new_order(None, Some(4127), None, Action::ImportReputation, payload);
+            wrap_message_nip44(
+                &message,
+                &create_test_keys(),
+                trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .unwrap()
+        }
+
+        async fn accept(ctx: &AppContext, event: &Event, mostro: &Keys) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        #[tokio::test]
+        async fn import_intake_answers_missing_and_wrong_payloads() {
+            let ctx = context(true).await;
+            let mostro = create_test_keys();
+            for payload in [None, Some(Payload::RatingUser(5))] {
+                let trade = create_test_keys();
+                let event = event(&mostro, &trade, payload);
+                assert!(!accept(&ctx, &event, &mostro).await);
+                assert_eq!(
+                    cant_do_reasons_for(&trade.public_key()).await,
+                    vec![CantDoReason::InvalidPayload]
+                );
+                let queue = crate::config::MESSAGE_QUEUES
+                    .queue_order_cantdo
+                    .read()
+                    .await;
+                let (reply, _) = queue
+                    .iter()
+                    .find(|(_, pk)| *pk == trade.public_key())
+                    .unwrap();
+                assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
+                assert!(reply.get_inner_message_kind().id.is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn import_intake_checks_disabled_before_invalid_payload() {
+            let ctx = context(false).await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            assert!(!accept(&ctx, &event(&mostro, &trade, None), &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidAction]
+            );
+        }
+
+        #[tokio::test]
+        async fn import_intake_does_not_answer_a_forged_event() {
+            let ctx = context(true).await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            let mut forged = event(&mostro, &trade, None);
+            forged.sig = EventBuilder::new(NostrKind::TextNote, "decoy")
+                .finalize(&create_test_keys())
+                .unwrap()
+                .sig;
+            assert!(!accept(&ctx, &forged, &mostro).await);
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
         }
     }
 
@@ -2055,6 +2180,48 @@ mod tests {
                 result.is_ok(),
                 "RestoreSession must route to the no-LN handler, got {result:?}"
             );
+        }
+
+        /// `import-reputation` reaches its handler on both routers. With import
+        /// enabled and no payload the handler answers `InvalidPayload`, which
+        /// neither the default arm (`Ok`) nor the Cashu block
+        /// (`InvalidAction`) produces.
+        #[tokio::test]
+        async fn routes_import_reputation_to_its_handler_in_both_modes() {
+            use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+            use crate::config::types::ReputationImportSettings;
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            let mut settings = test_settings();
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled: true,
+                ..Default::default()
+            });
+            let ctx = TestContextBuilder::new()
+                .with_pool(std::sync::Arc::new(pool))
+                .with_settings(settings)
+                .build();
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+            let action = Action::ImportReputation;
+            let msg = create_test_message(action.clone(), None);
+            let invalid_payload = |result: Result<()>| {
+                matches!(
+                    result,
+                    Err(e) if e.downcast_ref::<MostroError>()
+                        == Some(&MostroError::MostroCantDo(CantDoReason::InvalidPayload))
+                )
+            };
+            assert!(invalid_payload(
+                handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx).await
+            ));
+            assert!(invalid_payload(
+                dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await
+            ));
         }
     }
 

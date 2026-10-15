@@ -830,14 +830,40 @@ pub(crate) fn dev_fee_retry_delay_secs(failed_attempts: i64, jitter: f64) -> i64
 /// always counted.
 ///
 /// The count is incremented by one `UPDATE ... RETURNING`, so concurrent
-/// failures never overwrite each other; the delay is then written only if no
-/// later failure has been counted in between.
+/// failures never overwrite each other, and the deadline is written in the
+/// same transaction ([`count_dev_fee_failure`]). Callers release the claim
+/// or hash only after this returns.
 pub(crate) async fn record_dev_fee_failure(
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     payment_hash: Option<&str>,
 ) {
-    let failed_attempts = match sqlx::query_scalar::<_, i64>(
+    match count_dev_fee_failure(pool, order_id, payment_hash).await {
+        Ok(Some((failed_attempts, delay))) => info!(
+            "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
+            order_id, failed_attempts, delay
+        ),
+        // Paid, gone, or this hash's failure was already counted.
+        Ok(None) => {}
+        Err(e) => error!(
+            "Failed to record the dev fee failure for order {}: {:?}",
+            order_id, e
+        ),
+    }
+}
+
+/// The writes behind [`record_dev_fee_failure`], in one transaction: the
+/// count, the counted hash and the deadline are committed together or not
+/// at all, so a crash or error in between can never leave a hash counted
+/// with no deadline (which would let the order be retried at once).
+/// Returns the new count and the delay, or `None` when nothing was counted.
+async fn count_dev_fee_failure(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    payment_hash: Option<&str>,
+) -> Result<Option<(i64, i64)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(failed_attempts) = sqlx::query_scalar::<_, i64>(
         "UPDATE orders
          SET dev_fee_failed_attempts = dev_fee_failed_attempts + 1,
              dev_fee_failed_hash = ?2
@@ -847,42 +873,19 @@ pub(crate) async fn record_dev_fee_failure(
     )
     .bind(order_id)
     .bind(payment_hash)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(failed_attempts)) => failed_attempts,
-        // Paid, gone, or this hash's failure was already counted.
-        Ok(None) => return,
-        Err(e) => {
-            error!(
-                "Failed to count the dev fee failure for order {}: {:?}",
-                order_id, e
-            );
-            return;
-        }
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
     };
     let delay = dev_fee_retry_delay_secs(failed_attempts, rand::random::<f64>());
-    let next_attempt_at = Utc::now().timestamp().saturating_add(delay);
-    match sqlx::query(
-        "UPDATE orders
-         SET dev_fee_next_attempt_at = ?
-         WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_failed_attempts = ?",
-    )
-    .bind(next_attempt_at)
-    .bind(order_id)
-    .bind(failed_attempts)
-    .execute(pool)
-    .await
-    {
-        Ok(_) => info!(
-            "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
-            order_id, failed_attempts, delay
-        ),
-        Err(e) => error!(
-            "Failed to record dev fee backoff for order {}: {:?}",
-            order_id, e
-        ),
-    }
+    sqlx::query("UPDATE orders SET dev_fee_next_attempt_at = ? WHERE id = ?")
+        .bind(Utc::now().timestamp().saturating_add(delay))
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some((failed_attempts, delay)))
 }
 
 /// LND confirmed `existing_hash` `Failed` (Phase 3, or a send that timed
@@ -1905,6 +1908,53 @@ mod tests {
                 "released with no backoff in place: {deadline:?}"
             );
         }
+    }
+
+    /// Codex review on #1064 (round 4): if storing the deadline fails after
+    /// the count and hash were written, nothing may stay half-written: a
+    /// counted hash with no deadline would let the order be retried at once.
+    #[tokio::test]
+    async fn a_failed_deadline_write_leaves_nothing_half_written() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_deadline BEFORE UPDATE OF dev_fee_next_attempt_at ON orders \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+
+        let row: (i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_failed_attempts, dev_fee_failed_hash, dev_fee_next_attempt_at \
+             FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (0, None, None),
+            "the whole failure record is rolled back"
+        );
+
+        // Once the write works again, the same failure is counted normally.
+        sqlx::query("DROP TRIGGER fail_deadline")
+            .execute(&pool)
+            .await
+            .unwrap();
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test]

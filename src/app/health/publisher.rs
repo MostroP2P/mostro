@@ -569,18 +569,15 @@ impl Publisher {
             // read within the shared database budget: without that read,
             // which mints to probe is unknown. The network probes have their
             // own bound.
-            let open = cashu.mint_urls.is_empty();
             let mints = bounded_db(database_ok, budget.remaining(), "escrow mints", async {
                 escrow_mints(pool).await
             })
             .await
             .map(|escrow| mints_to_probe(&cashu.mint_urls, escrow));
             let state = match mints {
-                Some(mints) => {
-                    tokio::time::timeout(CASHU_MINT_PROBE_TIMEOUT, probe_mints(&mints, open))
-                        .await
-                        .unwrap_or(CheckState::Unknown)
-                }
+                Some(mints) => tokio::time::timeout(CASHU_MINT_PROBE_TIMEOUT, probe_mints(&mints))
+                    .await
+                    .unwrap_or(CheckState::Unknown),
                 None => CheckState::Unknown,
             };
             checks.push((CheckName::CashuMint, state));

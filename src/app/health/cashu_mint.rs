@@ -6,7 +6,9 @@
 //! `[cashu].mint_urls` allowlist and the distinct mints that currently hold
 //! escrow (orders past the escrow step, with a token locked, not yet
 //! terminal), even with a non-empty allowlist: a mint removed from the
-//! allowlist while it still holds escrow keeps being probed. Never a mint a
+//! allowlist while it still holds escrow keeps being probed. Only allowlisted
+//! mints are reached directly; any other one passes the public-host check
+//! and is reached at the address that passed it. Never a mint a
 //! pending order merely names: anyone can publish an order naming an
 //! unreachable mint, and that must not make the instance look down. Nothing
 //! to probe (empty allowlist, no escrow held) is `ok`. A mint counts as
@@ -71,15 +73,30 @@ pub(crate) fn escrow_mints_query() -> sqlx::AssertSqlSafe<String> {
     ))
 }
 
-/// Probe one mint. A mint a maker chose (open node) gets the same public-host
-/// check as when the daemon connects to it, and the request is pinned to the
-/// address that passed it.
-async fn probe(mint_url: &str, open: bool) -> bool {
-    if !open {
-        return mint_answers_info(mint_url, None).await;
+/// A mint to probe, and how to reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintTarget {
+    /// Canonical URL ([`normalize_mint_url`]).
+    pub url: String,
+    /// In the current `[cashu].mint_urls` allowlist: the operator chose it,
+    /// so it is reached directly. Any other mint (on an open node, or one
+    /// removed from the allowlist while it still holds escrow) was chosen by
+    /// a maker: its host may since resolve to a private address, so it gets
+    /// the public-host check on every probe.
+    pub listed: bool,
+}
+
+/// Probe one mint. A mint not in the allowlist gets the same public-host
+/// check as when an open node connects to it, and the request is pinned to
+/// the address that passed it: one whose host now resolves to a private
+/// address (loopback, link-local metadata, LAN) is never contacted and
+/// counts as unreachable.
+async fn probe(mint: &MintTarget) -> bool {
+    if mint.listed {
+        return mint_answers_info(&mint.url, None).await;
     }
-    match public_mint_addr(mint_url).await {
-        Ok(addr) => mint_answers_info(mint_url, Some(addr)).await,
+    match public_mint_addr(&mint.url).await {
+        Ok(addr) => mint_answers_info(&mint.url, Some(addr)).await,
         Err(_) => false,
     }
 }
@@ -93,34 +110,43 @@ pub async fn cashu_mint_check(pool: &SqlitePool, cashu: &CashuSettings) -> Check
             return CheckState::Unknown;
         }
     };
-    let mints = mints_to_probe(&cashu.mint_urls, escrow);
-    probe_mints(&mints, cashu.mint_urls.is_empty()).await
+    probe_mints(&mints_to_probe(&cashu.mint_urls, escrow)).await
 }
 
-/// The probe set: the allowlist plus the mints holding escrow, canonicalised
-/// and without duplicates.
-pub fn mints_to_probe(allowlist: &[String], escrow: Vec<String>) -> Vec<String> {
-    allowlist
+/// The probe set: the allowlist plus the mints holding escrow (`escrow`,
+/// canonical), without duplicates, each marked with whether it is in the
+/// allowlist.
+pub fn mints_to_probe(allowlist: &[String], escrow: Vec<String>) -> Vec<MintTarget> {
+    let listed: BTreeSet<String> = allowlist
         .iter()
         .filter_map(|url| normalize_mint_url(url).ok())
-        .chain(escrow)
-        .collect::<BTreeSet<_>>()
+        .collect();
+    let unlisted: BTreeSet<String> = escrow
         .into_iter()
+        .filter(|url| !listed.contains(url))
+        .collect();
+    listed
+        .into_iter()
+        .map(|url| MintTarget { url, listed: true })
+        .chain(
+            unlisted
+                .into_iter()
+                .map(|url| MintTarget { url, listed: false }),
+        )
         .collect()
 }
 
 /// Probe `mints` and derive the check. Network only: the health publisher
 /// reads the mints holding escrow within its database budget, builds the set
-/// with [`mints_to_probe`] and calls this. Each mint is reached the way the
-/// daemon itself connects to it (`CashuMints::client_for`): on an open node
-/// (empty allowlist) with the public-host check and a pinned address,
-/// otherwise directly.
-pub async fn probe_mints(mints: &[String], open: bool) -> CheckState {
-    let probes = mints.iter().map(|mint| probe(mint, open));
-    let reachable = futures::future::join_all(probes).await;
+/// with [`mints_to_probe`] and calls this.
+pub async fn probe_mints(mints: &[MintTarget]) -> CheckState {
+    let reachable = futures::future::join_all(mints.iter().map(probe)).await;
     for (mint, up) in mints.iter().zip(&reachable) {
         if !up {
-            warn!("Health event: Cashu mint {mint} did not answer /v1/info");
+            warn!(
+                "Health event: Cashu mint {} did not answer /v1/info",
+                mint.url
+            );
         }
     }
     cashu_mint_state(&reachable)
@@ -130,6 +156,8 @@ pub async fn probe_mints(mints: &[String], open: bool) -> CheckState {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -281,8 +309,84 @@ mod tests {
         assert_eq!(cashu_mint_check(&pool, &cashu).await, CheckState::Fail);
     }
 
+    /// A loopback mint that counts the connections it receives.
+    async fn counting_mint() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, AtomicOrdering::SeqCst);
+                let body = r#"{"name":"mock mint","nuts":{}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// Codex review on #1066 (SSRF): with an allowlist, a mint that holds
+    /// escrow but is not listed (a maker's choice from when the node was
+    /// open, or a de-listed one) still gets the public-host check. One that
+    /// resolves to loopback answers, but is never contacted and counts as
+    /// unreachable.
+    #[tokio::test]
+    async fn an_unlisted_escrow_mint_on_loopback_is_never_contacted() {
+        let pool = pool().await;
+        let (private, hits) = counting_mint().await;
+        insert(&pool, "active", &format!("http://{private}"), true).await;
+        let listed = format!("http://{}", mock_mint().await);
+
+        let state = cashu_mint_check(&pool, &settings(vec![listed])).await;
+
+        assert_eq!(state, CheckState::Warn, "listed up, unlisted unreachable");
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0, "never contacted");
+    }
+
+    /// The same for the cloud metadata address: rejected by the host check
+    /// at once, without a connection attempt or a 10 s timeout.
+    #[tokio::test]
+    async fn an_unlisted_escrow_mint_on_the_metadata_address_is_never_contacted() {
+        let pool = pool().await;
+        insert(&pool, "active", "http://169.254.169.254", true).await;
+        let listed = format!("http://{}", mock_mint().await);
+
+        let started = std::time::Instant::now();
+        let state = cashu_mint_check(&pool, &settings(vec![listed])).await;
+
+        assert_eq!(state, CheckState::Warn);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A listed mint is still reached directly, even on loopback: the
+    /// operator chose it.
+    #[tokio::test]
+    async fn a_listed_mint_holding_escrow_is_reached_directly() {
+        let pool = pool().await;
+        let (listed, hits) = counting_mint().await;
+        let listed = format!("http://{listed}");
+        insert(&pool, "active", &listed, true).await;
+
+        let state = cashu_mint_check(&pool, &settings(vec![listed])).await;
+
+        assert_eq!(state, CheckState::Ok);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "probed once");
+    }
+
     /// Spec update on protocol #84: a mint removed from the allowlist while
     /// it still holds escrow keeps being probed, alongside the allowlist.
+    /// (Here it is unreachable twice over: on loopback, it also fails the
+    /// public-host check every unlisted mint gets.)
     #[tokio::test]
     async fn a_delisted_mint_still_holding_escrow_is_probed() {
         let pool = pool().await;
@@ -306,13 +410,23 @@ mod tests {
                 "https://delisted.example.net".to_string(),
             ],
         );
+        let target = |url: &str, listed: bool| MintTarget {
+            url: url.to_string(),
+            listed,
+        };
         assert_eq!(
             set,
             vec![
-                "https://b.example.org".to_string(),
-                "https://delisted.example.net".to_string(),
-                "https://mint.example.com".to_string(),
-            ]
+                target("https://b.example.org", true),
+                target("https://mint.example.com", true),
+                target("https://delisted.example.net", false),
+            ],
+            "an escrow mint that is also listed is reached as listed"
+        );
+        assert_eq!(
+            mints_to_probe(&[], vec!["https://maker.example.net".to_string()]),
+            vec![target("https://maker.example.net", false)],
+            "open node: every mint is unlisted"
         );
         assert!(mints_to_probe(&[], vec![]).is_empty());
     }

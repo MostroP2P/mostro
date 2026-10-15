@@ -72,7 +72,7 @@ The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). most
 |---|---|---|
 | `lnd_sync` | Lightning | see [above](#the-lnd_sync-check) |
 | `payouts` | Lightning | `fail` when a settled-but-unpaid order is over 2 h old and no payout succeeded in 2 h, or when more than half of at least 3 payout attempts in the last hour failed; `warn` when a settled-but-unpaid order is over 15 min old; otherwise `ok`; `unknown` if the database cannot be read |
-| `cashu_mint` | Cashu | probes `GET /v1/info` (10 s) on the `[cashu].mint_urls` allowlist plus the distinct mints currently holding escrow (an escrow token locked on an order that is not terminal; never a mint a pending order merely names), so a de-listed mint still holding escrow keeps being probed; each is reached the way the daemon connects to it (on an open node, with the public-host check); `ok` all answer (or none to probe), `warn` some, `fail` none, `unknown` when the orders cannot be read |
+| `cashu_mint` | Cashu | probes `GET /v1/info` (10 s) on the `[cashu].mint_urls` allowlist plus the distinct mints currently holding escrow (an escrow token locked on an order that is not terminal; never a mint a pending order merely names), so a de-listed mint still holding escrow keeps being probed; only allowlisted mints are reached directly, any other passes the public-host check (a host that now resolves to a private address is never contacted and counts as unreachable) and is reached at the address that passed it; `ok` all answer (or none to probe), `warn` some, `fail` none, `unknown` when the orders cannot be read |
 | `relays` | both | `ok` all connected, `warn` some, `fail` none |
 | `database` | both | `SELECT 1` within 5 s |
 

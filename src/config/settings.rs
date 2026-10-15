@@ -210,6 +210,15 @@ impl Settings {
         Self::get_cashu().is_some_and(|cfg| cfg.enabled)
     }
 
+    /// The `[health]` configuration from the global `MOSTRO_CONFIG`, or the
+    /// defaults when settings are not initialized (tests).
+    pub fn get_health() -> HealthSettings {
+        MOSTRO_CONFIG
+            .get()
+            .map(|settings| settings.health.clone())
+            .unwrap_or_default()
+    }
+
     /// Retrieve the `[payer_history]` configuration from the global
     /// `MOSTRO_CONFIG`. Returns `None` when the block is absent (treated as
     /// disabled) and also when the global settings haven't been initialized

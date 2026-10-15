@@ -392,7 +392,14 @@ async fn main() -> Result<()> {
 
     // Maintenance (drain) flag: one instance shared by the admin RPC (which
     // flips it) and the event loop's AppContext (which gates on it).
-    let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+    // With `[health].auto_maintenance_on_lnd_unsynced` off, maintenance the
+    // daemon turned on in an earlier run is lifted here, since the sync job
+    // will not (#1063). Operator maintenance is kept.
+    let maintenance = MaintenanceState::load_for_lightning(
+        get_db_pool().as_ref(),
+        Settings::get_health().auto_maintenance_on_lnd_unsynced,
+    )
+    .await?;
     if maintenance.is_enabled() {
         tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
     }

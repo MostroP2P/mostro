@@ -77,11 +77,32 @@ impl MaintenanceState {
     /// block new orders forever. It is lifted here; operator maintenance is
     /// kept.
     pub async fn load_for_cashu(pool: &SqlitePool) -> Result<Self, MostroError> {
+        Self::load_lifting_automatic(pool, "Cashu mode has no LND").await
+    }
+
+    /// [`MaintenanceState::load`] for a Lightning node, given
+    /// `[health].auto_maintenance_on_lnd_unsynced`. With the automation on,
+    /// the sync job lifts the daemon's own maintenance once LND is synced.
+    /// With it off, that job never acts, so maintenance the daemon turned on
+    /// in an earlier run would block new orders forever: it is lifted here,
+    /// if and only if the ownership marker says it is the daemon's.
+    pub async fn load_for_lightning(
+        pool: &SqlitePool,
+        auto_maintenance: bool,
+    ) -> Result<Self, MostroError> {
+        if auto_maintenance {
+            return Self::load(pool).await;
+        }
+        Self::load_lifting_automatic(pool, "auto_maintenance_on_lnd_unsynced is off").await
+    }
+
+    /// Load the flag and lift the daemon's own maintenance, keeping an
+    /// operator's. `why` goes into the log line.
+    async fn load_lifting_automatic(pool: &SqlitePool, why: &str) -> Result<Self, MostroError> {
         let state = Self::load(pool).await?;
         if state.disable_if_automatic(pool).await? {
             tracing::warn!(
-                "Lifted the maintenance the daemon had enabled because LND was unsynced: \
-                 Cashu mode has no LND"
+                "Lifted the maintenance the daemon had enabled because LND was unsynced: {why}"
             );
         }
         Ok(state)
@@ -718,6 +739,46 @@ mod tests {
             state.reason(&pool).await.unwrap().as_deref(),
             Some("upgrade")
         );
+    }
+
+    /// Codex review on #1065: an operator who turns the automation off must
+    /// not be left with the daemon's maintenance from an earlier run.
+    #[tokio::test]
+    async fn turning_the_automation_off_lifts_the_daemons_maintenance_at_startup() {
+        let pool = pool().await;
+        MaintenanceState::load(&pool)
+            .await
+            .unwrap()
+            .enable_unless_enabled(&pool, REASON_LND_UNSYNCED)
+            .await
+            .unwrap();
+
+        // Automation on: the sync job owns it, nothing changes at startup.
+        let kept = MaintenanceState::load_for_lightning(&pool, true)
+            .await
+            .unwrap();
+        assert!(kept.is_enabled());
+
+        // Automation off: lifted.
+        let lifted = MaintenanceState::load_for_lightning(&pool, false)
+            .await
+            .unwrap();
+        assert!(!lifted.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn turning_the_automation_off_keeps_operator_maintenance() {
+        let pool = pool().await;
+        MaintenanceState::load(&pool)
+            .await
+            .unwrap()
+            .set(&pool, true, Some("upgrade"))
+            .await
+            .unwrap();
+        let state = MaintenanceState::load_for_lightning(&pool, false)
+            .await
+            .unwrap();
+        assert!(state.is_enabled());
     }
 
     #[tokio::test]

@@ -399,6 +399,12 @@ mod tests {
         .await
         .expect("bond_payout_recipient migration");
         sqlx::query(include_str!(
+            "../../../migrations/20261015120100_bond_payout_sent_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_sent_at migration");
+        sqlx::query(include_str!(
             "../../../migrations/20260611120000_bond_slice_slash_unique.sql"
         ))
         .execute(&pool)
@@ -491,6 +497,7 @@ mod tests {
             payout_invoice: Some("pi-sentinel".into()),
             payout_routing_fee_sats: Some(15),
             payout_payment_hash: Some("q".repeat(64)),
+            payout_sent_at: Some(1_700_000_000),
             node_share_sats: Some(17),
 
             payout_recipient: None,
@@ -529,6 +536,7 @@ mod tests {
             "payout_invoice" => bond.payout_invoice.clone(),
             "payout_routing_fee_sats" => bond.payout_routing_fee_sats.map(|v| v.to_string()),
             "payout_payment_hash" => bond.payout_payment_hash.clone(),
+            "payout_sent_at" => bond.payout_sent_at.map(|v| v.to_string()),
             "node_share_sats" => bond.node_share_sats.map(|v| v.to_string()),
             "payout_attempts" => Some(bond.payout_attempts.to_string()),
             "invoice_request_attempts" => Some(bond.invoice_request_attempts.to_string()),
@@ -572,6 +580,7 @@ mod tests {
             | "taker_identity"
             | "taker_invoice" => row.try_get::<Option<String>, _>(column).unwrap(),
             "payout_routing_fee_sats"
+            | "payout_sent_at"
             | "node_share_sats"
             | "last_invoice_request_at"
             | "locked_at"

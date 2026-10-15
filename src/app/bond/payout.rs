@@ -86,34 +86,12 @@ use crate::util::{bytes_to_string, enqueue_order_msg};
 
 use super::db::{find_bond_by_id, find_bonds_by_state};
 use crate::app::health::lnd_sync::LndSyncState;
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-
-/// When each bond payout was last sent, in this process (#1063). A failure
-/// found later (by the send's own stream, or by reconciliation on a later
-/// tick) is judged against the LND sync state since that moment: a failure
-/// caused by our node's unhealthy spell does not consume the bond's retry
-/// budget. Absent after a restart: reconciliation then treats any deferring
-/// spell seen since startup as the cause.
-static BOND_SEND_STARTED_AT: LazyLock<Mutex<HashMap<Uuid, i64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn bond_send_started_at(bond_id: Uuid) -> Option<i64> {
-    match BOND_SEND_STARTED_AT.lock() {
-        Ok(map) => map.get(&bond_id).copied(),
-        Err(poisoned) => poisoned.into_inner().get(&bond_id).copied(),
-    }
-}
-
-fn set_bond_send_started_at(bond_id: Uuid, at: i64) {
-    match BOND_SEND_STARTED_AT.lock() {
-        Ok(mut map) => map.insert(bond_id, at),
-        Err(poisoned) => poisoned.into_inner().insert(bond_id, at),
-    };
-}
 
 /// A payout failure our own node caused: payments were deferred at some
-/// moment since the send (or, without a recorded send time, since startup).
+/// moment since `sent_at`, the stamp of the send that failed
+/// (`bonds.payout_sent_at`, persisted in the same CAS as the hash, so it
+/// survives a restart). Without a stamp (a row from before that column
+/// existed) nothing is attributed and the normal retry handling applies.
 /// The persisted hash is cleared for a terminal failure, so the next tick
 /// sends the same invoice again; an indeterminate one keeps it for
 /// reconciliation. No retry is consumed and the winner is not re-prompted.
@@ -124,8 +102,11 @@ async fn defer_bond_failure_if_ours(
     lnd_sync: &LndSyncState,
     kind: PaymentFailureKind,
     payment_hash_hex: &str,
+    sent_at: Option<i64>,
 ) -> bool {
-    let started_at = bond_send_started_at(bond.id).unwrap_or(0);
+    let Some(started_at) = sent_at else {
+        return false;
+    };
     if !lnd_sync
         .snapshot()
         .deferred_since(started_at, Utc::now().timestamp())
@@ -139,7 +120,7 @@ async fn defer_bond_failure_if_ours(
     );
     if kind == PaymentFailureKind::Terminal {
         if let Err(e) = sqlx::query(
-            "UPDATE bonds SET payout_payment_hash = NULL \
+            "UPDATE bonds SET payout_payment_hash = NULL, payout_sent_at = NULL \
              WHERE id = ? AND state = ? AND payout_payment_hash = ?",
         )
         .bind(bond.id)
@@ -680,6 +661,7 @@ async fn pay_counterparty(
                         lnd_sync,
                         PaymentFailureKind::Terminal,
                         &payment_hash_hex,
+                        bond.payout_sent_at,
                     )
                     .await
                     {
@@ -786,14 +768,19 @@ async fn pay_counterparty(
     // `fee_limit_sat`, so this informational column never misleads an
     // operator debugging a payout (notably small ones, where LND uses a
     // 1% rate with a 10-sat floor rather than `max_routing_fee`).
+    // `payout_sent_at` is stamped here, before the send, so it bounds it:
+    // a failure reported later is judged against the LND sync state since
+    // this moment (#1063).
     let routing_fee_cap = routing_fee_cap_sats(counterparty_share);
+    let sent_at = Utc::now().timestamp();
     let persisted = sqlx::query(
         "UPDATE bonds \
-           SET payout_routing_fee_sats = ?, payout_payment_hash = ? \
+           SET payout_routing_fee_sats = ?, payout_payment_hash = ?, payout_sent_at = ? \
          WHERE id = ? AND state = ?",
     )
     .bind(routing_fee_cap)
     .bind(&payment_hash_hex)
+    .bind(sent_at)
     .bind(bond.id)
     .bind(BondState::PendingPayout.to_string())
     .execute(pool)
@@ -833,7 +820,6 @@ async fn pay_counterparty(
     // error, or dropped by the timeout — `tx` drops and `rx.recv()` yields
     // `None`.
     let (tx, mut rx) = channel(100);
-    set_bond_send_started_at(bond.id, Utc::now().timestamp());
 
     let send_fut = timeout(
         crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT,
@@ -886,7 +872,16 @@ async fn pay_counterparty(
     match classify_send_verdict(send_outcome, stream) {
         SendVerdict::Settled => slash_after_success(pool, bond, counterparty_share).await,
         SendVerdict::Failure(kind, msg) => {
-            if defer_bond_failure_if_ours(pool, bond, lnd_sync, kind, &payment_hash_hex).await {
+            if defer_bond_failure_if_ours(
+                pool,
+                bond,
+                lnd_sync,
+                kind,
+                &payment_hash_hex,
+                Some(sent_at),
+            )
+            .await
+            {
                 return Ok(());
             }
             on_send_payment_failure(pool, bond, max_retries, claim_window_seconds, kind, &msg).await
@@ -1185,6 +1180,7 @@ async fn on_send_payment_failure(
                SET payout_invoice = NULL, \
                    payout_routing_fee_sats = NULL, \
                    payout_payment_hash = NULL, \
+                   payout_sent_at = NULL, \
                    payout_attempts = 0, \
                    last_invoice_request_at = NULL \
              WHERE id = ? AND state = ?",
@@ -1704,7 +1700,8 @@ async fn apply_payout_invoice(
                        payout_invoice = ?, \
                        payout_attempts = 0, \
                        invoice_request_attempts = 0, \
-                       payout_payment_hash = NULL \
+                       payout_payment_hash = NULL, \
+                       payout_sent_at = NULL \
                  WHERE id = ? AND state = ?",
             )
             .bind(BondState::PendingPayout.to_string())
@@ -1864,6 +1861,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_recipient migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20261015120100_bond_payout_sent_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_sent_at migration");
         // cashu escrow columns (mostro-core 0.12.1) — `Order::by_id` SELECTs
         // them. Apply each ALTER separately for the same reason as dev_fee.
         for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
@@ -3845,9 +3848,6 @@ mod tests {
         assert_eq!(after.state, BondState::PendingPayout.to_string());
     }
 
-    /// Codex review on #1065: the slot claim can take seconds and fails
-    /// open; if LND stopped being able to pay meanwhile, nothing is
-    /// persisted or sent and no retry is consumed.
     /// Codex review on #1065: a bond send that fails because our node went
     /// unhealthy during it does not consume the winner's retry budget.
     #[tokio::test]
@@ -3910,6 +3910,9 @@ mod tests {
         assert_eq!(after.state, BondState::PendingPayout.to_string());
     }
 
+    /// Codex review on #1065: the slot claim can take seconds and fails
+    /// open; if LND stopped being able to pay meanwhile, nothing is
+    /// persisted or sent and no retry is consumed.
     #[tokio::test]
     async fn pay_counterparty_defers_when_lnd_went_bad_during_the_slot_claim() {
         init_test_settings();
@@ -3957,6 +3960,120 @@ mod tests {
         assert_eq!(after.state, bond.state);
     }
 
+    /// The send time persisted with the hash (`payout_sent_at`) is what a
+    /// failure is judged against, so it survives a restart: a spell that
+    /// ended before the send does not excuse the failure, one that ended
+    /// after it does. A row from before the column existed is not excused.
+    #[tokio::test]
+    async fn a_bond_failure_is_judged_against_the_persisted_send_time() {
+        use crate::app::health::lnd_sync::LndObservation;
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let now = Utc::now().timestamp();
+        let hash = "ab".repeat(32);
+        // A deferring spell that ended at `now - 100`.
+        let state = LndSyncState::new();
+        let observation = |synced| LndObservation {
+            synced_to_chain: synced,
+            block_height: 1,
+            best_header_timestamp: now,
+            network: None,
+            peers: 0,
+            channels_active: 0,
+            channels_inactive: 0,
+            channels_pending: 0,
+        };
+        state.observe(observation(false), now - 300);
+        state.observe(observation(true), now - 100);
+
+        // Sent after the spell ended: the failure is the invoice's.
+        let mut sent_after = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now - 1_000,
+            Some(&invoice),
+            None,
+        );
+        sent_after.payout_payment_hash = Some(hash.clone());
+        sent_after.payout_sent_at = Some(now - 50);
+        let sent_after = create_bond(&pool, sent_after).await.unwrap();
+        assert!(
+            !defer_bond_failure_if_ours(
+                &pool,
+                &sent_after,
+                &state,
+                PaymentFailureKind::Terminal,
+                &hash,
+                sent_after.payout_sent_at,
+            )
+            .await
+        );
+
+        // Sent before the spell ended (e.g. before a restart): ours, and
+        // the hash is cleared so the next tick sends the same invoice.
+        let mut sent_before = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now - 1_000,
+            Some(&invoice),
+            None,
+        );
+        sent_before.payout_payment_hash = Some(hash.clone());
+        sent_before.payout_sent_at = Some(now - 200);
+        let sent_before = create_bond(&pool, sent_before).await.unwrap();
+        assert!(
+            defer_bond_failure_if_ours(
+                &pool,
+                &sent_before,
+                &state,
+                PaymentFailureKind::Terminal,
+                &hash,
+                sent_before.payout_sent_at,
+            )
+            .await
+        );
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(sent_before.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_payment_hash, None);
+        assert_eq!(after.payout_sent_at, None);
+        assert_eq!(after.payout_attempts, 0);
+
+        // No stamp (row older than the column): not attributed, the normal
+        // retry handling applies.
+        let mut legacy = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            now - 1_000,
+            Some(&invoice),
+            None,
+        );
+        legacy.payout_payment_hash = Some(hash.clone());
+        let legacy = create_bond(&pool, legacy).await.unwrap();
+        assert!(
+            !defer_bond_failure_if_ours(
+                &pool,
+                &legacy,
+                &state,
+                PaymentFailureKind::Indeterminate,
+                &hash,
+                None,
+            )
+            .await
+        );
+    }
+
     #[tokio::test]
     async fn pay_counterparty_fresh_send_persists_hash_then_fails_indeterminate() {
         // The pre-send CAS must persist the routing-fee cap and the
@@ -3981,6 +4098,7 @@ mod tests {
         );
         let bond = create_bond(&pool, bond).await.unwrap();
 
+        let before_send = Utc::now().timestamp();
         let mut ln = dead_lnd().await;
         pay_counterparty(
             &pool,
@@ -4000,6 +4118,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.payout_payment_hash.as_deref(), Some(&*expected_hash));
+        assert!(
+            after.payout_sent_at.is_some_and(|at| at >= before_send),
+            "the send time is stamped with the hash: {:?}",
+            after.payout_sent_at
+        );
         assert_eq!(
             after.payout_routing_fee_sats,
             Some(routing_fee_cap_sats(5_000))

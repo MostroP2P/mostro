@@ -1,0 +1,11 @@
+-- Timestamp (unix seconds) stamped on a bond right before its counterparty
+-- payout is sent, in the same CAS that persists `payout_payment_hash`, and
+-- cleared wherever that hash is cleared.
+--
+-- A payout failure, whether reported by the send itself or found by
+-- reconciliation on a later tick or after a restart, is judged against the
+-- LND sync state since this moment: a failure caused by our own node being
+-- unsynced or unreachable at any point since the send does not consume the
+-- bond winner's retry budget (#1063). Rows written before this column
+-- existed have NULL: their failures are not attributed to the node.
+ALTER TABLE bonds ADD COLUMN payout_sent_at integer;

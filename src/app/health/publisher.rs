@@ -107,17 +107,20 @@ pub async fn payout_rows(
     now: i64,
 ) -> Result<PayoutRows, MostroError> {
     let settled = Status::SettledHoldInvoice.to_string();
-    let (awaiting, unpaid, oldest): (i64, i64, Option<i64>) = sqlx::query_as(PAYOUT_ROWS_QUERY)
-        .bind(&settled)
-        .bind(payment_attempts)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?;
+    let stale_before = now.saturating_sub(PAYOUTS_STALE_SECS);
+    let (awaiting, unpaid, oldest, stale): (i64, i64, Option<i64>, i64) =
+        sqlx::query_as(PAYOUT_ROWS_QUERY)
+            .bind(&settled)
+            .bind(payment_attempts)
+            .bind(stale_before)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
     Ok(PayoutRows {
         settled_unpaid: unpaid.max(0) as u64,
-        stale_settled_unpaid: 0,
+        stale_settled_unpaid: stale.max(0) as u64,
         oldest_settled_unpaid_age_secs: oldest
-            .filter(|_| unpaid > 0)
+            .filter(|_| unpaid > stale)
             .map(|at| now.saturating_sub(at).max(0)),
         awaiting_buyer_invoice: awaiting.max(0) as u64,
     })
@@ -126,8 +129,10 @@ pub async fn payout_rows(
 /// Settled orders, in one pass over `idx_orders_status`: those waiting on
 /// the buyer for a new invoice (attempts used up and no payout in flight, the
 /// state in which `check_failure_retries` sent `add-invoice`), the others
-/// (the daemon is still paying them), and when the oldest of those was
-/// settled.
+/// (the daemon is still paying them), when the oldest of those settled
+/// after `?3` was settled, and how many of them settled before `?3` (stale:
+/// residue the daemon will not pay, see `PAYOUTS_STALE_SECS`). An order
+/// with no settle time at all is stale too.
 const PAYOUT_ROWS_QUERY: &str = "SELECT \
        COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                           AND payment_attempts >= ?2 THEN 1 ELSE 0 END), 0), \
@@ -135,7 +140,12 @@ const PAYOUT_ROWS_QUERY: &str = "SELECT \
                           AND payment_attempts >= ?2 THEN 0 ELSE 1 END), 0), \
        MIN(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                      AND payment_attempts >= ?2 THEN NULL \
-                ELSE COALESCE(hold_settled_at, invoice_held_at) END) \
+                WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN NULL \
+                ELSE COALESCE(hold_settled_at, invoice_held_at) END), \
+       COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
+                          AND payment_attempts >= ?2 THEN 0 \
+                     WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN 1 \
+                     ELSE 0 END), 0) \
      FROM orders WHERE status = ?1";
 
 /// Completed orders whose dev fee is not paid yet, from the partial index
@@ -957,12 +967,15 @@ mod tests {
     #[tokio::test]
     async fn health_queries_use_an_index() {
         let pool = pool().await;
-        for (query, binds) in [(PAYOUT_ROWS_QUERY, 2), (DEV_FEE_PENDING_QUERY, 0)] {
+        for (query, binds) in [(PAYOUT_ROWS_QUERY, 3), (DEV_FEE_PENDING_QUERY, 0)] {
             let mut explain = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
                 format!("EXPLAIN QUERY PLAN {query}"),
             ));
-            if binds == 2 {
-                explain = explain.bind("settled-hold-invoice").bind(3_i64);
+            if binds == 3 {
+                explain = explain
+                    .bind("settled-hold-invoice")
+                    .bind(3_i64)
+                    .bind(NOW - PAYOUTS_STALE_SECS);
             }
             let plan: Vec<String> = explain
                 .fetch_all(&pool)

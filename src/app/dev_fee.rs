@@ -572,28 +572,18 @@ async fn process_new_dev_fee_payments(
             "Storing payment hash {} for order {}",
             payment_hash_hex, order_id
         );
-        // Targeted update: store real hash only if we still own the PENDING marker.
-        let updated = match sqlx::query(
-            "UPDATE orders
-             SET dev_fee_payment_hash = ?
-             WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
-        )
-        .bind(&payment_hash_hex)
-        .bind(order_id)
-        .bind(&pending_marker)
-        .execute(pool)
-        .await
-        {
-            Err(e) => {
-                error!(
-                    "Failed to store payment hash for order {}: {:?}",
-                    order_id, e
-                );
-                release_pending_claim(pool, order_id, &pending_marker).await;
-                continue;
-            }
-            Ok(result) => result.rows_affected() > 0,
-        };
+        let updated =
+            match store_payment_hash(pool, order_id, &pending_marker, &payment_hash_hex).await {
+                Err(e) => {
+                    error!(
+                        "Failed to store payment hash for order {}: {:?}",
+                        order_id, e
+                    );
+                    release_pending_claim(pool, order_id, &pending_marker).await;
+                    continue;
+                }
+                Ok(updated) => updated,
+            };
 
         if !updated {
             warn!(
@@ -998,6 +988,34 @@ async fn release_if_deferred(
     );
     release_pending_claim(pool, order_id, pending_marker).await;
     true
+}
+
+/// Store the real payment hash of a new attempt, only if we still own the
+/// PENDING marker. Returns whether the row was ours.
+///
+/// `dev_fee_failed_hash` is reset here: it exists so a failure the send
+/// already counted is not counted again by recovery for the *same* attempt.
+/// An LNURL endpoint may hand out the same invoice again for the next
+/// attempt, and that attempt's failure must count and set a new backoff; if
+/// the hash stayed remembered, `record_dev_fee_failure` would skip it and the
+/// order would be retried every cycle (Codex review on #1065).
+async fn store_payment_hash(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    pending_marker: &str,
+    payment_hash_hex: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE orders
+         SET dev_fee_payment_hash = ?, dev_fee_failed_hash = NULL
+         WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+    )
+    .bind(payment_hash_hex)
+    .bind(order_id)
+    .bind(pending_marker)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -1949,6 +1967,58 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    /// Codex review on #1065: an LNURL endpoint may return the same invoice
+    /// for a later attempt. That attempt's failure must still be counted and
+    /// get a backoff; only a repeat report of the *same* attempt is skipped.
+    #[tokio::test]
+    async fn a_failure_on_a_reused_invoice_is_counted_again() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        // First attempt: failed with this hash, counted once; the deadline
+        // has since passed and the order was claimed again.
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+        let repeat = super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+        assert!(
+            repeat.is_ok(),
+            "a repeat report of the same attempt is a no-op"
+        );
+        sqlx::query(
+            "UPDATE orders SET dev_fee_payment_hash = 'PENDING-x-2', dev_fee_next_attempt_at = 0 \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Second attempt resolves to the same invoice.
+        assert!(
+            super::store_payment_hash(&pool, id, "PENDING-x-2", VALID_HEX_HASH)
+                .await
+                .unwrap()
+        );
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 2, "the second attempt's failure is counted");
+        assert!(
+            row.1.is_some_and(|at| at > chrono::Utc::now().timestamp()),
+            "and it gets a new backoff: {:?}",
+            row.1
+        );
     }
 
     /// Codex review on #1064 (round 3): the backoff must already be stored

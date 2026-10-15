@@ -18,7 +18,8 @@ With a stale block height every outgoing HTLC carried a CLTV expiry the receiver
 
 - when the current uninterrupted run of `synced_to_chain = false` began (`unsynced_since`);
 - when the current run of `synced_to_chain = true` began (`synced_since`);
-- when LND stopped answering (`unreachable_since`), and the last `GetInfo` it did answer.
+- when LND stopped answering (`unreachable_since`), and the last `GetInfo` it did answer;
+- when the current run of "cannot pay", unsynced or unreachable in any mix, began (`unhealthy_since`), the one clock outgoing payments are deferred on, and when the last such run that lasted long enough to defer payments ended (`deferral_ended_at`), so a failure that arrives after LND recovered can still be recognised as caused by that run.
 
 A broken gRPC connection is rebuilt on the next poll. Transitions (synced/unsynced, reachable/unreachable) are logged once, at `warn` when something went wrong.
 
@@ -31,7 +32,8 @@ Once LND has been unsynced or has not answered, in any mix, for **60 seconds** w
 | Payment | While deferred |
 |---|---|
 | Buyer payout (`do_payment`, after `release` or `admin-settle`, or a new invoice from the buyer) | Not sent. The order stays in `settled-hold-invoice` with `failed_payment = true` and `payment_attempts` unchanged, so `job_retry_failed_payments` pays it once LND recovers. The buyer is not notified. |
-| Buyer payout that fails anyway (it was already in flight when LND went bad) | Recorded the same way: no attempt consumed, no `payment-failed`, no `add-invoice`. |
+| Buyer payout that fails anyway (it was already in flight when LND went bad) | Recorded the same way: no attempt consumed, no `payment-failed`, no `add-invoice`. A failure that arrives after LND recovered is treated the same if payments were deferred at any moment since the send (`payout_claimed_at` bounds the send). |
+| Bond payout that fails anyway | Same rule, judged from `bonds.payout_sent_at`, stamped with the payment hash right before the send: no retry consumed, the invoice is kept, and a terminal failure clears the hash so the next tick sends the same invoice again. |
 | `job_retry_failed_payments` | Skips its pass. |
 | Dev fee job, bond payout job | Skip their cycle. |
 

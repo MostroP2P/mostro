@@ -187,13 +187,17 @@ The maintenance flag plus the counters of what is still bound to the connected L
 
 ### 9. Revoke Reputation Imports
 
-Reverse the reputation imports made with an issuer key after that key was compromised (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md), "Revoking an issuer key"). Remove the key from `[reputation_import]` first, so no new import is accepted with it, then call this.
+Reverse the reputation imports made with an issuer key after that key was compromised (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md), "Revoking an issuer key"). Remove the key from `[reputation_import]` and restart with the updated settings first, so no new import is accepted with it, then call this. The RPC warns when the key is still trusted by the running daemon; it does not remove it from the trust list, and keeping it trusted permits users to import with it again.
 
-Each import made with the key is reversed exactly — its ratings and its share of the average come off, the shown date goes back to the earliest of the native date and the remaining imports — and its row is deleted, so the user can import again with an attestation from the issuer's new key. Native ratings received in the meantime are kept. Imports signed by the issuer's other keys are untouched. The user's rating event is republished, and every reversal is logged.
+Each import made with the key is reversed exactly — its ratings and its share of the average come off, the shown date goes back to the earliest of the native date and the remaining imports — and its row is deleted, so the user can import again with an attestation from the issuer's new key. Native ratings received in the meantime are kept. Imports signed by the issuer's other keys are untouched. Concurrent calls claim each receipt by deleting it before updating the user in the same transaction, so they neither reverse nor count it twice. Transactions are per import, not across the entire RPC batch.
+
+Every reversal is logged. Updated kind 38384 rating events are queued for the revoked receipt's trade key and the trade keys recorded on the identity's remaining imports, since their displayed aggregates also changed. Publication uses strictly increasing timestamps per node author and trade key. Delivery occurs on the next `user_rates_sent_interval_seconds` tick (default: 3600 seconds), is best effort, and is lost if the daemon restarts before sending. Trade-key aliases not recorded in these receipts are not enumerated.
+
+The affected maker's orders in `pending` or `waiting-taker-bond` are queued for the existing orderbook reconciler, so their kind 38383 `rating` tags are refreshed too. It reloads current order state before publishing; active trades and other makers' orders are not queued by this RPC. The reconciler runs every 60 seconds and waits for 120 seconds without an order publication before sending. Relay failures use its existing retry limit; its queue is also in memory. A successful RPC response confirms the database reversals, not relay delivery.
 
 The selection is by key and by **this node's import time**, never by the attestation's `created_at`, which whoever holds the key chooses: an attestation backdated to before the cutoff but imported after it is still revoked.
 
-**Loopback only**, like `SetMaintenanceMode`.
+**Loopback only**, like `SetMaintenanceMode`. When `[rpc].auth_token` is configured, the bearer token is required as well; without it, only the loopback restriction applies.
 
 **Request:**
 

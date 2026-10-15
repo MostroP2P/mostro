@@ -88,11 +88,10 @@ impl AdminServiceImpl {
         }
     }
 
-    /// The admin service has no authentication interceptor; mutating the
-    /// maintenance flag is restricted to loopback peers so a non-loopback
-    /// `[rpc].listen_address` or a forwarded port cannot close or reopen the
-    /// book. Missing peer info is refused too (same as `validate_db_password`).
-    fn require_loopback<T>(request: &Request<T>) -> Result<std::net::IpAddr, Status> {
+    /// Restrict local administration RPCs to loopback peers. Forwarded
+    /// connections also need the configured bearer token; missing peer
+    /// information is refused rather than assumed local.
+    fn require_loopback<T>(request: &Request<T>, rpc: &str) -> Result<std::net::IpAddr, Status> {
         let ip = request
             .remote_addr()
             .ok_or_else(|| Status::internal("Unable to determine client address"))?
@@ -100,10 +99,10 @@ impl AdminServiceImpl {
         if ip.is_loopback() {
             Ok(ip)
         } else {
-            warn!("SetMaintenanceMode refused for non-loopback peer {ip}");
-            Err(Status::permission_denied(
-                "SetMaintenanceMode is only accepted from loopback peers",
-            ))
+            warn!("{rpc} refused for non-loopback peer {ip}");
+            Err(Status::permission_denied(format!(
+                "{rpc} is only accepted from loopback peers"
+            )))
         }
     }
 }
@@ -507,7 +506,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SetMaintenanceModeRequest>,
     ) -> Result<Response<SetMaintenanceModeResponse>, Status> {
-        let ip = Self::require_loopback(&request)?;
+        let ip = Self::require_loopback(&request, "SetMaintenanceMode")?;
         self.require_auth(&request, "SetMaintenanceMode")?;
         let req = request.into_inner();
         info!(
@@ -543,7 +542,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<RevokeReputationImportsRequest>,
     ) -> Result<Response<RevokeReputationImportsResponse>, Status> {
-        let ip = Self::require_loopback(&request)?;
+        let ip = Self::require_loopback(&request, "RevokeReputationImports")?;
         self.require_auth(&request, "RevokeReputationImports")?;
         let req = request.into_inner();
         info!(
@@ -560,6 +559,13 @@ impl AdminService for AdminServiceImpl {
         let Ok(key) = nostr_sdk::prelude::PublicKey::parse(req.issuer_key.trim()) else {
             return failure(format!("invalid issuer key: {}", req.issuer_key));
         };
+        if Settings::get_reputation_import().is_some_and(|import| import.issuer_for(&key).is_some())
+        {
+            warn!(
+                "RevokeReputationImports: issuer key {key} is still trusted; remove it from \
+                 [reputation_import] and restart, or new imports with it remain possible"
+            );
+        }
         match crate::app::reputation::revoke::revoke_imports(
             &self.pool,
             &key,

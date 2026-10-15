@@ -1915,7 +1915,29 @@ where
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
-/// Delete an import's row once it is reversed, so its user can import again.
+/// Open orderbook entries advertising this maker's reputation. Revocation
+/// callers use their transaction to collect these before committing, then
+/// queue their IDs for the reconciler to rebuild from current DB state.
+pub async fn find_open_orders_by_maker<'e, E>(
+    executor: E,
+    identity: &str,
+) -> Result<Vec<Uuid>, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT id FROM orders WHERE status IN ('pending', 'waiting-taker-bond') \
+         AND ((kind = 'sell' AND master_seller_pubkey = ?1) \
+           OR (kind = 'buy' AND master_buyer_pubkey = ?1))",
+    )
+    .bind(identity)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Claim an import's reversal by deleting its receipt in the same
+/// transaction as the aggregate update. `false` means it was already gone.
 pub async fn delete_reputation_import<'e, E>(
     executor: E,
     attestation_id: &str,

@@ -373,6 +373,16 @@ That is accepted: those fields are informational tags of the kind 38384 event,
 no decision reads them, and recomputing them would need a per-review history
 the daemon does not keep.
 
+`RevokeReputationImports` claims each receipt by deleting it before reading
+and updating the user's aggregate, in the same transaction. A concurrent
+call that finds it already deleted skips it, including in the returned
+count. The RPC queues corrected rating events for the trade keys recorded
+on the revoked and remaining imports of that identity. It also queues the
+maker's `pending` and `waiting-taker-bond` orders for the existing orderbook
+reconciler, which reloads their current state before republishing the
+`rating` tag. See [RPC.md](RPC.md#9-revoke-reputation-imports) for delivery
+intervals, the limits of the in-memory queues, and the operator procedure.
+
 ## 6. Merging on the destination
 
 Each figure has its own merge rule, because they measure different things:

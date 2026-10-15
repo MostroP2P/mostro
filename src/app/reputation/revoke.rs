@@ -3,22 +3,24 @@
 
 use crate::app::rate_user::rating_event_tags;
 use crate::db::{
-    delete_reputation_import, reputation_imports_by_key, reputation_imports_for_identity,
-    update_user_reputation, ReputationImportRow,
+    delete_reputation_import, find_open_orders_by_maker, reputation_imports_by_key,
+    reputation_imports_for_identity, update_user_reputation, ReputationImportRow,
 };
-use crate::util::update_user_rating_event;
+use crate::util::{mark_orderbook_publish_failed, update_user_rating_event};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 
 /// Reverse every import signed by `issuer_key`, or with `imported_after` only
 /// those this node recorded at or after that time — the node's own clock,
 /// never the attestation's `created_at`, which whoever holds the key
 /// chooses. Each import is reversed and its row deleted in one transaction,
 /// so its user can import again with an attestation from the new key; the
-/// user's rating event is republished under the trade key that imported.
-/// Imports signed by the entry's other keys are untouched. Returns the
-/// imports reversed.
+/// corrected rating events are queued under the trade keys recorded on
+/// the revoked and remaining imports of that identity. Its open maker
+/// orders are queued for the orderbook reconciler. Other imports are not
+/// reversed. Returns only the receipts this call actually claimed.
 pub async fn revoke_imports(
     pool: &SqlitePool,
     issuer_key: &PublicKey,
@@ -26,42 +28,82 @@ pub async fn revoke_imports(
     keys: &Keys,
 ) -> Result<Vec<ReputationImportRow>, MostroError> {
     let rows = reputation_imports_by_key(pool, &issuer_key.to_hex(), imported_after).await?;
-    for row in &rows {
-        let user = revert(pool, row).await?;
+    let mut revoked = Vec::new();
+    for row in rows {
+        let Some(reverted) = revert(pool, &row).await? else {
+            continue;
+        };
         tracing::warn!(
-            "reputation: revoked import {} by {} ({} ratings from `{}`, key {})",
+            "reputation: revoked import {} ({} ratings from `{}`, key {})",
             row.attestation_id,
-            row.identity_pubkey,
             row.reviews,
             row.issuer,
             row.issuer_key
         );
-        if let Some(trade_pubkey) = &row.trade_pubkey {
-            update_user_rating_event(trade_pubkey, rating_event_tags(&user), keys).await?;
+        // Queue only after the receipt and aggregate commit. The reconciler
+        // reloads current state and respects transitions still in flight.
+        for order_id in reverted.open_order_ids {
+            mark_orderbook_publish_failed(order_id);
         }
+        for trade_pubkey in reverted.trade_pubkeys {
+            update_user_rating_event(&trade_pubkey, rating_event_tags(&reverted.user), keys)
+                .await?;
+        }
+        revoked.push(row);
     }
-    Ok(rows)
+    Ok(revoked)
 }
 
-/// Reverse one import and delete its row, in one transaction.
-async fn revert(pool: &SqlitePool, row: &ReputationImportRow) -> Result<User, MostroError> {
+struct RevertedImport {
+    user: User,
+    trade_pubkeys: BTreeSet<String>,
+    open_order_ids: Vec<uuid::Uuid>,
+}
+
+/// Claim and reverse one receipt. A stale snapshot already claimed by
+/// another call is a no-op, including its publication and returned count.
+async fn revert(
+    pool: &SqlitePool,
+    row: &ReputationImportRow,
+) -> Result<Option<RevertedImport>, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
     let mut tx = pool.begin().await.map_err(db_err)?;
+    // Write first: acquire SQLite's writer lock before reading the user,
+    // avoiding a read-to-write upgrade on a stale snapshot. The deletion
+    // and aggregate update roll back together if any later step fails.
+    if !delete_reputation_import(&mut *tx, &row.attestation_id).await? {
+        tx.rollback().await.map_err(db_err)?;
+        return Ok(None);
+    }
     let mut user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE pubkey = ?1")
         .bind(&row.identity_pubkey)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-    delete_reputation_import(&mut *tx, &row.attestation_id).await?;
-    let remaining_since = reputation_imports_for_identity(&mut *tx, &row.identity_pubkey)
-        .await?
-        .iter()
-        .map(|other| other.since)
-        .min();
+    let remaining = reputation_imports_for_identity(&mut *tx, &row.identity_pubkey).await?;
+    let remaining_since = remaining.iter().map(|other| other.since).min();
     user.revert_reputation_import(&row.figures()?, remaining_since);
     update_user_reputation(&mut *tx, &user).await?;
+    // Remaining receipts may have advertised the aggregate under a
+    // different trade key; correcting only the revoked receipt leaves
+    // those events displaying the reputation that was just removed.
+    let trade_pubkeys = row
+        .trade_pubkey
+        .iter()
+        .chain(
+            remaining
+                .iter()
+                .filter_map(|other| other.trade_pubkey.as_ref()),
+        )
+        .cloned()
+        .collect();
+    let open_order_ids = find_open_orders_by_maker(&mut *tx, &row.identity_pubkey).await?;
     tx.commit().await.map_err(db_err)?;
-    Ok(user)
+    Ok(Some(RevertedImport {
+        user,
+        trade_pubkeys,
+        open_order_ids,
+    }))
 }
 
 #[cfg(test)]
@@ -220,7 +262,7 @@ mod tests {
         assert_eq!(after_first.total_reviews, 2);
 
         // Another RPC selected this receipt before the first one committed.
-        revert(ctx.pool(), &cached).await.unwrap();
+        assert!(revert(ctx.pool(), &cached).await.unwrap().is_none());
         assert_eq!(user(&ctx, &identity).await, after_first);
     }
 

@@ -1196,16 +1196,21 @@ async fn dispatch_payout(
         let lookup = match &send_outcome {
             Ok(Err(_)) => match Vec::<u8>::from_hex(&payout_hash) {
                 Ok(bytes) if bytes.len() == 32 => {
-                    Some(ln_client_payment.lookup_payment_status(&bytes).await)
+                    Some(ln_client_payment.lookup_payment(&bytes).await)
                 }
                 _ => None,
             },
             _ => None,
         };
 
-        // LND reports the payment failed although the send RPC errored:
-        // a final failed attempt for the health event's payout counters.
-        let lookup_says_failed = matches!(lookup, Some(Ok(Some(PaymentStatus::Failed))));
+        // LND reports the payment failed although the send RPC errored: a
+        // final failed attempt for the health event's payout counters, at
+        // the time LND failed it and with its reason (Codex review on #1066).
+        let failed_lookup = match &lookup {
+            Some(Ok(Some(found))) if found.status == PaymentStatus::Failed => Some(*found),
+            _ => None,
+        };
+        let lookup = lookup.map(|result| result.map(|found| found.map(|found| found.status)));
         match classify_dispatch(send_outcome, lookup) {
             // The send stream ended. Usually a terminal update was delivered
             // and the watcher finishes the bookkeeping — but send_payment's
@@ -1235,10 +1240,12 @@ async fn dispatch_payout(
                 .await
                 .unwrap_or(false)
                 {
-                    if lookup_says_failed {
+                    if let Some(failed) = failed_lookup {
                         ctx.health_stats().record_payout_failure(
-                            chrono::Utc::now().timestamp(),
-                            crate::app::health::stats::REASON_OTHER,
+                            failed
+                                .resolved_at
+                                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                            crate::app::health::stats::failure_reason_key(failed.failure_reason),
                         );
                     }
                     check_failure_retries_or_log(&ctx, &order, request_id, Some(send_started_at))

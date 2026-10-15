@@ -96,7 +96,11 @@ use super::types::{BondSlashReason, BondState};
 /// — but every state transition is still done with a guarded CAS so a
 /// concurrent admin retry or a daemon restart that re-fires the same
 /// tick cannot double-settle a row.
-pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConnector) {
+pub async fn run_bond_payout_cycle(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut LndConnector,
+    lnd_sync: &crate::app::health::lnd_sync::LndSyncState,
+) {
     let bonds = match find_bonds_by_state(pool, BondState::PendingPayout).await {
         Ok(b) => b,
         Err(e) => {
@@ -113,6 +117,12 @@ pub async fn run_bond_payout_cycle(pool: &Pool<Sqlite>, ln_client: &mut LndConne
     );
 
     for bond in bonds {
+        // Checked before each bond: a pass can outlast the moment our node
+        // stops being able to pay (#1063).
+        if lnd_sync.defers_outgoing_payments(chrono::Utc::now().timestamp()) {
+            warn!("bond payout: stopping the pass, LND is not synced to chain or not reachable");
+            break;
+        }
         if let Err(e) = process_one_bond(pool, ln_client, &bond).await {
             warn!(
                 bond_id = %bond.id,
@@ -3374,7 +3384,12 @@ mod tests {
         init_test_settings();
         let pool = setup_pool().await;
         let mut ln = dead_lnd().await;
-        run_bond_payout_cycle(&pool, &mut ln).await;
+        run_bond_payout_cycle(
+            &pool,
+            &mut ln,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3387,7 +3402,12 @@ mod tests {
             .unwrap();
         let mut ln = dead_lnd().await;
         // Must log-and-return, not panic or propagate.
-        run_bond_payout_cycle(&pool, &mut ln).await;
+        run_bond_payout_cycle(
+            &pool,
+            &mut ln,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3418,7 +3438,12 @@ mod tests {
         let node_only = create_bond(&pool, node_only).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        run_bond_payout_cycle(&pool, &mut ln).await;
+        run_bond_payout_cycle(
+            &pool,
+            &mut ln,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await;
 
         let broken_after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(broken.id)

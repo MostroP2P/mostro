@@ -77,6 +77,7 @@
 //! re-sends every unpaid dev fee every cycle, hundreds of failed payments an
 //! hour (#1063).
 
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
@@ -126,13 +127,14 @@ pub async fn run_dev_fee_cycle(
     confirmed: &mut HashSet<uuid::Uuid>,
     unverifiable: &mut HashSet<uuid::Uuid>,
     keys: &Keys,
+    lnd_sync: &LndSyncState,
 ) {
     info!("Checking for unpaid development fees");
 
     cleanup_stale_pending_markers(pool).await;
     verify_confirmed_orders(pool, ln_client, confirmed, unverifiable).await;
     recover_partial_payments(pool, ln_client, confirmed).await;
-    process_new_dev_fee_payments(pool, ln_client, confirmed, keys).await;
+    process_new_dev_fee_payments(pool, ln_client, confirmed, keys, lnd_sync).await;
 }
 
 // ── Phase 1: Stale PENDING cleanup ──────────────────────────────────────
@@ -479,6 +481,7 @@ async fn process_new_dev_fee_payments(
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
     keys: &Keys,
+    lnd_sync: &LndSyncState,
 ) {
     let unpaid_orders = match find_unpaid_dev_fees(pool).await {
         Ok(orders) => orders,
@@ -491,6 +494,13 @@ async fn process_new_dev_fee_payments(
 
     for order in unpaid_orders {
         let order_id = order.id;
+
+        // A pass can take minutes (20 s to resolve, 50 s to send, per order):
+        // stop as soon as our node can no longer pay (#1063).
+        if lnd_sync.defers_outgoing_payments(Utc::now().timestamp()) {
+            warn!("Stopping the dev fee pass: LND is not synced to chain or not reachable");
+            break;
+        }
 
         // STEP 0: Atomically claim this order to prevent duplicate processing.
         let now_ts = Utc::now().timestamp() as u64;
@@ -1311,6 +1321,7 @@ mod tests {
         handle_payment_success, parse_pending_timestamp, release_all_pending_claims,
         release_pending_claim, try_claim_order_for_dev_fee,
     };
+    use crate::app::health::lnd_sync::LndSyncState;
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::error::MostroError;
@@ -2343,6 +2354,7 @@ mod tests {
             &mut confirmed,
             &mut HashSet::new(),
             &Keys::generate(),
+            &LndSyncState::new(),
         )
         .await;
         assert!(confirmed.is_empty());
@@ -2654,7 +2666,14 @@ mod tests {
 
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut confirmed,
+            &Keys::generate(),
+            &LndSyncState::new(),
+        )
+        .await;
 
         let row: (i32, Option<String>) =
             sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
@@ -2667,6 +2686,50 @@ mod tests {
         assert!(confirmed.is_empty());
     }
 
+    /// Codex review on #1065: a pass stops as soon as payments are
+    /// deferred, instead of trying (and backing off) every remaining order.
+    #[tokio::test]
+    async fn dev_fee_pass_stops_while_payments_are_deferred() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        let lnd_sync = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        lnd_sync.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+
+        let mut ln = dead_lnd().await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut HashSet::new(),
+            &Keys::generate(),
+            &lnd_sync,
+        )
+        .await;
+
+        let row: (Option<String>, i64) = sqlx::query_as(
+            "SELECT dev_fee_payment_hash, dev_fee_failed_attempts FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, 0), "not claimed, not attempted, not backed off");
+    }
+
     #[tokio::test]
     async fn process_new_payments_query_failure_returns_early() {
         let pool = setup_orders_db().await;
@@ -2676,7 +2739,14 @@ mod tests {
             .unwrap();
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut confirmed,
+            &Keys::generate(),
+            &LndSyncState::new(),
+        )
+        .await;
         assert!(confirmed.is_empty());
     }
 

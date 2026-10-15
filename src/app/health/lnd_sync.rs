@@ -108,6 +108,10 @@ pub struct LndSyncSnapshot {
     /// moving between the two unhealthy states never restarts the deferral
     /// clock and lets payments out for another 60 seconds.
     pub unhealthy_since: Option<i64>,
+    /// When the last spell long enough to defer payments ended (the synced
+    /// observation that closed it). Lets a failure that arrives after LND
+    /// recovered be recognised as caused by that spell.
+    pub deferral_ended_at: Option<i64>,
 }
 
 impl LndSyncSnapshot {
@@ -117,6 +121,12 @@ impl LndSyncSnapshot {
         self.observed_at = Some(now);
         self.unreachable_since = None;
         let transition = if observation.synced_to_chain {
+            if self
+                .unhealthy_since
+                .is_some_and(|since| now.saturating_sub(since) >= PAYMENT_DEFER_AFTER_SECS)
+            {
+                self.deferral_ended_at = Some(now);
+            }
             self.unsynced_since = None;
             self.unhealthy_since = None;
             self.synced_since = self.synced_since.or(Some(now));
@@ -180,6 +190,17 @@ impl LndSyncSnapshot {
             && self
                 .unhealthy_since
                 .is_some_and(|since| now.saturating_sub(since) >= PAYMENT_DEFER_AFTER_SECS)
+    }
+
+    /// Whether payments were deferred at any moment between `started_at` and
+    /// `now`: they are now, or a deferring spell ended after `started_at`.
+    /// A payment sent at `started_at` that fails later is then our node's
+    /// fault, even if LND has recovered by the time the failure arrives.
+    pub fn deferred_since(&self, started_at: i64, now: i64) -> bool {
+        self.defers_outgoing_payments(now)
+            || self
+                .deferral_ended_at
+                .is_some_and(|ended_at| ended_at >= started_at)
     }
 
     /// Seconds LND has been synced without interruption, if it is now.
@@ -517,6 +538,31 @@ mod tests {
         state.observe_at_startup(observation(true), T0);
         assert!(!state.defers_outgoing_payments(T0));
         assert_eq!(state.snapshot().sync_check(T0, 600), CheckState::Ok);
+    }
+
+    /// Codex review on #1065: a payout sent before LND went bad and failed
+    /// after it recovered was still caused by the spell.
+    #[test]
+    fn a_deferring_spell_during_a_send_is_remembered_after_recovery() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        let sent_at = T0 + 5;
+        poll(&state, false, T0 + 15, T0 + 90);
+        state.observe(observation(true), T0 + 105);
+        let snapshot = state.snapshot();
+        assert!(!snapshot.defers_outgoing_payments(T0 + 110));
+        assert!(snapshot.deferred_since(sent_at, T0 + 110));
+        // A send started after the spell ended is judged on its own.
+        assert!(!snapshot.deferred_since(T0 + 106, T0 + 110));
+    }
+
+    #[test]
+    fn a_short_blip_during_a_send_is_not_a_deferral() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        state.observe(observation(false), T0 + 15);
+        state.observe(observation(true), T0 + 30);
+        assert!(!state.snapshot().deferred_since(T0, T0 + 30));
     }
 
     #[test]

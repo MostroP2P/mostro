@@ -1652,6 +1652,7 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
                 &mut confirmed,
                 &mut unverifiable,
                 keys,
+                ctx.lnd_sync(),
             )
             .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -1706,7 +1707,7 @@ async fn job_process_bond_payouts(ctx: AppContext) {
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
                 continue;
             }
-            bond::run_bond_payout_cycle(pool, &mut ln_client).await;
+            bond::run_bond_payout_cycle(pool, &mut ln_client, ctx.lnd_sync()).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

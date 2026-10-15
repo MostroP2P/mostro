@@ -297,6 +297,13 @@ one enum in core carrying `#[serde(other)]`, so an old client degrades a new
 reason to `Unknown` instead of failing. `Action` and `Payload` have no such
 fallback — see section 9 for why that is still safe.
 
+A retry is confirmed, not refused. The daemon queues its replies in memory,
+so a `reputation-imported` can be lost after step 8 committed. If step 7 fails
+because this same attestation (same event id) is already recorded for this
+identity, the destination replies `reputation-imported` again and changes
+nothing. Any other attestation of an imported account, even a newer one from
+the same issuer, is still refused with `reputation-already-imported`.
+
 **Issuer keys and rotation.** An issuer signs with one key at a time, but a
 destination does not identify it by that key. Each trust-list entry has a
 local, stable `name` and one or more `keys` (section 7); the name is what

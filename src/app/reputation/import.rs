@@ -4,7 +4,10 @@
 
 use crate::app::context::AppContext;
 use crate::config::types::ReputationImportSettings;
-use crate::db::{insert_reputation_import, update_user_reputation, ReputationImportRow};
+use crate::db::{
+    insert_reputation_import, reputation_imports_for_identity, update_user_reputation,
+    ReputationImportRow,
+};
 use crate::util::enqueue_order_msg;
 use mostro_core::prelude::*;
 use mostro_core::reputation::ReputationImport;
@@ -50,16 +53,30 @@ pub async fn import_reputation_action(
         return Err(MostroCantDo(CantDoReason::ReputationIdentityMismatch));
     }
 
-    record_import(ctx, &issuer.name, &attestation, event).await?;
     // Name the trade key, as the reply's log line does: the identity key
     // would tie a long-lived identity to its import in the logs.
-    tracing::info!(
-        "reputation: trade key {} imported {} ratings from `{}` (attestation {})",
-        event.sender,
-        attestation.reviews,
-        issuer.name,
-        attestation.id
-    );
+    match record_import(ctx, &issuer.name, &attestation, event).await {
+        Ok(_) => tracing::info!(
+            "reputation: trade key {} imported {} ratings from `{}` (attestation {})",
+            event.sender,
+            attestation.reviews,
+            issuer.name,
+            attestation.id
+        ),
+        // This very attestation is already recorded: a retry whose first
+        // reply was lost, since the reply queue lives in memory. Confirm it
+        // again; nothing is merged twice.
+        Err(MostroCantDo(CantDoReason::ReputationAlreadyImported))
+            if is_recorded(ctx, &attestation, event).await? =>
+        {
+            tracing::info!(
+                "reputation: trade key {} resent attestation {}, already imported",
+                event.sender,
+                attestation.id
+            )
+        }
+        Err(e) => return Err(e),
+    }
     enqueue_order_msg(
         kind.request_id,
         None,
@@ -123,12 +140,25 @@ async fn record_import(
     Ok(user)
 }
 
+/// Whether this attestation is already imported for the proved identity.
+/// Its id covers every tag, so a match is the same signed figures for the
+/// same destination, and a reversed import no longer has a row.
+async fn is_recorded(
+    ctx: &AppContext,
+    attestation: &ReputationAttestation,
+    event: &UnwrappedMessage,
+) -> Result<bool, MostroError> {
+    let id = attestation.id.to_hex();
+    let rows = reputation_imports_for_identity(ctx.pool(), &event.identity.to_hex()).await?;
+    Ok(rows.iter().any(|row| row.attestation_id == id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::config::types::ReputationIssuer;
-    use crate::db::{add_new_user, is_user_present, reputation_imports_for_identity};
+    use crate::db::{add_new_user, is_user_present};
     use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;

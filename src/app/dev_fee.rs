@@ -730,6 +730,9 @@ async fn handle_payment_failure(
         "Dev fee payment failed for order {} - error: {:?}",
         order_id, e
     );
+    // An attempt was sent: its failure, once LND confirms it, must count
+    // even if the invoice (and hash) is the same as a counted one.
+    forget_counted_failure(pool, order_id).await;
     warn!(
         "Keeping payment hash for order {} to let idempotency check verify on next cycle",
         order_id
@@ -765,6 +768,8 @@ async fn handle_payment_timeout(
         "Dev fee payment timeout (50s) for order {} ({} sats), checking LN status",
         order_id, dev_fee
     );
+    // An attempt was sent (see `forget_counted_failure`).
+    forget_counted_failure(pool, order_id).await;
 
     match check_dev_fee_payment_status(&order, ln_client).await {
         DevFeePaymentState::Succeeded => {
@@ -991,14 +996,9 @@ async fn release_if_deferred(
 }
 
 /// Store the real payment hash of a new attempt, only if we still own the
-/// PENDING marker. Returns whether the row was ours.
-///
-/// `dev_fee_failed_hash` is reset here: it exists so a failure the send
-/// already counted is not counted again by recovery for the *same* attempt.
-/// An LNURL endpoint may hand out the same invoice again for the next
-/// attempt, and that attempt's failure must count and set a new backoff; if
-/// the hash stayed remembered, `record_dev_fee_failure` would skip it and the
-/// order would be retried every cycle (Codex review on #1065).
+/// PENDING marker. Returns whether the row was ours. The counted-failure
+/// dedupe (`dev_fee_failed_hash`) is deliberately left alone here: nothing
+/// has been sent yet, see [`forget_counted_failure`].
 async fn store_payment_hash(
     pool: &SqlitePool,
     order_id: uuid::Uuid,
@@ -1007,7 +1007,7 @@ async fn store_payment_hash(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE orders
-         SET dev_fee_payment_hash = ?, dev_fee_failed_hash = NULL
+         SET dev_fee_payment_hash = ?
          WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
     )
     .bind(payment_hash_hex)
@@ -1016,6 +1016,33 @@ async fn store_payment_hash(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// A new attempt was actually sent: forget the hash whose failure was
+/// already counted, so this attempt's failure counts too.
+///
+/// `dev_fee_failed_hash` keeps a failure from being counted twice, by the
+/// send and again by recovery, for the *same* attempt. An LNURL endpoint may
+/// hand out the same invoice again for the next attempt; if the hash stayed
+/// remembered, that attempt's failure would be skipped, no backoff set, and
+/// the order retried every cycle (Codex review on #1065). It is reset only
+/// once `send_payment` has returned, failed or timed out: resetting it before
+/// the send would let a crash in between make recovery count the *old*
+/// failure again for an attempt that never happened.
+async fn forget_counted_failure(pool: &SqlitePool, order_id: uuid::Uuid) {
+    if let Err(e) = sqlx::query(
+        "UPDATE orders SET dev_fee_failed_hash = NULL WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(order_id)
+    .execute(pool)
+    .await
+    {
+        warn!(
+            "Dev fee for order {}: could not reset the counted failure ({e}); \
+             a failure of this attempt may go uncounted",
+            order_id
+        );
+    }
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -1996,12 +2023,27 @@ mod tests {
         .await
         .unwrap();
 
-        // Second attempt resolves to the same invoice.
+        // Second attempt resolves to the same invoice. Storing the hash alone
+        // keeps the dedupe: a crash before the send must not let recovery
+        // count the old failure again (Codex review on #1065, round 2).
         assert!(
             super::store_payment_hash(&pool, id, "PENDING-x-2", VALID_HEX_HASH)
                 .await
                 .unwrap()
         );
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "nothing was sent yet");
+
+        // The send happened and failed: now the failure counts.
+        super::forget_counted_failure(&pool, id).await;
         super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
             .await
             .unwrap();

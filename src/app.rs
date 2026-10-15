@@ -2182,6 +2182,108 @@ mod tests {
             );
         }
 
+        /// A valid import must publish the native + imported aggregate under
+        /// the node key supplied by either router, including an exact retry.
+        #[tokio::test]
+        async fn rating_events_from_both_routers_use_merged_figures_and_node_keys() {
+            use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+            use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+            use mostro_core::prelude::{Payload, ReputationAttestation, User};
+            use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
+
+            let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+            let since = 1_696_204_800;
+            for cashu in [false, true] {
+                let issuer = Keys::generate();
+                let node = Keys::generate();
+                let base = create_migrated_ctx().await;
+                let mut settings = test_settings();
+                settings.reputation_import = Some(ReputationImportSettings {
+                    enabled: true,
+                    issuers: vec![ReputationIssuer {
+                        name: "test-issuer".to_string(),
+                        keys: vec![issuer.public_key().to_hex()],
+                    }],
+                    ..Default::default()
+                });
+                let ctx = TestContextBuilder::new()
+                    .with_pool(base.pool_arc())
+                    .with_settings(settings)
+                    .with_keys(node.clone())
+                    .build();
+                let mut event = create_test_unwrapped_message();
+                let mut native = User::new(event.identity.to_hex(), 0, 0, 0, 0, 1);
+                native.update_rating(3);
+                native.update_rating(4);
+                crate::db::add_new_user(ctx.pool(), native).await.unwrap();
+                let attestation = ReputationAttestation::build(
+                    &issuer,
+                    &event.identity,
+                    "account",
+                    214,
+                    4.87,
+                    since,
+                    Timestamp::now(),
+                    ATTESTATION_LIFETIME_SECS,
+                )
+                .unwrap();
+                let msg = Message::new_order(
+                    None,
+                    Some(19),
+                    None,
+                    Action::ImportReputation,
+                    Some(Payload::ReputationAttestation(attestation.as_json())),
+                );
+                event.message = msg.clone();
+                for _ in 0..2 {
+                    let result = if cashu {
+                        dispatch_cashu(&Action::ImportReputation, msg.clone(), &event, &node, &ctx)
+                            .await
+                    } else {
+                        handle_message_action_no_ln(
+                            &Action::ImportReputation,
+                            msg.clone(),
+                            &event,
+                            &node,
+                            &ctx,
+                        )
+                        .await
+                    };
+                    result.unwrap();
+                }
+                let tag = |ev: &Event, name: &str| {
+                    ev.tags.iter().find_map(|tag| {
+                        let values = tag.as_slice();
+                        (values.first().map(String::as_str) == Some(name))
+                            .then(|| values.get(1).cloned())
+                            .flatten()
+                    })
+                };
+                let published: Vec<_> = crate::config::MESSAGE_QUEUES
+                    .queue_order_rate
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|ev| tag(ev, "d") == Some(event.sender.to_hex()))
+                    .cloned()
+                    .collect();
+                assert_eq!(published.len(), 2, "import and exact retry both publish");
+                for ev in &published {
+                    ev.verify().unwrap();
+                    assert_eq!(ev.pubkey, node.public_key());
+                    assert_eq!(
+                        ev.kind.as_u16(),
+                        mostro_core::prelude::NOSTR_RATING_EVENT_KIND
+                    );
+                    assert_eq!(tag(ev, "total_reviews").as_deref(), Some("216"));
+                    let average: f64 = tag(ev, "total_rating").unwrap().parse().unwrap();
+                    assert!((average - (3.0 + 4.0 + 214.0 * 4.87) / 216.0).abs() < 1e-9);
+                    assert_eq!(tag(ev, "since"), Some(since.to_string()));
+                }
+                assert!(published[1].created_at > published[0].created_at);
+            }
+        }
+
         /// `import-reputation` reaches its handler on both routers. With import
         /// enabled and no payload the handler answers `InvalidPayload`, which
         /// neither the default arm (`Ok`) nor the Cashu block

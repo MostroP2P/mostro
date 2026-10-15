@@ -1309,6 +1309,54 @@ mod tests {
     }
 
     #[test]
+    fn rating_events_strictly_order_consecutive_revisions() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        let events: Vec<_> = (1..=16)
+            .map(|reviews| {
+                super::new_rating_event(
+                    &keys,
+                    "",
+                    id.clone(),
+                    Tags::from_list(vec![Tag::custom("total_reviews", [reviews.to_string()])]),
+                )
+                .unwrap()
+            })
+            .collect();
+        for pair in events.windows(2) {
+            assert!(
+                pair[1].created_at > pair[0].created_at,
+                "a newer aggregate must supersede the previous rating event"
+            );
+        }
+    }
+
+    #[test]
+    fn rating_events_keep_independent_authors_and_trade_keys() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let other_node = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        for _ in 0..16 {
+            super::new_rating_event(&keys, "", id.clone(), Tags::new()).unwrap();
+        }
+        let before = Timestamp::now();
+        let other_trade = super::new_rating_event(
+            &keys,
+            "",
+            Keys::generate().public_key().to_hex(),
+            Tags::new(),
+        )
+        .unwrap();
+        let other_author = super::new_rating_event(&other_node, "", id, Tags::new()).unwrap();
+        let after = Timestamp::now();
+        for event in [other_trade, other_author] {
+            assert!((before..=after).contains(&event.created_at));
+        }
+    }
+
+    #[test]
     fn info_to_tags_advertises_both_pow_difficulties() {
         // The `pow` tag only tells a client what the known-keys lane costs.
         // Without a companion tag a brand-new trade key cannot know how much

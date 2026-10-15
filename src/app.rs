@@ -980,6 +980,103 @@ mod tests {
         }
     }
 
+    mod reputation_import_intake_tests {
+        use super::*;
+        use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+        use crate::config::types::ReputationImportSettings;
+        use mostro_core::prelude::Payload;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        async fn context(enabled: bool) -> AppContext {
+            let ctx = create_migrated_ctx().await;
+            let mut settings = test_settings();
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled,
+                ..Default::default()
+            });
+            TestContextBuilder::new()
+                .with_pool(std::sync::Arc::new(ctx.pool().clone()))
+                .with_settings(settings)
+                .build()
+        }
+
+        fn event(mostro: &Keys, trade: &Keys, payload: Option<Payload>) -> Event {
+            let message =
+                Message::new_order(None, Some(4127), None, Action::ImportReputation, payload);
+            wrap_message_nip44(
+                &message,
+                &create_test_keys(),
+                trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .unwrap()
+        }
+
+        async fn accept(ctx: &AppContext, event: &Event, mostro: &Keys) -> bool {
+            accept_event(
+                ctx,
+                event,
+                mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        #[tokio::test]
+        async fn import_intake_answers_missing_and_wrong_payloads() {
+            let ctx = context(true).await;
+            let mostro = create_test_keys();
+            for payload in [None, Some(Payload::RatingUser(5))] {
+                let trade = create_test_keys();
+                let event = event(&mostro, &trade, payload);
+                assert!(!accept(&ctx, &event, &mostro).await);
+                assert_eq!(
+                    cant_do_reasons_for(&trade.public_key()).await,
+                    vec![CantDoReason::InvalidPayload]
+                );
+                let queue = crate::config::MESSAGE_QUEUES
+                    .queue_order_cantdo
+                    .read()
+                    .await;
+                let (reply, _) = queue
+                    .iter()
+                    .find(|(_, pk)| *pk == trade.public_key())
+                    .unwrap();
+                assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
+                assert!(reply.get_inner_message_kind().id.is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn import_intake_checks_disabled_before_invalid_payload() {
+            let ctx = context(false).await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            assert!(!accept(&ctx, &event(&mostro, &trade, None), &mostro).await);
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidAction]
+            );
+        }
+
+        #[tokio::test]
+        async fn import_intake_does_not_answer_a_forged_event() {
+            let ctx = context(true).await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            let mut forged = event(&mostro, &trade, None);
+            forged.sig = EventBuilder::new(NostrKind::TextNote, "decoy")
+                .finalize(&create_test_keys())
+                .unwrap()
+                .sig;
+            assert!(!accept(&ctx, &forged, &mostro).await);
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
+        }
+    }
+
     /// Synchronous recognition (#857): after a create, take or dispute take,
     /// the sender's trade key enters the spam gate as soon as the DB ties it
     /// to an order or dispute, so the follow-up needs only the base `pow`

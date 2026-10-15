@@ -451,6 +451,134 @@ mod tests {
         assert_eq!(rows[0].trade_pubkey, Some(first.sender.to_hex()));
     }
 
+    /// Seed an import committed while the attestation was valid, then retry
+    /// it after expiration without sleeping or changing the system clock.
+    async fn recorded_expired_attestation(f: &Fixture, identity: &PublicKey) -> String {
+        let created_at =
+            Timestamp::from(Timestamp::now().as_secs() - 2 * ATTESTATION_LIFETIME_SECS);
+        let json = attestation_at(&f.issuer, identity, "acct-1", created_at);
+        let (attestation, _) =
+            ReputationAttestation::parse_json(&json, created_at, ATTESTATION_LIFETIME_SECS)
+                .unwrap();
+        let (_, event) = request(identity, &json);
+        record_import(&f.ctx, "lnp2pbot", &attestation, &event)
+            .await
+            .unwrap();
+        json
+    }
+
+    #[tokio::test]
+    async fn an_expired_recorded_attestation_is_confirmed_without_writes() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = recorded_expired_attestation(&f, &identity).await;
+        let before = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        let (msg, retry) = request(&identity, &json);
+        import_reputation_action(&f.ctx, msg, &retry).await.unwrap();
+
+        let replies = replies_to(retry.sender).await;
+        assert_eq!(replies.len(), 1);
+        let reply = replies[0].get_inner_message_kind();
+        assert_eq!(reply.action, Action::ReputationImported);
+        assert_eq!(reply.request_id, Some(7));
+        assert!(reply.payload.is_none());
+        let after = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+                .await
+                .unwrap(),
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_retry_still_requires_the_exact_signed_event_and_identity() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = recorded_expired_attestation(&f, &identity).await;
+        let signed = Event::from_json(&json).unwrap();
+        let mut forged = signed.clone();
+        forged.sig = EventBuilder::new(nostr_sdk::prelude::Kind::TextNote, "decoy")
+            .finalize(&Keys::generate())
+            .unwrap()
+            .sig;
+        assert_eq!(
+            refused(import(&f, &identity, &forged.as_json()).await),
+            CantDoReason::InvalidReputationAttestation
+        );
+        forged = signed.clone();
+        forged.content = "changed without updating the id".into();
+        assert_eq!(
+            refused(import(&f, &identity, &forged.as_json()).await),
+            CantDoReason::InvalidReputationAttestation
+        );
+        let other = Keys::generate().public_key();
+        assert!(import(&f, &other, &json).await.is_err());
+        let different = attestation_at(
+            &f.issuer,
+            &identity,
+            "acct-1",
+            Timestamp::from(signed.created_at.as_secs() - 60),
+        );
+        assert_eq!(
+            refused(import(&f, &identity, &different).await),
+            CantDoReason::ExpiredReputationAttestation
+        );
+        assert_eq!(
+            is_user_present(f.ctx.pool(), identity.to_hex())
+                .await
+                .unwrap()
+                .total_reviews,
+            214
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_retry_cannot_restore_a_reversed_import() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = recorded_expired_attestation(&f, &identity).await;
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        let mut user = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        user.revert_reputation_import(&rows[0].figures().unwrap(), None);
+        let mut tx = f.ctx.pool().begin().await.unwrap();
+        update_user_reputation(&mut *tx, &user).await.unwrap();
+        crate::db::delete_reputation_import(&mut *tx, &rows[0].attestation_id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            refused(import(&f, &identity, &json).await),
+            CantDoReason::ExpiredReputationAttestation
+        );
+        assert!(
+            reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            is_user_present(f.ctx.pool(), identity.to_hex())
+                .await
+                .unwrap()
+                .total_reviews,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn a_rotated_issuer_key_cannot_reopen_an_imported_account() {
         let (old, new) = (Keys::generate(), Keys::generate());

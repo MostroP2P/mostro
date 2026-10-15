@@ -1,0 +1,11 @@
+-- When the seller's hold invoice was settled (issue #1063).
+--
+-- Written by the same guarded UPDATE that moves an order to
+-- `settled-hold-invoice` (release and admin-settle). The health event reports
+-- how long the oldest settled-but-unpaid order has been waiting for its buyer
+-- payout, measured from this moment.
+--
+-- NULL for orders settled before this migration; the health query falls back
+-- to `invoice_held_at` for those, which overstates their age by the time the
+-- trade took before the release.
+ALTER TABLE orders ADD COLUMN hold_settled_at integer;

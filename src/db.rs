@@ -2453,7 +2453,8 @@ mod tests {
                 cashu_escrow_token text,
                 cashu_escrow_locked_at integer,
                 payout_payment_hash char(64),
-                payout_claimed_at integer
+                payout_claimed_at integer,
+                hold_settled_at integer
             )
             "#,
         )

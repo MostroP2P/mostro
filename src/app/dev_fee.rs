@@ -867,6 +867,7 @@ pub(crate) async fn record_dev_fee_failure(
 ) -> Result<(), sqlx::Error> {
     match count_dev_fee_failure(pool, order_id, payment_hash).await {
         Ok(Some((failed_attempts, delay))) => {
+            crate::app::health::stats::record_dev_fee_failure(Utc::now().timestamp());
             info!(
                 "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
                 order_id, failed_attempts, delay

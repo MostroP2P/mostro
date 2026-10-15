@@ -10,8 +10,8 @@ use fedimint_tonic_lnd::invoicesrpc::{
     SettleInvoiceMsg, SettleInvoiceResp,
 };
 use fedimint_tonic_lnd::lnrpc::{
-    invoice::InvoiceState, payment, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment,
-    PaymentHash,
+    invoice::InvoiceState, payment, Channel, GetInfoRequest, GetInfoResponse, InvoiceHtlcState,
+    ListChannelsRequest, Payment, PaymentHash,
 };
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
@@ -992,6 +992,22 @@ impl LndConnector {
         }
     }
 
+    /// Liquidity and pending HTLCs over the node's channels, for the health
+    /// event (#1063).
+    pub async fn channel_facts(
+        &mut self,
+    ) -> Result<crate::app::health::content::ChannelFacts, MostroError> {
+        let channels = self
+            .client
+            .lightning()
+            .list_channels(ListChannelsRequest::default())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .into_inner()
+            .channels;
+        Ok(channel_facts_of(&channels))
+    }
+
     pub async fn get_node_info(&mut self) -> Result<GetInfoResponse, MostroError> {
         let info = self.client.lightning().get_info(GetInfoRequest {}).await;
 
@@ -1011,6 +1027,28 @@ pub struct LnStatus {
     pub chains: Vec<String>,
     pub networks: Vec<String>,
     pub uris: Vec<String>,
+}
+
+/// Sum the balances of the active channels and gather their pending HTLCs.
+pub fn channel_facts_of(channels: &[Channel]) -> crate::app::health::content::ChannelFacts {
+    let mut facts = crate::app::health::content::ChannelFacts::default();
+    for channel in channels {
+        if channel.active {
+            facts.outbound_liquidity_sats += channel.local_balance;
+            facts.inbound_liquidity_sats += channel.remote_balance;
+        }
+        for htlc in &channel.pending_htlcs {
+            facts.pending_htlcs += 1;
+            facts.nearest_htlc_expiration_height = Some(
+                facts
+                    .nearest_htlc_expiration_height
+                    .map_or(htlc.expiration_height, |nearest| {
+                        nearest.min(htlc.expiration_height)
+                    }),
+            );
+        }
+    }
+    facts
 }
 
 impl LnStatus {
@@ -1601,5 +1639,46 @@ mod offline_connector_tests {
         assert_eq!(status.chains, vec!["bitcoin".to_string()]);
         assert_eq!(status.networks, vec!["regtest".to_string()]);
         assert_eq!(status.uris, vec!["02abc@127.0.0.1:9735".to_string()]);
+    }
+
+    #[test]
+    fn channel_facts_sum_active_balances_and_find_the_nearest_htlc() {
+        use fedimint_tonic_lnd::lnrpc::{Channel, Htlc};
+        let htlc = |expiration_height| Htlc {
+            expiration_height,
+            ..Default::default()
+        };
+        let channels = vec![
+            Channel {
+                active: true,
+                local_balance: 1_000,
+                remote_balance: 200,
+                pending_htlcs: vec![htlc(971_806), htlc(971_640)],
+                ..Default::default()
+            },
+            Channel {
+                active: false,
+                local_balance: 50_000,
+                remote_balance: 7,
+                pending_htlcs: vec![htlc(971_700)],
+                ..Default::default()
+            },
+            Channel {
+                active: true,
+                local_balance: 300,
+                remote_balance: 4_000,
+                ..Default::default()
+            },
+        ];
+        let facts = super::channel_facts_of(&channels);
+        // Liquidity counts only active channels; HTLCs count on every channel.
+        assert_eq!(facts.outbound_liquidity_sats, 1_300);
+        assert_eq!(facts.inbound_liquidity_sats, 4_200);
+        assert_eq!(facts.pending_htlcs, 3);
+        assert_eq!(facts.nearest_htlc_expiration_height, Some(971_640));
+        assert_eq!(
+            super::channel_facts_of(&[]).nearest_htlc_expiration_height,
+            None
+        );
     }
 }

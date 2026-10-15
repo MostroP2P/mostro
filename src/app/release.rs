@@ -384,16 +384,19 @@ pub async fn release_action(
     // explicit write the settled-hold-invoice status only lived in memory and
     // was persisted as a side-effect of the full-row writes in
     // check_failure_retries / payment_success (now replaced by targeted updates).
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
-            .bind(&order.status)
-            .bind(&order.event_id)
-            .bind(order.id)
-            .bind(Status::FiatSent.to_string())
-            .bind(Status::Dispute.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query(
+        "UPDATE orders SET status = ?, event_id = ?, hold_settled_at = ? \
+             WHERE id = ? AND status IN (?, ?)",
+    )
+    .bind(&order.status)
+    .bind(&order.event_id)
+    .bind(chrono::Utc::now().timestamp())
+    .bind(order.id)
+    .bind(Status::FiatSent.to_string())
+    .bind(Status::Dispute.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
         tracing::warn!(
@@ -1110,6 +1113,12 @@ async fn dispatch_payout(
                                     "Order Id {}: Invoice with hash: {} paid!",
                                     order.id, msg.payment.payment_hash
                                 );
+                                ctx.health_stats()
+                                    .record_payout_success(
+                                        ctx.pool(),
+                                        chrono::Utc::now().timestamp(),
+                                    )
+                                    .await;
                                 // Release our claim only if the order actually
                                 // reached Success. If finalization fails, keep the
                                 // marker so reconciliation retries it — clearing it
@@ -1137,6 +1146,12 @@ async fn dispatch_payout(
                                 warn!(
                                     "Order Id {}: Invoice with hash: {} has failed!",
                                     order.id, msg.payment.payment_hash
+                                );
+                                ctx.health_stats().record_payout_failure(
+                                    chrono::Utc::now().timestamp(),
+                                    crate::app::health::stats::failure_reason_key(
+                                        msg.payment.failure_reason,
+                                    ),
                                 );
 
                                 // Release our own claim (scoped to this hash and
@@ -1192,6 +1207,9 @@ async fn dispatch_payout(
             _ => None,
         };
 
+        // LND reports the payment failed although the send RPC errored:
+        // a final failed attempt for the health event's payout counters.
+        let lookup_says_failed = matches!(lookup, Some(Ok(Some(PaymentStatus::Failed))));
         match classify_dispatch(send_outcome, lookup) {
             // The send stream ended. Usually a terminal update was delivered
             // and the watcher finishes the bookkeeping — but send_payment's
@@ -1212,6 +1230,12 @@ async fn dispatch_payout(
                     "Order Id {}: payout dispatch failed ({cause}); re-arming retry for hash {}",
                     order.id, payout_hash
                 );
+                if lookup_says_failed {
+                    ctx.health_stats().record_payout_failure(
+                        chrono::Utc::now().timestamp(),
+                        crate::app::health::stats::REASON_OTHER,
+                    );
+                }
                 if crate::db::fail_order_payout(
                     ctx.pool(),
                     order.id,
@@ -1555,6 +1579,9 @@ pub async fn reconcile_inflight_payout(
                 _ => false,
             };
             if finalized {
+                ctx.health_stats()
+                    .record_payout_success(pool, chrono::Utc::now().timestamp())
+                    .await;
                 crate::db::clear_order_payout(
                     pool,
                     order_id,
@@ -1564,7 +1591,16 @@ pub async fn reconcile_inflight_payout(
                 .await?;
             }
         }
-        Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
+        lookup
+        @ (Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None)) => {
+            // Only a payment LND reports as Failed reached a final state; an
+            // unknown or missing record is not an attempt (health counters).
+            if matches!(lookup, Ok(Some(PaymentStatus::Failed))) {
+                ctx.health_stats().record_payout_failure(
+                    chrono::Utc::now().timestamp(),
+                    crate::app::health::stats::REASON_OTHER,
+                );
+            }
             // Snapshot the order *before* re-arming so the bookkeeping sees the
             // pre-failure state: `fail_order_payout` sets failed_payment = true,
             // and `count_failed_payment` treats an already-failed order as a

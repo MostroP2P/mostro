@@ -193,6 +193,17 @@ port = 50051
 
 # Health monitoring (docs/HEALTH.md). Absent section ≡ these defaults.
 [health]
+# Publish the health event (kind 38389): a signed report of whether this
+# instance is working (LND synced, buyers paid, relays, database), so a
+# watchdog or a status page can tell. Public tags are coarse; the detailed
+# metrics are only sent, encrypted, when `watchdog_pubkey` is set.
+enabled = true
+# Seconds between publications (30 to 3600). The event expires after three.
+interval = 60
+# Hex or npub pubkey of your watchdog. When set, liquidity, payout failure
+# rates and stuck orders are NIP-44 encrypted to it in `content`. Note that
+# the `p` tag then publicly links this instance to that key.
+watchdog_pubkey = ""
 # Seconds LND may report synced_to_chain = false without interruption before
 # it counts as a failure. Outgoing payments (buyer payouts, dev fees, bond
 # payouts) already wait after 60s, without consuming the buyer's attempts.

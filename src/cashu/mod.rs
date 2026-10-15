@@ -73,6 +73,34 @@ pub struct CashuClient {
     client: BaseHttpClient<MintTransport>,
 }
 
+/// Whether the mint at `mint_url` answers its NUT-06 info endpoint
+/// (`GET /v1/info`) with a success status within [`MINT_REQUEST_TIMEOUT`].
+/// With `pinned`, the request goes to that address instead of resolving the
+/// host again (see [`CashuClient::connect_pinned`]). The health event's
+/// `cashu_mint` check (#1063).
+pub async fn mint_answers_info(mint_url: &str, pinned: Option<std::net::SocketAddr>) -> bool {
+    let Ok(url) = MintUrl::from_str(mint_url) else {
+        return false;
+    };
+    let transport = match pinned {
+        None => MintTransport::default(),
+        Some(addr) => {
+            let host = reqwest::Url::parse(mint_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string));
+            match host.map(|host| MintTransport::pinned(&host, addr)) {
+                Some(Ok(transport)) => transport,
+                _ => return false,
+            }
+        }
+    };
+    let client = BaseHttpClient::with_transport(url, transport, None);
+    matches!(
+        tokio::time::timeout(MINT_REQUEST_TIMEOUT, client.get_mint_info()).await,
+        Ok(Ok(_))
+    )
+}
+
 impl CashuClient {
     /// Connect to a mint URL and verify it can back the escrow flows.
     ///

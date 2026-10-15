@@ -102,6 +102,11 @@ pub struct LndSyncSnapshot {
     /// When the current uninterrupted run of `synced_to_chain = true` began.
     /// Reset by an unreachable spell.
     pub synced_since: Option<i64>,
+    /// When the current uninterrupted run of "cannot pay" began: unsynced
+    /// or unreachable, in any mix. Only a synced observation ends it, so
+    /// moving between the two unhealthy states never restarts the deferral
+    /// clock and lets payments out for another 60 seconds.
+    pub unhealthy_since: Option<i64>,
 }
 
 impl LndSyncSnapshot {
@@ -112,11 +117,13 @@ impl LndSyncSnapshot {
         self.unreachable_since = None;
         let transition = if observation.synced_to_chain {
             self.unsynced_since = None;
+            self.unhealthy_since = None;
             self.synced_since = self.synced_since.or(Some(now));
             (was_synced == Some(false)).then_some(SyncTransition::BecameSynced)
         } else {
             self.synced_since = None;
             self.unsynced_since = self.unsynced_since.or(Some(now));
+            self.unhealthy_since = self.unhealthy_since.or(Some(now));
             (was_synced != Some(false)).then_some(SyncTransition::BecameUnsynced)
         };
         self.last = Some(observation);
@@ -132,6 +139,7 @@ impl LndSyncSnapshot {
         self.last = None;
         self.synced_since = None;
         self.unreachable_since = self.unreachable_since.or(Some(now));
+        self.unhealthy_since = self.unhealthy_since.or(Some(now));
         was_reachable.then_some(SyncTransition::BecameUnreachable)
     }
 
@@ -158,21 +166,19 @@ impl LndSyncSnapshot {
         }
     }
 
-    /// Whether outgoing payments must wait: LND has been unsynced, or could
-    /// not be reached, for [`PAYMENT_DEFER_AFTER_SECS`] without interruption.
-    /// A stale observation never defers anything, so a dead monitor cannot
-    /// hold payouts back.
+    /// Whether outgoing payments must wait: LND has been unsynced or
+    /// unreachable, in any mix, for [`PAYMENT_DEFER_AFTER_SECS`] without a
+    /// synced observation in between. A stale observation never defers
+    /// anything, so a dead monitor cannot hold payouts back.
     pub fn defers_outgoing_payments(&self, now: i64) -> bool {
         if !self.is_fresh(now) {
             return false;
         }
-        let long_enough = |since: Option<i64>| {
-            since.is_some_and(|since| now.saturating_sub(since) >= PAYMENT_DEFER_AFTER_SECS)
-        };
-        match &self.last {
-            None => long_enough(self.unreachable_since),
-            Some(last) => !last.synced_to_chain && long_enough(self.unsynced_since),
-        }
+        let healthy = self.last.as_ref().is_some_and(|last| last.synced_to_chain);
+        !healthy
+            && self
+                .unhealthy_since
+                .is_some_and(|since| now.saturating_sub(since) >= PAYMENT_DEFER_AFTER_SECS)
     }
 
     /// Seconds LND has been synced without interruption, if it is now.
@@ -427,6 +433,32 @@ mod tests {
         assert!(!state.defers_outgoing_payments(T0 + 30));
         state.observe_unreachable(T0 + 75);
         assert!(state.defers_outgoing_payments(T0 + 75));
+    }
+
+    /// Codex review on #1065: going from unsynced to unreachable (or back)
+    /// once payments are deferred must not let them out again for 60 s.
+    #[test]
+    fn deferral_survives_moving_between_unsynced_and_unreachable() {
+        let state = LndSyncState::new();
+        poll(&state, false, T0, T0 + 45);
+        state.observe_unreachable(T0 + 60);
+        assert!(
+            state.defers_outgoing_payments(T0 + 60),
+            "60s unhealthy across both states"
+        );
+        state.observe(observation(false), T0 + 75);
+        assert!(state.defers_outgoing_payments(T0 + 75), "back to unsynced");
+        state.observe_unreachable(T0 + 90);
+        assert!(state.defers_outgoing_payments(T0 + 90), "unreachable again");
+        // Only a synced observation ends the spell.
+        state.observe(observation(true), T0 + 105);
+        assert!(!state.defers_outgoing_payments(T0 + 105));
+        state.observe_unreachable(T0 + 120);
+        assert!(
+            !state.defers_outgoing_payments(T0 + 120),
+            "a new spell starts its own clock"
+        );
+        assert_eq!(state.snapshot().unhealthy_since, Some(T0 + 120));
     }
 
     #[test]

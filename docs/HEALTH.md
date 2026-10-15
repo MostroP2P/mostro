@@ -26,7 +26,7 @@ An observation older than three polls is not trusted: if the monitor itself stop
 
 ## Outgoing payments wait
 
-Once LND has been unsynced, or has not answered, for **60 seconds** without interruption (`PAYMENT_DEFER_AFTER_SECS`), outgoing payments wait instead of failing. LND reports `synced_to_chain = false` for a few seconds whenever a block arrives; that does not hold anything back.
+Once LND has been unsynced or has not answered, in any mix, for **60 seconds** without a synced answer in between (`PAYMENT_DEFER_AFTER_SECS`), outgoing payments wait instead of failing. Moving between the two unhealthy states does not restart that clock. LND reports `synced_to_chain = false` for a few seconds whenever a block arrives; that does not hold anything back.
 
 | Payment | While deferred |
 |---|---|

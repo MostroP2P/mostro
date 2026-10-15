@@ -45,6 +45,8 @@ Set `[health].auto_maintenance_on_lnd_unsynced = false` to opt out.
 
 ## The `lnd_sync` check
 
+Computed from the sync state above; it is what turns automatic maintenance on (`fail`). It uses the definition of the `lnd_sync` check of the health event (kind 38389, protocol `health_event.md`); publishing that event is not part of this change.
+
 | State | When |
 |---|---|
 | `ok` | `synced_to_chain` is `true` |

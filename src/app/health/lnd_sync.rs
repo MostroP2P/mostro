@@ -19,7 +19,9 @@
 //!   synced for `[health].lnd_resynced_clear_after` seconds, but only if the
 //!   maintenance is still its own (`KEY_AUTOMATIC`, never inferred from the
 //!   reason text).
-//! - The `lnd_sync` check of the health event.
+//! - [`LndSyncSnapshot::sync_check`]: the `lnd_sync` check, with the
+//!   definition of the health event (kind 38389); here it drives the
+//!   automatic maintenance.
 
 use crate::app::context::AppContext;
 use crate::app::health::check::CheckState;

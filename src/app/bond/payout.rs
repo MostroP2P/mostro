@@ -85,6 +85,77 @@ use crate::lightning::{
 use crate::util::{bytes_to_string, enqueue_order_msg};
 
 use super::db::{find_bond_by_id, find_bonds_by_state};
+use crate::app::health::lnd_sync::LndSyncState;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
+/// When each bond payout was last sent, in this process (#1063). A failure
+/// found later (by the send's own stream, or by reconciliation on a later
+/// tick) is judged against the LND sync state since that moment: a failure
+/// caused by our node's unhealthy spell does not consume the bond's retry
+/// budget. Absent after a restart: reconciliation then treats any deferring
+/// spell seen since startup as the cause.
+static BOND_SEND_STARTED_AT: LazyLock<Mutex<HashMap<Uuid, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn bond_send_started_at(bond_id: Uuid) -> Option<i64> {
+    match BOND_SEND_STARTED_AT.lock() {
+        Ok(map) => map.get(&bond_id).copied(),
+        Err(poisoned) => poisoned.into_inner().get(&bond_id).copied(),
+    }
+}
+
+fn set_bond_send_started_at(bond_id: Uuid, at: i64) {
+    match BOND_SEND_STARTED_AT.lock() {
+        Ok(mut map) => map.insert(bond_id, at),
+        Err(poisoned) => poisoned.into_inner().insert(bond_id, at),
+    };
+}
+
+/// A payout failure our own node caused: payments were deferred at some
+/// moment since the send (or, without a recorded send time, since startup).
+/// The persisted hash is cleared for a terminal failure, so the next tick
+/// sends the same invoice again; an indeterminate one keeps it for
+/// reconciliation. No retry is consumed and the winner is not re-prompted.
+/// Returns whether the failure was handled this way.
+async fn defer_bond_failure_if_ours(
+    pool: &Pool<Sqlite>,
+    bond: &Bond,
+    lnd_sync: &LndSyncState,
+    kind: PaymentFailureKind,
+    payment_hash_hex: &str,
+) -> bool {
+    let started_at = bond_send_started_at(bond.id).unwrap_or(0);
+    if !lnd_sync
+        .snapshot()
+        .deferred_since(started_at, Utc::now().timestamp())
+    {
+        return false;
+    }
+    warn!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        "bond payout: failed while LND was not synced or reachable; not counting it as a retry"
+    );
+    if kind == PaymentFailureKind::Terminal {
+        if let Err(e) = sqlx::query(
+            "UPDATE bonds SET payout_payment_hash = NULL \
+             WHERE id = ? AND state = ? AND payout_payment_hash = ?",
+        )
+        .bind(bond.id)
+        .bind(BondState::PendingPayout.to_string())
+        .bind(payment_hash_hex)
+        .execute(pool)
+        .await
+        {
+            warn!(
+                bond_id = %bond.id,
+                "bond payout: could not clear the failed hash ({e}); reconciliation will see it again"
+            );
+        }
+    }
+    true
+}
 use super::model::Bond;
 use super::types::{BondSlashReason, BondState};
 
@@ -553,7 +624,7 @@ async fn pay_counterparty(
     invoice: &str,
     max_retries: i64,
     claim_window_seconds: i64,
-    lnd_sync: &crate::app::health::lnd_sync::LndSyncState,
+    lnd_sync: &LndSyncState,
 ) -> Result<(), MostroError> {
     let counterparty_share = counterparty_share_sats(bond)?;
 
@@ -601,6 +672,19 @@ async fn pay_counterparty(
                     return slash_after_success(pool, bond, counterparty_share).await;
                 }
                 Ok(Some(PaymentStatus::Failed)) => {
+                    // Caused by our node's unhealthy spell: not the
+                    // winner's retry (#1063).
+                    if defer_bond_failure_if_ours(
+                        pool,
+                        bond,
+                        lnd_sync,
+                        PaymentFailureKind::Terminal,
+                        &payment_hash_hex,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
                     // LND confirms the prior payment for this invoice
                     // failed — terminal, safe to abandon the invoice.
                     return on_send_payment_failure(
@@ -749,6 +833,7 @@ async fn pay_counterparty(
     // error, or dropped by the timeout — `tx` drops and `rx.recv()` yields
     // `None`.
     let (tx, mut rx) = channel(100);
+    set_bond_send_started_at(bond.id, Utc::now().timestamp());
 
     let send_fut = timeout(
         crate::lightning::PAYOUT_SEND_PAYMENT_TIMEOUT,
@@ -801,6 +886,9 @@ async fn pay_counterparty(
     match classify_send_verdict(send_outcome, stream) {
         SendVerdict::Settled => slash_after_success(pool, bond, counterparty_share).await,
         SendVerdict::Failure(kind, msg) => {
+            if defer_bond_failure_if_ours(pool, bond, lnd_sync, kind, &payment_hash_hex).await {
+                return Ok(());
+            }
             on_send_payment_failure(pool, bond, max_retries, claim_window_seconds, kind, &msg).await
         }
     }
@@ -3760,6 +3848,68 @@ mod tests {
     /// Codex review on #1065: the slot claim can take seconds and fails
     /// open; if LND stopped being able to pay meanwhile, nothing is
     /// persisted or sent and no retry is consumed.
+    /// Codex review on #1065: a bond send that fails because our node went
+    /// unhealthy during it does not consume the winner's retry budget.
+    #[tokio::test]
+    async fn pay_counterparty_failure_during_a_deferral_is_not_a_retry() {
+        use crate::app::health::lnd_sync::LndObservation;
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        // Payments are not deferred when the send starts, but a deferring
+        // spell ends after it: the node went bad during the send.
+        let state = LndSyncState::new();
+        let later = Utc::now().timestamp() + 1_000;
+        let observation = |synced| LndObservation {
+            synced_to_chain: synced,
+            block_height: 1,
+            best_header_timestamp: later,
+            network: None,
+            peers: 0,
+            channels_active: 0,
+            channels_inactive: 0,
+            channels_pending: 0,
+        };
+        state.observe(observation(false), later - 120);
+        state.observe(observation(false), later - 30);
+        state.observe(observation(true), later);
+
+        // The dead endpoint fails the send.
+        let mut ln = dead_lnd().await;
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            &invoice,
+            5,
+            CLAIM_WINDOW_SECONDS,
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_attempts, 0, "not the winner's retry");
+        assert_eq!(after.payout_invoice.as_deref(), Some(invoice.as_str()));
+        assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
     #[tokio::test]
     async fn pay_counterparty_defers_when_lnd_went_bad_during_the_slot_claim() {
         init_test_settings();

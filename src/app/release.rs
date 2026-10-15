@@ -1488,9 +1488,12 @@ async fn payment_success(
     // atomically with finalization in effect (only the task that wins this
     // status CAS gets here), so it is counted once and never lost to a
     // later cleanup failure.
+    // Memory only here; the time is persisted in the background, so the
+    // database cannot delay or fail the buyer's notifications below.
     ctx.health_stats()
-        .record_payout_success(pool, chrono::Utc::now().timestamp())
-        .await;
+        .record_payout_success(chrono::Utc::now().timestamp());
+    ctx.health_stats()
+        .persist_last_success_in_background(ctx.pool_arc());
 
     // Committed by us — notify the buyer now.
     enqueue_order_msg(
@@ -3618,6 +3621,43 @@ mod tests {
         assert!(marker_of(&pool, id).await.is_none(), "cleanup retried");
         let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::Success.to_string());
+    }
+
+    /// Codex review on #1066: the success time's database write is off the
+    /// finalization path; if it fails, the buyer is still notified, the
+    /// claim is still cleared and the success is still known.
+    #[tokio::test]
+    async fn a_payout_is_finalized_even_if_the_success_time_cannot_be_saved() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        sqlx::query(
+            "CREATE TRIGGER no_last_success BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_last_payout_success_at' \
+             BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert!(marker_of(&pool, id).await.is_none());
+        assert!(queued_actions_for(id)
+            .await
+            .contains(&Action::PurchaseCompleted));
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 1);
+        assert!(ctx.health_stats().last_success_in_memory().is_some());
     }
 
     #[tokio::test]

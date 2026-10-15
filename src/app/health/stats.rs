@@ -19,6 +19,9 @@ pub const WINDOW_SECS: i64 = 3_600;
 /// `daemon_state` key of the last successful buyer payout (unix seconds).
 pub const KEY_LAST_PAYOUT_SUCCESS_AT: &str = "health_last_payout_success_at";
 
+/// Bound on a background write of the last successful payout time.
+const PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Failure reason for a failure that cannot be mapped to one of LND's.
 pub const REASON_OTHER: &str = "other";
 
@@ -129,22 +132,37 @@ impl HealthStats {
         Self::default()
     }
 
-    /// A buyer payout reached `Succeeded` in LND. Also records the time as
-    /// the last successful payout, in memory at once and persisted; a failed
-    /// write is logged, not propagated (the payout itself is not affected),
-    /// and retried by [`HealthStats::persist_last_success`].
-    pub async fn record_payout_success(&self, pool: &SqlitePool, now: i64) {
+    /// A buyer payout reached `Succeeded` in LND. Memory only: it never
+    /// touches the database, so it can sit on the payout finalization path
+    /// without delaying or failing it. The time also becomes the latest
+    /// successful payout (newest wins), to be persisted by
+    /// [`HealthStats::persist_last_success`] (in the background, see
+    /// [`HealthStats::persist_last_success_in_background`], and on every
+    /// health evaluation).
+    pub fn record_payout_success(&self, now: i64) {
         lock(&self.payouts).push(now, PayoutOutcome::Succeeded);
-        {
-            let mut last = lock(&self.last_success);
-            if last.at.is_none_or(|at| now >= at) {
-                *last = LastSuccess {
-                    at: Some(now),
-                    persisted: false,
-                };
-            }
+        let mut last = lock(&self.last_success);
+        if last.at.is_none_or(|at| now >= at) {
+            *last = LastSuccess {
+                at: Some(now),
+                persisted: false,
+            };
         }
-        self.persist_last_success(pool).await;
+    }
+
+    /// Persist the latest successful payout time off the caller's path, in
+    /// a spawned task bounded to [`PERSIST_TIMEOUT`]. A failure only leaves it
+    /// pending for the next attempt.
+    pub fn persist_last_success_in_background(&self, pool: std::sync::Arc<SqlitePool>) {
+        let stats = self.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(PERSIST_TIMEOUT, stats.persist_last_success(&pool))
+                .await
+                .is_err()
+            {
+                warn!("Saving the last successful payout time did not finish in time");
+            }
+        });
     }
 
     /// Write the latest successful payout time if it is not persisted yet.
@@ -273,10 +291,9 @@ mod tests {
 
     #[tokio::test]
     async fn payout_window_counts_the_last_hour_only() {
-        let pool = pool().await;
         let stats = HealthStats::new();
         stats.record_payout_failure(T0, "no_route");
-        stats.record_payout_success(&pool, T0 + 10).await;
+        stats.record_payout_success(T0 + 10);
         stats.record_payout_failure(T0 + 20, "incorrect_payment_details");
         stats.record_payout_failure(T0 + 30, "incorrect_payment_details");
 
@@ -300,7 +317,9 @@ mod tests {
     async fn last_payout_success_survives_a_restart() {
         let pool = pool().await;
         assert_eq!(last_payout_success_at(&pool).await.unwrap(), None);
-        HealthStats::new().record_payout_success(&pool, T0).await;
+        let first = HealthStats::new();
+        first.record_payout_success(T0);
+        first.persist_last_success(&pool).await;
         // A new process: fresh counters, same database.
         let restarted = HealthStats::new();
         assert_eq!(restarted.payout_window(T0 + 1).attempts(), 0);
@@ -317,7 +336,8 @@ mod tests {
         sqlx::query(block).execute(&pool).await.unwrap();
         let stats = HealthStats::new();
 
-        stats.record_payout_success(&pool, T0).await;
+        stats.record_payout_success(T0);
+        stats.persist_last_success(&pool).await;
 
         assert_eq!(last_payout_success_at(&pool).await.unwrap(), None);
         assert_eq!(stats.last_success_in_memory(), Some(T0), "kept in memory");
@@ -347,8 +367,9 @@ mod tests {
     async fn an_older_success_never_replaces_a_newer_one() {
         let pool = pool().await;
         let stats = HealthStats::new();
-        stats.record_payout_success(&pool, T0 + 100).await;
-        stats.record_payout_success(&pool, T0).await;
+        stats.record_payout_success(T0 + 100);
+        stats.record_payout_success(T0);
+        stats.persist_last_success(&pool).await;
         assert_eq!(stats.last_success_in_memory(), Some(T0 + 100));
         assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0 + 100));
     }

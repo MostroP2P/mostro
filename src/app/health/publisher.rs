@@ -262,6 +262,10 @@ pub struct Publisher {
     /// reports, and it is saved again on every evaluation until it lands, so
     /// a restart in the middle of an outage still knows when it started.
     pending_outage: Option<crate::app::health::event::RelayOutage>,
+    /// An outage started or ended since the last publication. Readers need
+    /// it promptly, even when the checks look the same as before (an outage
+    /// that began and ended between two publications).
+    outage_unpublished: bool,
     had_relay_connection: bool,
     ln_client: Option<LndConnector>,
     /// Bound on the database probe and on every database operation after it.
@@ -279,6 +283,7 @@ impl Publisher {
             persisted: PersistedHealth::default(),
             persisted_loaded: false,
             pending_outage: None,
+            outage_unpublished: false,
             had_relay_connection: false,
             ln_client: None,
             db_timeout: DATABASE_PROBE_TIMEOUT,
@@ -359,6 +364,7 @@ impl Publisher {
                 info!("A relay is connected again after an outage");
             }
             self.pending_outage = Some(outage);
+            self.outage_unpublished = true;
         }
         if let Some(outage) = self.pending_outage {
             if bounded_db(
@@ -550,7 +556,8 @@ impl Publisher {
         if elapsed >= Duration::from_secs(self.interval) {
             return true;
         }
-        let changed = self.last_signature.as_ref() != Some(&evaluation.signature());
+        let changed = self.last_signature.as_ref() != Some(&evaluation.signature())
+            || self.outage_unpublished;
         changed && elapsed >= Duration::from_secs(MIN_REPUBLISH_SECS)
     }
 
@@ -620,6 +627,7 @@ impl Publisher {
                     stamp.seq
                 );
                 self.last_publish = Some(Instant::now());
+                self.outage_unpublished = false;
                 self.last_signature = Some(evaluation.signature());
             }
             Ok(output) => warn!(
@@ -1103,9 +1111,7 @@ mod tests {
              WHEN NEW.key = 'health_last_payout_success_at' \
              BEGIN SELECT RAISE(ABORT, 'injected'); END";
         sqlx::query(block).execute(&pool).await.unwrap();
-        ctx.health_stats()
-            .record_payout_success(&pool, NOW - 60)
-            .await;
+        ctx.health_stats().record_payout_success(NOW - 60);
         let mut publisher = Publisher::new(&ctx).await;
 
         let evaluation = publisher.evaluate(&ctx, NOW).await;
@@ -1278,6 +1284,32 @@ mod tests {
             persisted.last_stamp.map(|s| s.created_at),
             Some(event.created_at.as_secs() as i64)
         );
+    }
+
+    /// Codex review on #1066: an outage that began and ended between two
+    /// publications leaves the checks unchanged, but it is republished
+    /// promptly (still at most once per 10 s) so the watchdog learns of it.
+    #[tokio::test]
+    async fn an_outage_between_publications_is_republished_promptly() {
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        let evaluation = publisher.evaluate(&ctx, NOW).await;
+        publisher.last_signature = Some(evaluation.signature());
+        publisher.last_publish = Some(Instant::now() - Duration::from_secs(MIN_REPUBLISH_SECS));
+        assert!(!publisher.should_publish(&evaluation), "nothing new");
+
+        // The last relay was lost and came back since the last publication.
+        publisher.had_relay_connection = true;
+        publisher.evaluate(&ctx, NOW + 1).await;
+        assert!(publisher.outage_unpublished);
+        assert!(publisher.should_publish(&evaluation));
+
+        publisher.last_publish = Some(Instant::now());
+        assert!(!publisher.should_publish(&evaluation), "10 s spacing holds");
     }
 
     #[tokio::test]

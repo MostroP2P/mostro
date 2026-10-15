@@ -8,6 +8,7 @@ use crate::lightning::LnStatus;
 use crate::util::{
     first_trade_since, get_expiration_timestamp_for_kind, get_keys,
     monotonic_dispute_event_timestamp, monotonic_info_event_timestamp,
+    monotonic_rating_event_timestamp,
 };
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
@@ -119,13 +120,15 @@ pub fn new_rating_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
+    let created_at =
+        monotonic_rating_event_timestamp(keys.public_key(), &identifier, Timestamp::now());
     create_event(
         keys,
         content,
         identifier,
         extra_tags,
         NOSTR_RATING_EVENT_KIND,
-        None,
+        Some(created_at),
     )
 }
 
@@ -1306,6 +1309,54 @@ mod tests {
             second.created_at,
             first.created_at
         );
+    }
+
+    #[test]
+    fn rating_events_strictly_order_consecutive_revisions() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        let events: Vec<_> = (1..=16)
+            .map(|reviews| {
+                super::new_rating_event(
+                    &keys,
+                    "",
+                    id.clone(),
+                    Tags::from_list(vec![Tag::custom("total_reviews", [reviews.to_string()])]),
+                )
+                .unwrap()
+            })
+            .collect();
+        for pair in events.windows(2) {
+            assert!(
+                pair[1].created_at > pair[0].created_at,
+                "a newer aggregate must supersede the previous rating event"
+            );
+        }
+    }
+
+    #[test]
+    fn rating_events_keep_independent_authors_and_trade_keys() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let other_node = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        for _ in 0..16 {
+            super::new_rating_event(&keys, "", id.clone(), Tags::new()).unwrap();
+        }
+        let before = Timestamp::now();
+        let other_trade = super::new_rating_event(
+            &keys,
+            "",
+            Keys::generate().public_key().to_hex(),
+            Tags::new(),
+        )
+        .unwrap();
+        let other_author = super::new_rating_event(&other_node, "", id, Tags::new()).unwrap();
+        let after = Timestamp::now();
+        for event in [other_trade, other_author] {
+            assert!((before..=after).contains(&event.created_at));
+        }
     }
 
     #[test]

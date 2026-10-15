@@ -767,10 +767,21 @@ pub async fn run_health_publisher(ctx: AppContext) {
     if publisher.interval != DEFAULT_HEALTH_INTERVAL {
         info!("Health event every {}s", publisher.interval);
     }
+    // Evaluations run on a fixed grid of `EVALUATION_SECS`, whatever a tick
+    // took: a probe that ran to its timeout (LND, a mint, the database) must
+    // not push every later evaluation back by that much, or the advertised
+    // cadence and the publication interval drift (Codex review on #1066). A
+    // tick longer than the period skips the grid points it covered instead
+    // of running them back to back.
+    let mut cadence = tokio::time::interval(Duration::from_secs(EVALUATION_SECS));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick of an interval resolves at once; the first evaluation is
+    // run explicitly below, so consume it.
+    cadence.tick().await;
     loop {
         publisher.tick(&ctx).await;
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(EVALUATION_SECS)) => {}
+            _ = cadence.tick() => {}
             _ = ctx.maintenance().health_changed() => {}
         }
     }

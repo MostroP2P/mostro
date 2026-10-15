@@ -3,9 +3,10 @@
 //! reputation_attestation.md, "Redemption").
 
 use crate::app::context::AppContext;
+use crate::app::rate_user::rating_event_tags;
 use crate::config::types::ReputationImportSettings;
 use crate::db::{insert_reputation_import, update_user_reputation, ReputationImportRow};
-use crate::util::enqueue_order_msg;
+use crate::util::{enqueue_order_msg, update_user_rating_event};
 use mostro_core::prelude::*;
 use mostro_core::reputation::{AttestationError, ReputationImport};
 use nostr_sdk::prelude::*;
@@ -20,12 +21,14 @@ pub fn import_settings(ctx: &AppContext) -> Option<&ReputationImportSettings> {
 
 /// Run the redemption checks on an `import-reputation` request, record the
 /// import and merge it into the identity's reputation in one transaction,
-/// then confirm with `reputation-imported`. Every refusal is a `cant-do`
-/// whose reason says which check failed.
+/// then confirm with `reputation-imported` and queue a rating event for the
+/// importing trade key. Exact retries also queue the current aggregate.
+/// Every refusal is a `cant-do` whose reason says which check failed.
 pub async fn import_reputation_action(
     ctx: &AppContext,
     msg: Message,
     event: &UnwrappedMessage,
+    my_keys: &Keys,
 ) -> Result<(), MostroError> {
     let import = import_settings(ctx).ok_or(MostroCantDo(CantDoReason::InvalidAction))?;
     let kind = msg.get_inner_message_kind();
@@ -114,6 +117,11 @@ pub async fn import_reputation_action(
         None,
     )
     .await;
+    // Read the current aggregate on retries too: the original queued event
+    // may have been lost on restart, and later ratings/imports must not be
+    // replaced by the figures of this attestation alone.
+    let user = crate::db::is_user_present(ctx.pool(), event.identity.to_hex()).await?;
+    update_user_rating_event(&event.sender.to_hex(), rating_event_tags(&user), my_keys).await?;
     Ok(())
 }
 
@@ -205,6 +213,7 @@ mod tests {
     }
 
     async fn fixture_with(issuers: Vec<(&str, Vec<String>)>, issuer: Keys) -> Fixture {
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
         // One connection: an in-memory SQLite database is per connection.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -296,7 +305,7 @@ mod tests {
 
     async fn import(f: &Fixture, identity: &PublicKey, json: &str) -> Result<(), MostroError> {
         let (msg, event) = request(identity, json);
-        import_reputation_action(&f.ctx, msg, &event).await
+        import_reputation_action(&f.ctx, msg, &event, f.ctx.keys()).await
     }
 
     fn refused(result: Result<(), MostroError>) -> CantDoReason {
@@ -319,7 +328,9 @@ mod tests {
             .unwrap();
 
         let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
-        import_reputation_action(&f.ctx, msg, &event).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &event, f.ctx.keys())
+            .await
+            .unwrap();
 
         let after = is_user_present(f.ctx.pool(), identity.to_hex())
             .await
@@ -364,7 +375,9 @@ mod tests {
 
         let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
         let at = Timestamp::now().as_secs() as i64;
-        import_reputation_action(&f.ctx, msg, &event).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &event, f.ctx.keys())
+            .await
+            .unwrap();
 
         let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
             .await
@@ -463,11 +476,15 @@ mod tests {
         let identity = Keys::generate().public_key();
         let json = attestation(&f.issuer, &identity, "acct-1");
         let (msg, first) = request(&identity, &json);
-        import_reputation_action(&f.ctx, msg, &first).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &first, f.ctx.keys())
+            .await
+            .unwrap();
 
         // The retry may come from another trade key.
         let (msg, retry) = request(&identity, &json);
-        import_reputation_action(&f.ctx, msg, &retry).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &retry, f.ctx.keys())
+            .await
+            .unwrap();
 
         let replies = replies_to(retry.sender).await;
         assert_eq!(replies.len(), 1);
@@ -506,14 +523,33 @@ mod tests {
         let f = fixture().await;
         let identity = Keys::generate().public_key();
         let json = recorded_expired_attestation(&f, &identity).await;
-        let before = is_user_present(f.ctx.pool(), identity.to_hex())
+        let mut before = is_user_present(f.ctx.pool(), identity.to_hex())
             .await
             .unwrap();
+        // A native rating arrived after the import. A replay must publish
+        // the current aggregate, not just the old attestation's figures.
+        before.update_rating(2);
+        let mut tx = f.ctx.pool().begin().await.unwrap();
+        crate::db::update_user_rating(
+            &mut *tx,
+            before.pubkey.clone(),
+            before.last_rating,
+            before.min_rating,
+            before.max_rating,
+            before.total_reviews,
+            before.total_rating,
+            before.native_rating_sum,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
         let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
             .await
             .unwrap();
         let (msg, retry) = request(&identity, &json);
-        import_reputation_action(&f.ctx, msg, &retry).await.unwrap();
+        import_reputation_action(&f.ctx, msg, &retry, f.ctx.keys())
+            .await
+            .unwrap();
 
         let replies = replies_to(retry.sender).await;
         assert_eq!(replies.len(), 1);
@@ -521,6 +557,24 @@ mod tests {
         assert_eq!(reply.action, Action::ReputationImported);
         assert_eq!(reply.request_id, Some(7));
         assert!(reply.payload.is_none());
+        let sender = retry.sender.to_hex();
+        let published = crate::config::MESSAGE_QUEUES
+            .queue_order_rate
+            .read()
+            .await
+            .iter()
+            .find(|ev| {
+                ev.tags
+                    .iter()
+                    .any(|tag| tag.as_slice() == ["d", sender.as_str()])
+            })
+            .cloned()
+            .expect("an expired committed import queues its current rating again");
+        assert_eq!(published.pubkey, f.ctx.keys().public_key());
+        assert!(published
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["total_reviews", "215"]));
         let after = is_user_present(f.ctx.pool(), identity.to_hex())
             .await
             .unwrap();
@@ -599,7 +653,7 @@ mod tests {
                 .build();
             let (msg, retry) = request(&identity, &json);
             assert_eq!(
-                refused(import_reputation_action(&ctx, msg, &retry).await),
+                refused(import_reputation_action(&ctx, msg, &retry, ctx.keys()).await),
                 reason
             );
             assert!(replies_to(retry.sender).await.is_empty());
@@ -607,7 +661,7 @@ mod tests {
         let (msg, mut retry) = request(&identity, &json);
         retry.sender = identity;
         assert_eq!(
-            refused(import_reputation_action(&f.ctx, msg, &retry).await),
+            refused(import_reputation_action(&f.ctx, msg, &retry, f.ctx.keys()).await),
             CantDoReason::ReputationIdentityRequired
         );
     }
@@ -689,14 +743,14 @@ mod tests {
         let (msg, mut event) = request(&identity, &valid);
         event.sender = identity;
         assert_eq!(
-            refused(import_reputation_action(&f.ctx, msg, &event).await),
+            refused(import_reputation_action(&f.ctx, msg, &event, f.ctx.keys()).await),
             CantDoReason::ReputationIdentityRequired
         );
         // Wrong payload.
         let (_, event) = request(&identity, &valid);
         let wrong = Message::new_order(None, None, None, Action::ImportReputation, None);
         assert_eq!(
-            refused(import_reputation_action(&f.ctx, wrong, &event).await),
+            refused(import_reputation_action(&f.ctx, wrong, &event, f.ctx.keys()).await),
             CantDoReason::InvalidPayload
         );
         assert_eq!(

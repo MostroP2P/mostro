@@ -360,6 +360,22 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
     });
 }
 
+/// Publish one rating-event batch. The callback keeps queue concurrency
+/// testable independently of relay timing and connectivity.
+async fn flush_rating_events<F, Fut>(queue: &RwLock<Vec<nostr_sdk::prelude::Event>>, mut send: F)
+where
+    F: FnMut(nostr_sdk::prelude::Event) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Detach this batch before any network await. A producer can enqueue
+    // the next batch while sends are in progress, without a later clear()
+    // deleting events that this cycle never sent.
+    let batch = std::mem::take(&mut *queue.write().await);
+    for event in batch {
+        send(event).await;
+    }
+}
+
 async fn job_update_rate_events(ctx: AppContext) {
     // Clone for closure owning with Arc
     let queue_order_rate = MESSAGE_QUEUES.queue_order_rate.clone();
@@ -374,13 +390,13 @@ async fn job_update_rate_events(ctx: AppContext) {
                 interval / 60
             );
 
-            for ev in queue_order_rate.read().await.iter() {
-                // Send event to relay
-                let _ = client.send_event(&ev.clone()).await;
-            }
-
-            // Clear list after send events
-            queue_order_rate.write().await.clear();
+            flush_rating_events(&queue_order_rate, |ev| {
+                let client = &client;
+                async move {
+                    let _ = client.send_event(&ev).await;
+                }
+            })
+            .await;
 
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(
@@ -2532,20 +2548,74 @@ mod tests {
 
     #[tokio::test]
     async fn rate_events_job_drains_the_rate_queue() {
-        let ctx = migrated_ctx().await;
-        // Seed a signed dummy event; the job publishes (best-effort, no
-        // relays) and clears the queue.
         let keys = nostr_sdk::prelude::Keys::generate();
         let event = nostr_sdk::prelude::EventBuilder::new(nostr::event::Kind::TextNote, "rate")
             .finalize(&keys)
             .unwrap();
-        MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
+        let queue = RwLock::new(vec![event.clone()]);
+        let mut sent = Vec::new();
+        flush_rating_events(&queue, |ev| {
+            sent.push(ev.id);
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(sent, vec![event.id]);
+        assert!(queue.read().await.is_empty());
+    }
 
-        tokio::time::pause();
-        job_update_rate_events(ctx).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    #[tokio::test]
+    async fn rate_events_enqueued_during_a_flush_survive_for_the_next_batch() {
+        let event = |content| {
+            EventBuilder::new(NostrKind::TextNote, content)
+                .finalize(&Keys::generate())
+                .unwrap()
+        };
+        let first = event("first batch");
+        let second = event("next batch");
+        let queue = Arc::new(RwLock::new(vec![first.clone()]));
+        let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let flush = {
+            let queue = queue.clone();
+            let sent = sent.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                flush_rating_events(&queue, |ev| {
+                    let sent = sent.clone();
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        sent.lock().await.push(ev.id);
+                    }
+                })
+                .await;
+            })
+        };
+        started.notified().await;
 
-        assert!(MESSAGE_QUEUES.queue_order_rate.read().await.is_empty());
+        // Poll once while the first event is being sent. With the old read
+        // lock this writer queues ahead of the scheduler's final clear().
+        let mut enqueue = Box::pin(async { queue.write().await.push(second.clone()) });
+        let waiting = futures::poll!(enqueue.as_mut()).is_pending();
+        release.notify_one();
+        if waiting {
+            enqueue.await;
+        }
+        flush.await.unwrap();
+
+        assert_eq!(*sent.lock().await, vec![first.id]);
+        assert_eq!(queue.read().await.as_slice(), std::slice::from_ref(&second));
+        flush_rating_events(&queue, |ev| {
+            let sent = sent.clone();
+            async move { sent.lock().await.push(ev.id) }
+        })
+        .await;
+        assert_eq!(*sent.lock().await, vec![first.id, second.id]);
+        assert!(queue.read().await.is_empty());
     }
 
     #[tokio::test]

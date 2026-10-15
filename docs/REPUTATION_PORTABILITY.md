@@ -644,8 +644,16 @@ Independent of the migration and worth shipping first.
 | 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `max_lifetime`, and `issuers` as named entries with one or more `keys`) with parsing, defaults and validation: unique names, a key in one entry only, never the instance's own issuer key; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
 | 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, issuer_key, subject, identity_pubkey, reviews, rating, since, imported_at)`, `issuer` being the trust-list entry name, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`; a startup check refuses to run if a configured key has rows under a different name. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
 | 3.3 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
-| 3.4 | mostro | Publish the updated kind 38384 rating event after a successful import, reusing `update_user_rating_event`. | Event visible on the local relay. |
+| 3.4 | mostro | Queue the updated kind 38384 rating event after a successful import or exact retry, reusing `update_user_rating_event`, with a strictly increasing timestamp per node author and trade key. | Event visible on the local relay after the next rating-event tick. |
 | 3.5 | mostro | Admin RPC to revoke the imports made with an issuer key, optionally only those with `imported_at` after a given date, through `User::revert_reputation_import`, deleting their rows and republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation backdated before the cutoff but imported after it is revoked; imports under the entry's other key are left alone; the user can import again with an attestation from the new key. |
+
+Rating events are sent on the next `user_rates_sent_interval_seconds` tick
+(default: 3600 seconds), rather than immediately. Sending takes a batch out of
+the queue before awaiting relays, so events enqueued during that send remain
+for the following tick. Delivery remains best effort: failed sends are not
+retried, and the in-memory queue does not survive a restart. Resending an exact
+committed import queues the current aggregate again without applying its
+figures twice, including when the recorded attestation has since expired.
 
 ### Phase 4: mostrod as issuer (export)
 

@@ -527,8 +527,7 @@ async fn process_new_dev_fee_payments(
                     "Failed to resolve dev fee invoice for order {}: {:?}",
                     order_id, e
                 );
-                release_pending_claim(pool, order_id, &pending_marker).await;
-                record_dev_fee_failure(pool, order_id, None).await;
+                release_failed_claim(pool, order_id, &pending_marker).await;
                 continue;
             }
             Err(_) => {
@@ -536,8 +535,7 @@ async fn process_new_dev_fee_payments(
                     "Dev fee invoice resolution timeout (20s) for order {}",
                     order_id
                 );
-                release_pending_claim(pool, order_id, &pending_marker).await;
-                record_dev_fee_failure(pool, order_id, None).await;
+                release_failed_claim(pool, order_id, &pending_marker).await;
                 continue;
             }
         };
@@ -786,23 +784,12 @@ async fn handle_payment_timeout(
                 "Payment confirmed failed for order {}, clearing hash for retry",
                 order_id
             );
-            // Targeted reset: only clear hash if it still matches, and only while unpaid.
-            if let Err(e) = sqlx::query(
-                "UPDATE orders
-                 SET dev_fee_paid = 0, dev_fee_payment_hash = NULL
-                 WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+            clear_failed_payment_hash(
+                pool,
+                order_id,
+                order.dev_fee_payment_hash.as_deref().unwrap_or_default(),
             )
-            .bind(order_id)
-            .bind(order.dev_fee_payment_hash.as_deref().unwrap_or_default())
-            .execute(pool)
-            .await
-            {
-                error!(
-                    "Failed to reset after confirmed failure for order {}: {:?}",
-                    order_id, e
-                );
-            }
-            record_dev_fee_failure(pool, order_id, order.dev_fee_payment_hash.as_deref()).await;
+            .await;
         }
         DevFeePaymentState::Unknown | DevFeePaymentState::NotOnThisNode => {
             warn!(
@@ -898,11 +885,16 @@ pub(crate) async fn record_dev_fee_failure(
     }
 }
 
-/// Phase 3 found `existing_hash` `Failed` in LND: clear it so the order can
-/// be paid again, and count the failure if the send that made it did not
-/// (a payment that timed out in flight and failed later), so the retry still
-/// waits for its backoff instead of going out in Phase 4 of this same cycle.
+/// LND confirmed `existing_hash` `Failed` (Phase 3, or a send that timed
+/// out): count the failure if the send that made it did not (a payment that
+/// timed out in flight and failed later), then clear the hash so the order
+/// can be paid again once its backoff has passed.
+///
+/// The backoff is stored **before** the hash is cleared: while the hash is
+/// set no cycle can claim the order, so there is no moment when it is
+/// claimable without its deadline.
 async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, existing_hash: &str) {
+    record_dev_fee_failure(pool, order_id, Some(existing_hash)).await;
     // Targeted update: clear hash only if it still matches the one we checked.
     if let Err(e) = sqlx::query(
         "UPDATE orders
@@ -918,9 +910,15 @@ async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, exis
             "Failed to clear failed payment hash for order {}: {:?}",
             order_id, e
         );
-        return;
     }
-    record_dev_fee_failure(pool, order_id, Some(existing_hash)).await;
+}
+
+/// The dev fee invoice could not be resolved: count the failure and store
+/// its backoff while the PENDING claim is still held, then release the
+/// claim, so no other cycle can claim the order in between with no deadline.
+async fn release_failed_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_marker: &str) {
+    record_dev_fee_failure(pool, order_id, None).await;
+    release_pending_claim(pool, order_id, pending_marker).await;
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -1849,6 +1847,64 @@ mod tests {
         assert!(next_at.unwrap() > chrono::Utc::now().timestamp());
         let eligible = super::find_unpaid_dev_fees(&pool).await.unwrap();
         assert!(eligible.iter().all(|o| o.id != id));
+    }
+
+    /// Records, in `claim_releases`, the retry deadline an order had at the
+    /// moment its claim marker or payment hash was released. NULL there means
+    /// a window in which another cycle could claim it with no backoff.
+    async fn watch_claim_releases(pool: &sqlx::SqlitePool) {
+        for stmt in [
+            "CREATE TABLE claim_releases (next_attempt_at INTEGER)",
+            "CREATE TRIGGER watch_release AFTER UPDATE OF dev_fee_payment_hash ON orders \
+             WHEN OLD.dev_fee_payment_hash IS NOT NULL AND NEW.dev_fee_payment_hash IS NULL \
+             BEGIN INSERT INTO claim_releases VALUES (NEW.dev_fee_next_attempt_at); END",
+        ] {
+            sqlx::query(stmt).execute(pool).await.unwrap();
+        }
+    }
+
+    async fn deadlines_at_release(pool: &sqlx::SqlitePool) -> Vec<Option<i64>> {
+        sqlx::query_scalar("SELECT next_attempt_at FROM claim_releases")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Codex review on #1064 (round 3): the backoff must already be stored
+    /// when a failed attempt gives the order back, on every failure path.
+    #[tokio::test]
+    async fn backoff_is_stored_before_a_failed_attempt_releases_the_order() {
+        let pool = setup_orders_db().await;
+        watch_claim_releases(&pool).await;
+        let now = chrono::Utc::now().timestamp();
+
+        // LNURL resolution failed: the PENDING claim is released.
+        let unresolved = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            unresolved,
+            "success",
+            100,
+            false,
+            Some("PENDING-x-1"),
+        )
+        .await;
+        super::release_failed_claim(&pool, unresolved, "PENDING-x-1").await;
+
+        // LND confirmed the payment failed (recovery or timeout): the real
+        // hash is cleared.
+        let failed = uuid::Uuid::new_v4();
+        insert_test_order(&pool, failed, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH).await;
+
+        let deadlines = deadlines_at_release(&pool).await;
+        assert_eq!(deadlines.len(), 2, "both orders were given back");
+        for deadline in deadlines {
+            assert!(
+                deadline.is_some_and(|at| at > now),
+                "released with no backoff in place: {deadline:?}"
+            );
+        }
     }
 
     #[tokio::test]

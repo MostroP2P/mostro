@@ -14,7 +14,7 @@
 //!
 //! Orders with `dev_fee_payment_hash` like `PENDING-{uuid}-{ts}` older than
 //! 5 minutes are reset (hash cleared, `dev_fee_paid = false`). They become
-//! eligible again for Phase 4 so a fresh payment can be attempted.
+//! eligible again for Phase 4 once any retry backoff has elapsed.
 //!
 //! ## Phase 2: Verify confirmed orders
 //!
@@ -29,19 +29,23 @@
 //! Orders with a real payment hash but `dev_fee_paid = 0` are “partial”:
 //! the daemon stored the hash and then crashed before LND confirmed. This
 //! phase checks LN status for that hash. If **Succeeded**, the order is
-//! updated to paid and added to `confirmed`. If **Failed**, the hash is
-//! cleared so the next cycle can retry with a new invoice. InFlight/Unknown
-//! are left as-is to avoid duplicate payment risk.
+//! updated to paid and added to `confirmed`. If **Failed**, the failure is
+//! counted once per hash and its backoff is stored before clearing the hash.
+//! A new invoice can be attempted once that backoff has elapsed. A failed
+//! backoff write or an InFlight/Unknown result leaves the hash in place.
 //!
 //! ## Phase 4: Process new dev fee payments
 //!
-//! Orders with no existing payment hash (or empty/PENDING) are processed:
+//! Orders with no existing payment hash (NULL or empty) and no future retry
+//! deadline are processed:
 //!
 //! 1. **Claim** — Atomic DB update sets `dev_fee_payment_hash` to a unique
-//!    `PENDING-{uuid}-{ts}` so only one scheduler cycle owns the order.
+//!    `PENDING-{uuid}-{ts}`, rechecking the deadline so only an eligible
+//!    order can be claimed by one scheduler cycle.
 //! 2. **Resolve** — LNURL resolution for the dev fee lightning address yields
 //!    a payment request and the real payment hash. On failure or timeout,
-//!    the PENDING claim is released so the order can be retried later.
+//!    the backoff is stored before releasing the PENDING claim. If that
+//!    write fails, the claim is retained until stale-marker cleanup.
 //! 3. **Store hash** — The real hash is written to the DB (with
 //!    `dev_fee_paid` still false) *before* sending the payment. If the daemon
 //!    crashes after this, Phase 3 will find the hash and verify with LND on
@@ -49,11 +53,11 @@
 //! 4. **Send payment** — Lightning payment is sent (50s timeout). Outcome:
 //!    - **Success** — DB is updated to reflect payment, order is added to
 //!      `confirmed`, and an audit event may be published.
-//!    - **Failure** — `dev_fee_paid` is set false and DB updated; hash is
-//!      kept so the idempotency check (Phase 3 next cycle) can verify with LND.
+//!    - **Failure** — The failure is recorded while the hash is kept so
+//!      the idempotency check (Phase 3 next cycle) can verify with LND.
 //!    - **Timeout** — LN status is checked; if Succeeded, order is updated
-//!      and confirmed; if Failed, hash is cleared for retry; InFlight/Unknown
-//!      leave the hash in place to avoid duplicates.
+//!      and confirmed; if Failed, backoff is stored before clearing the hash;
+//!      InFlight/Unknown leave the hash in place to avoid duplicates.
 //!
 //! Key principle: the real payment hash is always stored before sending, and
 //! recovery paths (Phase 3 and timeout handling) query LND by that hash
@@ -154,7 +158,7 @@ pub async fn release_all_pending_claims(pool: &SqlitePool) -> Result<u64, sqlx::
 }
 
 /// Reset PENDING markers older than `CLEANUP_TTL_SECS` so those orders
-/// become eligible for a fresh payment attempt on the next cycle.
+/// become eligible for a fresh payment attempt once any backoff has elapsed.
 async fn cleanup_stale_pending_markers(pool: &SqlitePool) {
     const CLEANUP_TTL_SECS: u64 = 300; // 5 minutes
     let now_unix = Utc::now().timestamp() as u64;
@@ -821,8 +825,8 @@ pub(crate) fn dev_fee_retry_delay_secs(failed_attempts: i64, jitter: f64) -> i64
 /// Record a failed attempt for `order_id`: bump `dev_fee_failed_attempts` and
 /// push `dev_fee_next_attempt_at` out by [`dev_fee_retry_delay_secs`], so
 /// [`find_unpaid_dev_fees`] skips the order until then. Never touches a paid
-/// order. Logged, not propagated: a failed write only means the order may be
-/// retried sooner, as it was before backoff existed.
+/// order. Persistence errors are logged and returned so callers can keep
+/// the claim or payment hash until recovery can safely retry the operation.
 ///
 /// `payment_hash` is the hash of the attempt that failed, when there is one.
 /// A failure is counted once per hash: the send that fails and the next

@@ -50,7 +50,7 @@ The development fee mechanism provides sustainable funding for Mostro developmen
   - `dev_fee`: Always set to 0 at order creation, calculated when order is taken (unified for all order types)
   - `dev_fee_paid`: Changed from 0 to 1 after successful payment in scheduler
   - `dev_fee_payment_hash`: Set to Lightning payment hash on successful payment
-- Error handling and retry logic with automatic retries every 60 seconds
+- Error handling and automatic retries after a per-order backoff (see [Retry backoff](#retry-backoff))
 - Payment timeout handling (LNURL: 15s, send_payment: 5s, result: 25s, total: 50s per attempt)
 - Dev fee amount validation (rejects payments with dev_fee <= 0)
 - Enhanced logging with BEFORE/AFTER state tracking and database verification
@@ -693,7 +693,7 @@ Ok(hash) => {
 Err(e) => {
     order.dev_fee_paid = false;
     // Logged for audit
-    // Will be retried on next scheduler cycle (60 seconds)
+    // Retry after LND confirms failure and the per-order backoff has elapsed
 }
 ```
 
@@ -858,126 +858,22 @@ Edge Case - Dev Fee Payment Fails, Buyer Payment Succeeds (Race Condition):
   └─> Scheduler attempts dev fee payment → FAILS (dev_fee_paid = 0)
   └─> Simultaneously, buyer payment → SUCCEEDS → status = 'success'
   └─> Order now in 'success' status with dev_fee_paid = 0
-  └─> Query includes both statuses, so order is still picked up on next cycle
+  └─> Query includes both statuses, so order remains eligible once its backoff has elapsed
   └─> Dev fee payment eventually succeeds and updates dev_fee_paid = 1
 ```
 
 #### Actual Implementation
 
-The actual implementation in `src/scheduler.rs::job_process_dev_fee_payment()` includes enhanced logging:
+`job_process_dev_fee_payment` in `src/scheduler.rs` runs `run_dev_fee_cycle` in `src/app/dev_fee.rs`, then waits 60 seconds before starting the next cycle. The cycle has four phases:
 
-```rust
-/// Process unpaid development fees for successful orders
-/// Called every 60 seconds by scheduler
-async fn job_process_dev_fee_payment(ctx: AppContext) {
-    let interval = 60u64; // Every 60 seconds
+1. Release stale PENDING claim markers.
+2. Verify previously paid orders against LND, preserving their paid status.
+3. Recover unpaid orders with a stored payment hash. A confirmed failure is counted once per hash and backed off before its hash is cleared; an in-flight or unknown payment keeps its hash.
+4. Select unclaimed orders past their retry deadline with `find_unpaid_dev_fees`, recheck the deadline when atomically claiming each order, resolve an invoice, store its hash, and send the payment.
 
-    tokio::spawn(async move {
-        let pool = ctx.pool(); // Get pool from AppContext
-        loop {
-            info!("Checking for unpaid development fees");
+Failure handling commits the count, counted hash and retry deadline together. The claim or hash is released only after that transaction succeeds; a failed write leaves it in place for recovery. Buyer payment and order completion do not wait for this job.
 
-            // Query unpaid orders using find_unpaid_dev_fees()
-            // Query: WHERE (status = 'settled-hold-invoice' OR status = 'success')
-            //        AND dev_fee > 0 AND dev_fee_paid = 0
-            if let Ok(unpaid_orders) = find_unpaid_dev_fees(&pool).await {
-                info!("Found {} orders with unpaid dev fees", unpaid_orders.len());
-
-                for mut order in unpaid_orders {
-                    // Attempt payment with 50-second timeout (under 60s cycle)
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(50),
-                        send_dev_fee_payment(&order),
-                    )
-                    .await
-                    {
-                        Ok(Ok(payment_hash)) => {
-                            // SUCCESS: Update both fields atomically
-                            let order_id = order.id;
-                            let dev_fee_amount = order.dev_fee;
-
-                            // Enhanced logging - BEFORE state
-                            info!(
-                                "BEFORE UPDATE: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
-                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
-                            );
-
-                            order.dev_fee_paid = true;
-                            order.dev_fee_payment_hash = Some(payment_hash.clone());
-
-                            // Enhanced logging - AFTER modification
-                            info!(
-                                "AFTER MODIFY: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
-                                order_id, order.dev_fee_paid, order.dev_fee_payment_hash
-                            );
-
-                            match order.update(&pool).await {
-                                Err(e) => {
-                                    error!(
-                                        "❌ DATABASE UPDATE FAILED for order {}: {:?}",
-                                        order_id, e
-                                    );
-                                }
-                                Ok(_) => {
-                                    info!("✅ DATABASE UPDATE SUCCEEDED for order {}", order_id);
-
-                                    // Verification query - confirm database persistence
-                                    if let Ok(verified_order) = sqlx::query_as::<_, Order>(
-                                        "SELECT * FROM orders WHERE id = ?",
-                                    )
-                                    .bind(order_id)
-                                    .fetch_one(&*pool)
-                                    .await
-                                    {
-                                        info!(
-                                            "VERIFICATION: order_id={}, dev_fee_paid={}, dev_fee_payment_hash={:?}",
-                                            verified_order.id,
-                                            verified_order.dev_fee_paid,
-                                            verified_order.dev_fee_payment_hash
-                                        );
-                                    }
-
-                                    info!(
-                                        "Dev fee payment succeeded for order {} - amount: {} sats, hash: {}",
-                                        order_id, dev_fee_amount, payment_hash
-                                    );
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            // FAILURE: Leave fields unchanged for retry
-                            error!(
-                                "Dev fee payment failed for order {} ({} sats) - error: {:?}, will retry",
-                                order.id, order.dev_fee, e
-                            );
-                        }
-                        Err(_) => {
-                            // TIMEOUT: Leave fields unchanged for retry
-                            error!(
-                                "Dev fee payment timeout (50s) for order {} ({} sats) - will retry",
-                                order.id, order.dev_fee
-                            );
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-        }
-    });
-}
-```
-
-**Key Implementation Points:**
-
-1. **Atomic Updates:** Always update `dev_fee_paid` and `dev_fee_payment_hash` together in a single database transaction
-2. **Only Update on Success:** Never update these fields on payment failure - leave them unchanged for retry
-3. **Dual Status Query:** Query checks BOTH `'settled-hold-invoice'` AND `'success'` statuses to handle race conditions
-4. **Enhanced Logging:** BEFORE/AFTER/VERIFY pattern provides complete diagnostic trail
-5. **Database Verification:** After update, re-query database to confirm fields were persisted correctly
-6. **Automatic Retry:** Failed payments remain with `dev_fee_paid = 0`, causing them to be retried on the next cycle (60s)
-7. **Non-Blocking:** Order completion is never blocked by dev fee payment attempts
-8. **Error Categorization:** Separate handling for payment failures vs timeouts with specific error messages
+The 60-second scheduler interval is not the retry delay: a new attempt starts in a later cycle only after the order's backoff has elapsed (see [Retry backoff](#retry-backoff)). Processing other orders can delay it further.
 
 ### Error Handling
 
@@ -1115,7 +1011,7 @@ This section provides a checklist for implementing the remaining phases of the d
   - LNURL resolution failures (15s timeout)
   - Routing failures (25s timeout)
   - Scheduler timeout (50s total)
-  - All errors: Log and allow automatic retry on next cycle (60s)
+  - Errors: Log the failure and record a per-order backoff; keep unresolved payment hashes until LND confirms their outcome
 - [x] Market price order dev_fee calculation (commit 2655943)
   - Implemented in `take_buy.rs` and `take_sell.rs`
   - Calculates `dev_fee = get_dev_fee(fee * 2)` when order amount is determined
@@ -1322,7 +1218,7 @@ WHERE (status = 'settled-hold-invoice' OR status = 'success')
 ORDER BY created_at DESC;
 
 -- Check for orders stuck in settled-hold-invoice with unpaid dev fees:
--- These should be picked up by scheduler every 60 seconds
+-- Unclaimed orders become eligible once their per-order backoff has elapsed
 SELECT id, dev_fee, status, dev_fee_paid, created_at,
        (strftime('%s', 'now') - created_at) / 60 as minutes_since_creation
 FROM orders
@@ -1380,7 +1276,7 @@ Error: Configuration error: dev_fee_percentage (0.05) is below minimum (0.10)
 - Payment result timeout: 25 seconds (indicates routing issues or network congestion)
 - Total scheduler timeout: 50 seconds
 - Orders still complete successfully regardless of dev fee payment failures
-- Failed payments automatically retry every 60 seconds via scheduler
+- Failed payments retry automatically after a per-order backoff (60s doubling up to 1h, plus up to 25% jitter); see [Retry backoff](#retry-backoff)
 
 **4. Market Price Orders With Zero Dev Fee**
 

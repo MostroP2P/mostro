@@ -4,8 +4,12 @@ Design proposal for letting a user carry reputation earned in one trading venue
 (lnp2pBot, or another Mostro instance) into a Mostro instance, as the
 figures they earned there.
 
-Status: **proposal**. Values marked *open decision* are defaults to be
-confirmed before implementation.
+Status: **import implemented, export in review.** The specification, the
+shared types, the `since` rollout, mostrod as a destination (import and
+revocation) and lnp2pBot as an issuer are merged. Exporting from mostrod
+(phase 4) and the two apps (phases 5 and 5b) are in review. Section 11 tracks
+every pull request and explains how to operate what has landed. The open
+decisions were closed on 2026-10-03 with their defaults (section 10).
 
 ## 1. Goals
 
@@ -536,7 +540,7 @@ as long as both fields are published.
 ```toml
 [reputation_import]
 enabled = true
-max_lifetime = "7d"
+max_lifetime_seconds = 604800
 
 [[reputation_import.issuers]]
 name = "lnp2pbot"            # dedup key; never renamed
@@ -552,7 +556,7 @@ keys = [
 [reputation_export]
 enabled = true
 issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
-lifetime = "7d"
+lifetime_seconds = 604800
 ```
 
 ## 8. Multi-destination, Sybil and re-issuance
@@ -587,7 +591,7 @@ reviewed in full by a human and by the automated reviewers (CodeRabbit,
 Codex). A PR never mixes a protocol type change with behaviour, nor a
 migration with a handler. Every PR carries its own tests and lands green on
 its own; nothing in a later phase starts until the release it depends on is
-published.
+published. Section 11 records which of them have landed.
 
 Repositories: `protocol` (spec), `mostro-core` (shared types, crates.io),
 `mostro` (daemon), `mobile` (app 1.x, pure Dart), `app` (app 2.x, Flutter UI
@@ -632,7 +636,7 @@ Independent of the migration and worth shipping first.
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
 | 1.1 | mostro-core | `src/rating.rs`: `Rating` gains `since: Option<u64>` (serde default); `to_tags()` emits a `since` tag when set, `from_tags()` parses it; `Rating::new` keeps its signature and a `with_since(u64)` builder is added so no caller breaks. `src/user.rs`: `UserInfo` gains `since: Option<u64>` (serde default). Unit tests for both round trips. | Released (shipped in 0.15.0). |
-| 1.2 | mostro | In progress (mostro#1016). Bump core. One helper `first_trade_since(created_at)` over core's `day_truncate`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
+| 1.2 | mostro | Bump core. One helper `first_trade_since(created_at)` over core's `day_truncate`. `create_rating_tag` (`nip33.rs`) emits `days` **and** `since`; `rate_user.rs` builds the `Rating` with `.with_since()` and keeps pushing the `days` tag; the `UserInfo` built in `util.rs` fills `since`. Unit tests on the three emitters. | All three sites carry both fields on a local relay. |
 | 1.3 | mobile | `data/models/rating.dart` parses `since` and falls back to `days`; `data/models/user_info.dart` parses `since` and falls back to `operating_days`; age is computed at display time. Tests for both shapes. | Old and new daemons render the same age. |
 | 1.3b | app | Rust core: `nostr/order_events.rs::parse_rating_tag` reads `since` and falls back to `days`; `mostro/status.rs` maps `UserInfo.since` with fallback to `operating_days`. Bridge exposes `since` and the Dart side (`peer_reputation_card.dart`, trade detail) computes the age at display time. Tests for both shapes. | Old and new daemons render the same age. |
 | 1.4 | mostro | **Deferred to the last step of the rollout (phase 7), not part of this phase.** Remove `days` and `operating_days` emission. `UserInfo.operating_days` is removed from core in the same step, as a **minor** bump, never earlier: a core that drops it makes every daemon built on it stop sending it. | Removed with a changelog entry. |
@@ -651,9 +655,9 @@ Independent of the migration and worth shipping first.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `max_lifetime`, and `issuers` as named entries with one or more `keys`) with parsing, defaults and validation: unique names, a key in one entry only, never the instance's own issuer key; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
+| 3.1 | mostro | Settings section `[reputation_import]` (`enabled`, `max_lifetime_seconds`, and `issuers` as named entries with one or more `keys`) with parsing, defaults and validation: unique names, a key in one entry only, never the instance's own issuer key; the `reputation_import_issuers` tag in the kind 38385 info event. No other behaviour. | Bad config is rejected at startup with a clear error; the tag is absent when import is disabled. |
 | 3.2 | mostro | Bump core. Migration: `users` gains `seeded_reviews`, `seeded_rating_sum`, `native_rating_sum` (backfilled as `total_rating * total_reviews`, the legacy approximation of section 7), `native_created_at` (backfilled from `created_at`), `reputation_exported_to` and `reputation_exported_at`; new table `reputation_imports(attestation_id PK, issuer, issuer_key, subject, identity_pubkey, reviews, rating, since, imported_at)`, `issuer` being the trust-list entry name, with unique indexes on `(issuer, subject)` and `(issuer, identity_pubkey)`; a startup check refuses to run if a configured key has rows under a different name. `db.rs` accessors with tests; both the insert and every `users` update path persist `native_rating_sum`. | Migration applies on an existing database; a rating received after the migration moves `native_rating_sum`. |
-| 3.3 | mostro | Handler `src/app/import_reputation.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
+| 3.3 | mostro | Handler `src/app/reputation/import.rs`: routing in `app.rs`, `ReputationAttestation::parse` from core, then the trust list, self-issuer, identity-required and uniqueness checks of section 5.3 and `User::apply_reputation_import` in one transaction; replies `reputation-imported` or `cant-do`. Integration test end-to-end with a fixture issuer key, including two concurrent imports of the same source. | A second import of the same source is rejected; an import without an identity proof is rejected. |
 | 3.4 | mostro | Queue the updated kind 38384 rating event after a successful import or exact retry, reusing `update_user_rating_event`, with a strictly increasing timestamp per node author and trade key. | Event visible on the local relay after the next rating-event tick. |
 | 3.5 | mostro | Admin RPC to revoke the imports made with an issuer key, optionally only those with `imported_at` after a given date, through `User::revert_reputation_import`, deleting their rows and republishing the rating events. Logged. | Revoking an import with no native rating after it restores the row exactly in an integration test; an attestation backdated before the cutoff but imported after it is revoked; imports under the entry's other key are left alone; the user can import again with an attestation from the new key. |
 
@@ -669,7 +673,7 @@ figures twice, including when the recorded attestation has since expired.
 
 | PR | Repo | Scope | Done when |
 |---|---|---|---|
-| 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `issuer_key_env`, `lifetime`) with the dedicated issuer key loaded from the environment, and the `reputation_issuer` tag in the info event. Eligibility from `User::native_stats`, `is_banned`, and a `db.rs` query over the identity's `success` orders returning the completed count and the first trade date. Tested. | Imported values never reach an attestation; the issuer key is never the daemon key. |
+| 4.1 | mostro | Settings `[reputation_export]` (`enabled`, `issuer_key_env`, `lifetime_seconds`) with the dedicated issuer key loaded from the environment, and the `reputation_issuer` tag in the info event. Eligibility from `User::native_stats`, `is_banned`, and a `db.rs` query over the identity's `success` orders returning the completed count and the first trade date. Tested. | Imported values never reach an attestation; the issuer key is never the daemon key. |
 | 4.2 | mostro | Handler `export_reputation_action`: identity required, eligibility, the confirmation-gated binding of section 5.2 as one compare-and-set (`reputation_exported_to`, `reputation_exported_at`), sign with the issuer key, reply `reputation-exported`. Integration test: export from instance A, import on instance B, both in-process; two concurrent exports to different identities. | Round trip passes on two local daemons; exactly one of two concurrent bindings wins; an export to a second identity is refused. |
 | 4.3 | mostro | Rebinding: the rebind authorisation in the export request (section 5.2), and an admin RPC to rebind by hand, logged with the reason. | A valid authorisation moves the binding once; a replayed one is a no-op; one signed by any other key is refused. |
 
@@ -711,10 +715,12 @@ Runs in parallel with phase 5; shares the UI copy and the localized strings.
 
 ## 10. Open decisions
 
-1. Attestation kind number (default `38388`, to be reserved in protocol PR 0.2).
-2. Attestation lifetime (default 7 days, and the destination's cap on it).
-3. lnp2pBot `subject`: internal user id or Telegram id (default internal id).
-4. Refreshing an earlier import with newer figures: in v1 or later (default later).
+None left open. Closed on 2026-10-03, with the defaults:
+
+1. Attestation kind number: `38388`, reserved in MostroP2P/protocol#74.
+2. Attestation lifetime: 7 days, which is also a destination's default cap.
+3. lnp2pBot `subject`: its internal user id, never the Telegram id.
+4. Refreshing an earlier import with newer figures: later, not in v1.
 
 Closed during review:
 
@@ -761,3 +767,95 @@ Closed during review:
   controls.
 - **Action naming.** `reputation-exported` is the wire name for the export
   response, everywhere.
+
+## 11. Status and operation
+
+### Importing reputation
+
+Import is opt-in and disabled by default. To accept another venue's
+reputation:
+
+1. Add the issuers you trust to `settings.toml` and enable the section:
+
+   ```toml
+   [reputation_import]
+   enabled = true
+   max_lifetime_seconds = 604800
+
+   [[reputation_import.issuers]]
+   name = "lnp2pbot"
+   keys = ["<lnp2pBot's reputation issuer pubkey>"]
+   ```
+
+   Ask each issuer for its key; a Mostro that exports announces it in the
+   `reputation_issuer` tag of its info event. The `name` is what imports are
+   deduplicated on, so never rename an entry once an import is recorded under
+   it: mostrod refuses to start in that case (section 5.3). A name mistyped
+   before the first import can still be corrected; mostrod moves its keys to
+   the corrected name and logs it. A key belongs to one entry only.
+   `docs/STARTUP_AND_CONFIG.md` lists every field and the boot checks.
+2. Restart mostrod. Its info event now carries `reputation_import_issuers`,
+   which is what tells clients to offer the import.
+3. **Key rotation.** When an issuer rotates its key, add the new key to the
+   same entry, and remove the old one once its attestations have expired
+   (`max_lifetime_seconds`).
+4. **Compromised issuer key.** Remove the key from its entry and restart, then
+   reverse the imports made with it (add `-H 'authorization: Bearer <token>'`
+   when `[rpc].auth_token` is set):
+
+   ```bash
+   grpcurl -plaintext -import-path proto -proto admin.proto \
+     -d '{"issuer_key": "<npub or hex>", "imported_after": <unix>, "reason": "key leaked"}' \
+     127.0.0.1:50051 mostro.admin.v1.AdminService/RevokeReputationImports
+   ```
+
+   Leave `imported_after` out to reverse every import made with the key. The
+   selection uses this node's import time, never the attestation's date. Each
+   reversed user can import again with an attestation from the new key. The
+   RPC answers loopback peers only; see `docs/RPC.md` for the details.
+
+Exporting from mostrod (phase 4) is not merged yet; its operator guide comes
+with it.
+
+### Implementation status
+
+| Phase | Pull requests | State |
+|---|---|---|
+| 0, spec | MostroP2P/protocol#59 (`since`), #72 (`days` kept to the end), #74 (attestation), #75 (actions), #76 (test vectors) | Merged |
+| 1, `since` | MostroP2P/mostro-core#169, mostro#1016, mobile#740, app#664 | Released: core 0.15.0, mostrod 0.19.2, mobile 1.5.0, app 2.0.16. PR 1.4 waits for the end of the rollout |
+| 2, core | MostroP2P/mostro-core#177–#181, #187 (vectors in sync with protocol#76) | Released in mostro-core 0.17.0 |
+| 3, import | #1028 (3.1), #1029 (3.2), #1030 (3.3), #1031 (3.4), #1032 (3.5) | Merged. 3.1 shipped in mostrod 0.19.3; 3.2–3.5 ship in the next release |
+| 4, export | #1033 (4.1), #1034 (4.2), #1035 (4.3) | In review |
+| 5, mobile | MostroP2P/mobile#742 (5.1), #743 (5.2), #744 (5.3), #745 (5.4) | In review |
+| 5b, app | MostroP2P/app#675 (5b.1), #676 (5b.2), #677 (5b.3) | 5b.1 and 5b.2 merged; 5b.3 in review |
+| 6, lnp2pBot | lnp2pBot/bot#932 (6.1), #933 (6.2), #934 (6.3) | Merged |
+
+Where the code departs from the text above:
+
+- **Settings names.** Lifetimes are in seconds (`max_lifetime_seconds`,
+  `lifetime_seconds`), like every other duration in `settings.toml`, instead
+  of `"7d"`.
+- **`trade_pubkey` column.** `reputation_imports` also keeps the trade key
+  that sent the import. The rating event is republished under it after the
+  import and after a reversal.
+- **Own issuer key.** The refusal of an attestation signed by the node's own
+  issuer key (section 5.3, step 3) lands with 4.1, together with that key.
+  Until then a node has no issuer key, so there is nothing to refuse.
+- **Telegram hand-off.** lnp2pBot sends the attestation as a message to copy,
+  not as a button: Telegram URL buttons cannot open an app scheme, so pasting
+  is the hand-off on every platform (section 5.2).
+
+### Rollout
+
+Phase 7 of section 9, step by step:
+
+1. Done: mostrod, mobile and app publish and read `since`.
+2. Next mostrod release: deploy phase 3 on the reference instance with an
+   empty issuer list.
+3. Pending: merge phase 4, release lnp2pBot with `REPUTATION_ISSUER_SK`, then
+   add both issuer keys to the reference instance's trust list.
+4. Pending: ship mobile with phases 5.1–5.4 and app with 5b.1–5b.3.
+5. Operator side: this section, the settings template and
+   `docs/STARTUP_AND_CONFIG.md`; the export guide comes with phase 4. User
+   side: in-app help, pending.
+6. Last: PR 1.4 stops publishing `days` and `operating_days`.

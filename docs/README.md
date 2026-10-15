@@ -10,6 +10,7 @@ Quick links to architecture and feature guides.
 - Admin RPC & Disputes: ADMIN_RPC_AND_DISPUTES.md
 - Anti-Abuse Bond: ANTI_ABUSE_BOND.md (opt-in maker/taker Lightning bond; off by default)
 - Payment-Account History / Anti-Triangulation: PAYER_HISTORY_ANTI_TRIANGULATION.md (opt-in buyer payer declaration + private success history; off by default)
+- Reputation Portability: REPUTATION_PORTABILITY.md (import reputation earned on lnp2pBot or another Mostro; opt-in, off by default; §11 has the status and the operator steps)
 - Maintenance Mode & LN Node Migration: MAINTENANCE_MODE_LN_MIGRATION.md (design spec; operator procedure lives in LIGHTNING_OPS.md)
 - Contribution Quality Bar: [CONTRIBUTION_QUALITY_SPEC.md](./CONTRIBUTION_QUALITY_SPEC.md) (design spec: PR template, Manual testing, triage bot, red test on `main`; label-only at first)
 - RPC Interface Reference: RPC.md

@@ -8,6 +8,7 @@ use crate::lightning::LnStatus;
 use crate::util::{
     first_trade_since, get_expiration_timestamp_for_kind, get_keys,
     monotonic_dispute_event_timestamp, monotonic_info_event_timestamp,
+    monotonic_rating_event_timestamp,
 };
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
@@ -119,13 +120,15 @@ pub fn new_rating_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
+    let created_at =
+        monotonic_rating_event_timestamp(keys.public_key(), &identifier, Timestamp::now());
     create_event(
         keys,
         content,
         identifier,
         extra_tags,
         NOSTR_RATING_EVENT_KIND,
-        None,
+        Some(created_at),
     )
 }
 

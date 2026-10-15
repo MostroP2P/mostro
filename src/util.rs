@@ -849,10 +849,9 @@ pub fn get_keys() -> Result<&'static Keys, MostroError> {
 
 /// Build and enqueue a replaceable rating event for `user` (NIP-33 kind 38384).
 ///
-/// Callers must have already claimed the order's rating flag and persisted the
-/// aggregate user rating inside a committed transaction — this helper only
-/// publishes the Nostr side-effect after that durable claim. It does not write
-/// `buyer_sent_rate` / `seller_sent_rate`.
+/// Callers must have committed the aggregate user rating and its rating flag
+/// or import receipt. This helper queues the Nostr side-effect for the next
+/// rating-event tick; it does not change rating flags or persist the queue.
 pub async fn update_user_rating_event(
     user: &str,
     tags: Tags,
@@ -1161,6 +1160,30 @@ pub(crate) fn monotonic_info_event_timestamp(d_tag: &str, candidate: Timestamp) 
     Timestamp::from(monotonic_created_at(
         &mut last_ts,
         d_tag.to_owned(),
+        candidate.as_secs(),
+    ))
+}
+
+/// Last kind-38384 revision per node author and trade-key `d` tag. As with
+/// info/dispute events, the registry is process-local and bounded by the
+/// shared timestamp pruning policy.
+static RATING_EVENT_TIMESTAMPS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(PublicKey, String), u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Stamp a rating revision strictly after the previous event at the same
+/// Nostr address, so same-second imports/ratings cannot retain a stale total.
+pub(crate) fn monotonic_rating_event_timestamp(
+    author: PublicKey,
+    d_tag: &str,
+    candidate: Timestamp,
+) -> Timestamp {
+    let mut last_ts = RATING_EVENT_TIMESTAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Timestamp::from(monotonic_created_at(
+        &mut last_ts,
+        (author, d_tag.to_owned()),
         candidate.as_secs(),
     ))
 }

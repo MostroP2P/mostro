@@ -254,6 +254,10 @@ pub struct Publisher {
     recipient: Option<PublicKey>,
     tracker: CheckTracker,
     persisted: PersistedHealth,
+    /// Whether `persisted` was read from the database. Until it is, nothing
+    /// is published: a read error must never be taken for an empty database,
+    /// which would restart `seq` at 1 and could move `created_at` back.
+    persisted_loaded: bool,
     had_relay_connection: bool,
     ln_client: Option<LndConnector>,
     /// Bound on the database probe and on every database operation after it.
@@ -264,24 +268,46 @@ pub struct Publisher {
 
 impl Publisher {
     pub async fn new(ctx: &AppContext) -> Self {
-        let persisted = match load_persisted(ctx.pool()).await {
-            Ok(persisted) => persisted,
-            Err(e) => {
-                error!("Could not load the health event state, starting from scratch: {e}");
-                PersistedHealth::default()
-            }
-        };
-        Self {
+        let mut publisher = Self {
             interval: resolve_interval(ctx.settings().health.interval),
             recipient: resolve_recipient(&ctx.settings().health.watchdog_pubkey),
             tracker: CheckTracker::default(),
-            persisted,
+            persisted: PersistedHealth::default(),
+            persisted_loaded: false,
             had_relay_connection: false,
             ln_client: None,
             db_timeout: DATABASE_PROBE_TIMEOUT,
             last_publish: None,
             last_signature: None,
+        };
+        publisher.load_persisted_state(ctx).await;
+        publisher
+    }
+
+    /// Read `seq`, `created_at` and the relay outage from the database, if
+    /// not done yet. Returns whether they are loaded.
+    async fn load_persisted_state(&mut self, ctx: &AppContext) -> bool {
+        if self.persisted_loaded {
+            return true;
         }
+        match bounded_db(
+            true,
+            self.db_timeout,
+            "loading the health event state",
+            async { load_persisted(ctx.pool()).await },
+        )
+        .await
+        {
+            Some(persisted) => {
+                self.persisted = persisted;
+                self.persisted_loaded = true;
+            }
+            None => error!(
+                "Could not load the health event state (seq, created_at); \
+                 not publishing until it loads"
+            ),
+        }
+        self.persisted_loaded
     }
 
     async fn channel_facts(&mut self) -> Option<ChannelFacts> {
@@ -508,13 +534,20 @@ impl Publisher {
                 stamp.created_at
             );
         }
+        // Persisted before signing: an event whose stamp is not durable could
+        // be followed, after a restart, by one that repeats its `seq` or moves
+        // `created_at` back. Skip it; the next evaluation tries again.
         if bounded_db(true, self.db_timeout, "saving seq/created_at", async {
             save_stamp(ctx.pool(), stamp).await
         })
         .await
         .is_none()
         {
-            error!("Could not persist the health event seq/created_at");
+            error!(
+                "Could not persist the health event seq/created_at; not publishing seq {}",
+                stamp.seq
+            );
+            return;
         }
         self.persisted.last_stamp = Some(stamp);
 
@@ -572,6 +605,9 @@ impl Publisher {
 
     /// Evaluate and publish if due.
     pub async fn tick(&mut self, ctx: &AppContext) {
+        if !self.load_persisted_state(ctx).await {
+            return;
+        }
         let now = Utc::now().timestamp();
         let evaluation = self.evaluate(ctx, now).await;
         if !has_a_relay(&evaluation) {
@@ -864,6 +900,126 @@ mod tests {
         assert!(publisher.last_publish.is_none(), "not counted as published");
         let evaluation = publisher.evaluate(&ctx, NOW).await;
         assert!(publisher.should_publish(&evaluation), "retried next time");
+    }
+
+    /// A connected client on a fresh mock relay, and a context using it.
+    async fn relay_ctx(
+        pool: &SqlitePool,
+    ) -> (
+        AppContext,
+        nostr_sdk::prelude::Client,
+        nostr_sdk::local_relay::MockRelay,
+    ) {
+        use nostr_sdk::local_relay::MockRelay;
+        use nostr_sdk::prelude::{Client, Keys};
+        crate::config::init_test_nostr_keys();
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let relay = MockRelay::run().await.expect("mock relay");
+        let client = Client::default();
+        client.add_relay(relay.url().await).await.unwrap();
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .with_nostr_client(client.clone())
+            .with_keys(Keys::generate())
+            .build();
+        (ctx, client, relay)
+    }
+
+    async fn published_seqs(client: &nostr_sdk::prelude::Client, ctx: &AppContext) -> Vec<String> {
+        use nostr_sdk::prelude::{Filter, Kind};
+        client
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(38389))
+                    .author(ctx.keys().public_key()),
+            )
+            .timeout(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                event
+                    .tags
+                    .iter()
+                    .map(|t| t.as_slice())
+                    .find(|t| t[0] == "seq")
+                    .map(|t| t[1].clone())
+            })
+            .collect()
+    }
+
+    /// Codex review on #1066: a read error is not an empty database. The
+    /// publisher waits until the stored seq loads and then continues it.
+    #[tokio::test]
+    async fn nothing_is_published_until_the_stored_seq_loads() {
+        let pool = pool().await;
+        save_stamp(
+            &pool,
+            crate::app::health::event::Stamp {
+                seq: 41,
+                created_at: NOW,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE daemon_state RENAME TO daemon_state_away")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (ctx, client, _relay) = relay_ctx(&pool).await;
+        let mut publisher = Publisher::new(&ctx).await;
+        publisher.db_timeout = Duration::from_millis(200);
+
+        publisher.tick(&ctx).await;
+        assert!(
+            publisher.last_publish.is_none(),
+            "unreadable state: no event"
+        );
+
+        sqlx::query("ALTER TABLE daemon_state_away RENAME TO daemon_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        publisher.tick(&ctx).await;
+        assert_eq!(published_seqs(&client, &ctx).await, vec!["42".to_string()]);
+    }
+
+    /// Codex review on #1066: an event whose stamp could not be saved is not
+    /// sent, so a restart can never repeat its seq.
+    #[tokio::test]
+    async fn nothing_is_sent_when_the_stamp_cannot_be_saved() {
+        let pool = pool().await;
+        let (ctx, client, _relay) = relay_ctx(&pool).await;
+        let mut publisher = Publisher::new(&ctx).await;
+        for stmt in [
+            "CREATE TRIGGER no_seq_insert BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_seq' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            "CREATE TRIGGER no_seq_update BEFORE UPDATE ON daemon_state \
+             WHEN NEW.key = 'health_seq' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        publisher.tick(&ctx).await;
+        assert!(publisher.last_publish.is_none());
+        assert_eq!(publisher.persisted.last_stamp, None);
+        assert!(published_seqs(&client, &ctx).await.is_empty());
+
+        for stmt in ["DROP TRIGGER no_seq_insert", "DROP TRIGGER no_seq_update"] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+        publisher.tick(&ctx).await;
+        assert_eq!(published_seqs(&client, &ctx).await, vec!["1".to_string()]);
+        assert_eq!(
+            load_persisted(&pool)
+                .await
+                .unwrap()
+                .last_stamp
+                .map(|s| s.seq),
+            Some(1)
+        );
     }
 
     #[tokio::test]

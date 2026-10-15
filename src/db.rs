@@ -2406,6 +2406,7 @@ mod tests {
                 dev_fee_payment_hash char(64),
                 dev_fee_failed_attempts integer not null default 0,
                 dev_fee_next_attempt_at integer,
+                dev_fee_failed_hash char(64),
                 cashu_mint_url text,
                 cashu_escrow_token text,
                 cashu_escrow_locked_at integer,

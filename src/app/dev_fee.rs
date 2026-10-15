@@ -61,9 +61,10 @@
 //!
 //! ## Retry backoff
 //!
-//! Every failed attempt (LNURL resolution, payment failure, or a timeout
-//! that LND confirms as failed) is recorded per order with
-//! [`record_dev_fee_failure`]: it bumps `dev_fee_failed_attempts` and sets
+//! Every failed attempt (LNURL resolution, payment failure, a timeout that
+//! LND confirms as failed, or a payment the next cycle's recovery finds
+//! failed) is recorded per order with [`record_dev_fee_failure`], once per
+//! payment hash: it bumps `dev_fee_failed_attempts` and sets
 //! `dev_fee_next_attempt_at`, before which `find_unpaid_dev_fees` does not
 //! hand the order to Phase 4. The delay doubles from
 //! [`DEV_FEE_RETRY_BASE_SECS`] up to [`DEV_FEE_RETRY_MAX_SECS`], with jitter
@@ -447,22 +448,7 @@ async fn recover_partial_payments(
                     "Order {} existing payment failed (hash {}), clearing for retry",
                     order_id, existing_hash
                 );
-                // Targeted update: clear hash only if it still matches the one we checked.
-                if let Err(e) = sqlx::query(
-                    "UPDATE orders
-                     SET dev_fee_payment_hash = NULL
-                     WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
-                )
-                .bind(order_id)
-                .bind(&existing_hash)
-                .execute(pool)
-                .await
-                {
-                    error!(
-                        "Failed to clear failed payment hash for order {}: {:?}",
-                        order_id, e
-                    );
-                }
+                clear_failed_payment_hash(pool, order_id, &existing_hash).await;
             }
             DevFeePaymentState::InFlight => {
                 info!(
@@ -542,7 +528,7 @@ async fn process_new_dev_fee_payments(
                     order_id, e
                 );
                 release_pending_claim(pool, order_id, &pending_marker).await;
-                record_dev_fee_failure(pool, order_id).await;
+                record_dev_fee_failure(pool, order_id, None).await;
                 continue;
             }
             Err(_) => {
@@ -551,7 +537,7 @@ async fn process_new_dev_fee_payments(
                     order_id
                 );
                 release_pending_claim(pool, order_id, &pending_marker).await;
-                record_dev_fee_failure(pool, order_id).await;
+                record_dev_fee_failure(pool, order_id, None).await;
                 continue;
             }
         };
@@ -719,7 +705,7 @@ async fn handle_payment_success(
 }
 
 async fn handle_payment_failure(
-    _order: Order,
+    order: Order,
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     e: &MostroError,
@@ -750,7 +736,7 @@ async fn handle_payment_failure(
             order_id, db_err
         );
     }
-    record_dev_fee_failure(pool, order_id).await;
+    record_dev_fee_failure(pool, order_id, order.dev_fee_payment_hash.as_deref()).await;
 }
 
 async fn handle_payment_timeout(
@@ -816,7 +802,7 @@ async fn handle_payment_timeout(
                     order_id, e
                 );
             }
-            record_dev_fee_failure(pool, order_id).await;
+            record_dev_fee_failure(pool, order_id, order.dev_fee_payment_hash.as_deref()).await;
         }
         DevFeePaymentState::Unknown | DevFeePaymentState::NotOnThisNode => {
             warn!(
@@ -849,35 +835,55 @@ pub(crate) fn dev_fee_retry_delay_secs(failed_attempts: i64, jitter: f64) -> i64
 /// [`find_unpaid_dev_fees`] skips the order until then. Never touches a paid
 /// order. Logged, not propagated: a failed write only means the order may be
 /// retried sooner, as it was before backoff existed.
-pub(crate) async fn record_dev_fee_failure(pool: &SqlitePool, order_id: uuid::Uuid) {
-    let previous = match sqlx::query_scalar::<_, i64>(
-        "SELECT dev_fee_failed_attempts FROM orders WHERE id = ? AND dev_fee_paid = 0",
+///
+/// `payment_hash` is the hash of the attempt that failed, when there is one.
+/// A failure is counted once per hash: the send that fails and the next
+/// cycle's recovery, which sees the same hash `Failed` in LND, both report
+/// it. A failure without a hash (the LNURL invoice could not be resolved) is
+/// always counted.
+///
+/// The count is incremented by one `UPDATE ... RETURNING`, so concurrent
+/// failures never overwrite each other; the delay is then written only if no
+/// later failure has been counted in between.
+pub(crate) async fn record_dev_fee_failure(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    payment_hash: Option<&str>,
+) {
+    let failed_attempts = match sqlx::query_scalar::<_, i64>(
+        "UPDATE orders
+         SET dev_fee_failed_attempts = dev_fee_failed_attempts + 1,
+             dev_fee_failed_hash = ?2
+         WHERE id = ?1 AND dev_fee_paid = 0
+           AND (?2 IS NULL OR dev_fee_failed_hash IS NULL OR dev_fee_failed_hash != ?2)
+         RETURNING dev_fee_failed_attempts",
     )
     .bind(order_id)
+    .bind(payment_hash)
     .fetch_optional(pool)
     .await
     {
-        Ok(Some(previous)) => previous,
+        Ok(Some(failed_attempts)) => failed_attempts,
+        // Paid, gone, or this hash's failure was already counted.
         Ok(None) => return,
         Err(e) => {
             error!(
-                "Failed to read dev fee attempts for order {}: {:?}",
+                "Failed to count the dev fee failure for order {}: {:?}",
                 order_id, e
             );
             return;
         }
     };
-    let failed_attempts = previous.saturating_add(1);
     let delay = dev_fee_retry_delay_secs(failed_attempts, rand::random::<f64>());
     let next_attempt_at = Utc::now().timestamp().saturating_add(delay);
     match sqlx::query(
         "UPDATE orders
-         SET dev_fee_failed_attempts = ?, dev_fee_next_attempt_at = ?
-         WHERE id = ? AND dev_fee_paid = 0",
+         SET dev_fee_next_attempt_at = ?
+         WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_failed_attempts = ?",
     )
-    .bind(failed_attempts)
     .bind(next_attempt_at)
     .bind(order_id)
+    .bind(failed_attempts)
     .execute(pool)
     .await
     {
@@ -890,6 +896,31 @@ pub(crate) async fn record_dev_fee_failure(pool: &SqlitePool, order_id: uuid::Uu
             order_id, e
         ),
     }
+}
+
+/// Phase 3 found `existing_hash` `Failed` in LND: clear it so the order can
+/// be paid again, and count the failure if the send that made it did not
+/// (a payment that timed out in flight and failed later), so the retry still
+/// waits for its backoff instead of going out in Phase 4 of this same cycle.
+async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, existing_hash: &str) {
+    // Targeted update: clear hash only if it still matches the one we checked.
+    if let Err(e) = sqlx::query(
+        "UPDATE orders
+         SET dev_fee_payment_hash = NULL
+         WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+    )
+    .bind(order_id)
+    .bind(existing_hash)
+    .execute(pool)
+    .await
+    {
+        error!(
+            "Failed to clear failed payment hash for order {}: {:?}",
+            order_id, e
+        );
+        return;
+    }
+    record_dev_fee_failure(pool, order_id, Some(existing_hash)).await;
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -1761,6 +1792,82 @@ mod tests {
         );
     }
 
+    /// Codex review on #1064: a payment that timed out in flight is not
+    /// counted when the timeout fires; when the next cycle's recovery finds it
+    /// `Failed`, it must be counted and backed off, not resent in Phase 4 of
+    /// that same cycle.
+    #[tokio::test]
+    async fn recovery_counts_a_failure_the_send_did_not() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+
+        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH).await;
+
+        let (hash, attempts, next_at): (Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_payment_hash, dev_fee_failed_attempts, dev_fee_next_attempt_at \
+             FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hash, None);
+        assert_eq!(attempts, 1);
+        assert!(next_at.unwrap() > chrono::Utc::now().timestamp());
+        let eligible = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(eligible.iter().all(|o| o.id != id));
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_counted_once_per_hash() {
+        use mostro_core::order::Order;
+        use mostro_core::prelude::ServiceError;
+
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let err = MostroError::MostroInternalErr(ServiceError::LnPaymentError(
+            "payment failed: reason 2".to_string(),
+        ));
+
+        // The send fails, then the next cycle's recovery sees the same hash.
+        handle_payment_failure(order, &pool, id, &err).await;
+        super::clear_failed_payment_hash(&pool, id, VALID_HEX_HASH).await;
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_failures_are_all_counted() {
+        use super::record_dev_fee_failure;
+
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+
+        futures::future::join_all((0..5).map(|_| record_dev_fee_failure(&pool, id, None))).await;
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 5);
+    }
+
     #[test]
     fn dev_fee_retry_delay_doubles_up_to_the_cap() {
         use super::{dev_fee_retry_delay_secs, DEV_FEE_RETRY_BASE_SECS, DEV_FEE_RETRY_MAX_SECS};
@@ -1810,8 +1917,10 @@ mod tests {
         insert_test_order(&pool, failing, "success", 100, false, None).await;
         insert_test_order(&pool, healthy, "success", 100, false, None).await;
 
-        record_dev_fee_failure(&pool, failing).await;
-        record_dev_fee_failure(&pool, failing).await;
+        let before = chrono::Utc::now().timestamp();
+        record_dev_fee_failure(&pool, failing, None).await;
+        record_dev_fee_failure(&pool, failing, None).await;
+        let after = chrono::Utc::now().timestamp();
 
         let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",
@@ -1821,10 +1930,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 2);
-        let now = chrono::Utc::now().timestamp();
-        let wait = next_at.expect("backoff recorded") - now;
-        // Second failure: 2 × base, plus up to 25% jitter (allow 2s of clock).
-        assert!((118..=152).contains(&wait), "unexpected wait {wait}s");
+        let next_at = next_at.expect("backoff recorded");
+        // Second failure: 2 × base, plus up to 25% jitter, from a clock read
+        // between `before` and `after`.
+        assert!(
+            (before + 120..=after + 150).contains(&next_at),
+            "next attempt at {next_at}, expected within [{}, {}]",
+            before + 120,
+            after + 150
+        );
+        let now = after;
 
         // Only the order that failed waits; the other is still due.
         let eligible: Vec<_> = super::find_unpaid_dev_fees(&pool)
@@ -1854,7 +1969,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         insert_test_order(&pool, id, "success", 100, true, Some(VALID_HEX_HASH)).await;
 
-        record_dev_fee_failure(&pool, id).await;
+        record_dev_fee_failure(&pool, id, None).await;
 
         let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",

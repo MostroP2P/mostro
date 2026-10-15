@@ -993,7 +993,7 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
 
 #### Retry backoff
 
-Every failed attempt for an order (LNURL resolution failure or timeout, payment failure, or a payment timeout that LND confirms as failed) is recorded by `record_dev_fee_failure` in `src/app/dev_fee.rs`:
+Every failed attempt for an order (LNURL resolution failure or timeout, payment failure, a payment timeout that LND confirms as failed, or a payment that Phase 3 finds failed on the next cycle, for example one that timed out in flight) is recorded by `record_dev_fee_failure` in `src/app/dev_fee.rs`, once per payment hash (`dev_fee_failed_hash`), so a failure seen both when the send fails and again by Phase 3 counts once:
 
 - `dev_fee_failed_attempts` counts the consecutive failed attempts.
 - `dev_fee_next_attempt_at` is set to now plus a delay that doubles from 60 seconds up to one hour (60s, 120s, 240s, ... 3600s), plus up to 25% random jitter.
@@ -1027,6 +1027,7 @@ ALTER TABLE orders ADD COLUMN dev_fee_payment_hash CHAR(64);
 | `dev_fee_payment_hash` | CHAR(64) | NULL | Lightning payment hash for reconciliation |
 | `dev_fee_failed_attempts` | INTEGER | 0 | Consecutive failed attempts, drives the retry backoff (`migrations/20261015120000_dev_fee_retry_backoff.sql`) |
 | `dev_fee_next_attempt_at` | INTEGER | NULL | Unix seconds before which the order is not retried; NULL means no backoff |
+| `dev_fee_failed_hash` | CHAR(64) | NULL | Payment hash whose failure was last counted, so one failure is never counted twice |
 
 ### Backward Compatibility
 
@@ -1461,15 +1462,18 @@ WHERE status = 'pending'
 
 For orders with unpaid dev fees:
 
+Order ids are stored as 16-byte BLOBs (sqlx binds `uuid::Uuid` as a BLOB), so compare them through `hex(id)`; `<order_id>` below is the UUID as it appears in the logs.
+
 1. Identify unpaid fees, with their retry state:
 ```sql
-SELECT id, dev_fee, dev_fee_failed_attempts, dev_fee_next_attempt_at
+SELECT lower(hex(id)) AS id_hex, dev_fee, dev_fee_failed_attempts, dev_fee_next_attempt_at
 FROM orders WHERE dev_fee_paid = 0 AND dev_fee > 0;
 ```
 
    To make the daemon retry an order right away instead of paying it by hand, clear its backoff:
 ```sql
-UPDATE orders SET dev_fee_next_attempt_at = NULL WHERE id = '<order_id>';
+UPDATE orders SET dev_fee_next_attempt_at = NULL
+WHERE hex(id) = upper(replace('<order_id>', '-', ''));
 ```
 
 2. Use Lightning CLI to manually pay:
@@ -1481,7 +1485,7 @@ lncli payinvoice <invoice_from_lnurl>
 ```sql
 UPDATE orders
 SET dev_fee_paid = 1, dev_fee_payment_hash = '<payment_hash>'
-WHERE id = '<order_id>';
+WHERE hex(id) = upper(replace('<order_id>', '-', ''));
 ```
 
 ## Security Considerations

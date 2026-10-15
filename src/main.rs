@@ -286,8 +286,10 @@ async fn main() -> Result<()> {
     }
 
     let mut ln_client = LndConnector::new().await?;
-    let ln_status = ln_client.get_node_info().await?;
-    let ln_status = LnStatus::from_get_info_response(ln_status);
+    let node_info = ln_client.get_node_info().await?;
+    // Seeds the LND sync state before any payment job starts (#1063).
+    let startup_sync = app::health::lnd_sync::LndObservation::from(&node_info);
+    let ln_status = LnStatus::from_get_info_response(node_info);
     let node_pubkey = ln_status.node_pubkey.clone();
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
@@ -425,6 +427,13 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
+    // Payouts and dev fees must not go out against an unsynced node before
+    // the sync monitor's first poll (#1063).
+    let lnd_sync = app::health::lnd_sync::LndSyncState::new();
+    lnd_sync.observe_at_startup(startup_sync, chrono::Utc::now().timestamp());
+    if lnd_sync.defers_outgoing_payments(chrono::Utc::now().timestamp()) {
+        tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
+    }
     let ctx = AppContext::new(
         get_db_pool(),
         client.clone(),
@@ -432,7 +441,8 @@ async fn main() -> Result<()> {
         MESSAGE_QUEUES.queue_order_msg.clone(),
         mostro_keys.clone(),
     )
-    .with_maintenance(maintenance);
+    .with_maintenance(maintenance)
+    .with_lnd_sync(lnd_sync);
 
     // Start scheduler for tasks
     start_scheduler(ctx.clone()).await;

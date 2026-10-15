@@ -513,6 +513,21 @@ impl AdminService for AdminServiceImpl {
             "Received SetMaintenanceMode(enabled={}) from {ip}, request_id: {:?}",
             req.enabled, req.request_id
         );
+        // `lnd_unsynced` marks maintenance the daemon turned on by itself
+        // (#1063); an operator using it would make readers of the health and
+        // info events take their maintenance for the daemon's.
+        if req.reason.as_deref().map(str::trim)
+            == Some(crate::app::maintenance::REASON_LND_UNSYNCED)
+        {
+            warn!("SetMaintenanceMode refused: the reason is reserved for the daemon");
+            return Ok(Response::new(SetMaintenanceModeResponse {
+                success: false,
+                error_message: Some(format!(
+                    "the reason \"{}\" is reserved for maintenance the daemon enables by itself",
+                    crate::app::maintenance::REASON_LND_UNSYNCED
+                )),
+            }));
+        }
         match self
             .maintenance
             .set(&self.pool, req.enabled, req.reason.as_deref())
@@ -891,6 +906,28 @@ mod tests {
         assert!(!status.enabled);
         assert_eq!(status.reason, None);
         assert_eq!(status.since, None);
+    }
+
+    #[tokio::test]
+    async fn set_maintenance_mode_rejects_the_reserved_reason() {
+        let service = offline_service().await;
+
+        let resp = service
+            .set_maintenance_mode(request_with_addr(
+                SetMaintenanceModeRequest {
+                    enabled: true,
+                    reason: Some(" lnd_unsynced ".into()),
+                    request_id: None,
+                },
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error_message.unwrap().contains("reserved"));
+        assert!(!service.maintenance.is_enabled(), "nothing changed");
     }
 
     #[tokio::test]

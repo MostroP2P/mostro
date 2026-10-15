@@ -23,9 +23,14 @@ pub const KEY_SINCE: &str = "maintenance_since";
 /// Written by the boot node-identity guard (Phase 4); read by the status RPC.
 pub const KEY_LN_NODE_PUBKEY: &str = "ln_node_pubkey";
 /// Reason the daemon stores when it enters maintenance by itself because LND
-/// stopped being synced to chain (issue #1063). Reserved: maintenance with
-/// any other reason was set by an operator, and the daemon never lifts it.
+/// stopped being synced to chain (issue #1063). Reserved: the admin RPC
+/// refuses it, so an operator can never set it.
 pub const REASON_LND_UNSYNCED: &str = "lnd_unsynced";
+/// `"1"` while the current maintenance was turned on by the daemon itself
+/// (`enable_unless_enabled`), `"0"` once anyone else wrote the flag. What the
+/// daemon checks before lifting maintenance: ownership is never inferred
+/// from the reason text.
+pub const KEY_AUTOMATIC: &str = "maintenance_automatic";
 
 /// Process-wide maintenance flag, backed by `daemon_state`.
 ///
@@ -92,13 +97,14 @@ impl MaintenanceState {
         reason: Option<&str>,
     ) -> Result<(), MostroError> {
         let _guard = self.write_lock.lock().await;
-        self.write(pool, enabled, reason).await
+        self.write(pool, enabled, reason, false).await
     }
 
-    /// Enable maintenance with `reason`, unless it is already on. Returns
-    /// whether this call turned it on. Used by the daemon itself (reason
+    /// Enable maintenance with `reason`, unless it is already on, and mark
+    /// it as the daemon's own ([`KEY_AUTOMATIC`]). Returns whether this call
+    /// turned it on. Used by the daemon itself (reason
     /// [`REASON_LND_UNSYNCED`]): maintenance an operator already set keeps
-    /// its own reason, so the daemon can never later lift it by mistake.
+    /// its own reason and ownership, so the daemon can never lift it.
     pub async fn enable_unless_enabled(
         &self,
         pool: &SqlitePool,
@@ -108,27 +114,24 @@ impl MaintenanceState {
         if self.is_enabled() {
             return Ok(false);
         }
-        self.write(pool, true, Some(reason)).await?;
+        self.write(pool, true, Some(reason), true).await?;
         Ok(true)
     }
 
-    /// Disable maintenance only if it is on and its stored reason is still
-    /// `reason`. Returns whether this call turned it off. The reason is read
-    /// under the write lock, so an operator who re-enables maintenance with
-    /// their own reason in between always wins.
-    pub async fn disable_if_reason(
-        &self,
-        pool: &SqlitePool,
-        reason: &str,
-    ) -> Result<bool, MostroError> {
+    /// Disable maintenance only if it is on and still the daemon's own: no
+    /// operator has written the flag since `enable_unless_enabled` turned it
+    /// on. Returns whether this call turned it off. Ownership is read under
+    /// the write lock, so an operator who takes maintenance over in between
+    /// always wins, whatever reason they give.
+    pub async fn disable_if_automatic(&self, pool: &SqlitePool) -> Result<bool, MostroError> {
         let _guard = self.write_lock.lock().await;
         if !self.is_enabled() {
             return Ok(false);
         }
-        if daemon_state::get(pool, KEY_REASON).await?.as_deref() != Some(reason) {
+        if daemon_state::get(pool, KEY_AUTOMATIC).await?.as_deref() != Some("1") {
             return Ok(false);
         }
-        self.write(pool, false, None).await?;
+        self.write(pool, false, None, false).await?;
         Ok(true)
     }
 
@@ -142,12 +145,13 @@ impl MaintenanceState {
             .filter(|reason| !reason.is_empty()))
     }
 
-    /// Write the three rows and flip the flag. Callers hold `write_lock`.
+    /// Write the rows and flip the flag. Callers hold `write_lock`.
     async fn write(
         &self,
         pool: &SqlitePool,
         enabled: bool,
         reason: Option<&str>,
+        automatic: bool,
     ) -> Result<(), MostroError> {
         let since = if enabled {
             chrono::Utc::now().timestamp().to_string()
@@ -161,6 +165,7 @@ impl MaintenanceState {
         daemon_state::set_in(&mut tx, KEY_ENABLED, if enabled { "1" } else { "0" }).await?;
         daemon_state::set_in(&mut tx, KEY_REASON, reason.unwrap_or_default()).await?;
         daemon_state::set_in(&mut tx, KEY_SINCE, &since).await?;
+        daemon_state::set_in(&mut tx, KEY_AUTOMATIC, if automatic { "1" } else { "0" }).await?;
         tx.commit()
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -635,10 +640,7 @@ mod tests {
             .unwrap();
         state.set(&pool, true, Some("upgrade")).await.unwrap();
 
-        let turned_off = state
-            .disable_if_reason(&pool, REASON_LND_UNSYNCED)
-            .await
-            .unwrap();
+        let turned_off = state.disable_if_automatic(&pool).await.unwrap();
 
         assert!(!turned_off);
         assert!(state.is_enabled());
@@ -648,8 +650,38 @@ mod tests {
         );
     }
 
+    /// Codex review on #1065: ownership must not be inferred from the reason.
+    /// Maintenance an operator set, even with the reserved reason text, is
+    /// never lifted by the daemon.
     #[tokio::test]
-    async fn disable_if_reason_lifts_the_daemons_own_maintenance() {
+    async fn operator_maintenance_with_the_reserved_reason_is_not_lifted() {
+        let pool = pool().await;
+        let state = MaintenanceState::load(&pool).await.unwrap();
+        state
+            .set(&pool, true, Some(REASON_LND_UNSYNCED))
+            .await
+            .unwrap();
+
+        assert!(!state.disable_if_automatic(&pool).await.unwrap());
+        assert!(state.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn automatic_ownership_survives_a_restart() {
+        let pool = pool().await;
+        MaintenanceState::load(&pool)
+            .await
+            .unwrap()
+            .enable_unless_enabled(&pool, REASON_LND_UNSYNCED)
+            .await
+            .unwrap();
+        let restarted = MaintenanceState::load(&pool).await.unwrap();
+        assert!(restarted.disable_if_automatic(&pool).await.unwrap());
+        assert!(!restarted.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn disable_if_automatic_lifts_the_daemons_own_maintenance() {
         let pool = pool().await;
         let state = MaintenanceState::load(&pool).await.unwrap();
         state
@@ -657,19 +689,13 @@ mod tests {
             .await
             .unwrap();
 
-        let turned_off = state
-            .disable_if_reason(&pool, REASON_LND_UNSYNCED)
-            .await
-            .unwrap();
+        let turned_off = state.disable_if_automatic(&pool).await.unwrap();
 
         assert!(turned_off);
         assert!(!state.is_enabled());
         assert_eq!(state.reason(&pool).await.unwrap(), None);
         // Already off: nothing to do.
-        assert!(!state
-            .disable_if_reason(&pool, REASON_LND_UNSYNCED)
-            .await
-            .unwrap());
+        assert!(!state.disable_if_automatic(&pool).await.unwrap());
     }
 
     #[test]

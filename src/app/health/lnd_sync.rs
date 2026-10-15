@@ -17,7 +17,8 @@
 //!   enters maintenance with reason [`REASON_LND_UNSYNCED`], so no new escrow
 //!   is opened that it could not pay out, and lifts it again once LND has been
 //!   synced for `[health].lnd_resynced_clear_after` seconds, but only if the
-//!   reason is still its own.
+//!   maintenance is still its own (`KEY_AUTOMATIC`, never inferred from the
+//!   reason text).
 //! - The `lnd_sync` check of the health event.
 
 use crate::app::context::AppContext;
@@ -212,6 +213,23 @@ impl LndSyncState {
         self.write().observe(observation, now)
     }
 
+    /// Seed the state with the `GetInfo` mostrod made at startup, before any
+    /// job that sends payments starts. The grace period that keeps a block's
+    /// few seconds of `synced_to_chain = false` from holding payouts back
+    /// does not apply here: at startup there is no telling how long the node
+    /// has been unsynced, and a burst of retries of persisted failed payouts
+    /// against a stale chain would burn the buyers' attempts. If it is
+    /// unsynced, payments wait from the first moment; a node that was only
+    /// between blocks reports synced on the next poll, 15 s later.
+    pub fn observe_at_startup(&self, observation: LndObservation, now: i64) {
+        let mut state = self.write();
+        let synced = observation.synced_to_chain;
+        state.observe(observation, now);
+        if !synced {
+            state.unhealthy_since = Some(now.saturating_sub(PAYMENT_DEFER_AFTER_SECS));
+        }
+    }
+
     /// Record a failed or timed-out `GetInfo`.
     pub fn observe_unreachable(&self, now: i64) -> Option<SyncTransition> {
         self.write().observe_unreachable(now)
@@ -259,7 +277,8 @@ pub fn log_transition(transition: SyncTransition, snapshot: &LndSyncSnapshot) {
 pub enum AutoMaintenance {
     /// Enter maintenance with reason [`REASON_LND_UNSYNCED`].
     Enable,
-    /// Leave maintenance, if its reason is still [`REASON_LND_UNSYNCED`].
+    /// Leave maintenance, if it is still the daemon's own (turned on with
+    /// [`REASON_LND_UNSYNCED`] and not taken over by an operator since).
     Disable,
     Nothing,
 }
@@ -291,7 +310,7 @@ pub fn auto_maintenance_decision(
 
 /// Apply [`auto_maintenance_decision`] to the context's maintenance flag.
 /// Returns what was actually changed: `Disable` is only reported when the
-/// stored reason was still the daemon's own.
+/// maintenance was still the daemon's own.
 pub async fn apply_auto_maintenance(
     ctx: &AppContext,
     now: i64,
@@ -319,10 +338,7 @@ pub async fn apply_auto_maintenance(
             Ok(AutoMaintenance::Nothing)
         }
         AutoMaintenance::Disable => {
-            if maintenance
-                .disable_if_reason(ctx.pool(), REASON_LND_UNSYNCED)
-                .await?
-            {
+            if maintenance.disable_if_automatic(ctx.pool()).await? {
                 warn!(
                     "LND has been synced to chain for {}s: maintenance mode OFF (it was turned on by the daemon)",
                     ctx.settings().health.lnd_resynced_clear_after
@@ -459,6 +475,31 @@ mod tests {
             "a new spell starts its own clock"
         );
         assert_eq!(state.snapshot().unhealthy_since, Some(T0 + 120));
+    }
+
+    /// Codex review on #1065: at startup the retry job must not dispatch
+    /// persisted failed payouts against an unsynced node, neither before
+    /// the monitor's first poll nor during the usual 60 s grace period.
+    #[test]
+    fn an_unsynced_node_at_startup_defers_payments_at_once() {
+        let state = LndSyncState::new();
+        state.observe_at_startup(observation(false), T0);
+        assert!(state.defers_outgoing_payments(T0));
+        // The lnd_sync check itself still dates the spell from startup.
+        assert_eq!(state.snapshot().sync_check(T0, 600), CheckState::Warn);
+        // The monitor's polls keep it deferred, and a synced poll ends it.
+        state.observe(observation(false), T0 + 15);
+        assert!(state.defers_outgoing_payments(T0 + 15));
+        state.observe(observation(true), T0 + 30);
+        assert!(!state.defers_outgoing_payments(T0 + 30));
+    }
+
+    #[test]
+    fn a_synced_node_at_startup_defers_nothing() {
+        let state = LndSyncState::new();
+        state.observe_at_startup(observation(true), T0);
+        assert!(!state.defers_outgoing_payments(T0));
+        assert_eq!(state.snapshot().sync_check(T0, 600), CheckState::Ok);
     }
 
     #[test]

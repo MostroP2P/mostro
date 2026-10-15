@@ -26,7 +26,7 @@ An observation older than three polls is not trusted: if the monitor itself stop
 
 ## Outgoing payments wait
 
-Once LND has been unsynced or has not answered, in any mix, for **60 seconds** without a synced answer in between (`PAYMENT_DEFER_AFTER_SECS`), outgoing payments wait instead of failing. Moving between the two unhealthy states does not restart that clock. LND reports `synced_to_chain = false` for a few seconds whenever a block arrives; that does not hold anything back.
+Once LND has been unsynced or has not answered, in any mix, for **60 seconds** without a synced answer in between (`PAYMENT_DEFER_AFTER_SECS`), outgoing payments wait instead of failing. Moving between the two unhealthy states does not restart that clock. At startup there is no grace period: mostrod seeds this state from the `GetInfo` it makes while booting, and if LND is unsynced then, payments wait from the first moment, before any payment job runs. LND reports `synced_to_chain = false` for a few seconds whenever a block arrives; that does not hold anything back.
 
 | Payment | While deferred |
 |---|---|
@@ -37,7 +37,7 @@ Once LND has been unsynced or has not answered, in any mix, for **60 seconds** w
 
 ## Fail closed: automatic maintenance
 
-When LND has been unsynced for `[health].lnd_unsynced_fail_after` seconds (600 by default), the `lnd_sync` check is `fail` and the daemon enters maintenance mode with the reserved reason `lnd_unsynced`: new orders and takes are rejected, open trades can still be released, canceled and disputed. It leaves maintenance once LND has been synced for `[health].lnd_resynced_clear_after` seconds (300 by default), **only if the reason is still `lnd_unsynced`**. Maintenance an operator set is never overwritten or lifted. See [MAINTENANCE_MODE_LN_MIGRATION.md](MAINTENANCE_MODE_LN_MIGRATION.md) §3.8.
+When LND has been unsynced for `[health].lnd_unsynced_fail_after` seconds (600 by default), the `lnd_sync` check is `fail` and the daemon enters maintenance mode with the reserved reason `lnd_unsynced`: new orders and takes are rejected, open trades can still be released, canceled and disputed. It leaves maintenance once LND has been synced for `[health].lnd_resynced_clear_after` seconds (300 by default), **only if it is still the daemon's own** (a separate `maintenance_automatic` marker, never inferred from the reason). Maintenance an operator set is never overwritten or lifted, and `SetMaintenanceMode` refuses the reserved reason `lnd_unsynced`. See [MAINTENANCE_MODE_LN_MIGRATION.md](MAINTENANCE_MODE_LN_MIGRATION.md) §3.8.
 
 An LND that does not answer at all makes the check `unknown`, not `fail`, so it does not turn maintenance on by itself; outgoing payments still wait.
 

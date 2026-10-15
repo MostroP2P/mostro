@@ -6,10 +6,11 @@ figures they earned there.
 
 Status: **import implemented, export in review.** The specification, the
 shared types, the `since` rollout, mostrod as a destination (import and
-revocation) and lnp2pBot as an issuer are merged. Exporting from mostrod
-(phase 4) and the two apps (phases 5 and 5b) are in review. Section 11 tracks
-every pull request and explains how to operate what has landed. The open
-decisions were closed on 2026-10-03 with their defaults (section 10).
+revocation), lnp2pBot as an issuer and the 2.x app (phase 5b) are merged.
+Exporting from mostrod (phase 4) and the 1.x app (phase 5) are in review.
+Section 11 tracks every pull request and explains how to operate what has
+landed. The open decisions were closed on 2026-10-03 with their defaults
+(section 10).
 
 ## 1. Goals
 
@@ -827,7 +828,7 @@ with it.
 | 3, import | #1028 (3.1), #1029 (3.2), #1030 (3.3), #1031 (3.4), #1032 (3.5) | Merged. 3.1 shipped in mostrod 0.19.3; 3.2–3.5 ship in the next release |
 | 4, export | #1033 (4.1), #1034 (4.2), #1035 (4.3) | In review |
 | 5, mobile | MostroP2P/mobile#742 (5.1), #743 (5.2), #744 (5.3), #745 (5.4) | In review |
-| 5b, app | MostroP2P/app#675 (5b.1), #676 (5b.2), #677 (5b.3) | 5b.1 and 5b.2 merged; 5b.3 in review |
+| 5b, app | MostroP2P/app#675 (5b.1), #676 (5b.2), #827 (5b.3, replaces #677) | Merged; not yet in an app release |
 | 6, lnp2pBot | lnp2pBot/bot#932 (6.1), #933 (6.2), #934 (6.3) | Merged |
 
 Where the code departs from the text above:
@@ -854,7 +855,8 @@ Phase 7 of section 9, step by step:
    empty issuer list.
 3. Pending: merge phase 4, release lnp2pBot with `REPUTATION_ISSUER_SK`, then
    add both issuer keys to the reference instance's trust list.
-4. Pending: ship mobile with phases 5.1–5.4 and app with 5b.1–5b.3.
+4. Pending: ship mobile with phases 5.1–5.4, and release app with 5b.1–5b.3,
+   which are merged.
 5. Operator side: this section, the settings template and
    `docs/STARTUP_AND_CONFIG.md`; the export guide comes with phase 4. User
    side: in-app help, pending.

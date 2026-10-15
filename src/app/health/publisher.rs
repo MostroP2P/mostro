@@ -41,9 +41,10 @@ pub const MIN_REPUBLISH_SECS: u64 = 10;
 /// Bound on the database probe (`database` check), and on each database
 /// read or write the job makes after it.
 const DATABASE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bound on the Cashu mint probes (10 s each, in parallel) plus the read of
-/// the mints holding escrow.
-const CASHU_MINT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on the Cashu mint probes (10 s each, in parallel, plus the host
+/// check on an open node). Reading the mints holding escrow is part of the
+/// database budget instead.
+const CASHU_MINT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound on `ListChannels`.
 const LND_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -534,17 +535,27 @@ impl Publisher {
             }
         }
         if let Some(cashu) = settings.cashu.as_ref().filter(|cashu| cashu.enabled) {
-            // An open node finds its mints in the database: without it, which
-            // mints to probe is unknown. The allowlist needs no database.
-            let state = if !database_ok && cashu.mint_urls.is_empty() {
-                CheckState::Unknown
-            } else {
-                tokio::time::timeout(
-                    CASHU_MINT_CHECK_TIMEOUT,
-                    crate::app::health::cashu_mint::cashu_mint_check(pool, cashu),
-                )
+            use crate::app::health::cashu_mint::{escrow_mints, probe_mints};
+            // An open node finds its mints in the database, read within the
+            // shared budget: without it, which mints to probe is unknown. The
+            // allowlist needs no database. The network probes have their own
+            // bound.
+            let open = cashu.mint_urls.is_empty();
+            let mints = if open {
+                bounded_db(database_ok, budget.remaining(), "escrow mints", async {
+                    escrow_mints(pool).await
+                })
                 .await
-                .unwrap_or(CheckState::Unknown)
+            } else {
+                Some(cashu.mint_urls.clone())
+            };
+            let state = match mints {
+                Some(mints) => {
+                    tokio::time::timeout(CASHU_MINT_PROBE_TIMEOUT, probe_mints(&mints, open))
+                        .await
+                        .unwrap_or(CheckState::Unknown)
+                }
+                None => CheckState::Unknown,
             };
             checks.push((CheckName::CashuMint, state));
         }
@@ -655,9 +666,22 @@ impl Publisher {
         };
         // Only a send at least one relay accepted counts as published: a
         // failed one is retried at the next evaluation instead of waiting a
-        // whole interval.
-        match ctx.nostr_client().send_event(&event).await {
-            Ok(output) if !output.success.is_empty() => {
+        // whole interval. Resolves at the first acceptance, so a relay that
+        // never answers does not hold the loop for its full ack timeout (the
+        // other relays still get the event).
+        let seq = stamp.seq;
+        match crate::publish::send_event_first_ack(ctx.nostr_client(), &event, move |report| {
+            if !report.failed.is_empty() {
+                warn!(
+                    "Health event seq {seq}: {} relay(s) did not accept it: {:?}",
+                    report.failed.len(),
+                    report.failed
+                );
+            }
+        })
+        .await
+        {
+            Ok(()) => {
                 info!(
                     "Published health event: status {}, seq {}",
                     evaluation.report.status.as_str(),
@@ -667,12 +691,8 @@ impl Publisher {
                 self.outage_unpublished = false;
                 self.last_signature = Some(evaluation.signature());
             }
-            Ok(output) => warn!(
-                "No relay accepted the health event (seq {}): {:?}; retrying next evaluation",
-                stamp.seq, output.failed
-            ),
             Err(e) => warn!(
-                "Could not publish the health event (seq {}): {e}; retrying next evaluation",
+                "No relay accepted the health event (seq {}): {e}; retrying next evaluation",
                 stamp.seq
             ),
         }
@@ -1186,6 +1206,105 @@ mod tests {
 
         let payouts = evaluation.content.payouts.unwrap();
         assert_eq!(payouts.last_payout_success_at, Some(NOW - 60));
+    }
+
+    /// Codex review on #1066: on an open Cashu node the mint list is read
+    /// within the shared database budget, not under its own 15 s timeout.
+    #[tokio::test]
+    async fn an_open_cashu_nodes_mint_read_stays_in_the_budget() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let mut settings = test_settings();
+        settings.cashu = Some(crate::config::types::CashuSettings {
+            enabled: true,
+            ..Default::default()
+        });
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(settings)
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        publisher.db_timeout = Duration::from_millis(100);
+        let _held = pool.acquire().await.unwrap();
+
+        let started = Instant::now();
+        let evaluation = publisher.evaluate(&ctx, NOW).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let mint = evaluation
+            .report
+            .checks
+            .iter()
+            .find(|(name, _, _)| *name == CheckName::CashuMint)
+            .map(|(_, state, _)| *state);
+        assert_eq!(
+            mint,
+            Some(CheckState::Unknown),
+            "which mints to probe is unknown"
+        );
+    }
+
+    /// Codex review on #1066: a relay that never acknowledges must not hold
+    /// the publication for its full ack timeout when another relay accepted.
+    #[tokio::test]
+    async fn a_silent_relay_does_not_delay_the_publication() {
+        use nostr_sdk::local_relay::{LocalRelay, MockRelay, WritePolicy, WritePolicyResult};
+        use nostr_sdk::prelude::{Client, Event, Keys};
+        use std::future::Future;
+        use std::net::SocketAddr;
+        use std::pin::Pin;
+
+        #[derive(Debug)]
+        struct NeverAnswers;
+        impl WritePolicy for NeverAnswers {
+            fn admit_event<'a>(
+                &'a self,
+                _event: &'a Event,
+                _addr: &'a SocketAddr,
+            ) -> Pin<Box<dyn Future<Output = WritePolicyResult> + Send + 'a>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        crate::config::init_test_nostr_keys();
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let healthy = MockRelay::run().await.expect("mock relay");
+        let silent = LocalRelay::builder().write_policy(NeverAnswers).build();
+        silent.run().await.expect("silent relay");
+        let client = Client::default();
+        client.add_relay(healthy.url().await).await.unwrap();
+        client.add_relay(silent.url().await).await.unwrap();
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(Keys::generate())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+
+        let started = Instant::now();
+        publisher.tick(&ctx).await;
+
+        assert!(
+            publisher.last_publish.is_some(),
+            "published via the healthy relay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not wait for the silent relay: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

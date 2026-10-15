@@ -14,7 +14,6 @@ use crate::app::health::check::CheckState;
 use crate::cashu::mint_answers_info;
 use crate::cashu::mint_policy::{normalize_mint_url, public_mint_addr};
 use crate::config::types::CashuSettings;
-use crate::db::TERMINAL_ORDER_STATUSES;
 use mostro_core::error::MostroError::{self, MostroInternalErr};
 use mostro_core::error::ServiceError;
 use sqlx::SqlitePool;
@@ -34,17 +33,19 @@ pub fn cashu_mint_state(reachable: &[bool]) -> CheckState {
     }
 }
 
+/// Order statuses an order with a locked escrow token can still be in: every
+/// status that is neither terminal nor before the escrow step. Listed
+/// positively (not as `NOT IN` the terminal ones) so the query below can
+/// seek the partial index `idx_orders_cashu_escrow_status` per status
+/// instead of walking every historical token. `escrow_holding_statuses_cover_every_status`
+/// keeps it in step with `Status`.
+pub(crate) const ESCROW_HOLDING_STATUSES: &str = "'waiting-buyer-invoice','waiting-payment',\
+'active','fiat-sent','dispute','settled-hold-invoice','in-progress'";
+
 /// Distinct mints that currently hold escrow: a locked escrow token on an
 /// order that is not terminal. Canonicalised so one mint is probed once.
 pub async fn escrow_mints(pool: &SqlitePool) -> Result<Vec<String>, MostroError> {
-    // The status list is a compile-time constant, never user input.
-    let query = format!(
-        "SELECT DISTINCT cashu_mint_url FROM orders \
-         WHERE cashu_mint_url IS NOT NULL AND cashu_mint_url != '' \
-           AND cashu_escrow_token IS NOT NULL AND cashu_escrow_token != '' \
-           AND status NOT IN ({TERMINAL_ORDER_STATUSES})"
-    );
-    let urls: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+    let urls: Vec<String> = sqlx::query_scalar(escrow_mints_query())
         .fetch_all(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -54,6 +55,17 @@ pub async fn escrow_mints(pool: &SqlitePool) -> Result<Vec<String>, MostroError>
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect())
+}
+
+/// The query behind [`escrow_mints`]. The status list is a compile-time
+/// constant, never user input.
+pub(crate) fn escrow_mints_query() -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
+        "SELECT DISTINCT cashu_mint_url FROM orders \
+         WHERE cashu_escrow_token IS NOT NULL AND cashu_escrow_token != '' \
+           AND cashu_mint_url IS NOT NULL AND cashu_mint_url != '' \
+           AND status IN ({ESCROW_HOLDING_STATUSES})"
+    ))
 }
 
 /// Probe one mint. A mint a maker chose (open node) gets the same public-host
@@ -83,6 +95,13 @@ pub async fn cashu_mint_check(pool: &SqlitePool, cashu: &CashuSettings) -> Check
     } else {
         cashu.mint_urls.clone()
     };
+    probe_mints(&mints, open).await
+}
+
+/// Probe `mints` (the allowlist, or on an open node the mints holding
+/// escrow) and derive the check. Network only: the health publisher reads
+/// the open node's mint list within its database budget and calls this.
+pub async fn probe_mints(mints: &[String], open: bool) -> CheckState {
     let probes = mints.iter().map(|mint| probe(mint, open));
     let reachable = futures::future::join_all(probes).await;
     for (mint, up) in mints.iter().zip(&reachable) {
@@ -139,6 +158,82 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    /// Keeps [`ESCROW_HOLDING_STATUSES`] in step with `Status`: a new status
+    /// must be classified here (the match is exhaustive) before it compiles.
+    #[test]
+    fn escrow_holding_statuses_cover_every_status() {
+        use mostro_core::order::Status;
+        let holds_escrow = |status: Status| match status {
+            Status::WaitingBuyerInvoice
+            | Status::WaitingPayment
+            | Status::Active
+            | Status::FiatSent
+            | Status::Dispute
+            | Status::SettledHoldInvoice
+            | Status::InProgress => true,
+            // Before the escrow step, or terminal.
+            Status::Pending
+            | Status::WaitingMakerBond
+            | Status::WaitingTakerBond
+            | Status::Canceled
+            | Status::CanceledByAdmin
+            | Status::SettledByAdmin
+            | Status::CompletedByAdmin
+            | Status::Expired
+            | Status::Success
+            | Status::CooperativelyCanceled => false,
+        };
+        for status in [
+            Status::WaitingBuyerInvoice,
+            Status::WaitingPayment,
+            Status::Active,
+            Status::FiatSent,
+            Status::Dispute,
+            Status::SettledHoldInvoice,
+            Status::InProgress,
+            Status::Pending,
+            Status::WaitingMakerBond,
+            Status::WaitingTakerBond,
+            Status::Canceled,
+            Status::CanceledByAdmin,
+            Status::SettledByAdmin,
+            Status::CompletedByAdmin,
+            Status::Expired,
+            Status::Success,
+            Status::CooperativelyCanceled,
+        ] {
+            let listed = ESCROW_HOLDING_STATUSES.contains(&format!("'{status}'"));
+            assert_eq!(listed, holds_escrow(status), "{status}");
+            let terminal = crate::db::TERMINAL_ORDER_STATUSES.contains(&format!("'{status}'"));
+            assert!(!(listed && terminal), "{status} cannot be both");
+        }
+    }
+
+    /// Codex review on #1066: the escrow mint query seeks the partial index
+    /// per status instead of walking every historical token.
+    #[tokio::test]
+    async fn escrow_mints_query_uses_the_partial_index() {
+        let pool = pool().await;
+        let plan: Vec<String> = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
+            format!("EXPLAIN QUERY PLAN {}", escrow_mints_query().0),
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, _, detail)| detail)
+        .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("idx_orders_cashu_escrow_status")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN orders")),
+            "{plan:?}"
+        );
     }
 
     #[test]

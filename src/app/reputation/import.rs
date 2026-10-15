@@ -4,13 +4,10 @@
 
 use crate::app::context::AppContext;
 use crate::config::types::ReputationImportSettings;
-use crate::db::{
-    insert_reputation_import, reputation_imports_for_identity, update_user_reputation,
-    ReputationImportRow,
-};
+use crate::db::{insert_reputation_import, update_user_reputation, ReputationImportRow};
 use crate::util::enqueue_order_msg;
 use mostro_core::prelude::*;
-use mostro_core::reputation::ReputationImport;
+use mostro_core::reputation::{AttestationError, ReputationImport};
 use nostr_sdk::prelude::*;
 
 /// The import settings, only when import is enabled on this node.
@@ -41,9 +38,28 @@ pub async fn import_reputation_action(
     }
 
     // Steps 1, 2 and 4: the event itself and the clock.
-    let (attestation, _) =
-        ReputationAttestation::parse_json(json, Timestamp::now(), import.max_lifetime_seconds)
+    let signed = Event::from_json(json)
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidReputationAttestation))?;
+    let (attestation, expired) = match ReputationAttestation::parse(
+        &signed,
+        Timestamp::now(),
+        import.max_lifetime_seconds,
+    ) {
+        Ok(attestation) => (attestation, false),
+        Err(AttestationError::Expired) => {
+            // Recheck the signed event at issuance, including the lifetime
+            // cap. This permits only recovery of an existing receipt below;
+            // it must never authorize a new import of an expired event.
+            let attestation = ReputationAttestation::parse(
+                &signed,
+                signed.created_at,
+                import.max_lifetime_seconds,
+            )
             .map_err(|e| MostroCantDo(e.cant_do_reason()))?;
+            (attestation, true)
+        }
+        Err(e) => return Err(MostroCantDo(e.cant_do_reason())),
+    };
     // Step 3: a trusted key, which from here on stands for its entry's name.
     let issuer = import
         .issuer_for(&attestation.issuer)
@@ -53,29 +69,41 @@ pub async fn import_reputation_action(
         return Err(MostroCantDo(CantDoReason::ReputationIdentityMismatch));
     }
 
+    let replayed = if expired {
+        // A restart can lose the reply until after expiration. Confirm only
+        // this exact committed import; a reversal removes its receipt.
+        if !is_recorded(ctx, &attestation, event).await? {
+            return Err(MostroCantDo(CantDoReason::ExpiredReputationAttestation));
+        }
+        true
+    } else {
+        match record_import(ctx, &issuer.name, &attestation, event).await {
+            Ok(_) => false,
+            // A valid retry, including one racing the original request.
+            Err(MostroCantDo(CantDoReason::ReputationAlreadyImported))
+                if is_recorded(ctx, &attestation, event).await? =>
+            {
+                true
+            }
+            Err(e) => return Err(e),
+        }
+    };
     // Name the trade key, as the reply's log line does: the identity key
     // would tie a long-lived identity to its import in the logs.
-    match record_import(ctx, &issuer.name, &attestation, event).await {
-        Ok(_) => tracing::info!(
+    if replayed {
+        tracing::info!(
+            "reputation: trade key {} resent attestation {}, already imported",
+            event.sender,
+            attestation.id
+        );
+    } else {
+        tracing::info!(
             "reputation: trade key {} imported {} ratings from `{}` (attestation {})",
             event.sender,
             attestation.reviews,
             issuer.name,
             attestation.id
-        ),
-        // This very attestation is already recorded: a retry whose first
-        // reply was lost, since the reply queue lives in memory. Confirm it
-        // again; nothing is merged twice.
-        Err(MostroCantDo(CantDoReason::ReputationAlreadyImported))
-            if is_recorded(ctx, &attestation, event).await? =>
-        {
-            tracing::info!(
-                "reputation: trade key {} resent attestation {}, already imported",
-                event.sender,
-                attestation.id
-            )
-        }
-        Err(e) => return Err(e),
+        );
     }
     enqueue_order_msg(
         kind.request_id,
@@ -148,9 +176,15 @@ async fn is_recorded(
     attestation: &ReputationAttestation,
     event: &UnwrappedMessage,
 ) -> Result<bool, MostroError> {
-    let id = attestation.id.to_hex();
-    let rows = reputation_imports_for_identity(ctx.pool(), &event.identity.to_hex()).await?;
-    Ok(rows.iter().any(|row| row.attestation_id == id))
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM reputation_imports \
+         WHERE attestation_id = ?1 AND identity_pubkey = ?2)",
+    )
+    .bind(attestation.id.to_hex())
+    .bind(event.identity.to_hex())
+    .fetch_one(ctx.pool())
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 #[cfg(test)]
@@ -158,7 +192,7 @@ mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::config::types::ReputationIssuer;
-    use crate::db::{add_new_user, is_user_present};
+    use crate::db::{add_new_user, is_user_present, reputation_imports_for_identity};
     use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
@@ -538,6 +572,43 @@ mod tests {
                 .unwrap()
                 .total_reviews,
             214
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_retry_still_obeys_the_current_import_policy() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = recorded_expired_attestation(&f, &identity).await;
+        for reason in [
+            CantDoReason::InvalidAction,
+            CantDoReason::UntrustedReputationIssuer,
+            CantDoReason::InvalidReputationAttestation,
+        ] {
+            let mut settings = test_settings();
+            settings.reputation_import = f.ctx.settings().reputation_import.clone();
+            let policy = settings.reputation_import.as_mut().unwrap();
+            match reason {
+                CantDoReason::InvalidAction => policy.enabled = false,
+                CantDoReason::UntrustedReputationIssuer => policy.issuers.clear(),
+                _ => policy.max_lifetime_seconds = 1,
+            }
+            let ctx = TestContextBuilder::new()
+                .with_pool(Arc::new(f.ctx.pool().clone()))
+                .with_settings(settings)
+                .build();
+            let (msg, retry) = request(&identity, &json);
+            assert_eq!(
+                refused(import_reputation_action(&ctx, msg, &retry).await),
+                reason
+            );
+            assert!(replies_to(retry.sender).await.is_empty());
+        }
+        let (msg, mut retry) = request(&identity, &json);
+        retry.sender = identity;
+        assert_eq!(
+            refused(import_reputation_action(&f.ctx, msg, &retry).await),
+            CantDoReason::ReputationIdentityRequired
         );
     }
 

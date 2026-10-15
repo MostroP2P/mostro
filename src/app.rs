@@ -479,6 +479,27 @@ async fn accept_event(
     }
 
     if !message.verify() {
+        // Core rejects missing/wrong import payloads before dispatch, but the
+        // protocol requires a cant-do for these authenticated requests. Keep
+        // the handler's disabled-before-payload precedence, and leave other
+        // invalid message shapes on the ordinary drop path.
+        if inner_message.action == Action::ImportReputation
+            && matches!(&message, Message::Order(_))
+            && inner_message.id.is_none()
+        {
+            let reason = if reputation::import::import_settings(ctx).is_some() {
+                CantDoReason::InvalidPayload
+            } else {
+                CantDoReason::InvalidAction
+            };
+            manage_errors(
+                MostroError::MostroCantDo(reason),
+                message.clone(),
+                unwrapped.clone(),
+                &inner_message.action,
+            )
+            .await;
+        }
         return None;
     }
     // Core's verify also admits the `user-info` reply shape; intake takes only the request.

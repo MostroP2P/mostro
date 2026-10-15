@@ -301,8 +301,19 @@ A retry is confirmed, not refused. The daemon queues its replies in memory,
 so a `reputation-imported` can be lost after step 8 committed. If step 7 fails
 because this same attestation (same event id) is already recorded for this
 identity, the destination replies `reputation-imported` again and changes
-nothing. Any other attestation of an imported account, even a newer one from
-the same issuer, is still refused with `reputation-already-imported`.
+nothing. This recovery also works after expiration: the signature, tag rules,
+lifetime cap, current trust list and proved destination are still checked,
+but the expiry check does not prevent confirming this exact recorded import.
+An expired attestation without that record is refused and never merged; a
+reversal deletes the record, so a retry cannot restore a reversed import.
+Any other still-valid attestation of an imported account, even a newer one
+from the same issuer, is refused with `reputation-already-imported`.
+
+An authenticated `import-reputation` request in the `order` wrapper with no
+order id and a missing or wrong payload receives `cant-do` `invalid_payload`
+at intake, before the generic message-shape check can discard it. A node
+with import disabled answers `invalid_action` first. Transport authentication,
+PoW, replay and freshness checks still precede these replies.
 
 **Issuer keys and rotation.** An issuer signs with one key at a time, but a
 destination does not identify it by that key. Each trust-list entry has a

@@ -211,7 +211,7 @@ lnd_unsynced_fail_after = 600
 # Fail closed: past that threshold, enter maintenance mode with reason
 # "lnd_unsynced" (no new orders or takes; open trades can finish), and leave
 # it again once LND has been synced for `lnd_resynced_clear_after` seconds.
-# Maintenance an operator set with any other reason is never lifted.
+# Maintenance an operator set is never lifted by the daemon, whatever its reason.
 auto_maintenance_on_lnd_unsynced = true
 lnd_resynced_clear_after = 300
 

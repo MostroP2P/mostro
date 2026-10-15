@@ -10,7 +10,7 @@ use crate::app::context::AppContext;
 use crate::app::dev_fee::dev_fee_payments_enabled;
 use crate::app::health::check::{
     database_check, derive_status, payouts_check, relays_check, CheckName, CheckState,
-    CheckTracker, HealthStatus, PayoutFacts,
+    CheckTracker, HealthStatus, PayoutFacts, PAYOUTS_STALE_SECS,
 };
 use crate::app::health::content::{
     nearest_htlc_expiry_blocks, ChannelFacts, DevFeeContent, HealthContent, LndContent,
@@ -86,6 +86,10 @@ pub fn resolve_recipient(configured: &str) -> Option<PublicKey> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayoutRows {
     pub settled_unpaid: u64,
+    /// Among `settled_unpaid`, those settled over [`PAYOUTS_STALE_SECS`]
+    /// ago. They are not what the `payouts` check watches.
+    pub stale_settled_unpaid: u64,
+    /// Age of the oldest settled unpaid order that is not stale.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
     pub awaiting_buyer_invoice: u64,
 }
@@ -103,16 +107,20 @@ pub async fn payout_rows(
     now: i64,
 ) -> Result<PayoutRows, MostroError> {
     let settled = Status::SettledHoldInvoice.to_string();
-    let (awaiting, unpaid, oldest): (i64, i64, Option<i64>) = sqlx::query_as(PAYOUT_ROWS_QUERY)
-        .bind(&settled)
-        .bind(payment_attempts)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?;
+    let stale_before = now.saturating_sub(PAYOUTS_STALE_SECS);
+    let (awaiting, unpaid, oldest, stale): (i64, i64, Option<i64>, i64) =
+        sqlx::query_as(PAYOUT_ROWS_QUERY)
+            .bind(&settled)
+            .bind(payment_attempts)
+            .bind(stale_before)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
     Ok(PayoutRows {
         settled_unpaid: unpaid.max(0) as u64,
+        stale_settled_unpaid: stale.max(0) as u64,
         oldest_settled_unpaid_age_secs: oldest
-            .filter(|_| unpaid > 0)
+            .filter(|_| unpaid > stale)
             .map(|at| now.saturating_sub(at).max(0)),
         awaiting_buyer_invoice: awaiting.max(0) as u64,
     })
@@ -121,8 +129,10 @@ pub async fn payout_rows(
 /// Settled orders, in one pass over `idx_orders_status`: those waiting on
 /// the buyer for a new invoice (attempts used up and no payout in flight, the
 /// state in which `check_failure_retries` sent `add-invoice`), the others
-/// (the daemon is still paying them), and when the oldest of those was
-/// settled.
+/// (the daemon is still paying them), when the oldest of those settled
+/// after `?3` was settled, and how many of them settled before `?3` (stale:
+/// residue the daemon will not pay, see `PAYOUTS_STALE_SECS`). An order
+/// with no settle time at all is stale too.
 const PAYOUT_ROWS_QUERY: &str = "SELECT \
        COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                           AND payment_attempts >= ?2 THEN 1 ELSE 0 END), 0), \
@@ -130,7 +140,12 @@ const PAYOUT_ROWS_QUERY: &str = "SELECT \
                           AND payment_attempts >= ?2 THEN 0 ELSE 1 END), 0), \
        MIN(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                      AND payment_attempts >= ?2 THEN NULL \
-                ELSE COALESCE(hold_settled_at, invoice_held_at) END) \
+                WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN NULL \
+                ELSE COALESCE(hold_settled_at, invoice_held_at) END), \
+       COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
+                          AND payment_attempts >= ?2 THEN 0 \
+                     WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN 1 \
+                     ELSE 0 END), 0) \
      FROM orders WHERE status = ?1";
 
 /// Completed orders whose dev fee is not paid yet, from the partial index
@@ -533,6 +548,7 @@ impl Publisher {
                 (Some(rows), Some(last_success_at)) => Some(PayoutFacts {
                     succeeded_1h: window.succeeded,
                     failed_1h: window.failed,
+                    failed_orders_1h: window.failed_orders,
                     last_success_at,
                     oldest_settled_unpaid_age_secs: rows.oldest_settled_unpaid_age_secs,
                 }),
@@ -543,9 +559,11 @@ impl Publisher {
                 window_secs: WINDOW_SECS,
                 payouts_succeeded_1h: window.succeeded,
                 payouts_failed_1h: window.failed,
+                payouts_failed_orders_1h: window.failed_orders,
                 failure_reasons_1h: window.failure_reasons,
                 last_payout_success_at: last_success.flatten(),
                 settled_unpaid_orders: rows.map(|r| r.settled_unpaid),
+                stale_settled_unpaid_orders: rows.map(|r| r.stale_settled_unpaid),
                 oldest_settled_unpaid_order_age_secs: rows
                     .and_then(|r| r.oldest_settled_unpaid_age_secs),
                 awaiting_buyer_invoice_orders: rows.map(|r| r.awaiting_buyer_invoice),
@@ -927,6 +945,7 @@ mod tests {
             rows,
             PayoutRows {
                 settled_unpaid: 2,
+                stale_settled_unpaid: 0,
                 oldest_settled_unpaid_age_secs: Some(5_000),
                 awaiting_buyer_invoice: 1,
             }
@@ -938,12 +957,15 @@ mod tests {
     #[tokio::test]
     async fn health_queries_use_an_index() {
         let pool = pool().await;
-        for (query, binds) in [(PAYOUT_ROWS_QUERY, 2), (DEV_FEE_PENDING_QUERY, 0)] {
+        for (query, binds) in [(PAYOUT_ROWS_QUERY, 3), (DEV_FEE_PENDING_QUERY, 0)] {
             let mut explain = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
                 format!("EXPLAIN QUERY PLAN {query}"),
             ));
-            if binds == 2 {
-                explain = explain.bind("settled-hold-invoice").bind(3_i64);
+            if binds == 3 {
+                explain = explain
+                    .bind("settled-hold-invoice")
+                    .bind(3_i64)
+                    .bind(NOW - PAYOUTS_STALE_SECS);
             }
             let plan: Vec<String> = explain
                 .fetch_all(&pool)
@@ -962,6 +984,46 @@ mod tests {
                 "{query}: {plan:?}"
             );
         }
+    }
+
+    /// Staging, 2026-10-15: four orders settled months earlier on a previous
+    /// node sat in `settled-hold-invoice` with no attempt recorded. They
+    /// made the oldest settled unpaid order months old at every evaluation,
+    /// so `payouts` never left `warn` and failed on any quiet two hours.
+    #[tokio::test]
+    async fn payout_rows_leave_stale_settled_orders_out_of_the_oldest_age() {
+        let pool = pool().await;
+        insert(
+            &pool,
+            "settled-hold-invoice",
+            false,
+            0,
+            NOW - PAYOUTS_STALE_SECS - 1,
+        )
+        .await;
+        insert(&pool, "settled-hold-invoice", false, 0, NOW - 1_000).await;
+
+        let rows = payout_rows(&pool, 3, NOW).await.unwrap();
+        assert_eq!(
+            rows,
+            PayoutRows {
+                settled_unpaid: 2,
+                stale_settled_unpaid: 1,
+                oldest_settled_unpaid_age_secs: Some(1_000),
+                awaiting_buyer_invoice: 0,
+            }
+        );
+
+        // Only residue left: nothing for the check to watch.
+        sqlx::query("DELETE FROM orders WHERE hold_settled_at = ?")
+            .bind(NOW - 1_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = payout_rows(&pool, 3, NOW).await.unwrap();
+        assert_eq!(rows.settled_unpaid, 1);
+        assert_eq!(rows.stale_settled_unpaid, 1);
+        assert_eq!(rows.oldest_settled_unpaid_age_secs, None);
     }
 
     #[tokio::test]

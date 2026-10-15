@@ -111,6 +111,17 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Clone, Debug, Default)]
 pub struct HealthStats {
     payouts: Arc<Mutex<Window<PayoutOutcome>>>,
+    /// The latest successful payout this process has seen, and whether it
+    /// has been persisted. Kept in memory so a failed write never loses it:
+    /// the health event uses it at once, and [`HealthStats::persist_last_success`]
+    /// retries the write until it lands.
+    last_success: Arc<Mutex<LastSuccess>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LastSuccess {
+    at: Option<i64>,
+    persisted: bool,
 }
 
 impl HealthStats {
@@ -118,15 +129,47 @@ impl HealthStats {
         Self::default()
     }
 
-    /// A buyer payout reached `Succeeded` in LND. Also persists the time as
-    /// the last successful payout; a failed write is logged, not propagated,
-    /// because the payout itself is not affected.
+    /// A buyer payout reached `Succeeded` in LND. Also records the time as
+    /// the last successful payout, in memory at once and persisted; a failed
+    /// write is logged, not propagated (the payout itself is not affected),
+    /// and retried by [`HealthStats::persist_last_success`].
     pub async fn record_payout_success(&self, pool: &SqlitePool, now: i64) {
         lock(&self.payouts).push(now, PayoutOutcome::Succeeded);
-        if let Err(e) = daemon_state::set(pool, KEY_LAST_PAYOUT_SUCCESS_AT, &now.to_string()).await
         {
-            warn!("Could not persist the last successful payout time: {e}");
+            let mut last = lock(&self.last_success);
+            if last.at.is_none_or(|at| now >= at) {
+                *last = LastSuccess {
+                    at: Some(now),
+                    persisted: false,
+                };
+            }
         }
+        self.persist_last_success(pool).await;
+    }
+
+    /// Write the latest successful payout time if it is not persisted yet.
+    /// Called after every success and on every health evaluation, so a time
+    /// whose write failed reaches the database once it is available again.
+    pub async fn persist_last_success(&self, pool: &SqlitePool) {
+        let LastSuccess { at, persisted } = *lock(&self.last_success);
+        let Some(at) = at.filter(|_| !persisted) else {
+            return;
+        };
+        match daemon_state::set(pool, KEY_LAST_PAYOUT_SUCCESS_AT, &at.to_string()).await {
+            Ok(()) => {
+                let mut last = lock(&self.last_success);
+                // A newer success recorded meanwhile stays pending.
+                if last.at == Some(at) {
+                    last.persisted = true;
+                }
+            }
+            Err(e) => warn!("Could not persist the last successful payout time: {e}"),
+        }
+    }
+
+    /// The latest successful payout this process has seen, persisted or not.
+    pub fn last_success_in_memory(&self) -> Option<i64> {
+        lock(&self.last_success).at
     }
 
     /// A buyer payout reached `Failed` in LND, with this protocol reason key
@@ -238,6 +281,39 @@ mod tests {
         let restarted = HealthStats::new();
         assert_eq!(restarted.payout_window(T0 + 1).attempts(), 0);
         assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0));
+    }
+
+    /// Codex review on #1066: a success whose write fails is not lost.
+    #[tokio::test]
+    async fn a_success_whose_write_fails_is_kept_and_persisted_later() {
+        let pool = pool().await;
+        let block = "CREATE TRIGGER no_last_success BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_last_payout_success_at' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END";
+        sqlx::query(block).execute(&pool).await.unwrap();
+        let stats = HealthStats::new();
+
+        stats.record_payout_success(&pool, T0).await;
+
+        assert_eq!(last_payout_success_at(&pool).await.unwrap(), None);
+        assert_eq!(stats.last_success_in_memory(), Some(T0), "kept in memory");
+
+        sqlx::query("DROP TRIGGER no_last_success")
+            .execute(&pool)
+            .await
+            .unwrap();
+        stats.persist_last_success(&pool).await;
+        assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0));
+    }
+
+    #[tokio::test]
+    async fn an_older_success_never_replaces_a_newer_one() {
+        let pool = pool().await;
+        let stats = HealthStats::new();
+        stats.record_payout_success(&pool, T0 + 100).await;
+        stats.record_payout_success(&pool, T0).await;
+        assert_eq!(stats.last_success_in_memory(), Some(T0 + 100));
+        assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0 + 100));
     }
 
     #[test]

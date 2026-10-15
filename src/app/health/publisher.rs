@@ -258,6 +258,10 @@ pub struct Publisher {
     /// is published: a read error must never be taken for an empty database,
     /// which would restart `seq` at 1 and could move `created_at` back.
     persisted_loaded: bool,
+    /// A relay outage transition not saved yet. It is what the event
+    /// reports, and it is saved again on every evaluation until it lands, so
+    /// a restart in the middle of an outage still knows when it started.
+    pending_outage: Option<crate::app::health::event::RelayOutage>,
     had_relay_connection: bool,
     ln_client: Option<LndConnector>,
     /// Bound on the database probe and on every database operation after it.
@@ -274,6 +278,7 @@ impl Publisher {
             tracker: CheckTracker::default(),
             persisted: PersistedHealth::default(),
             persisted_loaded: false,
+            pending_outage: None,
             had_relay_connection: false,
             ln_client: None,
             db_timeout: DATABASE_PROBE_TIMEOUT,
@@ -338,16 +343,16 @@ impl Publisher {
         connected: usize,
         now: i64,
     ) {
-        if let Some(outage) =
-            self.persisted
-                .relay_outage
-                .observe(self.had_relay_connection, connected, now)
-        {
+        let current = self.current_outage();
+        if let Some(outage) = current.observe(self.had_relay_connection, connected, now) {
             if outage.ended_at.is_none() {
                 warn!("Lost every relay connection");
             } else {
                 info!("A relay is connected again after an outage");
             }
+            self.pending_outage = Some(outage);
+        }
+        if let Some(outage) = self.pending_outage {
             if bounded_db(
                 database_ok,
                 self.db_timeout,
@@ -355,15 +360,22 @@ impl Publisher {
                 async { save_relay_outage(pool, outage).await },
             )
             .await
-            .is_none()
+            .is_some()
             {
-                error!("Could not persist the relay outage; it is kept in memory");
+                self.persisted.relay_outage = outage;
+                self.pending_outage = None;
+            } else {
+                error!("Could not persist the relay outage; retrying at the next evaluation");
             }
-            self.persisted.relay_outage = outage;
         }
         if connected > 0 {
             self.had_relay_connection = true;
         }
+    }
+
+    /// The relay outage as it stands, saved or not.
+    fn current_outage(&self) -> crate::app::health::event::RelayOutage {
+        self.pending_outage.unwrap_or(self.persisted.relay_outage)
     }
 
     /// Collect every fact and evaluate the checks at `now`.
@@ -422,10 +434,16 @@ impl Publisher {
                 payout_rows(pool, i64::from(settings.lightning.payment_attempts), now).await
             })
             .await;
+            // A success whose write failed is still known in memory; retry
+            // persisting it, and report the newer of the two.
+            if database_ok {
+                ctx.health_stats().persist_last_success(pool).await;
+            }
             let last_success = bounded_db(database_ok, deadline, "last payout query", async {
                 last_payout_success_at(pool).await
             })
-            .await;
+            .await
+            .map(|stored| stored.max(ctx.health_stats().last_success_in_memory()));
             let facts = match (rows, last_success) {
                 (Some(rows), Some(last_success_at)) => Some(PayoutFacts {
                     succeeded_1h: window.succeeded,
@@ -500,8 +518,8 @@ impl Publisher {
             relays: RelaysContent {
                 configured: configured as u64,
                 connected: connected as u64,
-                last_outage_started_at: self.persisted.relay_outage.started_at,
-                last_outage_ended_at: self.persisted.relay_outage.ended_at,
+                last_outage_started_at: self.current_outage().started_at,
+                last_outage_ended_at: self.current_outage().ended_at,
             },
             maintenance: MaintenanceContent {
                 enabled: maintenance_enabled,
@@ -1020,6 +1038,68 @@ mod tests {
                 .map(|s| s.seq),
             Some(1)
         );
+    }
+
+    /// Codex review on #1066: an outage transition whose write fails stays
+    /// pending, keeps its start time and is saved once the database is back.
+    #[tokio::test]
+    async fn an_unsaved_relay_outage_is_retried_with_its_start_time() {
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        publisher.had_relay_connection = true;
+        let block = "CREATE TRIGGER no_outage BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_relay_outage_started_at' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END";
+        sqlx::query(block).execute(&pool).await.unwrap();
+
+        // The last relay is lost while the write fails.
+        let first = publisher.evaluate(&ctx, NOW).await;
+        assert_eq!(first.content.relays.last_outage_started_at, Some(NOW));
+        assert_eq!(
+            load_persisted(&pool).await.unwrap().relay_outage.started_at,
+            None
+        );
+
+        // Still down, database back: the original start time is saved.
+        sqlx::query("DROP TRIGGER no_outage")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = publisher.evaluate(&ctx, NOW + 15).await;
+        assert_eq!(second.content.relays.last_outage_started_at, Some(NOW));
+        assert_eq!(
+            load_persisted(&pool).await.unwrap().relay_outage.started_at,
+            Some(NOW)
+        );
+        assert!(publisher.pending_outage.is_none());
+    }
+
+    /// Codex review on #1066: a success whose write failed still counts for
+    /// the `payouts` check and the content.
+    #[tokio::test]
+    async fn the_latest_success_in_memory_is_reported() {
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let block = "CREATE TRIGGER no_last_success BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_last_payout_success_at' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END";
+        sqlx::query(block).execute(&pool).await.unwrap();
+        ctx.health_stats()
+            .record_payout_success(&pool, NOW - 60)
+            .await;
+        let mut publisher = Publisher::new(&ctx).await;
+
+        let evaluation = publisher.evaluate(&ctx, NOW).await;
+
+        let payouts = evaluation.content.payouts.unwrap();
+        assert_eq!(payouts.last_payout_success_at, Some(NOW - 60));
     }
 
     #[tokio::test]

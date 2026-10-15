@@ -1056,6 +1056,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoke_reputation_imports_refuses_non_loopback_even_with_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key().to_hex();
+        for ip in ["203.0.113.1", "2001:db8::1"] {
+            let err = service
+                .revoke_reputation_imports(bearer(
+                    request_with_ip(revoke_req(&key), ip.parse().unwrap()),
+                    "s3cret",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert!(err.message().contains("RevokeReputationImports"));
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_preserves_the_cutoff_and_node_signature() {
+        use crate::db::{add_new_user, insert_reputation_import, ReputationImportRow};
+        use mostro_core::prelude::User;
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key();
+        let other_key = Keys::generate().public_key();
+        let mut cases = Vec::new();
+        for (issuer, imported_at, revoked) in [
+            (key, 199, false),
+            (key, 200, true),
+            (key, 201, true),
+            (other_key, 201, false),
+        ] {
+            let identity = Keys::generate().public_key().to_hex();
+            let trade = Keys::generate().public_key().to_hex();
+            let row = ReputationImportRow {
+                attestation_id: Keys::generate().public_key().to_hex(),
+                issuer: "fixture".to_string(),
+                issuer_key: issuer.to_hex(),
+                subject: identity.clone(),
+                identity_pubkey: identity.clone(),
+                trade_pubkey: Some(trade.clone()),
+                reviews: 5,
+                rating_hundredths: 450,
+                since: 1_696_204_800,
+                imported_at,
+            };
+            let mut user = User::new(identity.clone(), 0, 0, 0, 0, 1);
+            add_new_user(service.pool.as_ref(), user.clone())
+                .await
+                .unwrap();
+            user.apply_reputation_import(&row.figures().unwrap());
+            crate::db::update_user_reputation(service.pool.as_ref(), &user)
+                .await
+                .unwrap();
+            insert_reputation_import(service.pool.as_ref(), &row)
+                .await
+                .unwrap();
+            cases.push((identity, trade, revoked));
+        }
+        let mut req = revoke_req(&key.to_hex());
+        req.imported_after = Some(200);
+        let response = service
+            .revoke_reputation_imports(bearer(request_with_addr(req, 1), "s3cret"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{:?}", response.error_message);
+        assert_eq!(response.revoked, 2);
+        for (identity, trade, revoked) in cases {
+            let user = crate::db::is_user_present(service.pool.as_ref(), identity.clone())
+                .await
+                .unwrap();
+            assert_eq!(user.total_reviews, if revoked { 0 } else { 5 });
+            assert_eq!(
+                crate::db::reputation_imports_for_identity(service.pool.as_ref(), &identity)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                revoked
+            );
+            let events: Vec<_> = crate::config::MESSAGE_QUEUES
+                .queue_order_rate
+                .read()
+                .await
+                .iter()
+                .filter(|ev| {
+                    ev.tags
+                        .iter()
+                        .any(|tag| tag.as_slice() == ["d", trade.as_str()])
+                })
+                .cloned()
+                .collect();
+            assert_eq!(events.len(), usize::from(revoked));
+            if revoked {
+                events[0].verify().unwrap();
+                assert_eq!(events[0].pubkey, service.keys.public_key());
+                assert_eq!(
+                    events[0].kind.as_u16(),
+                    mostro_core::prelude::NOSTR_RATING_EVENT_KIND
+                );
+                assert!(events[0]
+                    .tags
+                    .iter()
+                    .any(|tag| tag.as_slice() == ["total_reviews", "0"]));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn revoke_reputation_imports_needs_loopback_and_the_token() {
         let service = with_token(offline_service().await, "s3cret");
         let key = Keys::generate().public_key().to_hex();

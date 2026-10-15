@@ -108,13 +108,24 @@ mod tests {
         subject: &str,
         signed_at: Timestamp,
     ) -> PublicKey {
+        import_since(ctx, issuer, identity, subject, signed_at, 1_696_204_800).await
+    }
+
+    async fn import_since(
+        ctx: &AppContext,
+        issuer: &Keys,
+        identity: &PublicKey,
+        subject: &str,
+        signed_at: Timestamp,
+        since: u64,
+    ) -> PublicKey {
         let json = ReputationAttestation::build(
             issuer,
             identity,
             subject,
             100,
             4.5,
-            1_696_204_800,
+            since,
             signed_at,
             ATTESTATION_LIFETIME_SECS,
         )
@@ -135,7 +146,7 @@ mod tests {
             identity: *identity,
             created_at: Timestamp::now(),
         };
-        import_reputation_action(ctx, msg, &event, &Keys::generate())
+        import_reputation_action(ctx, msg, &event, ctx.keys())
             .await
             .unwrap();
         sender
@@ -145,6 +156,244 @@ mod tests {
         is_user_present(ctx.pool(), identity.to_hex())
             .await
             .unwrap()
+    }
+
+    async fn separate_issuers(keys: &[&Keys]) -> AppContext {
+        let base = ctx(keys).await;
+        let mut settings = base.settings().clone();
+        settings.reputation_import.as_mut().unwrap().issuers = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| ReputationIssuer {
+                name: format!("issuer-{i}"),
+                keys: vec![key.public_key().to_hex()],
+            })
+            .collect();
+        TestContextBuilder::new()
+            .with_pool(base.pool_arc())
+            .with_settings(settings)
+            .with_keys(base.keys().clone())
+            .build()
+    }
+
+    fn tag(event: &Event, name: &str) -> Option<String> {
+        event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some(name))
+                .then(|| values.get(1).cloned())
+                .flatten()
+        })
+    }
+
+    async fn rating_events(ctx: &AppContext, trade_key: PublicKey) -> Vec<Event> {
+        crate::config::MESSAGE_QUEUES
+            .queue_order_rate
+            .read()
+            .await
+            .iter()
+            .filter(|event| {
+                event.pubkey == ctx.keys().public_key()
+                    && tag(event, "d") == Some(trade_key.to_hex())
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_row_reversed_by_another_call_is_not_reversed_twice() {
+        let issuer = Keys::generate();
+        let ctx = ctx(&[&issuer]).await;
+        let identity = Keys::generate().public_key();
+        let mut native = User::new(identity.to_hex(), 0, 0, 0, 0, 1);
+        native.update_rating(5);
+        native.update_rating(3);
+        add_new_user(ctx.pool(), native).await.unwrap();
+        import(&ctx, &issuer, &identity, "stale-snapshot", Timestamp::now()).await;
+        let cached = reputation_imports_by_key(ctx.pool(), &issuer.public_key().to_hex(), None)
+            .await
+            .unwrap()
+            .remove(0);
+        revoke_imports(ctx.pool(), &issuer.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        let after_first = user(&ctx, &identity).await;
+        assert_eq!(after_first.total_reviews, 2);
+
+        // Another RPC selected this receipt before the first one committed.
+        revert(ctx.pool(), &cached).await.unwrap();
+        assert_eq!(user(&ctx, &identity).await, after_first);
+    }
+
+    #[tokio::test]
+    async fn overlapping_revocations_reverse_each_import_once() {
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let path = std::env::temp_dir().join(format!("mostro-revoke-{}.db", uuid::Uuid::new_v4()));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(4)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let issuer = Keys::generate();
+        let base = ctx(&[&issuer]).await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(base.settings().clone())
+            .with_keys(base.keys().clone())
+            .build();
+        for round in 0..4 {
+            let mut identities = Vec::new();
+            for n in 0..16 {
+                let identity = Keys::generate().public_key();
+                let mut native = User::new(identity.to_hex(), 0, 0, 0, 0, 1);
+                native.update_rating(5);
+                native.update_rating(3);
+                add_new_user(ctx.pool(), native).await.unwrap();
+                import(
+                    &ctx,
+                    &issuer,
+                    &identity,
+                    &format!("{round}-{n}"),
+                    Timestamp::now(),
+                )
+                .await;
+                identities.push(identity);
+            }
+            let key = issuer.public_key();
+            let (a, b) = tokio::join!(
+                revoke_imports(ctx.pool(), &key, None, ctx.keys()),
+                revoke_imports(ctx.pool(), &key, None, ctx.keys())
+            );
+            assert_eq!(a.unwrap().len() + b.unwrap().len(), identities.len());
+            for identity in identities {
+                let user = user(&ctx, &identity).await;
+                assert_eq!(user.total_reviews, 2);
+                assert!((user.total_rating - 2.75).abs() < 1e-9);
+                assert_eq!(user.native_stats(), (2, 4.0));
+                assert_eq!(user.seeded_reviews, 0);
+                assert!(user.seeded_rating_sum.abs() < 1e-9);
+            }
+        }
+        ctx.pool().close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoking_restores_the_earliest_remaining_import_date() {
+        let (a, b, c) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let ctx = separate_issuers(&[&a, &b, &c]).await;
+        let identity = Keys::generate().public_key();
+        for (key, since) in [
+            (&a, 1_609_459_200),
+            (&b, 1_640_995_200),
+            (&c, 1_672_531_200),
+        ] {
+            import_since(&ctx, key, &identity, "account", Timestamp::now(), since).await;
+        }
+        revoke_imports(ctx.pool(), &a.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        let after = user(&ctx, &identity).await;
+        assert_eq!(after.total_reviews, 200);
+        assert_eq!(after.created_at, 1_640_995_200);
+        revoke_imports(ctx.pool(), &b.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        assert_eq!(user(&ctx, &identity).await.created_at, 1_672_531_200);
+    }
+
+    #[tokio::test]
+    async fn revoking_updates_the_trade_keys_of_remaining_imports() {
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let ctx = separate_issuers(&[&a, &b]).await;
+        let identity = Keys::generate().public_key();
+        let first = import(&ctx, &a, &identity, "first", Timestamp::now()).await;
+        let second = import(&ctx, &b, &identity, "second", Timestamp::now()).await;
+        assert_eq!(
+            tag(
+                rating_events(&ctx, second).await.last().unwrap(),
+                "total_reviews"
+            )
+            .as_deref(),
+            Some("200")
+        );
+
+        revoke_imports(ctx.pool(), &a.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        for trade_key in [first, second] {
+            let events = rating_events(&ctx, trade_key).await;
+            let latest = events.last().unwrap();
+            latest.verify().unwrap();
+            assert_eq!(tag(latest, "total_reviews").as_deref(), Some("100"));
+            assert_eq!(tag(latest, "total_rating").as_deref(), Some("4.5"));
+            assert_eq!(latest.kind.as_u16(), NOSTR_RATING_EVENT_KIND);
+            assert!(events.len() >= 2);
+            assert!(latest.created_at > events[events.len() - 2].created_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_supersedes_the_import_event_under_the_same_node_key() {
+        let issuer = Keys::generate();
+        let ctx = ctx(&[&issuer]).await;
+        let identity = Keys::generate().public_key();
+        let trade = import(&ctx, &issuer, &identity, "same-second", Timestamp::now()).await;
+        revoke_imports(ctx.pool(), &issuer.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        let events = rating_events(&ctx, trade).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(tag(&events[1], "total_reviews").as_deref(), Some("0"));
+        assert!(events[1].created_at > events[0].created_at);
+    }
+
+    #[tokio::test]
+    async fn revoking_queues_only_the_affected_makers_open_orders() {
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let issuer = Keys::generate();
+        let ctx = ctx(&[&issuer]).await;
+        let identity = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        import(&ctx, &issuer, &identity, "maker", Timestamp::now()).await;
+        let mut orders = Vec::new();
+        for (kind, status, buyer, seller, expected) in [
+            ("sell", "pending", other, identity, true),
+            ("buy", "pending", identity, other, true),
+            ("sell", "waiting-taker-bond", other, identity, true),
+            ("buy", "waiting-taker-bond", identity, other, true),
+            ("sell", "active", other, identity, false),
+            ("sell", "pending", identity, other, false),
+            ("buy", "pending", other, identity, false),
+            ("sell", "waiting-maker-bond", other, identity, false),
+        ] {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO orders (id, kind, event_id, status, premium, payment_method, \
+                 amount, fiat_code, fiat_amount, created_at, expires_at, master_buyer_pubkey, master_seller_pubkey) \
+                 VALUES (?1, ?2, 'event', ?3, 0, 'lightning', 1000, 'USD', 1, 1700000000, 1900000000, ?4, ?5)"
+            )
+            .bind(id).bind(kind).bind(status).bind(buyer.to_hex()).bind(seller.to_hex())
+            .execute(ctx.pool()).await.unwrap();
+            orders.push((id, expected));
+        }
+        revoke_imports(ctx.pool(), &issuer.public_key(), None, ctx.keys())
+            .await
+            .unwrap();
+        for (id, expected) in orders {
+            assert_eq!(
+                crate::util::is_orderbook_publish_queued(id),
+                expected,
+                "order {id}"
+            );
+            crate::util::clear_orderbook_publish_failure_up_to(id, u64::MAX);
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@ use crate::config::payer_history::PayerHistorySettings;
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
-    LightningSettings, MostroSettings, NostrSettings, ReputationImportSettings, RpcSettings,
+    HealthSettings, LightningSettings, MostroSettings, NostrSettings, ReputationImportSettings,
+    RpcSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
@@ -50,6 +51,9 @@ pub struct Settings {
     /// disabled (D-10).
     #[serde(default)]
     pub payer_history: Option<PayerHistorySettings>,
+    /// Health monitoring (issue #1063). Absent section ≡ defaults.
+    #[serde(default)]
+    pub health: HealthSettings,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
@@ -204,6 +208,15 @@ impl Settings {
     /// when settings haven't been initialized.
     pub fn is_cashu_enabled() -> bool {
         Self::get_cashu().is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// The `[health]` configuration from the global `MOSTRO_CONFIG`, or the
+    /// defaults when settings are not initialized (tests).
+    pub fn get_health() -> HealthSettings {
+        MOSTRO_CONFIG
+            .get()
+            .map(|settings| settings.health.clone())
+            .unwrap_or_default()
     }
 
     /// Retrieve the `[payer_history]` configuration from the global

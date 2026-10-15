@@ -6,6 +6,7 @@
 //!
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::app::maintenance::MaintenanceState;
 use crate::cashu::mints::CashuMints;
 use crate::config::settings::Settings;
@@ -50,6 +51,10 @@ pub struct AppContext {
     /// flag; `main.rs` attaches the one loaded from `daemon_state` with
     /// [`AppContext::with_maintenance`].
     maintenance: MaintenanceState,
+    /// Whether the Lightning node is synced to chain and reachable, fed by
+    /// `job_lnd_sync_monitor`. Defaults to a state that knows nothing and
+    /// defers nothing (tests, Cashu mode).
+    lnd_sync: LndSyncState,
 }
 
 impl AppContext {
@@ -72,6 +77,7 @@ impl AppContext {
             keys,
             cashu_mints: None,
             maintenance: MaintenanceState::new(),
+            lnd_sync: LndSyncState::new(),
         }
     }
 
@@ -85,6 +91,17 @@ impl AppContext {
     /// Maintenance (drain) mode flag.
     pub fn maintenance(&self) -> &MaintenanceState {
         &self.maintenance
+    }
+
+    /// Attach a shared LND sync state (the one the monitor job feeds).
+    pub fn with_lnd_sync(mut self, lnd_sync: LndSyncState) -> Self {
+        self.lnd_sync = lnd_sync;
+        self
+    }
+
+    /// Whether the Lightning node is synced to chain and reachable.
+    pub fn lnd_sync(&self) -> &LndSyncState {
+        &self.lnd_sync
     }
 
     /// Attach the Cashu mint clients (Cashu mode). Returns a new context; the
@@ -327,6 +344,7 @@ pub mod test_utils {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         }
     }
 }

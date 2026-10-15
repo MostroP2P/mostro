@@ -1,11 +1,13 @@
 //! RPC service implementation for admin operations
 
+use crate::app::context::AppContext;
 use crate::app::daemon_state;
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::app::maintenance::{
     drain_counters, MaintenanceState, KEY_LN_NODE_PUBKEY, KEY_REASON, KEY_SINCE,
 };
 use crate::config::settings::Settings;
-use crate::config::LN_STATUS;
+use crate::config::{LN_STATUS, MESSAGE_QUEUES};
 
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
@@ -17,7 +19,7 @@ use crate::rpc::admin::{
 };
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::transport::UnwrappedMessage;
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{Client, Keys};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -34,6 +36,10 @@ pub struct AdminServiceImpl {
     /// Same clone the event loop's `AppContext` holds, so a flip here is
     /// observed by the escrow gate immediately.
     maintenance: MaintenanceState,
+    /// The process-wide LND sync state the monitor job feeds: admin
+    /// settlements pay the buyer, and must defer exactly as the event loop
+    /// does while LND is unsynced (#1063).
+    lnd_sync: LndSyncState,
     /// `[rpc].auth_token`. When set, every mutating RPC requires
     /// `authorization: Bearer <token>`.
     auth_token: Option<SecretString>,
@@ -45,6 +51,7 @@ impl AdminServiceImpl {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
         maintenance: MaintenanceState,
+        lnd_sync: LndSyncState,
     ) -> Self {
         let retention_secs = Settings::get_rpc().rate_limiter_stale_duration;
         Self {
@@ -53,8 +60,23 @@ impl AdminServiceImpl {
             ln_client,
             password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
             maintenance,
+            lnd_sync,
             auth_token: Settings::get_rpc().auth_token.clone(),
         }
+    }
+
+    /// The context an admin action runs in: the shared maintenance flag and
+    /// LND sync state, never fresh defaults.
+    fn app_context(&self, nostr_client: Client, settings: Arc<Settings>) -> AppContext {
+        AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
+        )
+        .with_maintenance(self.maintenance.clone())
+        .with_lnd_sync(self.lnd_sync.clone())
     }
 
     /// Application-layer check for the mutating RPCs. A no-op unless
@@ -152,8 +174,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -166,13 +186,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -239,8 +253,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -253,13 +265,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -293,8 +299,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -307,13 +311,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin add solver failed: {}", e))?;
@@ -347,8 +345,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -361,13 +357,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin take dispute failed: {}", e))?;
@@ -513,6 +503,21 @@ impl AdminService for AdminServiceImpl {
             "Received SetMaintenanceMode(enabled={}) from {ip}, request_id: {:?}",
             req.enabled, req.request_id
         );
+        // `lnd_unsynced` marks maintenance the daemon turned on by itself
+        // (#1063); an operator using it would make readers of the health and
+        // info events take their maintenance for the daemon's.
+        if req.reason.as_deref().map(str::trim)
+            == Some(crate::app::maintenance::REASON_LND_UNSYNCED)
+        {
+            warn!("SetMaintenanceMode refused: the reason is reserved for the daemon");
+            return Ok(Response::new(SetMaintenanceModeResponse {
+                success: false,
+                error_message: Some(format!(
+                    "the reason \"{}\" is reserved for maintenance the daemon enables by itself",
+                    crate::app::maintenance::REASON_LND_UNSYNCED
+                )),
+            }));
+        }
         match self
             .maintenance
             .set(&self.pool, req.enabled, req.reason.as_deref())
@@ -795,7 +800,13 @@ mod tests {
 
         let pool = Arc::new(pool);
         let maintenance = MaintenanceState::load(&pool).await.unwrap();
-        AdminServiceImpl::new(Keys::generate(), pool, ln_client, maintenance)
+        AdminServiceImpl::new(
+            Keys::generate(),
+            pool,
+            ln_client,
+            maintenance,
+            LndSyncState::new(),
+        )
     }
 
     fn request_with_addr<T>(inner: T, last_octet: u8) -> Request<T> {
@@ -891,6 +902,66 @@ mod tests {
         assert!(!status.enabled);
         assert_eq!(status.reason, None);
         assert_eq!(status.since, None);
+    }
+
+    /// Codex review on #1065: admin actions (SettleOrder pays the buyer)
+    /// must run with the process-wide LND sync state and maintenance flag,
+    /// not fresh defaults that never defer.
+    #[tokio::test]
+    async fn admin_contexts_share_the_monitored_state() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let mut service = offline_service().await;
+        let lnd_sync = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        lnd_sync.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+        service.lnd_sync = lnd_sync;
+        service
+            .maintenance
+            .set(&service.pool, true, Some("upgrade"))
+            .await
+            .unwrap();
+
+        let ctx = service.app_context(
+            Client::default(),
+            Arc::new(crate::app::context::test_utils::test_settings()),
+        );
+
+        assert!(ctx.lnd_sync().defers_outgoing_payments(now));
+        assert!(ctx.maintenance().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn set_maintenance_mode_rejects_the_reserved_reason() {
+        let service = offline_service().await;
+
+        let resp = service
+            .set_maintenance_mode(request_with_addr(
+                SetMaintenanceModeRequest {
+                    enabled: true,
+                    reason: Some(" lnd_unsynced ".into()),
+                    request_id: None,
+                },
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error_message.unwrap().contains("reserved"));
+        assert!(!service.maintenance.is_enabled(), "nothing changed");
     }
 
     #[tokio::test]

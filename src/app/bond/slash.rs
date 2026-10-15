@@ -1576,6 +1576,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_recipient migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20261015120100_bond_payout_sent_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_sent_at migration");
         // Phase 6 chain-walk tests load full `Order` rows via `Order::by_id`,
         // which selects every column the model declares — so the orders
         // table must carry the later Cashu columns too.

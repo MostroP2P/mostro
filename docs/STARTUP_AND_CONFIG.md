@@ -165,6 +165,11 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 - `max_lifetime_seconds` (u64): Longest an attestation may live, `expiration - created_at`; caps a faulty or compromised issuer. Must be > 0 and at most 2592000, 30 days (default: 604800, 7 days)
 - `issuers` (list of `[[reputation_import.issuers]]`): The trust list. Each entry has a `name`, the stable key imports are deduplicated on (never rename one once an import is recorded under it; see Additional Boot Steps), and `keys`, the issuer's signing keys as npub or hex. To follow a key rotation, add the new key to the same entry and remove the old one once its attestations have expired. Names must be unique and without leading or trailing spaces, and a key belongs to one entry only; a violation, an empty entry or a key that does not parse stops the load, even while the section is disabled
 
+**Health** (`[health]`, optional; absent ≡ the defaults below; `HealthSettings` in `src/config/types.rs`). How mostrod reacts when its Lightning node stops being synced to chain (see [HEALTH.md](HEALTH.md)):
+- `lnd_unsynced_fail_after` (u64): Seconds LND may report `synced_to_chain = false` without interruption before it counts as a failure (default: 600). Independently of this value, outgoing payments (buyer payouts, dev fees, bond payouts) wait once LND has been unsynced or unreachable for 60 s, without consuming the buyer's payment attempts
+- `auto_maintenance_on_lnd_unsynced` (bool): Fail closed. Past `lnd_unsynced_fail_after`, enter maintenance mode with reason `lnd_unsynced` (no new orders or takes; open trades can finish), and leave it again once LND has been synced for `lnd_resynced_clear_after` seconds. Maintenance an operator set with any other reason is never lifted (default: true)
+- `lnd_resynced_clear_after` (u64): Seconds LND must stay synced before the automatic maintenance is lifted (default: 300)
+
 **RPC** (`src/config/types.rs:55-74`):
 - `enabled` (bool): Enable RPC server (Rust Default: false)
 - `listen_address` (String): Bind address (Rust Default: "127.0.0.1")

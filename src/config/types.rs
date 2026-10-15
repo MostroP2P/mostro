@@ -321,6 +321,49 @@ impl ReputationImportSettings {
     }
 }
 
+/// Health monitoring (`[health]`, issue #1063): how long LND may report
+/// `synced_to_chain = false` before it counts as a failure, and whether the
+/// daemon then fails closed by entering maintenance on its own. An absent
+/// section means the defaults.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct HealthSettings {
+    /// Seconds LND may report `synced_to_chain = false` without interruption
+    /// before the `lnd_sync` check turns from `warn` to `fail`.
+    #[serde(default = "default_lnd_unsynced_fail_after")]
+    pub lnd_unsynced_fail_after: u64,
+    /// Enter maintenance (reason `lnd_unsynced`) when `lnd_sync` reaches
+    /// `fail`, and leave it again once LND has been synced for
+    /// `lnd_resynced_clear_after` seconds. Maintenance an operator set is
+    /// never lifted.
+    #[serde(default = "default_auto_maintenance_on_lnd_unsynced")]
+    pub auto_maintenance_on_lnd_unsynced: bool,
+    /// Seconds LND must stay synced before automatic maintenance is lifted.
+    #[serde(default = "default_lnd_resynced_clear_after")]
+    pub lnd_resynced_clear_after: u64,
+}
+
+fn default_lnd_unsynced_fail_after() -> u64 {
+    600
+}
+
+fn default_auto_maintenance_on_lnd_unsynced() -> bool {
+    true
+}
+
+fn default_lnd_resynced_clear_after() -> u64 {
+    300
+}
+
+impl Default for HealthSettings {
+    fn default() -> Self {
+        Self {
+            lnd_unsynced_fail_after: default_lnd_unsynced_fail_after(),
+            auto_maintenance_on_lnd_unsynced: default_auto_maintenance_on_lnd_unsynced(),
+            lnd_resynced_clear_after: default_lnd_resynced_clear_after(),
+        }
+    }
+}
+
 /// The node-wide escrow mode (locked decision §4.1: a node runs in exactly
 /// one mode, fixed in `settings.toml` — never per-order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

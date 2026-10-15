@@ -28,6 +28,7 @@ pub(crate) const BOND_INSERT_COLUMNS: &[&str] = &[
     "payout_invoice",
     "payout_routing_fee_sats",
     "payout_payment_hash",
+    "payout_sent_at",
     "node_share_sats",
     // `payout_recipient` is omitted on purpose: only the slash CAS and the
     // slice-slash insert write it, so a `Bond` created here starts NULL.
@@ -64,6 +65,7 @@ fn push_bond_insert_binds(b: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
         .push_bind(&bond.payout_invoice)
         .push_bind(bond.payout_routing_fee_sats)
         .push_bind(&bond.payout_payment_hash)
+        .push_bind(bond.payout_sent_at)
         .push_bind(bond.node_share_sats)
         .push_bind(bond.payout_attempts)
         .push_bind(bond.invoice_request_attempts)
@@ -111,6 +113,8 @@ fn push_bond_update_set(set: &mut Separated<'_, Sqlite, &'static str>, bond: &Bo
         .push_bind_unseparated(bond.payout_routing_fee_sats);
     set.push("payout_payment_hash = ")
         .push_bind_unseparated(&bond.payout_payment_hash);
+    set.push("payout_sent_at = ")
+        .push_bind_unseparated(bond.payout_sent_at);
     set.push("node_share_sats = ")
         .push_bind_unseparated(bond.node_share_sats);
     set.push("payout_attempts = ")

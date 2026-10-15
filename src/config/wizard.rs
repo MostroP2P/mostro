@@ -79,6 +79,7 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         price: None,
         reputation_import: None,
         payer_history: None,
+        health: Default::default(),
     };
 
     let toml_content = toml::to_string_pretty(&settings)

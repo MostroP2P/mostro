@@ -77,6 +77,7 @@
 //! re-sends every unpaid dev fee every cycle, hundreds of failed payments an
 //! hour (#1063).
 
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
@@ -126,13 +127,14 @@ pub async fn run_dev_fee_cycle(
     confirmed: &mut HashSet<uuid::Uuid>,
     unverifiable: &mut HashSet<uuid::Uuid>,
     keys: &Keys,
+    lnd_sync: &LndSyncState,
 ) {
     info!("Checking for unpaid development fees");
 
     cleanup_stale_pending_markers(pool).await;
     verify_confirmed_orders(pool, ln_client, confirmed, unverifiable).await;
     recover_partial_payments(pool, ln_client, confirmed).await;
-    process_new_dev_fee_payments(pool, ln_client, confirmed, keys).await;
+    process_new_dev_fee_payments(pool, ln_client, confirmed, keys, lnd_sync).await;
 }
 
 // ── Phase 1: Stale PENDING cleanup ──────────────────────────────────────
@@ -479,6 +481,7 @@ async fn process_new_dev_fee_payments(
     ln_client: &mut LndConnector,
     confirmed: &mut HashSet<uuid::Uuid>,
     keys: &Keys,
+    lnd_sync: &LndSyncState,
 ) {
     let unpaid_orders = match find_unpaid_dev_fees(pool).await {
         Ok(orders) => orders,
@@ -491,6 +494,13 @@ async fn process_new_dev_fee_payments(
 
     for order in unpaid_orders {
         let order_id = order.id;
+
+        // A pass can take minutes (20 s to resolve, 50 s to send, per order):
+        // stop as soon as our node can no longer pay (#1063).
+        if lnd_sync.defers_outgoing_payments(Utc::now().timestamp()) {
+            warn!("Stopping the dev fee pass: LND is not synced to chain or not reachable");
+            break;
+        }
 
         // STEP 0: Atomically claim this order to prevent duplicate processing.
         let now_ts = Utc::now().timestamp() as u64;
@@ -544,6 +554,17 @@ async fn process_new_dev_fee_payments(
             }
         };
 
+        // Resolving the invoice can take up to 20 s: check again before the
+        // real hash is stored (only a DB write separates it from the send),
+        // and give the order back if payments are deferred now. Nothing was
+        // sent, so this is not a failure. Releasing the PENDING marker rather
+        // than a real hash keeps it self-healing: if the release fails, Phase
+        // 1 resets the stale marker, whereas recovery leaves alone a real hash
+        // LND never saw.
+        if release_if_deferred(pool, lnd_sync, order_id, &pending_marker).await {
+            break;
+        }
+
         // STEP 2: Store real payment hash BEFORE sending payment (leave dev_fee_paid false).
         // If daemon crashes after this point, Phase 3 will find the hash
         // on the next cycle and verify with LND.
@@ -551,28 +572,18 @@ async fn process_new_dev_fee_payments(
             "Storing payment hash {} for order {}",
             payment_hash_hex, order_id
         );
-        // Targeted update: store real hash only if we still own the PENDING marker.
-        let updated = match sqlx::query(
-            "UPDATE orders
-             SET dev_fee_payment_hash = ?
-             WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
-        )
-        .bind(&payment_hash_hex)
-        .bind(order_id)
-        .bind(&pending_marker)
-        .execute(pool)
-        .await
-        {
-            Err(e) => {
-                error!(
-                    "Failed to store payment hash for order {}: {:?}",
-                    order_id, e
-                );
-                release_pending_claim(pool, order_id, &pending_marker).await;
-                continue;
-            }
-            Ok(result) => result.rows_affected() > 0,
-        };
+        let updated =
+            match store_payment_hash(pool, order_id, &pending_marker, &payment_hash_hex).await {
+                Err(e) => {
+                    error!(
+                        "Failed to store payment hash for order {}: {:?}",
+                        order_id, e
+                    );
+                    release_pending_claim(pool, order_id, &pending_marker).await;
+                    continue;
+                }
+                Ok(updated) => updated,
+            };
 
         if !updated {
             warn!(
@@ -719,6 +730,9 @@ async fn handle_payment_failure(
         "Dev fee payment failed for order {} - error: {:?}",
         order_id, e
     );
+    // An attempt was sent: its failure, once LND confirms it, must count
+    // even if the invoice (and hash) is the same as a counted one.
+    forget_counted_failure(pool, order_id).await;
     warn!(
         "Keeping payment hash for order {} to let idempotency check verify on next cycle",
         order_id
@@ -754,6 +768,8 @@ async fn handle_payment_timeout(
         "Dev fee payment timeout (50s) for order {} ({} sats), checking LN status",
         order_id, dev_fee
     );
+    // An attempt was sent (see `forget_counted_failure`).
+    forget_counted_failure(pool, order_id).await;
 
     match check_dev_fee_payment_status(&order, ln_client).await {
         DevFeePaymentState::Succeeded => {
@@ -955,6 +971,78 @@ async fn release_failed_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_m
         return;
     }
     release_pending_claim(pool, order_id, pending_marker).await;
+}
+
+/// If payments are deferred now, release the PENDING claim without
+/// counting a failure, since nothing was sent. Returns whether payments are
+/// deferred, in which case the pass must stop. A release that fails leaves
+/// the marker for Phase 1 to reset once stale.
+async fn release_if_deferred(
+    pool: &SqlitePool,
+    lnd_sync: &LndSyncState,
+    order_id: uuid::Uuid,
+    pending_marker: &str,
+) -> bool {
+    if !lnd_sync.defers_outgoing_payments(Utc::now().timestamp()) {
+        return false;
+    }
+    warn!(
+        "Dev fee for order {}: LND stopped being synced or reachable before the send; \
+         releasing the claim and stopping the pass",
+        order_id
+    );
+    release_pending_claim(pool, order_id, pending_marker).await;
+    true
+}
+
+/// Store the real payment hash of a new attempt, only if we still own the
+/// PENDING marker. Returns whether the row was ours. The counted-failure
+/// dedupe (`dev_fee_failed_hash`) is deliberately left alone here: nothing
+/// has been sent yet, see [`forget_counted_failure`].
+async fn store_payment_hash(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    pending_marker: &str,
+    payment_hash_hex: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE orders
+         SET dev_fee_payment_hash = ?
+         WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+    )
+    .bind(payment_hash_hex)
+    .bind(order_id)
+    .bind(pending_marker)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// A new attempt was actually sent: forget the hash whose failure was
+/// already counted, so this attempt's failure counts too.
+///
+/// `dev_fee_failed_hash` keeps a failure from being counted twice, by the
+/// send and again by recovery, for the *same* attempt. An LNURL endpoint may
+/// hand out the same invoice again for the next attempt; if the hash stayed
+/// remembered, that attempt's failure would be skipped, no backoff set, and
+/// the order retried every cycle (Codex review on #1065). It is reset only
+/// once `send_payment` has returned, failed or timed out: resetting it before
+/// the send would let a crash in between make recovery count the *old*
+/// failure again for an attempt that never happened.
+async fn forget_counted_failure(pool: &SqlitePool, order_id: uuid::Uuid) {
+    if let Err(e) = sqlx::query(
+        "UPDATE orders SET dev_fee_failed_hash = NULL WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(order_id)
+    .execute(pool)
+    .await
+    {
+        warn!(
+            "Dev fee for order {}: could not reset the counted failure ({e}); \
+             a failure of this attempt may go uncounted",
+            order_id
+        );
+    }
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -1311,6 +1399,7 @@ mod tests {
         handle_payment_success, parse_pending_timestamp, release_all_pending_claims,
         release_pending_claim, try_claim_order_for_dev_fee,
     };
+    use crate::app::health::lnd_sync::LndSyncState;
     use crate::config::settings::Settings;
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::error::MostroError;
@@ -1339,6 +1428,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         });
     }
 
@@ -1906,6 +1996,73 @@ mod tests {
             .unwrap()
     }
 
+    /// Codex review on #1065: an LNURL endpoint may return the same invoice
+    /// for a later attempt. That attempt's failure must still be counted and
+    /// get a backoff; only a repeat report of the *same* attempt is skipped.
+    #[tokio::test]
+    async fn a_failure_on_a_reused_invoice_is_counted_again() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        // First attempt: failed with this hash, counted once; the deadline
+        // has since passed and the order was claimed again.
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+        let repeat = super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+        assert!(
+            repeat.is_ok(),
+            "a repeat report of the same attempt is a no-op"
+        );
+        sqlx::query(
+            "UPDATE orders SET dev_fee_payment_hash = 'PENDING-x-2', dev_fee_next_attempt_at = 0 \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Second attempt resolves to the same invoice. Storing the hash alone
+        // keeps the dedupe: a crash before the send must not let recovery
+        // count the old failure again (Codex review on #1065, round 2).
+        assert!(
+            super::store_payment_hash(&pool, id, "PENDING-x-2", VALID_HEX_HASH)
+                .await
+                .unwrap()
+        );
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "nothing was sent yet");
+
+        // The send happened and failed: now the failure counts.
+        super::forget_counted_failure(&pool, id).await;
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
+
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 2, "the second attempt's failure is counted");
+        assert!(
+            row.1.is_some_and(|at| at > chrono::Utc::now().timestamp()),
+            "and it gets a new backoff: {:?}",
+            row.1
+        );
+    }
+
     /// Codex review on #1064 (round 3): the backoff must already be stored
     /// when a failed attempt gives the order back, on every failure path.
     #[tokio::test]
@@ -2342,6 +2499,7 @@ mod tests {
             &mut confirmed,
             &mut HashSet::new(),
             &Keys::generate(),
+            &LndSyncState::new(),
         )
         .await;
         assert!(confirmed.is_empty());
@@ -2653,7 +2811,14 @@ mod tests {
 
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut confirmed,
+            &Keys::generate(),
+            &LndSyncState::new(),
+        )
+        .await;
 
         let row: (i32, Option<String>) =
             sqlx::query_as("SELECT dev_fee_paid, dev_fee_payment_hash FROM orders WHERE id = ?")
@@ -2666,6 +2831,127 @@ mod tests {
         assert!(confirmed.is_empty());
     }
 
+    /// Codex review on #1065: a pass stops as soon as payments are
+    /// deferred, instead of trying (and backing off) every remaining order.
+    #[tokio::test]
+    async fn dev_fee_pass_stops_while_payments_are_deferred() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        let lnd_sync = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        lnd_sync.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+
+        let mut ln = dead_lnd().await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut HashSet::new(),
+            &Keys::generate(),
+            &lnd_sync,
+        )
+        .await;
+
+        let row: (Option<String>, i64) = sqlx::query_as(
+            "SELECT dev_fee_payment_hash, dev_fee_failed_attempts FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, 0), "not claimed, not attempted, not backed off");
+    }
+
+    /// Codex review on #1066: LND can cross the deferral threshold while the
+    /// invoice resolves; the order is then given back, unsent and uncounted.
+    #[tokio::test]
+    async fn a_dev_fee_resolved_into_a_deferral_is_released_uncounted() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        let marker = "PENDING-dev-fee-1792000000";
+        insert_test_order(&pool, id, "success", 100, false, Some(marker)).await;
+
+        let healthy = LndSyncState::new();
+        assert!(!super::release_if_deferred(&pool, &healthy, id, marker).await);
+
+        let stuck = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        stuck.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+        assert!(super::release_if_deferred(&pool, &stuck, id, marker).await);
+
+        let row: (Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_payment_hash, dev_fee_failed_attempts, dev_fee_next_attempt_at \
+             FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, 0, None), "released, not counted, no backoff");
+    }
+
+    /// Codex review on #1065: if the release fails, what is left is a
+    /// PENDING marker that Phase 1 resets once stale, never a real hash that
+    /// recovery would leave alone forever.
+    #[tokio::test]
+    async fn a_failed_deferred_release_leaves_a_self_healing_marker() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        let stale = format!("PENDING-{}-{}", uuid::Uuid::new_v4(), 1_000_000_000);
+        insert_test_order(&pool, id, "success", 100, false, Some(&stale)).await;
+        sqlx::query(
+            "CREATE TRIGGER busy BEFORE UPDATE OF dev_fee_payment_hash ON orders \
+             BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stuck = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        stuck.observe_unreachable_at_startup(now);
+
+        assert!(super::release_if_deferred(&pool, &stuck, id, &stale).await);
+
+        sqlx::query("DROP TRIGGER busy")
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup_stale_pending_markers(&pool).await;
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash, None, "Phase 1 reset the stale marker");
+    }
+
     #[tokio::test]
     async fn process_new_payments_query_failure_returns_early() {
         let pool = setup_orders_db().await;
@@ -2675,7 +2961,14 @@ mod tests {
             .unwrap();
         let mut ln = dead_lnd().await;
         let mut confirmed = HashSet::new();
-        process_new_dev_fee_payments(&pool, &mut ln, &mut confirmed, &Keys::generate()).await;
+        process_new_dev_fee_payments(
+            &pool,
+            &mut ln,
+            &mut confirmed,
+            &Keys::generate(),
+            &LndSyncState::new(),
+        )
+        .await;
         assert!(confirmed.is_empty());
     }
 

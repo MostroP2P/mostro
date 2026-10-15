@@ -2154,6 +2154,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("bond_payout_recipient migration");
+        sqlx::query(include_str!(
+            "../../../migrations/20261015120100_bond_payout_sent_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bond_payout_sent_at migration");
         // cashu escrow columns (mostro-core 0.12.1) — `Order::by_id` SELECTs
         // them. Apply each ALTER separately for the same reason as dev_fee.
         for stmt in include_str!("../../../migrations/20260530120000_cashu_escrow_fields.sql")
@@ -3297,6 +3303,7 @@ mod tests {
             price: None,
             reputation_import: None,
             payer_history: None,
+            health: Default::default(),
         });
     }
 

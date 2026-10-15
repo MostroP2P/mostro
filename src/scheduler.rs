@@ -39,6 +39,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // that has no LND. Lightning mode is unaffected (`is_cashu_enabled()` is
     // `false`, so every job below still starts exactly as before).
     if !Settings::is_cashu_enabled() {
+        job_lnd_sync_monitor(ctx.clone()).await;
         job_cancel_orders(ctx.clone()).await;
         job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
@@ -261,6 +262,82 @@ async fn job_info_event_send(ctx: AppContext) {
     });
 }
 
+/// Poll LND's `GetInfo` every `LND_SYNC_POLL_SECS` into `ctx.lnd_sync()`,
+/// and apply the fail-closed maintenance rule (#1063). See
+/// [`crate::app::health::lnd_sync`].
+#[mutants::skip]
+async fn job_lnd_sync_monitor(ctx: AppContext) {
+    use crate::app::health::lnd_sync::{
+        apply_auto_maintenance, log_transition, record_deferral_transition, LndObservation,
+        LND_SYNC_POLL_SECS,
+    };
+    // Bounded so a hung LND counts as unreachable instead of stalling the
+    // monitor (and with it, the deferral of outgoing payments).
+    const GET_INFO_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+    tokio::spawn(async move {
+        let mut ln_client: Option<LndConnector> = None;
+        // Whether payments were deferred at the previous poll; `false` at
+        // start so a spell already open (seeded at startup) is persisted.
+        let mut was_deferring = false;
+        loop {
+            if ln_client.is_none() {
+                match LndConnector::new().await {
+                    Ok(client) => ln_client = Some(client),
+                    Err(e) => warn!("LND sync monitor: cannot connect to LND: {e}"),
+                }
+            }
+            let info = match ln_client.as_mut() {
+                Some(client) => {
+                    match tokio::time::timeout(GET_INFO_TIMEOUT, client.get_node_info()).await {
+                        Ok(Ok(info)) => Some(info),
+                        Ok(Err(e)) => {
+                            warn!("LND sync monitor: GetInfo failed: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            warn!(
+                                "LND sync monitor: GetInfo did not answer within {}s",
+                                GET_INFO_TIMEOUT.as_secs()
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let now = Utc::now().timestamp();
+            let transition = match &info {
+                Some(info) => ctx.lnd_sync().observe(LndObservation::from(info), now),
+                None => {
+                    // Reconnect on the next poll: a broken channel must not
+                    // leave the monitor reporting "unreachable" forever.
+                    ln_client = None;
+                    ctx.lnd_sync().observe_unreachable(now)
+                }
+            };
+            let snapshot = ctx.lnd_sync().snapshot();
+            if let Some(transition) = transition {
+                log_transition(transition, &snapshot);
+            }
+            // The spell's start and end are persisted so a restart does not
+            // forget it (#1065 review): on failure, keep the last known value
+            // and try again at the next transition.
+            match record_deferral_transition(ctx.pool(), &snapshot, was_deferring, now).await {
+                Ok(is_deferring) => was_deferring = is_deferring,
+                Err(e) => warn!("LND sync monitor: could not persist the deferral history: {e}"),
+            }
+
+            if let Err(e) = apply_auto_maintenance(&ctx, now).await {
+                error!("Automatic maintenance on LND sync failed: {e}");
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(LND_SYNC_POLL_SECS)).await;
+        }
+    });
+}
+
 async fn job_retry_failed_payments(ctx: AppContext) {
     let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
@@ -272,6 +349,20 @@ async fn job_retry_failed_payments(ctx: AppContext) {
                 "I run async every {} seconds - checking for failed lightning payment",
                 interval
             );
+
+            // While our own node cannot pay, a retry would only fail and burn
+            // the buyer's attempts (#1063). `do_payment` defers too; skipping
+            // the whole pass here just keeps the logs quiet.
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!(
+                    "Skipping failed payment retries: LND is not synced to chain or not reachable"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
 
             if let Ok(payment_failed_list) = crate::db::find_failed_payment(ctx.pool()).await {
                 for payment_failed in payment_failed_list.into_iter() {
@@ -1559,12 +1650,21 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
         let pool = ctx.pool();
         let keys = ctx.keys();
         loop {
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!("Skipping dev fee cycle: LND is not synced to chain or not reachable");
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
             run_dev_fee_cycle(
                 pool,
                 &mut ln_client,
                 &mut confirmed,
                 &mut unverifiable,
                 keys,
+                ctx.lnd_sync(),
             )
             .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -1611,7 +1711,15 @@ async fn job_process_bond_payouts(ctx: AppContext) {
 
         let pool = ctx.pool();
         loop {
-            bond::run_bond_payout_cycle(pool, &mut ln_client).await;
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!("Skipping bond payout cycle: LND is not synced to chain or not reachable");
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
+            bond::run_bond_payout_cycle(pool, &mut ln_client, ctx.lnd_sync()).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

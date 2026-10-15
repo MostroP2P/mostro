@@ -4,6 +4,7 @@
 // Application context (dependency injection)
 pub mod context;
 pub mod daemon_state; // key/value operator state (maintenance mode)
+pub mod health; // LND sync tracking, fail-closed maintenance, health checks
 pub mod maintenance; // maintenance (drain) mode flag + drain counters
 
 // Submodules for different trading actions

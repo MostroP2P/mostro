@@ -230,6 +230,14 @@ impl LndSyncState {
         }
     }
 
+    /// Like [`LndSyncState::observe_at_startup`], when the startup `GetInfo`
+    /// failed: payments wait from the first moment.
+    pub fn observe_unreachable_at_startup(&self, now: i64) {
+        let mut state = self.write();
+        state.observe_unreachable(now);
+        state.unhealthy_since = Some(now.saturating_sub(PAYMENT_DEFER_AFTER_SECS));
+    }
+
     /// Record a failed or timed-out `GetInfo`.
     pub fn observe_unreachable(&self, now: i64) -> Option<SyncTransition> {
         self.write().observe_unreachable(now)
@@ -492,6 +500,15 @@ mod tests {
         assert!(state.defers_outgoing_payments(T0 + 15));
         state.observe(observation(true), T0 + 30);
         assert!(!state.defers_outgoing_payments(T0 + 30));
+    }
+
+    #[test]
+    fn an_unreachable_node_at_startup_defers_payments_at_once() {
+        let state = LndSyncState::new();
+        state.observe_unreachable_at_startup(T0);
+        assert!(state.defers_outgoing_payments(T0));
+        state.observe(observation(true), T0 + 15);
+        assert!(!state.defers_outgoing_payments(T0 + 15));
     }
 
     #[test]

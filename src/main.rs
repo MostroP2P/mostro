@@ -265,7 +265,10 @@ async fn main() -> Result<()> {
                 .expect("MOSTRO_CONFIG not initialized")
                 .clone(),
         );
-        let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+        // There is no LND to resync in Cashu mode: maintenance the daemon
+        // turned on in a Lightning run because LND was unsynced would
+        // otherwise never be lifted (#1063). Operator maintenance stays.
+        let maintenance = MaintenanceState::load_for_cashu(get_db_pool().as_ref()).await?;
         if maintenance.is_enabled() {
             tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
         }
@@ -286,10 +289,8 @@ async fn main() -> Result<()> {
     }
 
     let mut ln_client = LndConnector::new().await?;
-    let node_info = ln_client.get_node_info().await?;
-    // Seeds the LND sync state before any payment job starts (#1063).
-    let startup_sync = app::health::lnd_sync::LndObservation::from(&node_info);
-    let ln_status = LnStatus::from_get_info_response(node_info);
+    let ln_status = ln_client.get_node_info().await?;
+    let ln_status = LnStatus::from_get_info_response(ln_status);
     let node_pubkey = ln_status.node_pubkey.clone();
     if LN_STATUS.set(ln_status).is_err() {
         panic!("No connection to LND node - shutting down Mostro!");
@@ -429,9 +430,23 @@ async fn main() -> Result<()> {
     );
     // Payouts and dev fees must not go out against an unsynced node before
     // the sync monitor's first poll (#1063).
+    // Asked again here, right before the jobs start: the resubscriptions
+    // above can take a while on a node with many open trades, and a stale
+    // "synced" from boot must not let payouts out (#1063).
     let lnd_sync = app::health::lnd_sync::LndSyncState::new();
-    lnd_sync.observe_at_startup(startup_sync, chrono::Utc::now().timestamp());
-    if lnd_sync.defers_outgoing_payments(chrono::Utc::now().timestamp()) {
+    let startup_info = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ln_client.get_node_info(),
+    )
+    .await;
+    let now = chrono::Utc::now().timestamp();
+    match startup_info {
+        Ok(Ok(info)) => {
+            lnd_sync.observe_at_startup(app::health::lnd_sync::LndObservation::from(&info), now)
+        }
+        _ => lnd_sync.observe_unreachable_at_startup(now),
+    }
+    if lnd_sync.defers_outgoing_payments(now) {
         tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
     }
     let ctx = AppContext::new(

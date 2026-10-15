@@ -70,6 +70,23 @@ impl MaintenanceState {
         })
     }
 
+    /// [`MaintenanceState::load`] for a node starting in Cashu mode. That
+    /// mode has no LND, so the job that lifts the daemon's own `lnd_unsynced`
+    /// maintenance never runs, and the admin RPC is not started either:
+    /// maintenance the daemon turned on in an earlier Lightning run would
+    /// block new orders forever. It is lifted here; operator maintenance is
+    /// kept.
+    pub async fn load_for_cashu(pool: &SqlitePool) -> Result<Self, MostroError> {
+        let state = Self::load(pool).await?;
+        if state.disable_if_automatic(pool).await? {
+            tracing::warn!(
+                "Lifted the maintenance the daemon had enabled because LND was unsynced: \
+                 Cashu mode has no LND"
+            );
+        }
+        Ok(state)
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }
@@ -664,6 +681,43 @@ mod tests {
 
         assert!(!state.disable_if_automatic(&pool).await.unwrap());
         assert!(state.is_enabled());
+    }
+
+    /// Codex review on #1065: a Lightning run left its own `lnd_unsynced`
+    /// maintenance on, and the node restarts in Cashu mode.
+    #[tokio::test]
+    async fn cashu_startup_lifts_the_daemons_own_maintenance() {
+        let pool = pool().await;
+        MaintenanceState::load(&pool)
+            .await
+            .unwrap()
+            .enable_unless_enabled(&pool, REASON_LND_UNSYNCED)
+            .await
+            .unwrap();
+
+        let state = MaintenanceState::load_for_cashu(&pool).await.unwrap();
+
+        assert!(!state.is_enabled());
+        assert!(!MaintenanceState::load(&pool).await.unwrap().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn cashu_startup_keeps_operator_maintenance() {
+        let pool = pool().await;
+        MaintenanceState::load(&pool)
+            .await
+            .unwrap()
+            .set(&pool, true, Some("upgrade"))
+            .await
+            .unwrap();
+
+        let state = MaintenanceState::load_for_cashu(&pool).await.unwrap();
+
+        assert!(state.is_enabled());
+        assert_eq!(
+            state.reason(&pool).await.unwrap().as_deref(),
+            Some("upgrade")
+        );
     }
 
     #[tokio::test]

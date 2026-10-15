@@ -610,6 +610,13 @@ async fn process_new_dev_fee_payments(
             }
         };
 
+        // Resolving the invoice can take up to 20 s: check again right
+        // before sending, and give the order back untouched if payments are
+        // deferred now. Nothing was sent, so this is not a failure.
+        if release_if_deferred(pool, lnd_sync, order_id, &payment_hash_hex).await {
+            break;
+        }
+
         // STEP 3: Send payment with pre-resolved invoice.
         match tokio::time::timeout(
             std::time::Duration::from_secs(50),
@@ -965,6 +972,27 @@ async fn release_failed_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_m
         return;
     }
     release_pending_claim(pool, order_id, pending_marker).await;
+}
+
+/// If payments are deferred now, release the claim (`stored_hash`, the
+/// real hash stored before sending) without counting a failure, since nothing
+/// was sent. Returns whether it did, in which case the pass must stop.
+async fn release_if_deferred(
+    pool: &SqlitePool,
+    lnd_sync: &LndSyncState,
+    order_id: uuid::Uuid,
+    stored_hash: &str,
+) -> bool {
+    if !lnd_sync.defers_outgoing_payments(Utc::now().timestamp()) {
+        return false;
+    }
+    warn!(
+        "Dev fee for order {}: LND stopped being synced or reachable before the send; \
+         releasing the claim and stopping the pass",
+        order_id
+    );
+    release_pending_claim(pool, order_id, stored_hash).await;
+    true
 }
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
@@ -2728,6 +2756,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, (None, 0), "not claimed, not attempted, not backed off");
+    }
+
+    /// Codex review on #1066: LND can cross the deferral threshold while the
+    /// invoice resolves; the order is then given back, unsent and uncounted.
+    #[tokio::test]
+    async fn a_dev_fee_resolved_into_a_deferral_is_released_uncounted() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+
+        let healthy = LndSyncState::new();
+        assert!(!super::release_if_deferred(&pool, &healthy, id, VALID_HEX_HASH).await);
+
+        let stuck = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        stuck.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+        assert!(super::release_if_deferred(&pool, &stuck, id, VALID_HEX_HASH).await);
+
+        let row: (Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_payment_hash, dev_fee_failed_attempts, dev_fee_next_attempt_at \
+             FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, 0, None), "released, not counted, no backoff");
     }
 
     #[tokio::test]

@@ -167,8 +167,8 @@ async fn check_failure_retries_or_log(
              not counting it as a payment attempt",
             order.id
         );
-        if let Err(e) = crate::db::mark_payout_deferred(ctx.pool(), order.id).await {
-            warn!(
+        if let Err(e) = defer_payout_durably(ctx.pool(), order.id).await {
+            tracing::error!(
                 "Order id {}: could not record the deferred payout: {e}",
                 order.id
             );
@@ -734,7 +734,7 @@ pub async fn do_payment(
             "Order id {}: deferring the buyer payout, LND is not synced to chain or not reachable",
             order.id
         );
-        return crate::db::mark_payout_deferred(ctx.pool(), order.id).await;
+        return defer_payout_durably(ctx.pool(), order.id).await;
     }
     // Single bookkeeping point for the pre-claim paths. An `Err` out of
     // `dispatch_payout` means the buyer was not paid *and* no payout marker
@@ -1229,6 +1229,45 @@ async fn dispatch_payout(
     });
 
     Ok(())
+}
+
+/// Pauses between the attempts of [`defer_payout_durably`].
+const DEFER_PAYOUT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+];
+
+/// [`crate::db::mark_payout_deferred`], retried with a short backoff. The
+/// mark is what makes a deferred payout discoverable by
+/// `job_retry_failed_payments` (`failed_payment = true`): `release` and
+/// `admin-settle` do not act on `do_payment`'s error, so a single busy
+/// SQLite would otherwise leave the order settled with no payout and no
+/// recovery job looking at it. Returns the last error if every attempt fails.
+async fn defer_payout_durably(
+    pool: &Pool<Sqlite>,
+    order_id: uuid::Uuid,
+) -> Result<(), MostroError> {
+    let mut last_error = match crate::db::mark_payout_deferred(pool, order_id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for delay in DEFER_PAYOUT_RETRY_DELAYS {
+        warn!(
+            "Order id {order_id}: could not mark the payout deferred ({last_error}); retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        match crate::db::mark_payout_deferred(pool, order_id).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = e,
+        }
+    }
+    tracing::error!(
+        "Order id {order_id}: could not mark the payout deferred after {} attempts ({last_error}); \
+         the buyer payout of this settled order needs attention",
+        DEFER_PAYOUT_RETRY_DELAYS.len() + 1
+    );
+    Err(last_error)
 }
 
 /// After the slot gate and the dispatch semaphore, whose waits can be long:
@@ -2027,6 +2066,47 @@ mod tests {
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert!(db_order.failed_payment, "left for the retry job");
         assert_eq!(db_order.payment_attempts, 0);
+    }
+
+    /// Codex review on #1066: a transient database error while marking a
+    /// deferred payout must not leave the order invisible to the retry job.
+    #[tokio::test]
+    async fn a_deferred_payout_mark_is_retried_until_it_lands() {
+        let pool = create_test_pool().await;
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+        for stmt in [
+            "CREATE TABLE busy (x INTEGER)",
+            "INSERT INTO busy VALUES (1)",
+            "CREATE TRIGGER busy_orders BEFORE UPDATE OF failed_payment ON orders \
+             WHEN (SELECT COUNT(*) FROM busy) > 0 BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+        // The database recovers shortly after the first attempt fails.
+        let unblock = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sqlx::query("DROP TRIGGER busy_orders")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        };
+
+        defer_payout_durably(&pool, order.id).await.unwrap();
+        unblock.await.unwrap();
+
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "the retry job can find it");
+        assert!(crate::db::find_failed_payment(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|o| o.id == order.id));
     }
 
     #[tokio::test]

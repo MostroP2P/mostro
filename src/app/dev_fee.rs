@@ -1051,10 +1051,15 @@ pub(crate) async fn try_claim_order_for_dev_fee(
            AND (status = 'settled-hold-invoice' OR status = 'success')
            AND dev_fee > 0
            AND dev_fee_paid = 0
-           AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')",
+           AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')
+           AND (dev_fee_next_attempt_at IS NULL OR dev_fee_next_attempt_at <= ?)",
     )
     .bind(pending_marker)
     .bind(order_id)
+    // The claim re-checks the retry backoff itself: a cycle working from a
+    // stale `find_unpaid_dev_fees` result must not claim an order another
+    // cycle has just backed off.
+    .bind(Utc::now().timestamp())
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1422,6 +1427,33 @@ mod tests {
             .await
             .unwrap();
         assert!(!claimed, "Should not claim an already-paid order");
+    }
+
+    /// Codex review on #1064: two overlapping cycles both select the order;
+    /// the first fails it and sets a backoff, the second must not claim it
+    /// from its stale selection.
+    #[tokio::test]
+    async fn atomic_claim_respects_the_retry_backoff() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, false, None).await;
+        let now = chrono::Utc::now().timestamp();
+        let set_next_attempt = |at: i64| {
+            sqlx::query("UPDATE orders SET dev_fee_next_attempt_at = ? WHERE id = ?")
+                .bind(at)
+                .bind(id)
+                .execute(&pool)
+        };
+
+        set_next_attempt(now + 600).await.unwrap();
+        assert!(!try_claim_order_for_dev_fee(&pool, id, "PENDING-a-1")
+            .await
+            .unwrap());
+
+        set_next_attempt(now - 1).await.unwrap();
+        assert!(try_claim_order_for_dev_fee(&pool, id, "PENDING-b-1")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

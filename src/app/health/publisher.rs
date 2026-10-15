@@ -253,27 +253,55 @@ pub fn lnd_view(
 }
 
 /// What a change of triggers an immediate republish: `status`, every
-/// check state, and the maintenance flag.
-type Signature = (HealthStatus, Vec<(CheckName, CheckState)>, bool);
+/// check state, and maintenance (the flag and its reason).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Signature {
+    status: HealthStatus,
+    checks: Vec<(CheckName, CheckState)>,
+    maintenance: bool,
+    /// `None` when the reason could not be read.
+    maintenance_reason: Option<Option<String>>,
+}
+
+impl Signature {
+    /// Whether this evaluation's signature differs from the `published` one.
+    /// A reason that could not be read is no change: a slow read must not
+    /// republish the event with a `null` reason. A reason read again after a
+    /// publication that lacked it is.
+    fn differs_from(&self, published: &Signature) -> bool {
+        self.status != published.status
+            || self.checks != published.checks
+            || self.maintenance != published.maintenance
+            || (self.maintenance_reason.is_some()
+                && self.maintenance_reason != published.maintenance_reason)
+    }
+}
 
 /// One evaluation: the public report and the private payload.
 #[derive(Clone, Debug)]
 pub struct Evaluation {
     pub report: HealthReport,
     pub content: HealthContent,
+    /// Whether `content.maintenance.reason` was read, rather than `None`
+    /// because the read was skipped or failed.
+    maintenance_reason_read: bool,
 }
 
 impl Evaluation {
     fn signature(&self) -> Signature {
-        (
-            self.report.status,
-            self.report
+        Signature {
+            status: self.report.status,
+            checks: self
+                .report
                 .checks
                 .iter()
                 .map(|(name, state, _)| (*name, *state))
                 .collect(),
-            self.report.maintenance,
-        )
+            maintenance: self.report.maintenance,
+            maintenance_reason: self
+                .maintenance_reason_read
+                .then(|| self.content.maintenance.reason.clone()),
+        }
     }
 }
 
@@ -449,8 +477,9 @@ impl Publisher {
             "maintenance reason",
             async { ctx.maintenance().reason(pool).await },
         )
-        .await
-        .flatten();
+        .await;
+        let maintenance_reason_read = maintenance_reason.is_some();
+        let maintenance_reason = maintenance_reason.flatten();
 
         let mut checks: Vec<(CheckName, CheckState)> = Vec::with_capacity(4);
         let mut lnd_content = None;
@@ -589,7 +618,11 @@ impl Publisher {
                 reason: maintenance_reason,
             },
         };
-        Evaluation { report, content }
+        Evaluation {
+            report,
+            content,
+            maintenance_reason_read,
+        }
     }
 
     /// Whether `evaluation` must be published now.
@@ -601,7 +634,10 @@ impl Publisher {
         if elapsed >= Duration::from_secs(self.interval) {
             return true;
         }
-        let changed = self.last_signature.as_ref() != Some(&evaluation.signature())
+        let changed = self
+            .last_signature
+            .as_ref()
+            .is_none_or(|published| evaluation.signature().differs_from(published))
             || self.outage_unpublished;
         changed && elapsed >= Duration::from_secs(MIN_REPUBLISH_SECS)
     }
@@ -1494,6 +1530,58 @@ mod tests {
 
         publisher.last_publish = Some(Instant::now());
         assert!(!publisher.should_publish(&evaluation), "10 s spacing holds");
+    }
+
+    /// Codex review on #1066: a new maintenance reason, set while
+    /// maintenance stays on, is republished promptly; a reason that could not
+    /// be read is not taken for a change.
+    #[tokio::test]
+    async fn a_new_maintenance_reason_is_republished_promptly() {
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        ctx.maintenance()
+            .set(&pool, true, Some("upgrading LND"))
+            .await
+            .unwrap();
+        let mut publisher = Publisher::new(&ctx).await;
+        let published = publisher.evaluate(&ctx, NOW).await;
+        publisher.last_signature = Some(published.signature());
+        publisher.last_publish = Some(Instant::now() - Duration::from_secs(MIN_REPUBLISH_SECS));
+        assert!(!publisher.should_publish(&published), "nothing new");
+
+        ctx.maintenance()
+            .set(&pool, true, Some("moving channels"))
+            .await
+            .unwrap();
+        let new_reason = publisher.evaluate(&ctx, NOW + 1).await;
+        assert!(new_reason.report.maintenance);
+        assert_eq!(
+            new_reason.content.maintenance.reason.as_deref(),
+            Some("moving channels")
+        );
+        assert!(publisher.should_publish(&new_reason), "reason changed");
+
+        let mut unread = new_reason.clone();
+        unread.maintenance_reason_read = false;
+        unread.content.maintenance.reason = None;
+        publisher.last_signature = Some(new_reason.signature());
+        assert!(
+            !publisher.should_publish(&unread),
+            "an unread reason is no change"
+        );
+
+        publisher.last_signature = Some(unread.signature());
+        assert!(
+            publisher.should_publish(&new_reason),
+            "read again after a gap"
+        );
+
+        publisher.last_signature = Some(published.signature());
+        publisher.last_publish = Some(Instant::now());
+        assert!(!publisher.should_publish(&new_reason), "10 s spacing holds");
     }
 
     #[tokio::test]

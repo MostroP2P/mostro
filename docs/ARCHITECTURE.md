@@ -47,6 +47,7 @@ flowchart LR
 - Orders: `order.rs`, `take_buy.rs`, `take_sell.rs`, `cancel.rs`, `release.rs`, `add_invoice.rs`, `fiat_sent.rs`, `orders.rs`, `restore_session.rs`, `trade_pubkey.rs`, `rate_user.rs`, `dispute.rs`.
 - Admin: `admin_cancel.rs`, `admin_settle.rs`, `admin_add_solver.rs`, `admin_take_dispute.rs`.
 - Anti-abuse bond (`app/bond/*`): `flow.rs` (lock/release lifecycle), `slash.rs` (dispute + timeout slash), `payout.rs` (counterparty payout), `db.rs`/`model.rs` (the `bonds` table), `math.rs` (amount/split math), `types.rs` (`BondRole`, `BondState`, `BondSlashReason`). Opt-in and off by default; see `docs/ANTI_ABUSE_BOND.md`.
+- Reputation portability (`app/reputation/*`): `import.rs` (the `import-reputation` handler), `revoke.rs` (reversal behind the `RevokeReputationImports` RPC), `mod.rs` (boot check binding trust-list keys to their names). Opt-in and off by default; see `docs/REPUTATION_PORTABILITY.md`.
 - Router: `app.rs:handle_message_action` matches `mostro_core::message::Action` and calls module functions.
 
 ### Per‑Action Summaries

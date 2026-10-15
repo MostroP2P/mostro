@@ -315,12 +315,20 @@ impl Publisher {
         self.persisted_loaded
     }
 
+    /// `ListChannels`, with the connection (re)built if needed. Both are
+    /// bounded together by [`LND_CALL_TIMEOUT`], so neither a hung connect
+    /// nor a hung call can stall the evaluation.
     async fn channel_facts(&mut self) -> Option<ChannelFacts> {
-        if self.ln_client.is_none() {
-            self.ln_client = LndConnector::new().await.ok();
-        }
-        let client = self.ln_client.as_mut()?;
-        match tokio::time::timeout(LND_CALL_TIMEOUT, client.channel_facts()).await {
+        let ln_client = &mut self.ln_client;
+        let outcome = tokio::time::timeout(LND_CALL_TIMEOUT, async {
+            let client = match ln_client {
+                Some(client) => client,
+                None => ln_client.insert(LndConnector::new().await?),
+            };
+            client.channel_facts().await
+        })
+        .await;
+        match outcome {
             Ok(Ok(facts)) => Some(facts),
             Ok(Err(e)) => {
                 warn!("Health event: ListChannels failed: {e}");
@@ -328,7 +336,7 @@ impl Publisher {
                 None
             }
             Err(_) => {
-                warn!("Health event: ListChannels did not answer in time");
+                warn!("Health event: connecting to LND or ListChannels did not finish in time");
                 self.ln_client = None;
                 None
             }
@@ -436,8 +444,12 @@ impl Publisher {
             .await;
             // A success whose write failed is still known in memory; retry
             // persisting it, and report the newer of the two.
-            if database_ok {
-                ctx.health_stats().persist_last_success(pool).await;
+            if database_ok
+                && tokio::time::timeout(deadline, ctx.health_stats().persist_last_success(pool))
+                    .await
+                    .is_err()
+            {
+                warn!("Health event: saving the last payout time did not finish in time");
             }
             let last_success = bounded_db(database_ok, deadline, "last payout query", async {
                 last_payout_success_at(pool).await

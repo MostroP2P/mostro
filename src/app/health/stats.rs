@@ -155,7 +155,7 @@ impl HealthStats {
         let Some(at) = at.filter(|_| !persisted) else {
             return;
         };
-        match daemon_state::set(pool, KEY_LAST_PAYOUT_SUCCESS_AT, &at.to_string()).await {
+        match save_last_success(pool, at).await {
             Ok(()) => {
                 let mut last = lock(&self.last_success);
                 // A newer success recorded meanwhile stays pending.
@@ -196,6 +196,30 @@ impl HealthStats {
         }
         window
     }
+}
+
+/// Store `at` as the last successful payout, unless a later time is already
+/// stored: concurrent writers (the payout watcher, a reconciliation, the
+/// health job's retry) may finish in any order, and the stored value must
+/// never move back.
+async fn save_last_success(pool: &SqlitePool, at: i64) -> Result<(), MostroError> {
+    sqlx::query(
+        "INSERT INTO daemon_state (key, value, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at \
+         WHERE CAST(excluded.value AS INTEGER) > CAST(daemon_state.value AS INTEGER) \
+            OR daemon_state.value = ''",
+    )
+    .bind(KEY_LAST_PAYOUT_SUCCESS_AT)
+    .bind(at.to_string())
+    .bind(chrono::Utc::now().timestamp())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        mostro_core::error::MostroError::MostroInternalErr(
+            mostro_core::error::ServiceError::DbAccessError(e.to_string()),
+        )
+    })
 }
 
 /// When the last buyer payout succeeded, from `daemon_state`. `None` if
@@ -304,6 +328,19 @@ mod tests {
             .unwrap();
         stats.persist_last_success(&pool).await;
         assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0));
+    }
+
+    /// Codex review on #1066: writes finishing out of order never move the
+    /// stored time back.
+    #[tokio::test]
+    async fn the_stored_last_success_never_moves_back() {
+        let pool = pool().await;
+        save_last_success(&pool, T0 + 100).await.unwrap();
+        // A slower writer with an older value lands afterwards.
+        save_last_success(&pool, T0).await.unwrap();
+        assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0 + 100));
+        save_last_success(&pool, T0 + 200).await.unwrap();
+        assert_eq!(last_payout_success_at(&pool).await.unwrap(), Some(T0 + 200));
     }
 
     #[tokio::test]

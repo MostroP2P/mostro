@@ -1479,6 +1479,9 @@ pub async fn find_inflight_payouts(
     Ok(out)
 }
 
+/// Orders whose dev fee is due for a new payment attempt: unpaid, unclaimed,
+/// and past any retry backoff (`dev_fee_next_attempt_at`, set by
+/// `dev_fee::record_dev_fee_failure` after a failed attempt).
 pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let orders = sqlx::query_as::<_, Order>(
         r#"
@@ -1488,8 +1491,10 @@ pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, Mostr
             AND dev_fee > 0
             AND dev_fee_paid = 0
             AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')
+            AND (dev_fee_next_attempt_at IS NULL OR dev_fee_next_attempt_at <= ?)
         "#,
     )
+    .bind(chrono::Utc::now().timestamp())
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -2399,6 +2404,8 @@ mod tests {
                 dev_fee integer default 0,
                 dev_fee_paid integer not null default 0,
                 dev_fee_payment_hash char(64),
+                dev_fee_failed_attempts integer not null default 0,
+                dev_fee_next_attempt_at integer,
                 cashu_mint_url text,
                 cashu_escrow_token text,
                 cashu_escrow_locked_at integer,
@@ -3650,6 +3657,28 @@ mod tests {
             result.is_empty(),
             "Should not return orders with zero dev_fee"
         );
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_orders_still_in_backoff() {
+        let pool = setup_orders_db().await.unwrap();
+        let waiting = uuid::Uuid::new_v4();
+        let due = uuid::Uuid::new_v4();
+        insert_test_order(&pool, waiting, "success", 100, false, None).await;
+        insert_test_order(&pool, due, "success", 100, false, None).await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, next_at) in [(waiting, now + 600), (due, now - 1)] {
+            sqlx::query("UPDATE orders SET dev_fee_next_attempt_at = ? WHERE id = ?")
+                .bind(next_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        let ids: Vec<_> = result.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![due], "only the order past its backoff is due");
     }
 
     #[tokio::test]

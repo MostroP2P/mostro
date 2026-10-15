@@ -58,6 +58,19 @@
 //! Key principle: the real payment hash is always stored before sending, and
 //! recovery paths (Phase 3 and timeout handling) query LND by that hash
 //! instead of resolving a new invoice, preventing double payment.
+//!
+//! ## Retry backoff
+//!
+//! Every failed attempt (LNURL resolution, payment failure, or a timeout
+//! that LND confirms as failed) is recorded per order with
+//! [`record_dev_fee_failure`]: it bumps `dev_fee_failed_attempts` and sets
+//! `dev_fee_next_attempt_at`, before which `find_unpaid_dev_fees` does not
+//! hand the order to Phase 4. The delay doubles from
+//! [`DEV_FEE_RETRY_BASE_SECS`] up to [`DEV_FEE_RETRY_MAX_SECS`], with jitter
+//! so orders that failed together do not retry together. Without it, a node
+//! that cannot pay (2026-10-14: LND stuck on a stale chain) re-resolves and
+//! re-sends every unpaid dev fee every cycle, hundreds of failed payments an
+//! hour (#1063).
 
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::db::find_unpaid_dev_fees;
@@ -77,6 +90,14 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 use tokio::sync::mpsc::channel;
 use tracing::{debug, error, info, warn};
+
+/// Delay before retrying a dev fee after its first failed attempt, seconds.
+pub(crate) const DEV_FEE_RETRY_BASE_SECS: i64 = 60;
+/// Longest delay between two attempts for the same dev fee, seconds.
+pub(crate) const DEV_FEE_RETRY_MAX_SECS: i64 = 3_600;
+/// Share of the delay added at random, so that dev fees that failed in the
+/// same cycle spread out instead of retrying as one burst.
+const DEV_FEE_RETRY_JITTER: f64 = 0.25;
 
 // ── Public entry point ──────────────────────────────────────────────────
 
@@ -521,6 +542,7 @@ async fn process_new_dev_fee_payments(
                     order_id, e
                 );
                 release_pending_claim(pool, order_id, &pending_marker).await;
+                record_dev_fee_failure(pool, order_id).await;
                 continue;
             }
             Err(_) => {
@@ -529,6 +551,7 @@ async fn process_new_dev_fee_payments(
                     order_id
                 );
                 release_pending_claim(pool, order_id, &pending_marker).await;
+                record_dev_fee_failure(pool, order_id).await;
                 continue;
             }
         };
@@ -727,6 +750,7 @@ async fn handle_payment_failure(
             order_id, db_err
         );
     }
+    record_dev_fee_failure(pool, order_id).await;
 }
 
 async fn handle_payment_timeout(
@@ -792,6 +816,7 @@ async fn handle_payment_timeout(
                     order_id, e
                 );
             }
+            record_dev_fee_failure(pool, order_id).await;
         }
         DevFeePaymentState::Unknown | DevFeePaymentState::NotOnThisNode => {
             warn!(
@@ -803,6 +828,69 @@ async fn handle_payment_timeout(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Delay before the next attempt for a dev fee that has failed
+/// `failed_attempts` times in a row (`>= 1`), in seconds.
+///
+/// Doubles from [`DEV_FEE_RETRY_BASE_SECS`] up to [`DEV_FEE_RETRY_MAX_SECS`],
+/// then adds `jitter` (in `[0, 1)`) times [`DEV_FEE_RETRY_JITTER`] of it.
+/// Pure so the schedule is under test; the caller supplies the randomness.
+pub(crate) fn dev_fee_retry_delay_secs(failed_attempts: i64, jitter: f64) -> i64 {
+    let doublings = failed_attempts.saturating_sub(1).clamp(0, 30) as u32;
+    let delay = DEV_FEE_RETRY_BASE_SECS
+        .saturating_mul(1_i64 << doublings)
+        .min(DEV_FEE_RETRY_MAX_SECS);
+    let jitter = jitter.clamp(0.0, 1.0);
+    delay + (delay as f64 * DEV_FEE_RETRY_JITTER * jitter) as i64
+}
+
+/// Record a failed attempt for `order_id`: bump `dev_fee_failed_attempts` and
+/// push `dev_fee_next_attempt_at` out by [`dev_fee_retry_delay_secs`], so
+/// [`find_unpaid_dev_fees`] skips the order until then. Never touches a paid
+/// order. Logged, not propagated: a failed write only means the order may be
+/// retried sooner, as it was before backoff existed.
+pub(crate) async fn record_dev_fee_failure(pool: &SqlitePool, order_id: uuid::Uuid) {
+    let previous = match sqlx::query_scalar::<_, i64>(
+        "SELECT dev_fee_failed_attempts FROM orders WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(previous)) => previous,
+        Ok(None) => return,
+        Err(e) => {
+            error!(
+                "Failed to read dev fee attempts for order {}: {:?}",
+                order_id, e
+            );
+            return;
+        }
+    };
+    let failed_attempts = previous.saturating_add(1);
+    let delay = dev_fee_retry_delay_secs(failed_attempts, rand::random::<f64>());
+    let next_attempt_at = Utc::now().timestamp().saturating_add(delay);
+    match sqlx::query(
+        "UPDATE orders
+         SET dev_fee_failed_attempts = ?, dev_fee_next_attempt_at = ?
+         WHERE id = ? AND dev_fee_paid = 0",
+    )
+    .bind(failed_attempts)
+    .bind(next_attempt_at)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => info!(
+            "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
+            order_id, failed_attempts, delay
+        ),
+        Err(e) => error!(
+            "Failed to record dev fee backoff for order {}: {:?}",
+            order_id, e
+        ),
+    }
+}
 
 /// Release a PENDING claim back to NULL using exact marker match (safe release).
 /// Logs if the UPDATE fails (e.g. transient DB error).
@@ -1206,6 +1294,12 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to apply cashu escrow migration");
+        sqlx::query(include_str!(
+            "../../migrations/20261015120000_dev_fee_retry_backoff.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("Failed to apply dev fee retry backoff migration");
 
         pool
     }
@@ -1665,6 +1759,111 @@ mod tests {
             eligible.iter().all(|o| o.id != order_id),
             "a dev fee that just failed was immediately eligible for another attempt"
         );
+    }
+
+    #[test]
+    fn dev_fee_retry_delay_doubles_up_to_the_cap() {
+        use super::{dev_fee_retry_delay_secs, DEV_FEE_RETRY_BASE_SECS, DEV_FEE_RETRY_MAX_SECS};
+
+        assert_eq!(dev_fee_retry_delay_secs(1, 0.0), DEV_FEE_RETRY_BASE_SECS);
+        assert_eq!(
+            dev_fee_retry_delay_secs(2, 0.0),
+            2 * DEV_FEE_RETRY_BASE_SECS
+        );
+        assert_eq!(
+            dev_fee_retry_delay_secs(3, 0.0),
+            4 * DEV_FEE_RETRY_BASE_SECS
+        );
+        assert_eq!(dev_fee_retry_delay_secs(7, 0.0), DEV_FEE_RETRY_MAX_SECS);
+        // Huge counts neither overflow nor exceed the cap.
+        assert_eq!(
+            dev_fee_retry_delay_secs(i64::MAX, 0.0),
+            DEV_FEE_RETRY_MAX_SECS
+        );
+        // A count of zero (never failed) is treated like the first failure.
+        assert_eq!(dev_fee_retry_delay_secs(0, 0.0), DEV_FEE_RETRY_BASE_SECS);
+    }
+
+    #[test]
+    fn dev_fee_retry_jitter_adds_at_most_a_quarter() {
+        use super::{dev_fee_retry_delay_secs, DEV_FEE_RETRY_MAX_SECS};
+
+        let base = dev_fee_retry_delay_secs(3, 0.0);
+        let top = dev_fee_retry_delay_secs(3, 0.999);
+        assert!(top > base, "jitter must spread retries out");
+        assert!(
+            top <= base + base / 4,
+            "jitter is capped at 25% of the delay"
+        );
+        // Out-of-range randomness is clamped, never negative or unbounded.
+        assert_eq!(dev_fee_retry_delay_secs(3, -1.0), base);
+        assert!(dev_fee_retry_delay_secs(50, 7.0) <= DEV_FEE_RETRY_MAX_SECS * 5 / 4);
+    }
+
+    #[tokio::test]
+    async fn dev_fee_retry_backs_off_per_order() {
+        use super::record_dev_fee_failure;
+
+        let pool = setup_orders_db().await;
+        let failing = uuid::Uuid::new_v4();
+        let healthy = uuid::Uuid::new_v4();
+        insert_test_order(&pool, failing, "success", 100, false, None).await;
+        insert_test_order(&pool, healthy, "success", 100, false, None).await;
+
+        record_dev_fee_failure(&pool, failing).await;
+        record_dev_fee_failure(&pool, failing).await;
+
+        let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",
+        )
+        .bind(failing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
+        let now = chrono::Utc::now().timestamp();
+        let wait = next_at.expect("backoff recorded") - now;
+        // Second failure: 2 × base, plus up to 25% jitter (allow 2s of clock).
+        assert!((118..=152).contains(&wait), "unexpected wait {wait}s");
+
+        // Only the order that failed waits; the other is still due.
+        let eligible: Vec<_> = super::find_unpaid_dev_fees(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(eligible, vec![healthy]);
+
+        // Once the backoff has elapsed the order is due again.
+        sqlx::query("UPDATE orders SET dev_fee_next_attempt_at = ? WHERE id = ?")
+            .bind(now - 1)
+            .bind(failing)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let eligible = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(eligible.iter().any(|o| o.id == failing));
+    }
+
+    #[tokio::test]
+    async fn dev_fee_failure_never_touches_a_paid_order() {
+        use super::record_dev_fee_failure;
+
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        insert_test_order(&pool, id, "success", 100, true, Some(VALID_HEX_HASH)).await;
+
+        record_dev_fee_failure(&pool, id).await;
+
+        let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((attempts, next_at), (0, None));
     }
 
     #[tokio::test]

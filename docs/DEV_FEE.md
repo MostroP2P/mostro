@@ -619,7 +619,7 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
 
 2. **Scheduler Processing** (`src/scheduler.rs::job_process_dev_fee_payment()`):
    - Runs every 60 seconds
-   - Uses `find_unpaid_dev_fees()` to query database for orders where: `(status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`
+   - Uses `find_unpaid_dev_fees()` to query database for orders where: `(status = 'settled-hold-invoice' OR status = 'success') AND dev_fee > 0 AND dev_fee_paid = 0`, with no claim marker or payment hash, and past their retry backoff (`dev_fee_next_attempt_at`, see [Retry backoff](#retry-backoff))
    - **Important:** Query checks BOTH statuses to handle race conditions where buyer payment succeeds during dev fee payment
    - Processes each unpaid dev fee asynchronously with 50-second timeout per payment attempt
    - Mostrod pays the dev_fee amount (e.g., 300 sats) from its earnings to the development fund
@@ -630,11 +630,11 @@ The dev fee payment is executed by mostrod **from its earnings**, not from users
 - **Contribution from earnings:** Mostrod donates a percentage of what it earned to the dev fund
 - **Risk Mitigation:** Dev fee payment independent of buyer payment status
 - **Non-blocking:** Order flow continues regardless of dev fee payment status
-- **Retry mechanism:** Failed payments are automatically retried every 60 seconds
+- **Retry mechanism:** Failed payments are retried automatically, with a per-order backoff (see [Retry backoff](#retry-backoff))
 
 **Why Scheduler-Based?**
 - **Non-blocking order completion:** Seller release and buyer payment happen immediately, dev fee payment happens asynchronously
-- **Retry mechanism:** Failed payments are automatically retried on the next cycle (60 seconds)
+- **Retry mechanism:** Failed payments are retried automatically, after a per-order backoff that starts at 60 seconds (see [Retry backoff](#retry-backoff))
 - **Fault tolerance:** Order completes successfully even if dev fee payment fails temporarily
 - **Better user experience:** Users don't wait for dev fee payment during order release
 
@@ -750,7 +750,7 @@ WHERE id = ?
 **Remains `0` When:**
 - Payment hasn't been attempted yet (order just completed)
 - Payment failed (LNURL resolution error, routing failure, timeout)
-- Will retry on next scheduler cycle (60 seconds)
+- Will retry once its backoff has elapsed (see [Retry backoff](#retry-backoff))
 
 #### `dev_fee_payment_hash` Field Updates
 
@@ -842,7 +842,8 @@ Dev Fee Payment Failure (t=payment_timeout, could be 15s, 25s, or 50s timeout):
   └─> dev_fee_payment_hash = NULL (unchanged)
   └─> Database: No update (fields remain unchanged)
   └─> Order remains in retry queue
-  └─> Retry on next scheduler cycle (60 seconds later)
+  └─> dev_fee_failed_attempts += 1, dev_fee_next_attempt_at = now + backoff
+  └─> Retry once the backoff has elapsed (60s, 120s, 240s, ... up to 1h, plus jitter)
   └─> Will retry indefinitely until payment succeeds
 
 Edge Case - Buyer Payment Fails:
@@ -988,7 +989,16 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
 - Payment result timeout (25 seconds)
 - Scheduler timeout (50 seconds total)
 
-**Response:** All errors logged but order completes successfully. Failed payments are automatically retried on next scheduler cycle (60 seconds).
+**Response:** All errors logged but order completes successfully. Failed payments are retried automatically after a per-order backoff.
+
+#### Retry backoff
+
+Every failed attempt for an order (LNURL resolution failure or timeout, payment failure, or a payment timeout that LND confirms as failed) is recorded by `record_dev_fee_failure` in `src/app/dev_fee.rs`:
+
+- `dev_fee_failed_attempts` counts the consecutive failed attempts.
+- `dev_fee_next_attempt_at` is set to now plus a delay that doubles from 60 seconds up to one hour (60s, 120s, 240s, ... 3600s), plus up to 25% random jitter.
+
+`find_unpaid_dev_fees` skips an order until `dev_fee_next_attempt_at` has passed. Without this, a node that cannot pay at all (for example an LND stuck on a stale chain) re-resolved a fresh LNURL invoice and re-sent every unpaid dev fee on every 60-second cycle: hundreds of failed payments an hour, in bursts (issue #1063). The jitter keeps dev fees that failed in the same cycle from retrying together.
 
 **Common Error Scenarios:**
 
@@ -1015,6 +1025,8 @@ ALTER TABLE orders ADD COLUMN dev_fee_payment_hash CHAR(64);
 | `dev_fee` | INTEGER | 0 | Development fee amount in satoshis |
 | `dev_fee_paid` | INTEGER | 0 | Boolean: 0 = failed/not paid, 1 = paid |
 | `dev_fee_payment_hash` | CHAR(64) | NULL | Lightning payment hash for reconciliation |
+| `dev_fee_failed_attempts` | INTEGER | 0 | Consecutive failed attempts, drives the retry backoff (`migrations/20261015120000_dev_fee_retry_backoff.sql`) |
+| `dev_fee_next_attempt_at` | INTEGER | NULL | Unix seconds before which the order is not retried; NULL means no backoff |
 
 ### Backward Compatibility
 
@@ -1449,9 +1461,15 @@ WHERE status = 'pending'
 
 For orders with unpaid dev fees:
 
-1. Identify unpaid fees:
+1. Identify unpaid fees, with their retry state:
 ```sql
-SELECT id, dev_fee FROM orders WHERE dev_fee_paid = 0 AND dev_fee > 0;
+SELECT id, dev_fee, dev_fee_failed_attempts, dev_fee_next_attempt_at
+FROM orders WHERE dev_fee_paid = 0 AND dev_fee > 0;
+```
+
+   To make the daemon retry an order right away instead of paying it by hand, clear its backoff:
+```sql
+UPDATE orders SET dev_fee_next_attempt_at = NULL WHERE id = '<order_id>';
 ```
 
 2. Use Lightning CLI to manually pay:

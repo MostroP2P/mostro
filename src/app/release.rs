@@ -4,8 +4,8 @@ use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
-    claim_payout_slot, LndConnector, PaymentMessage, PayoutCaps, PayoutGateReason, SlotVerdict,
-    PAYOUT_SEND_PAYMENT_TIMEOUT,
+    claim_payout_slot, LndConnector, PaymentLookup, PaymentMessage, PayoutCaps, PayoutGateReason,
+    SlotVerdict, PAYOUT_SEND_PAYMENT_TIMEOUT,
 };
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
@@ -1123,6 +1123,7 @@ async fn dispatch_payout(
                                     buyer_pubkey,
                                     &my_keys,
                                     request_id,
+                                    Some(chrono::Utc::now().timestamp()),
                                 )
                                 .await
                                 .unwrap_or(false)
@@ -1443,12 +1444,19 @@ fn classify_dispatch(
 ///
 /// Buyer notifications (`PurchaseCompleted`, `Rate`) are enqueued only after a
 /// successful commit, so a retried finalization never spams the buyer.
+///
+/// `succeeded_at` is when LND settled the payout, for the health event: now
+/// for the live watcher, LND's own record for a payout recovered by
+/// reconciliation (possibly hours old). `None` when unknown: the success is
+/// then left out of the time-bounded health metrics (the one-hour window
+/// and the last successful payout) rather than counted as recent.
 async fn payment_success(
     ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
+    succeeded_at: Option<i64>,
 ) -> Result<bool> {
     let pool = ctx.pool();
 
@@ -1490,10 +1498,11 @@ async fn payment_success(
     // later cleanup failure.
     // Memory only here; the time is persisted in the background, so the
     // database cannot delay or fail the buyer's notifications below.
-    ctx.health_stats()
-        .record_payout_success(chrono::Utc::now().timestamp());
-    ctx.health_stats()
-        .persist_last_success_in_background(ctx.pool_arc());
+    if let Some(at) = succeeded_at {
+        ctx.health_stats().record_payout_success(at);
+        ctx.health_stats()
+            .persist_last_success_in_background(ctx.pool_arc());
+    }
 
     // Committed by us — notify the buyer now.
     enqueue_order_msg(
@@ -1518,16 +1527,16 @@ async fn payment_success(
 }
 
 /// The one LND capability `reconcile_inflight_payout` needs: query a payment's
-/// status by hash. Behind a trait (mirroring [`crate::app::cancel`]'s
-/// `CancelLightning`) so the reconcile branches are unit-testable with a stub
-/// instead of a live node.
+/// status by hash, with the time it reached it. Behind a trait (mirroring
+/// [`crate::app::cancel`]'s `CancelLightning`) so the reconcile branches are
+/// unit-testable with a stub instead of a live node.
 pub trait PayoutStatusLookup {
-    fn lookup_payment_status<'a>(
+    fn lookup_payment<'a>(
         &'a mut self,
         payment_hash: &'a [u8],
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+            dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                 + Send
                 + 'a,
         >,
@@ -1535,17 +1544,17 @@ pub trait PayoutStatusLookup {
 }
 
 impl PayoutStatusLookup for LndConnector {
-    fn lookup_payment_status<'a>(
+    fn lookup_payment<'a>(
         &'a mut self,
         payment_hash: &'a [u8],
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+            dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                 + Send
                 + 'a,
         >,
     > {
-        Box::pin(async move { LndConnector::lookup_payment_status(self, payment_hash).await })
+        Box::pin(async move { LndConnector::lookup_payment(self, payment_hash).await })
     }
 }
 
@@ -1595,7 +1604,15 @@ pub async fn reconcile_inflight_payout(
         }
     };
 
-    match ln_client.lookup_payment_status(&hash_bytes).await {
+    let lookup = ln_client.lookup_payment(&hash_bytes).await;
+    // When LND says the payment reached its final state: an outcome
+    // recovered here may be hours old, so the health metrics count it at
+    // that time, or not at all when LND gives none.
+    let resolved_at = match &lookup {
+        Ok(Some(found)) => found.resolved_at,
+        _ => None,
+    };
+    match lookup.map(|found| found.map(|found| found.status)) {
         Ok(Some(PaymentStatus::Succeeded)) => {
             // Clear the marker only once the order is actually finalized. If
             // finalization fails (or the buyer key is unreadable), keep the
@@ -1605,11 +1622,16 @@ pub async fn reconcile_inflight_payout(
                 Ok(Some(mut order)) => {
                     let my_keys = ctx.keys().clone();
                     match order.get_buyer_pubkey() {
-                        Ok(buyer_pubkey) => {
-                            payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None)
-                                .await
-                                .unwrap_or(false)
-                        }
+                        Ok(buyer_pubkey) => payment_success(
+                            ctx,
+                            &mut order,
+                            buyer_pubkey,
+                            &my_keys,
+                            None,
+                            resolved_at,
+                        )
+                        .await
+                        .unwrap_or(false),
                         Err(_) => false,
                     }
                 }
@@ -1637,12 +1659,13 @@ pub async fn reconcile_inflight_payout(
             {
                 // Only a payment LND reports as Failed reached a final state
                 // (an unknown or missing record is not an attempt), and it is
-                // counted once, by whoever wins the guarded re-arm.
-                if matches!(lookup, Ok(Some(PaymentStatus::Failed))) {
-                    ctx.health_stats().record_payout_failure(
-                        chrono::Utc::now().timestamp(),
-                        crate::app::health::stats::REASON_OTHER,
-                    );
+                // counted once, by whoever wins the guarded re-arm, at the
+                // time LND failed it.
+                if let Some(at) =
+                    resolved_at.filter(|_| matches!(lookup, Ok(Some(PaymentStatus::Failed))))
+                {
+                    ctx.health_stats()
+                        .record_payout_failure(at, crate::app::health::stats::REASON_OTHER);
                 }
                 if let Some(order) = pre {
                     // The claim is stamped before the send, so it bounds it.
@@ -3323,7 +3346,15 @@ mod tests {
         let my_keys = Keys::generate();
 
         // Act
-        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+        let result = payment_success(
+            &ctx,
+            &mut order,
+            buyer,
+            &my_keys,
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await;
 
         // Assert: committed the transition (returns true) and notified the buyer.
         assert!(result.unwrap(), "a committed finalization returns true");
@@ -3348,7 +3379,15 @@ mod tests {
         let my_keys = Keys::generate();
 
         // Act
-        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+        let result = payment_success(
+            &ctx,
+            &mut order,
+            buyer,
+            &my_keys,
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await;
 
         // Assert: the guarded UPDATE matched no rows (already finalized
         // elsewhere), so the call reports terminal (`true`) — the caller may
@@ -3373,28 +3412,34 @@ mod tests {
     struct StubLnClient {
         status: Option<PaymentStatus>,
         error: bool,
+        /// When LND resolved the payment (`PaymentLookup::resolved_at`).
+        resolved_at: Option<i64>,
     }
 
     impl PayoutStatusLookup for StubLnClient {
-        fn lookup_payment_status<'a>(
+        fn lookup_payment<'a>(
             &'a mut self,
             _payment_hash: &'a [u8],
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+                dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                     + Send
                     + 'a,
             >,
         > {
             let status = self.status;
             let error = self.error;
+            let resolved_at = self.resolved_at;
             Box::pin(async move {
                 if error {
                     Err(MostroInternalErr(ServiceError::LnPaymentError(
                         "stub".to_string(),
                     )))
                 } else {
-                    Ok(status)
+                    Ok(status.map(|status| PaymentLookup {
+                        status,
+                        resolved_at,
+                    }))
                 }
             })
         }
@@ -3435,6 +3480,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Succeeded),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3526,6 +3572,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Failed),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3559,6 +3606,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Failed),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3609,6 +3657,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Succeeded),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3643,6 +3692,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Succeeded),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3669,6 +3719,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Succeeded),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3684,6 +3735,96 @@ mod tests {
         assert_eq!(window.failed, 0);
     }
 
+    /// Codex review on #1066: a payout recovered by reconciliation is
+    /// counted at the time LND resolved it, so an hours-old success neither
+    /// lands in the one-hour window nor looks like a recent payout.
+    #[tokio::test]
+    async fn a_reconciled_success_is_counted_at_lnds_time() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let now = chrono::Utc::now().timestamp();
+        let settled_at = now - 3 * 3600;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: Some(settled_at),
+        };
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 0);
+        assert_eq!(
+            ctx.health_stats().last_success_in_memory(),
+            Some(settled_at)
+        );
+    }
+
+    /// Without LND's time, a recovered outcome stays out of the
+    /// time-bounded metrics; the order is still finalized or re-armed.
+    #[tokio::test]
+    async fn a_reconciled_outcome_without_lnds_time_is_not_counted() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let now = chrono::Utc::now().timestamp();
+
+        let (paid, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: None,
+        };
+        reconcile_inflight_payout(&ctx, &mut ln, paid, &hash, Some(token))
+            .await
+            .unwrap();
+        let db_order = Order::by_id(&pool, paid).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert!(ctx.health_stats().last_success_in_memory().is_none());
+
+        let (failed, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Failed),
+            error: false,
+            resolved_at: None,
+        };
+        reconcile_inflight_payout(&ctx, &mut ln, failed, &hash, Some(token))
+            .await
+            .unwrap();
+        assert!(marker_of(&pool, failed).await.is_none(), "re-armed");
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.attempts(), 0);
+    }
+
+    /// An hours-old failure recovered by reconciliation cannot trip the
+    /// failure-rate rule; a recent one counts.
+    #[tokio::test]
+    async fn a_reconciled_failure_is_counted_at_lnds_time() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let now = chrono::Utc::now().timestamp();
+        for resolved_at in [now - 3 * 3600, now - 60] {
+            let (id, hash, token) = settled_order_with_marker(&pool).await;
+            let mut ln = StubLnClient {
+                status: Some(PaymentStatus::Failed),
+                error: false,
+                resolved_at: Some(resolved_at),
+            };
+            reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(ctx.health_stats().payout_window(now).failed, 1);
+    }
+
     #[tokio::test]
     async fn reconcile_inflight_is_a_noop() {
         init_global_config();
@@ -3693,6 +3834,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::InFlight),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3734,6 +3876,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: None,
             error: true,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         reconcile_inflight_payout(&ctx, &mut ln, order.id, "abc", Some(1000))
             .await

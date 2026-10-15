@@ -82,7 +82,7 @@ The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). most
 
 **Where the numbers come from.**
 
-- Payout attempts are counted where buyer payouts reach a final state in LND: the payout watcher and the in-flight reconciliation in `src/app/release.rs` (`HealthStats` in `src/app/health/stats.rs`, an in-memory one-hour window). A deferred payout is not an attempt.
+- Payout attempts are counted where buyer payouts reach a final state in LND: the payout watcher and the in-flight reconciliation in `src/app/release.rs` (`HealthStats` in `src/app/health/stats.rs`, an in-memory one-hour window). A deferred payout is not an attempt. An outcome recovered by reconciliation (after a restart, say) is counted at the time LND resolved it, from the payment's HTLC records, so an hours-old success or failure neither enters the one-hour window nor looks like a recent payout; without that time it is left out of both.
 - The last successful payout time, `seq` and the last `created_at`, and the last relay outage are persisted in `daemon_state`, so they survive a restart.
 - The age of a settled order is measured from `orders.hold_settled_at`, stamped when the hold invoice is settled (`release`, `admin-settle`); orders settled before that column existed fall back to `invoice_held_at`.
 - `lnd` data comes from the sync monitor's last `GetInfo` and a `ListChannels` call.

@@ -82,8 +82,12 @@ impl<T> Default for Window<T> {
 }
 
 impl<T> Window<T> {
+    /// Record `value` at `at`. Usually the newest entry, but an outcome
+    /// recovered by reconciliation carries LND's (older) time: the window
+    /// stays ordered, so [`Window::recent`] drops it once it is out.
     fn push(&mut self, at: i64, value: T) {
-        self.entries.push_back((at, value));
+        let index = self.entries.partition_point(|(t, _)| *t <= at);
+        self.entries.insert(index, (at, value));
         while self.entries.len() > MAX_WINDOW_ENTRIES {
             self.entries.pop_front();
         }
@@ -311,6 +315,23 @@ mod tests {
         let window = stats.payout_window(T0 + WINDOW_SECS + 1);
         assert_eq!(window.failed, 2);
         assert_eq!(window.failure_reasons.get("no_route"), None);
+    }
+
+    /// Codex review on #1066: an outcome recorded late at its own (older)
+    /// time is in the window only while that time is.
+    #[test]
+    fn an_outcome_recorded_late_counts_at_its_own_time() {
+        let stats = HealthStats::new();
+        let now = T0 + 3 * WINDOW_SECS;
+        stats.record_payout_success(now - 10);
+        stats.record_payout_failure(now - 2 * WINDOW_SECS, "no_route");
+        stats.record_payout_success(now - 3 * WINDOW_SECS);
+        stats.record_payout_failure(now - 60, "no_route");
+
+        let window = stats.payout_window(now);
+        assert_eq!(window.succeeded, 1, "the hours-old success is out");
+        assert_eq!(window.failed, 1, "the hours-old failure is out");
+        assert_eq!(stats.last_success_in_memory(), Some(now - 10));
     }
 
     #[tokio::test]

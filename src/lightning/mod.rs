@@ -905,6 +905,20 @@ impl LndConnector {
         &mut self,
         payment_hash: &[u8],
     ) -> Result<Option<fedimint_tonic_lnd::lnrpc::payment::PaymentStatus>, MostroError> {
+        Ok(self
+            .lookup_payment(payment_hash)
+            .await?
+            .map(|payment| payment.status))
+    }
+
+    /// [`LndConnector::lookup_payment_status`], plus when the payment
+    /// reached its final state according to LND's own record
+    /// ([`payment_resolved_at`]). Reconciliation counts a recovered outcome
+    /// at that time, which may be long before it is recovered.
+    pub async fn lookup_payment(
+        &mut self,
+        payment_hash: &[u8],
+    ) -> Result<Option<PaymentLookup>, MostroError> {
         let track_req = TrackPaymentRequest {
             payment_hash: payment_hash.to_vec(),
             no_inflight_updates: false,
@@ -934,7 +948,10 @@ impl LndConnector {
                                 "Unknown payment status".to_string(),
                             ))
                         })?;
-                Ok(Some(status))
+                Ok(Some(PaymentLookup {
+                    status,
+                    resolved_at: payment_resolved_at(&payment),
+                }))
             }
             Ok(None) => Ok(None),
             Err(status) => {
@@ -1067,6 +1084,39 @@ impl LnStatus {
     }
 }
 
+/// A payment LND tracks: its status and, once final, when it got there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaymentLookup {
+    pub status: payment::PaymentStatus,
+    /// Unix seconds; see [`payment_resolved_at`].
+    pub resolved_at: Option<i64>,
+}
+
+/// When `payment` reached its final state, from LND's record: for a success
+/// the latest resolution of a settled HTLC; for a failure the latest HTLC
+/// resolution, or its creation when no HTLC was attempted (no route), since
+/// pathfinding then fails within the payment timeout. `None` while it is in
+/// flight or when LND records no time.
+pub fn payment_resolved_at(payment: &Payment) -> Option<i64> {
+    use fedimint_tonic_lnd::lnrpc::htlc_attempt::HtlcStatus;
+    let latest_resolution = |settled_only: bool| {
+        payment
+            .htlcs
+            .iter()
+            .filter(|htlc| !settled_only || htlc.status == HtlcStatus::Succeeded as i32)
+            .map(|htlc| htlc.resolve_time_ns)
+            .filter(|ns| *ns > 0)
+            .max()
+    };
+    let ns = match payment::PaymentStatus::try_from(payment.status).ok()? {
+        payment::PaymentStatus::Succeeded => latest_resolution(true),
+        payment::PaymentStatus::Failed => latest_resolution(false)
+            .or((payment.creation_time_ns > 0).then_some(payment.creation_time_ns)),
+        _ => None,
+    }?;
+    Some(ns / 1_000_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1078,6 +1128,62 @@ mod tests {
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::*;
     use std::sync::{Arc, Mutex};
+
+    /// Codex review on #1066: reconciliation counts a recovered payout at
+    /// the time LND resolved it.
+    #[test]
+    fn a_payments_resolution_time_comes_from_lnd() {
+        use super::{payment, payment_resolved_at, Payment};
+        use fedimint_tonic_lnd::lnrpc::{htlc_attempt::HtlcStatus, HtlcAttempt};
+        const S: i64 = 1_000_000_000;
+        let htlc = |status: HtlcStatus, resolved_s: i64| HtlcAttempt {
+            status: status as i32,
+            resolve_time_ns: resolved_s * S,
+            ..Default::default()
+        };
+        let paid = Payment {
+            status: payment::PaymentStatus::Succeeded as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![
+                htlc(HtlcStatus::Failed, 130),
+                htlc(HtlcStatus::Succeeded, 120),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&paid), Some(120), "the settled HTLC");
+
+        let failed = Payment {
+            status: payment::PaymentStatus::Failed as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![htlc(HtlcStatus::Failed, 140), htlc(HtlcStatus::Failed, 110)],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&failed), Some(140), "the last attempt");
+
+        let no_route = Payment {
+            status: payment::PaymentStatus::Failed as i32,
+            creation_time_ns: 100 * S,
+            ..Default::default()
+        };
+        assert_eq!(
+            payment_resolved_at(&no_route),
+            Some(100),
+            "no HTLC attempted"
+        );
+
+        let in_flight = Payment {
+            status: payment::PaymentStatus::InFlight as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![htlc(HtlcStatus::Failed, 110)],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&in_flight), None);
+        let unrecorded = Payment {
+            status: payment::PaymentStatus::Succeeded as i32,
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&unrecorded), None);
+    }
 
     fn init_test_settings() {
         crate::config::init_test_nostr_keys();

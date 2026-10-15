@@ -1,6 +1,6 @@
 use crate::app::bond;
 use crate::app::context::AppContext;
-use crate::app::dispute::close_dispute_after_user_resolution;
+use crate::app::dispute::close_dispute_after_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
@@ -373,8 +373,7 @@ pub async fn release_action(
     // `admin-settle` writes, and keeping the two apart is what lets anyone
     // reading the dispute tell a trade the users resolved themselves from
     // one a solver decided.
-    close_dispute_after_user_resolution(ctx, &order, DisputeStatus::Released, my_keys, "release")
-        .await;
+    close_dispute_after_resolution(ctx, &order, DisputeStatus::Released, my_keys, "release").await;
 
     enqueue_order_msg(
         None,

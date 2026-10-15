@@ -1621,6 +1621,52 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("existing-hash"));
     }
 
+    /// Regression for the 2026-10-14 retry storm: while LND could not pay,
+    /// every cycle (60s) re-resolved a fresh LNURL invoice and re-sent the
+    /// dev fee of every unpaid order back to back, ~400–670 failed payments
+    /// an hour. A dev fee that just failed must wait before it is eligible
+    /// again, instead of being picked up by the very next cycle.
+    #[tokio::test]
+    async fn failed_dev_fee_is_not_retried_on_the_next_cycle() {
+        use mostro_core::order::Order;
+        use mostro_core::prelude::ServiceError;
+
+        let pool = setup_orders_db().await;
+        let order_id = uuid::Uuid::new_v4();
+        // Phase 4 stored the real hash before sending.
+        insert_test_order(&pool, order_id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The send fails (no_route, incorrect_payment_details, ...).
+        let err = MostroError::MostroInternalErr(ServiceError::LnPaymentError(
+            "payment failed: reason 2".to_string(),
+        ));
+        handle_payment_failure(order, &pool, order_id, &err).await;
+
+        // Next cycle, Phase 3 asks LND, which reports the payment Failed, and
+        // clears the hash exactly as `recover_partial_payments` does.
+        sqlx::query(
+            "UPDATE orders SET dev_fee_payment_hash = NULL \
+             WHERE id = ? AND dev_fee_paid = 0 AND dev_fee_payment_hash = ?",
+        )
+        .bind(order_id)
+        .bind(VALID_HEX_HASH)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Phase 4 of that same cycle must not pick the order up again.
+        let eligible = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        assert!(
+            eligible.iter().all(|o| o.id != order_id),
+            "a dev fee that just failed was immediately eligible for another attempt"
+        );
+    }
+
     #[tokio::test]
     async fn targeted_dev_fee_updates_do_not_overwrite_status() {
         use mostro_core::order::Order;

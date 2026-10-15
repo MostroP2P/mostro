@@ -2,13 +2,16 @@
 //! protocol `health_event.md`, "`cashu_mint`").
 //!
 //! The daemon cannot escrow anything while its mint is down, even with
-//! healthy relays and database. The mints probed are the `[cashu].mint_urls`
-//! allowlist, or, on an open node (empty allowlist), the distinct mints that
-//! currently hold escrow: orders past the escrow step, with a token locked,
-//! not yet terminal. Never a mint a pending order merely names: anyone can
-//! publish an order naming an unreachable mint, and that must not make the
-//! instance look down. A mint counts as reachable when it answers
-//! `GET /v1/info` (NUT-06) with a success status within 10 seconds.
+//! healthy relays and database. The mints probed are the union of the
+//! `[cashu].mint_urls` allowlist and the distinct mints that currently hold
+//! escrow (orders past the escrow step, with a token locked, not yet
+//! terminal), even with a non-empty allowlist: a mint removed from the
+//! allowlist while it still holds escrow keeps being probed. Never a mint a
+//! pending order merely names: anyone can publish an order naming an
+//! unreachable mint, and that must not make the instance look down. Nothing
+//! to probe (empty allowlist, no escrow held) is `ok`. A mint counts as
+//! reachable when it answers `GET /v1/info` (NUT-06) with a success status
+//! within 10 seconds.
 
 use crate::app::health::check::CheckState;
 use crate::cashu::mint_answers_info;
@@ -83,24 +86,35 @@ async fn probe(mint_url: &str, open: bool) -> bool {
 
 /// The `cashu_mint` check for this node.
 pub async fn cashu_mint_check(pool: &SqlitePool, cashu: &CashuSettings) -> CheckState {
-    let open = cashu.mint_urls.is_empty();
-    let mints = if open {
-        match escrow_mints(pool).await {
-            Ok(mints) => mints,
-            Err(e) => {
-                warn!("Health event: cannot list the mints holding escrow: {e}");
-                return CheckState::Unknown;
-            }
+    let escrow = match escrow_mints(pool).await {
+        Ok(mints) => mints,
+        Err(e) => {
+            warn!("Health event: cannot list the mints holding escrow: {e}");
+            return CheckState::Unknown;
         }
-    } else {
-        cashu.mint_urls.clone()
     };
-    probe_mints(&mints, open).await
+    let mints = mints_to_probe(&cashu.mint_urls, escrow);
+    probe_mints(&mints, cashu.mint_urls.is_empty()).await
 }
 
-/// Probe `mints` (the allowlist, or on an open node the mints holding
-/// escrow) and derive the check. Network only: the health publisher reads
-/// the open node's mint list within its database budget and calls this.
+/// The probe set: the allowlist plus the mints holding escrow, canonicalised
+/// and without duplicates.
+pub fn mints_to_probe(allowlist: &[String], escrow: Vec<String>) -> Vec<String> {
+    allowlist
+        .iter()
+        .filter_map(|url| normalize_mint_url(url).ok())
+        .chain(escrow)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Probe `mints` and derive the check. Network only: the health publisher
+/// reads the mints holding escrow within its database budget, builds the set
+/// with [`mints_to_probe`] and calls this. Each mint is reached the way the
+/// daemon itself connects to it (`CashuMints::client_for`): on an open node
+/// (empty allowlist) with the public-host check and a pinned address,
+/// otherwise directly.
 pub async fn probe_mints(mints: &[String], open: bool) -> CheckState {
     let probes = mints.iter().map(|mint| probe(mint, open));
     let reachable = futures::future::join_all(probes).await;
@@ -265,6 +279,42 @@ mod tests {
         let pool = pool().await;
         let cashu = settings(vec![format!("http://{}", dead_port().await)]);
         assert_eq!(cashu_mint_check(&pool, &cashu).await, CheckState::Fail);
+    }
+
+    /// Spec update on protocol #84: a mint removed from the allowlist while
+    /// it still holds escrow keeps being probed, alongside the allowlist.
+    #[tokio::test]
+    async fn a_delisted_mint_still_holding_escrow_is_probed() {
+        let pool = pool().await;
+        let delisted = format!("http://{}", dead_port().await);
+        insert(&pool, "active", &delisted, true).await;
+        let listed = format!("http://{}", mock_mint().await);
+        let cashu = settings(vec![listed]);
+
+        assert_eq!(cashu_mint_check(&pool, &cashu).await, CheckState::Warn);
+    }
+
+    #[test]
+    fn the_probe_set_is_the_allowlist_plus_the_escrow_mints() {
+        let set = mints_to_probe(
+            &[
+                "https://Mint.example.com/".to_string(),
+                "https://b.example.org".to_string(),
+            ],
+            vec![
+                "https://mint.example.com".to_string(),
+                "https://delisted.example.net".to_string(),
+            ],
+        );
+        assert_eq!(
+            set,
+            vec![
+                "https://b.example.org".to_string(),
+                "https://delisted.example.net".to_string(),
+                "https://mint.example.com".to_string(),
+            ]
+        );
+        assert!(mints_to_probe(&[], vec![]).is_empty());
     }
 
     #[tokio::test]

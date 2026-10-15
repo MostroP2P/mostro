@@ -535,20 +535,17 @@ impl Publisher {
             }
         }
         if let Some(cashu) = settings.cashu.as_ref().filter(|cashu| cashu.enabled) {
-            use crate::app::health::cashu_mint::{escrow_mints, probe_mints};
-            // An open node finds its mints in the database, read within the
-            // shared budget: without it, which mints to probe is unknown. The
-            // allowlist needs no database. The network probes have their own
-            // bound.
+            use crate::app::health::cashu_mint::{escrow_mints, mints_to_probe, probe_mints};
+            // The probe set is the allowlist plus the mints holding escrow,
+            // read within the shared database budget: without that read,
+            // which mints to probe is unknown. The network probes have their
+            // own bound.
             let open = cashu.mint_urls.is_empty();
-            let mints = if open {
-                bounded_db(database_ok, budget.remaining(), "escrow mints", async {
-                    escrow_mints(pool).await
-                })
-                .await
-            } else {
-                Some(cashu.mint_urls.clone())
-            };
+            let mints = bounded_db(database_ok, budget.remaining(), "escrow mints", async {
+                escrow_mints(pool).await
+            })
+            .await
+            .map(|escrow| mints_to_probe(&cashu.mint_urls, escrow));
             let state = match mints {
                 Some(mints) => {
                     tokio::time::timeout(CASHU_MINT_PROBE_TIMEOUT, probe_mints(&mints, open))

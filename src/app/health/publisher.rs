@@ -38,8 +38,12 @@ use tracing::{error, info, warn};
 pub const EVALUATION_SECS: u64 = 15;
 /// Minimum time between two publications, seconds.
 pub const MIN_REPUBLISH_SECS: u64 = 10;
-/// Bound on the database probe (`database` check), seconds.
+/// Bound on the database probe (`database` check), and on each database
+/// read or write the job makes after it.
 const DATABASE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on the Cashu mint probes (10 s each, in parallel) plus the read of
+/// the mints holding escrow.
+const CASHU_MINT_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound on `ListChannels`.
 const LND_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -139,16 +143,41 @@ pub async fn dev_fee_pending(pool: &SqlitePool) -> Result<u64, MostroError> {
     Ok(count.max(0) as u64)
 }
 
-/// The `database` probe: a trivial query within [`DATABASE_PROBE_TIMEOUT`].
-async fn database_answers(pool: &SqlitePool) -> bool {
+/// The `database` probe: a trivial query within `deadline`.
+async fn database_answers(pool: &SqlitePool, deadline: Duration) -> bool {
     matches!(
-        tokio::time::timeout(
-            DATABASE_PROBE_TIMEOUT,
-            sqlx::query("SELECT 1").execute(pool)
-        )
-        .await,
+        tokio::time::timeout(deadline, sqlx::query("SELECT 1").execute(pool)).await,
         Ok(Ok(_))
     )
+}
+
+/// Run one database operation for the health event: `None` when the probe
+/// already failed (the read is skipped, so a stuck pool cannot hold the
+/// evaluation back for every query's own timeout), when it does not finish
+/// within `deadline`, or when it fails.
+async fn bounded_db<T, F>(
+    database_ok: bool,
+    deadline: Duration,
+    what: &str,
+    operation: F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = Result<T, MostroError>>,
+{
+    if !database_ok {
+        return None;
+    }
+    match tokio::time::timeout(deadline, operation).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            warn!("Health event: {what} failed: {e}");
+            None
+        }
+        Err(_) => {
+            warn!("Health event: {what} did not finish in time");
+            None
+        }
+    }
 }
 
 /// The `lnd` content and the LND tags from the sync monitor's snapshot and
@@ -227,6 +256,8 @@ pub struct Publisher {
     persisted: PersistedHealth,
     had_relay_connection: bool,
     ln_client: Option<LndConnector>,
+    /// Bound on the database probe and on every database operation after it.
+    db_timeout: Duration,
     last_publish: Option<Instant>,
     last_signature: Option<Signature>,
 }
@@ -247,6 +278,7 @@ impl Publisher {
             persisted,
             had_relay_connection: false,
             ln_client: None,
+            db_timeout: DATABASE_PROBE_TIMEOUT,
             last_publish: None,
             last_signature: None,
         }
@@ -273,7 +305,13 @@ impl Publisher {
     }
 
     /// Track the relay outage and persist it when it changes.
-    async fn observe_relays(&mut self, pool: &SqlitePool, connected: usize, now: i64) {
+    async fn observe_relays(
+        &mut self,
+        pool: &SqlitePool,
+        database_ok: bool,
+        connected: usize,
+        now: i64,
+    ) {
         if let Some(outage) =
             self.persisted
                 .relay_outage
@@ -284,8 +322,16 @@ impl Publisher {
             } else {
                 info!("A relay is connected again after an outage");
             }
-            if let Err(e) = save_relay_outage(pool, outage).await {
-                error!("Could not persist the relay outage: {e}");
+            if bounded_db(
+                database_ok,
+                self.db_timeout,
+                "saving the relay outage",
+                async { save_relay_outage(pool, outage).await },
+            )
+            .await
+            .is_none()
+            {
+                error!("Could not persist the relay outage; it is kept in memory");
             }
             self.persisted.relay_outage = outage;
         }
@@ -307,20 +353,20 @@ impl Publisher {
             .values()
             .filter(|relay| relay.status().is_connected())
             .count();
-        self.observe_relays(pool, connected, now).await;
 
-        // Database.
-        let database_ok = database_answers(pool).await;
+        // Database: probed first, and every later read is skipped if it did
+        // not answer, so the evaluation stays within one probe's timeout.
+        let database_ok = database_answers(pool, self.db_timeout).await;
+        let deadline = self.db_timeout;
+        self.observe_relays(pool, database_ok, connected, now).await;
 
         // Maintenance.
         let maintenance_enabled = ctx.maintenance().is_enabled();
-        let maintenance_reason = match ctx.maintenance().reason(pool).await {
-            Ok(reason) => reason,
-            Err(e) => {
-                warn!("Health event: could not read the maintenance reason: {e}");
-                None
-            }
-        };
+        let maintenance_reason = bounded_db(database_ok, deadline, "maintenance reason", async {
+            ctx.maintenance().reason(pool).await
+        })
+        .await
+        .flatten();
 
         let mut checks: Vec<(CheckName, CheckState)> = Vec::with_capacity(4);
         let mut lnd_content = None;
@@ -346,14 +392,14 @@ impl Publisher {
             checks.push((CheckName::LndSync, snapshot.sync_check(now, fail_after)));
 
             let window = ctx.health_stats().payout_window(now);
-            let rows = payout_rows(pool, i64::from(settings.lightning.payment_attempts), now)
-                .await
-                .inspect_err(|e| warn!("Health event: payout query failed: {e}"))
-                .ok();
-            let last_success = last_payout_success_at(pool)
-                .await
-                .inspect_err(|e| warn!("Health event: last payout query failed: {e}"))
-                .ok();
+            let rows = bounded_db(database_ok, deadline, "payout query", async {
+                payout_rows(pool, i64::from(settings.lightning.payment_attempts), now).await
+            })
+            .await;
+            let last_success = bounded_db(database_ok, deadline, "last payout query", async {
+                last_payout_success_at(pool).await
+            })
+            .await;
             let facts = match (rows, last_success) {
                 (Some(rows), Some(last_success_at)) => Some(PayoutFacts {
                     succeeded_1h: window.succeeded,
@@ -380,19 +426,28 @@ impl Publisher {
                 && networks.as_deref().is_some_and(dev_fee_payments_enabled);
             if pays_dev_fee {
                 dev_fee_content = Some(DevFeeContent {
-                    pending: dev_fee_pending(pool)
-                        .await
-                        .inspect_err(|e| warn!("Health event: dev fee query failed: {e}"))
-                        .ok(),
+                    pending: bounded_db(database_ok, deadline, "dev fee query", async {
+                        dev_fee_pending(pool).await
+                    })
+                    .await,
                     failed_1h: dev_fee_failures_1h(now),
                 });
             }
         }
         if let Some(cashu) = settings.cashu.as_ref().filter(|cashu| cashu.enabled) {
-            checks.push((
-                CheckName::CashuMint,
-                crate::app::health::cashu_mint::cashu_mint_check(pool, cashu).await,
-            ));
+            // An open node finds its mints in the database: without it, which
+            // mints to probe is unknown. The allowlist needs no database.
+            let state = if !database_ok && cashu.mint_urls.is_empty() {
+                CheckState::Unknown
+            } else {
+                tokio::time::timeout(
+                    CASHU_MINT_CHECK_TIMEOUT,
+                    crate::app::health::cashu_mint::cashu_mint_check(pool, cashu),
+                )
+                .await
+                .unwrap_or(CheckState::Unknown)
+            };
+            checks.push((CheckName::CashuMint, state));
         }
         checks.push((CheckName::Relays, relays_check(configured, connected)));
         checks.push((CheckName::Database, database_check(database_ok)));
@@ -453,8 +508,13 @@ impl Publisher {
                 stamp.created_at
             );
         }
-        if let Err(e) = save_stamp(ctx.pool(), stamp).await {
-            error!("Could not persist the health event seq/created_at: {e}");
+        if bounded_db(true, self.db_timeout, "saving seq/created_at", async {
+            save_stamp(ctx.pool(), stamp).await
+        })
+        .await
+        .is_none()
+        {
+            error!("Could not persist the health event seq/created_at");
         }
         self.persisted.last_stamp = Some(stamp);
 
@@ -486,16 +546,28 @@ impl Publisher {
             Ok(event) => event,
             Err(e) => return error!("Could not build the health event: {e}"),
         };
+        // Only a send at least one relay accepted counts as published: a
+        // failed one is retried at the next evaluation instead of waiting a
+        // whole interval.
         match ctx.nostr_client().send_event(&event).await {
-            Ok(_) => info!(
-                "Published health event: status {}, seq {}",
-                evaluation.report.status.as_str(),
+            Ok(output) if !output.success.is_empty() => {
+                info!(
+                    "Published health event: status {}, seq {}",
+                    evaluation.report.status.as_str(),
+                    stamp.seq
+                );
+                self.last_publish = Some(Instant::now());
+                self.last_signature = Some(evaluation.signature());
+            }
+            Ok(output) => warn!(
+                "No relay accepted the health event (seq {}): {:?}; retrying next evaluation",
+                stamp.seq, output.failed
+            ),
+            Err(e) => warn!(
+                "Could not publish the health event (seq {}): {e}; retrying next evaluation",
                 stamp.seq
             ),
-            Err(e) => warn!("Could not publish the health event: {e}"),
         }
-        self.last_publish = Some(Instant::now());
-        self.last_signature = Some(evaluation.signature());
     }
 
     /// Evaluate and publish if due.
@@ -696,6 +768,102 @@ mod tests {
             payout_rows(&pool, 3, NOW).await.unwrap(),
             PayoutRows::default()
         );
+    }
+
+    /// Codex review on #1066: once the database probe times out, the reads
+    /// that depend on it are skipped, so the evaluation finishes within one
+    /// probe's timeout and reports `database = fail` with unknown metrics.
+    #[tokio::test]
+    async fn a_stuck_database_does_not_hold_the_evaluation_back() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        publisher.db_timeout = Duration::from_millis(100);
+        // Every connection is taken: each query would wait on the pool.
+        let _held = pool.acquire().await.unwrap();
+
+        let started = Instant::now();
+        let evaluation = publisher.evaluate(&ctx, NOW).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        let state = |name: CheckName| {
+            evaluation
+                .report
+                .checks
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .map(|(_, s, _)| *s)
+        };
+        assert_eq!(state(CheckName::Database), Some(CheckState::Fail));
+        assert_eq!(state(CheckName::Payouts), Some(CheckState::Unknown));
+        let payouts = evaluation.content.payouts.expect("an object on lightning");
+        assert_eq!(payouts.settled_unpaid_orders, None);
+        assert_eq!(payouts.awaiting_buyer_invoice_orders, None);
+        assert_eq!(payouts.last_payout_success_at, None);
+    }
+
+    /// Codex review on #1066: a send no relay accepts is not a publication,
+    /// so the next evaluation retries instead of waiting a whole interval.
+    #[tokio::test]
+    async fn a_rejected_send_is_retried_at_the_next_evaluation() {
+        use nostr_sdk::local_relay::{LocalRelay, WritePolicy, WritePolicyResult};
+        use nostr_sdk::prelude::{Client, Event, Keys, MachineReadablePrefix};
+        use std::future::Future;
+        use std::net::SocketAddr;
+        use std::pin::Pin;
+
+        #[derive(Debug)]
+        struct RejectAll;
+        impl WritePolicy for RejectAll {
+            fn admit_event<'a>(
+                &'a self,
+                _event: &'a Event,
+                _addr: &'a SocketAddr,
+            ) -> Pin<Box<dyn Future<Output = WritePolicyResult> + Send + 'a>> {
+                Box::pin(async {
+                    WritePolicyResult::Reject {
+                        prefix: MachineReadablePrefix::Blocked,
+                        message: "no".into(),
+                        status: false,
+                    }
+                })
+            }
+        }
+
+        crate::config::init_test_nostr_keys();
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let relay = LocalRelay::builder().write_policy(RejectAll).build();
+        relay.run().await.expect("run relay");
+        let client = Client::default();
+        client.add_relay(relay.url().await).await.unwrap();
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(Keys::generate())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+
+        publisher.tick(&ctx).await;
+
+        assert!(publisher.last_publish.is_none(), "not counted as published");
+        let evaluation = publisher.evaluate(&ctx, NOW).await;
+        assert!(publisher.should_publish(&evaluation), "retried next time");
     }
 
     #[tokio::test]

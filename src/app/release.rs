@@ -1113,12 +1113,6 @@ async fn dispatch_payout(
                                     "Order Id {}: Invoice with hash: {} paid!",
                                     order.id, msg.payment.payment_hash
                                 );
-                                ctx.health_stats()
-                                    .record_payout_success(
-                                        ctx.pool(),
-                                        chrono::Utc::now().timestamp(),
-                                    )
-                                    .await;
                                 // Release our claim only if the order actually
                                 // reached Success. If finalization fails, keep the
                                 // marker so reconciliation retries it — clearing it
@@ -1133,13 +1127,24 @@ async fn dispatch_payout(
                                 .await
                                 .unwrap_or(false)
                                 {
-                                    let _ = crate::db::clear_order_payout(
+                                    // Counted once, by whoever clears the claim
+                                    // (this watcher or a reconcile tick).
+                                    if crate::db::clear_order_payout(
                                         ctx.pool(),
                                         order.id,
                                         &payout_hash,
                                         Some(payout_claimed_at),
                                     )
-                                    .await;
+                                    .await
+                                    .unwrap_or(false)
+                                    {
+                                        ctx.health_stats()
+                                            .record_payout_success(
+                                                ctx.pool(),
+                                                chrono::Utc::now().timestamp(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             PaymentStatus::Failed => {
@@ -1147,13 +1152,6 @@ async fn dispatch_payout(
                                     "Order Id {}: Invoice with hash: {} has failed!",
                                     order.id, msg.payment.payment_hash
                                 );
-                                ctx.health_stats().record_payout_failure(
-                                    chrono::Utc::now().timestamp(),
-                                    crate::app::health::stats::failure_reason_key(
-                                        msg.payment.failure_reason,
-                                    ),
-                                );
-
                                 // Release our own claim (scoped to this hash and
                                 // the per-claim timestamp) and re-arm retry. Only
                                 // do the failure bookkeeping and buyer
@@ -1170,6 +1168,14 @@ async fn dispatch_payout(
                                 .await
                                 .unwrap_or(false)
                                 {
+                                    // Counted once, by whoever wins the
+                                    // guarded re-arm.
+                                    ctx.health_stats().record_payout_failure(
+                                        chrono::Utc::now().timestamp(),
+                                        crate::app::health::stats::failure_reason_key(
+                                            msg.payment.failure_reason,
+                                        ),
+                                    );
                                     check_failure_retries_or_log(
                                         &ctx,
                                         &order,
@@ -1230,12 +1236,6 @@ async fn dispatch_payout(
                     "Order Id {}: payout dispatch failed ({cause}); re-arming retry for hash {}",
                     order.id, payout_hash
                 );
-                if lookup_says_failed {
-                    ctx.health_stats().record_payout_failure(
-                        chrono::Utc::now().timestamp(),
-                        crate::app::health::stats::REASON_OTHER,
-                    );
-                }
                 if crate::db::fail_order_payout(
                     ctx.pool(),
                     order.id,
@@ -1245,6 +1245,12 @@ async fn dispatch_payout(
                 .await
                 .unwrap_or(false)
                 {
+                    if lookup_says_failed {
+                        ctx.health_stats().record_payout_failure(
+                            chrono::Utc::now().timestamp(),
+                            crate::app::health::stats::REASON_OTHER,
+                        );
+                    }
                     check_failure_retries_or_log(&ctx, &order, request_id, Some(send_started_at))
                         .await;
                 }
@@ -1578,29 +1584,23 @@ pub async fn reconcile_inflight_payout(
                 }
                 _ => false,
             };
-            if finalized {
-                ctx.health_stats()
-                    .record_payout_success(pool, chrono::Utc::now().timestamp())
-                    .await;
-                crate::db::clear_order_payout(
+            if finalized
+                && crate::db::clear_order_payout(
                     pool,
                     order_id,
                     payout_payment_hash,
                     payout_claimed_at,
                 )
-                .await?;
+                .await?
+            {
+                // Counted once, by whoever clears the claim.
+                ctx.health_stats()
+                    .record_payout_success(pool, chrono::Utc::now().timestamp())
+                    .await;
             }
         }
         lookup
         @ (Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None)) => {
-            // Only a payment LND reports as Failed reached a final state; an
-            // unknown or missing record is not an attempt (health counters).
-            if matches!(lookup, Ok(Some(PaymentStatus::Failed))) {
-                ctx.health_stats().record_payout_failure(
-                    chrono::Utc::now().timestamp(),
-                    crate::app::health::stats::REASON_OTHER,
-                );
-            }
             // Snapshot the order *before* re-arming so the bookkeeping sees the
             // pre-failure state: `fail_order_payout` sets failed_payment = true,
             // and `count_failed_payment` treats an already-failed order as a
@@ -1614,6 +1614,15 @@ pub async fn reconcile_inflight_payout(
             if crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
                 .await?
             {
+                // Only a payment LND reports as Failed reached a final state
+                // (an unknown or missing record is not an attempt), and it is
+                // counted once, by whoever wins the guarded re-arm.
+                if matches!(lookup, Ok(Some(PaymentStatus::Failed))) {
+                    ctx.health_stats().record_payout_failure(
+                        chrono::Utc::now().timestamp(),
+                        crate::app::health::stats::REASON_OTHER,
+                    );
+                }
                 if let Some(order) = pre {
                     // The claim is stamped before the send, so it bounds it.
                     check_failure_retries_or_log(ctx, &order, None, payout_claimed_at).await;
@@ -3515,6 +3524,63 @@ mod tests {
                 .contains(&Action::PaymentFailed),
             "buyer notified on first failure"
         );
+    }
+
+    /// Codex review on #1066: a failed payout is counted once, by whoever
+    /// wins the guarded re-arm. A second reconcile of the same (already
+    /// released) claim, or one with a stale token, must not count it again.
+    #[tokio::test]
+    async fn a_failed_payout_is_counted_once() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Failed),
+            error: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        // The same snapshot reconciled again (another tick, or the watcher
+        // racing): the claim is already gone.
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        // A stale token that never owned the claim.
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token - 1))
+            .await
+            .unwrap();
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.failed, 1);
+        assert_eq!(window.succeeded, 0);
+    }
+
+    #[tokio::test]
+    async fn a_paid_payout_is_counted_once() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.succeeded, 1);
+        assert_eq!(window.failed, 0);
     }
 
     #[tokio::test]

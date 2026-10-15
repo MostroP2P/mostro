@@ -3,8 +3,11 @@
 //!
 //! The daemon cannot escrow anything while its mint is down, even with
 //! healthy relays and database. The mints probed are the `[cashu].mint_urls`
-//! allowlist, or, on an open node (empty allowlist), the distinct mints of
-//! the orders in progress. A mint counts as reachable when it answers
+//! allowlist, or, on an open node (empty allowlist), the distinct mints that
+//! currently hold escrow: orders past the escrow step, with a token locked,
+//! not yet terminal. Never a mint a pending order merely names: anyone can
+//! publish an order naming an unreachable mint, and that must not make the
+//! instance look down. A mint counts as reachable when it answers
 //! `GET /v1/info` (NUT-06) with a success status within 10 seconds.
 
 use crate::app::health::check::CheckState;
@@ -31,14 +34,15 @@ pub fn cashu_mint_state(reachable: &[bool]) -> CheckState {
     }
 }
 
-/// Distinct mints of the orders in progress (not pending, not terminal),
-/// canonicalised so one mint is probed once.
-pub async fn in_progress_mints(pool: &SqlitePool) -> Result<Vec<String>, MostroError> {
+/// Distinct mints that currently hold escrow: a locked escrow token on an
+/// order that is not terminal. Canonicalised so one mint is probed once.
+pub async fn escrow_mints(pool: &SqlitePool) -> Result<Vec<String>, MostroError> {
     // The status list is a compile-time constant, never user input.
     let query = format!(
         "SELECT DISTINCT cashu_mint_url FROM orders \
          WHERE cashu_mint_url IS NOT NULL AND cashu_mint_url != '' \
-           AND status != 'pending' AND status NOT IN ({TERMINAL_ORDER_STATUSES})"
+           AND cashu_escrow_token IS NOT NULL AND cashu_escrow_token != '' \
+           AND status NOT IN ({TERMINAL_ORDER_STATUSES})"
     );
     let urls: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
         .fetch_all(pool)
@@ -69,10 +73,10 @@ async fn probe(mint_url: &str, open: bool) -> bool {
 pub async fn cashu_mint_check(pool: &SqlitePool, cashu: &CashuSettings) -> CheckState {
     let open = cashu.mint_urls.is_empty();
     let mints = if open {
-        match in_progress_mints(pool).await {
+        match escrow_mints(pool).await {
             Ok(mints) => mints,
             Err(e) => {
-                warn!("Health event: cannot list the mints of orders in progress: {e}");
+                warn!("Health event: cannot list the mints holding escrow: {e}");
                 return CheckState::Unknown;
             }
         }
@@ -175,40 +179,70 @@ mod tests {
         assert_eq!(cashu_mint_check(&pool, &cashu).await, CheckState::Ok);
     }
 
-    async fn insert(pool: &SqlitePool, status: &str, mint: &str) {
+    /// An order on `mint`; `locked` gives it an escrow token, as the escrow
+    /// step does.
+    async fn insert(pool: &SqlitePool, status: &str, mint: &str, locked: bool) {
+        let id = uuid::Uuid::new_v4();
+        let token = locked.then(|| format!("cashuB-{id}"));
         sqlx::query(
             "INSERT INTO orders (id, kind, event_id, status, premium, payment_method, amount, \
-             fiat_code, fiat_amount, created_at, expires_at, cashu_mint_url) \
-             VALUES (?, 'sell', 'e', ?, 0, 'cash', 1000, 'USD', 10, 0, 0, ?)",
+             fiat_code, fiat_amount, created_at, expires_at, cashu_mint_url, \
+             cashu_escrow_token, cashu_escrow_locked_at) \
+             VALUES (?, 'sell', 'e', ?, 0, 'cash', 1000, 'USD', 10, 0, 0, ?, ?, ?)",
         )
-        .bind(uuid::Uuid::new_v4())
+        .bind(id)
         .bind(status)
         .bind(mint)
+        .bind(&token)
+        .bind(token.as_ref().map(|_| 1_792_000_000_i64))
         .execute(pool)
         .await
         .unwrap();
     }
 
     #[tokio::test]
-    async fn open_node_probes_the_mints_of_orders_in_progress() {
+    async fn open_node_probes_only_the_mints_holding_escrow() {
         let pool = pool().await;
-        insert(&pool, "active", "https://mint.example.com").await;
-        insert(&pool, "fiat-sent", "https://MINT.example.com/").await;
-        insert(&pool, "waiting-payment", "https://other.example.org").await;
-        insert(&pool, "pending", "https://pending.example.net").await;
-        insert(&pool, "success", "https://done.example.net").await;
+        insert(&pool, "active", "https://mint.example.com", true).await;
+        insert(&pool, "fiat-sent", "https://MINT.example.com/", true).await;
+        insert(&pool, "dispute", "https://other.example.org", true).await;
+        // Named but not escrowed yet: the seller has not locked the token.
+        insert(
+            &pool,
+            "waiting-payment",
+            "https://waiting.example.net",
+            false,
+        )
+        .await;
+        insert(&pool, "pending", "https://pending.example.net", false).await;
+        // Terminal, even with a token.
+        insert(&pool, "success", "https://done.example.net", true).await;
 
-        let mints = in_progress_mints(&pool).await.unwrap();
-        assert_eq!(mints.len(), 2, "one per mint, in progress only: {mints:?}");
+        let mints = escrow_mints(&pool).await.unwrap();
+        assert_eq!(mints.len(), 2, "one per mint holding escrow: {mints:?}");
         assert!(mints
             .iter()
-            .all(|m| !m.contains("pending") && !m.contains("done")));
+            .all(|m| !m.contains("waiting") && !m.contains("pending") && !m.contains("done")));
     }
 
     #[tokio::test]
-    async fn open_node_with_no_order_in_progress_is_ok() {
+    async fn open_node_with_no_escrow_is_ok() {
         let pool = pool().await;
-        insert(&pool, "pending", "https://pending.example.net").await;
+        insert(&pool, "pending", "https://pending.example.net", false).await;
+        assert_eq!(
+            cashu_mint_check(&pool, &settings(vec![])).await,
+            CheckState::Ok
+        );
+    }
+
+    /// Spec update on protocol #84: anyone can publish a pending order naming
+    /// an unreachable mint; that must not make the instance look down.
+    #[tokio::test]
+    async fn a_pending_order_naming_a_dead_mint_keeps_the_check_ok() {
+        let pool = pool().await;
+        let dead = dead_port().await;
+        insert(&pool, "pending", &format!("http://{dead}"), false).await;
+        insert(&pool, "waiting-payment", &format!("http://{dead}"), false).await;
         assert_eq!(
             cashu_mint_check(&pool, &settings(vec![])).await,
             CheckState::Ok
@@ -221,7 +255,7 @@ mod tests {
         // it counts as unreachable even though it answers.
         let pool = pool().await;
         let addr = mock_mint().await;
-        insert(&pool, "active", &format!("http://{addr}")).await;
+        insert(&pool, "active", &format!("http://{addr}"), true).await;
         assert_eq!(
             cashu_mint_check(&pool, &settings(vec![])).await,
             CheckState::Fail

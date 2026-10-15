@@ -62,7 +62,7 @@ Computed from the sync state above; it is what turns automatic maintenance on (`
 
 The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). mostrod publishes it from `job_health_event_send` (`src/scheduler.rs`), implemented in `src/app/health/publisher.rs`, in both Lightning and Cashu mode, unless `[health].enabled = false`.
 
-**Cadence.** The checks are evaluated every 15 seconds and whenever maintenance mode changes. The event is published every `[health].interval` seconds (60 by default), and at once when `status`, a check state or `maintenance_mode` changes, but never twice within 10 seconds. It goes to the same relays as the info event.
+**Cadence.** The checks are evaluated every 15 seconds; every database read is skipped once the `SELECT 1` probe fails and bounded at 5 s otherwise, so a stuck database is reported in time and whenever maintenance mode changes. The event is published every `[health].interval` seconds (60 by default), and at once when `status`, a check state or `maintenance_mode` changes, but never twice within 10 seconds. It goes to the same relays as the info event. A send no relay accepts does not count as a publication and is retried at the next evaluation.
 
 **Public tags** (`src/app/health/event.rs`): `d` = the Mostro pubkey, `y`, `z` = `health`, `status`, one `check` per check with the time it entered its state, `escrow_mode`, `lnd_block_height` / `lnd_synced_to_chain` / `lnd_network` (Lightning, when LND answered), `maintenance_mode`, `mostro_version`, `interval`, `seq`, `p` (only with a watchdog key) and `expiration` = `created_at` + 3 × `interval`. No tag is ever repeated.
 
@@ -72,7 +72,7 @@ The spec is `health_event.md` in the protocol book (MostroP2P/protocol#83). most
 |---|---|---|
 | `lnd_sync` | Lightning | see [above](#the-lnd_sync-check) |
 | `payouts` | Lightning | `fail` when a settled-but-unpaid order is over 2 h old and no payout succeeded in 2 h, or when more than half of at least 3 payout attempts in the last hour failed; `warn` when a settled-but-unpaid order is over 15 min old; otherwise `ok`; `unknown` if the database cannot be read |
-| `cashu_mint` | Cashu | probes `GET /v1/info` (10 s) on the `[cashu].mint_urls` allowlist, or on an open node the distinct mints of the orders in progress (with the same public-host check used to connect to them); `ok` all answer (or none to probe), `warn` some, `fail` none, `unknown` when the orders cannot be read |
+| `cashu_mint` | Cashu | probes `GET /v1/info` (10 s) on the `[cashu].mint_urls` allowlist, or on an open node the distinct mints currently holding escrow (an escrow token locked on an order that is not terminal; never a mint a pending order merely names), with the same public-host check used to connect to them; `ok` all answer (or none to probe), `warn` some, `fail` none, `unknown` when the orders cannot be read |
 | `relays` | both | `ok` all connected, `warn` some, `fail` none |
 | `database` | both | `SELECT 1` within 5 s |
 

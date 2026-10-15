@@ -502,10 +502,27 @@ impl Publisher {
     pub async fn tick(&mut self, ctx: &AppContext) {
         let now = Utc::now().timestamp();
         let evaluation = self.evaluate(ctx, now).await;
+        if !has_a_relay(&evaluation) {
+            // Nobody to publish to. Publishing anyway would only report a
+            // relay outage that is already over by the time a connection
+            // carries it (at boot, the first evaluation runs before the
+            // relays connect). Readers see the event go stale instead, and
+            // the outage reaches the watchdog through `relays.last_outage_*`.
+            return;
+        }
         if self.should_publish(&evaluation) {
             self.publish(ctx, &evaluation, now).await;
         }
     }
+}
+
+/// Whether at least one relay was connected when `evaluation` was made.
+fn has_a_relay(evaluation: &Evaluation) -> bool {
+    evaluation
+        .report
+        .checks
+        .iter()
+        .any(|(name, state, _)| *name == CheckName::Relays && *state != CheckState::Fail)
 }
 
 /// The job loop. Returns at once when `[health].enabled = false`.
@@ -679,6 +696,23 @@ mod tests {
             payout_rows(&pool, 3, NOW).await.unwrap(),
             PayoutRows::default()
         );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_published_without_a_connected_relay() {
+        // The test client has no relay: the first evaluation at boot looks
+        // like this before the relays connect.
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+
+        publisher.tick(&ctx).await;
+
+        assert!(publisher.last_publish.is_none());
+        assert_eq!(load_persisted(&pool).await.unwrap().last_stamp, None);
     }
 
     #[tokio::test]

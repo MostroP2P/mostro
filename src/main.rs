@@ -421,6 +421,14 @@ async fn main() -> Result<()> {
         }
         _ => lnd_sync.observe_unreachable_at_startup(now),
     }
+    // A deferring spell from an earlier run (ended while the daemon was
+    // down, or still open) must still excuse the payouts sent before it.
+    if let Err(e) = lnd_sync
+        .load_deferral_history(get_db_pool().as_ref(), now)
+        .await
+    {
+        tracing::warn!("Could not load the LND deferral history: {e}");
+    }
     if lnd_sync.defers_outgoing_payments(now) {
         tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
     }

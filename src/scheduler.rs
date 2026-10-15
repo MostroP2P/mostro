@@ -268,7 +268,8 @@ async fn job_info_event_send(ctx: AppContext) {
 #[mutants::skip]
 async fn job_lnd_sync_monitor(ctx: AppContext) {
     use crate::app::health::lnd_sync::{
-        apply_auto_maintenance, log_transition, LndObservation, LND_SYNC_POLL_SECS,
+        apply_auto_maintenance, log_transition, record_deferral_transition, LndObservation,
+        LND_SYNC_POLL_SECS,
     };
     // Bounded so a hung LND counts as unreachable instead of stalling the
     // monitor (and with it, the deferral of outgoing payments).
@@ -276,6 +277,9 @@ async fn job_lnd_sync_monitor(ctx: AppContext) {
 
     tokio::spawn(async move {
         let mut ln_client: Option<LndConnector> = None;
+        // Whether payments were deferred at the previous poll; `false` at
+        // start so a spell already open (seeded at startup) is persisted.
+        let mut was_deferring = false;
         loop {
             if ln_client.is_none() {
                 match LndConnector::new().await {
@@ -313,8 +317,16 @@ async fn job_lnd_sync_monitor(ctx: AppContext) {
                     ctx.lnd_sync().observe_unreachable(now)
                 }
             };
+            let snapshot = ctx.lnd_sync().snapshot();
             if let Some(transition) = transition {
-                log_transition(transition, &ctx.lnd_sync().snapshot());
+                log_transition(transition, &snapshot);
+            }
+            // The spell's start and end are persisted so a restart does not
+            // forget it (#1065 review): on failure, keep the last known value
+            // and try again at the next transition.
+            match record_deferral_transition(ctx.pool(), &snapshot, was_deferring, now).await {
+                Ok(is_deferring) => was_deferring = is_deferring,
+                Err(e) => warn!("LND sync monitor: could not persist the deferral history: {e}"),
             }
 
             if let Err(e) = apply_auto_maintenance(&ctx, now).await {

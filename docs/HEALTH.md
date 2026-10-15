@@ -34,6 +34,8 @@ Once LND has been unsynced or has not answered, in any mix, for **60 seconds** w
 | Buyer payout (`do_payment`, after `release` or `admin-settle`, or a new invoice from the buyer) | Not sent. The order stays in `settled-hold-invoice` with `failed_payment = true` and `payment_attempts` unchanged, so `job_retry_failed_payments` pays it once LND recovers. The buyer is not notified. |
 | Buyer payout that fails anyway (it was already in flight when LND went bad) | Recorded the same way: no attempt consumed, no `payment-failed`, no `add-invoice`. A failure that arrives after LND recovered is treated the same if payments were deferred at any moment since the send (`payout_claimed_at` bounds the send). |
 | Bond payout that fails anyway | Same rule, judged from `bonds.payout_sent_at`, stamped with the payment hash right before the send: no retry consumed, the invoice is kept, and a terminal failure clears the hash so the next tick sends the same invoice again. |
+
+The start and end of the last deferring run are persisted in `daemon_state` (`lnd_deferral_started_at`, `lnd_deferral_ended_at`) and loaded at startup, so a payout sent before a run that ended while the daemon was down is still not counted against anyone. A run still open at shutdown continues if LND is still unhealthy at startup, and is taken as ended at startup if LND is synced by then.
 | `job_retry_failed_payments` | Skips its pass. |
 | Dev fee job, bond payout job | Skip their cycle. |
 

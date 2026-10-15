@@ -24,11 +24,13 @@
 //!   automatic maintenance.
 
 use crate::app::context::AppContext;
+use crate::app::daemon_state;
 use crate::app::health::check::CheckState;
 use crate::app::maintenance::REASON_LND_UNSYNCED;
 use crate::config::types::HealthSettings;
 use fedimint_tonic_lnd::lnrpc::GetInfoResponse;
 use mostro_core::error::MostroError;
+use sqlx::SqlitePool;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
@@ -40,6 +42,15 @@ pub const LND_SYNC_POLL_SECS: u64 = 15;
 /// `synced_to_chain = false` for a few seconds whenever a block arrives;
 /// that must not hold payouts back.
 pub const PAYMENT_DEFER_AFTER_SECS: i64 = 60;
+
+/// `daemon_state` keys of the last deferring spell: when it started (the
+/// `unhealthy_since` that crossed [`PAYMENT_DEFER_AFTER_SECS`]) and when it
+/// ended (empty while it is still open). Written by the monitor through
+/// [`record_deferral_transition`] and read at startup by
+/// [`LndSyncState::load_deferral_history`], so a payout sent before a spell
+/// and found failed after a restart is still not counted against anyone.
+pub const KEY_DEFERRAL_STARTED_AT: &str = "lnd_deferral_started_at";
+pub const KEY_DEFERRAL_ENDED_AT: &str = "lnd_deferral_ended_at";
 
 /// An observation older than this is not trusted: if the monitor itself
 /// stopped, nothing is deferred and every check that depends on it is
@@ -271,6 +282,52 @@ impl LndSyncState {
         self.write().observe_unreachable(now)
     }
 
+    /// Restore the last deferring spell persisted by an earlier run, after
+    /// the startup observation was seeded. If LND is healthy now, a spell
+    /// still open at shutdown ended at the latest at `now`, and that end is
+    /// persisted; a closed one is taken as stored. If LND is still unhealthy,
+    /// the open spell continues from its stored start, so no part of it is
+    /// forgotten. Without this, `deferred_since` would not know about a
+    /// spell that ended while the daemon was down, and a payout sent before
+    /// it and reconciled as failed after the restart would be counted.
+    pub async fn load_deferral_history(
+        &self,
+        pool: &SqlitePool,
+        now: i64,
+    ) -> Result<(), MostroError> {
+        let parse = |value: Option<String>| value.and_then(|v| v.trim().parse::<i64>().ok());
+        let Some(started_at) = parse(daemon_state::get(pool, KEY_DEFERRAL_STARTED_AT).await?)
+        else {
+            return Ok(());
+        };
+        let ended_at = parse(daemon_state::get(pool, KEY_DEFERRAL_ENDED_AT).await?);
+        let healthy_now = self
+            .snapshot()
+            .last
+            .as_ref()
+            .is_some_and(|last| last.synced_to_chain);
+        if healthy_now {
+            let ended_at = match ended_at {
+                Some(at) if at >= started_at => at,
+                _ => {
+                    // Open at shutdown: it ended somewhere before now.
+                    daemon_state::set(pool, KEY_DEFERRAL_ENDED_AT, &now.to_string()).await?;
+                    now
+                }
+            };
+            self.write().deferral_ended_at = Some(ended_at);
+        } else if ended_at.is_none_or(|at| at < started_at) {
+            // Still open: keep the real start, so the spell is not cut short.
+            let mut state = self.write();
+            state.unhealthy_since = Some(
+                state
+                    .unhealthy_since
+                    .map_or(started_at, |since| since.min(started_at)),
+            );
+        }
+        Ok(())
+    }
+
     /// A copy of the current state.
     pub fn snapshot(&self) -> LndSyncSnapshot {
         match self.inner.read() {
@@ -290,6 +347,28 @@ impl LndSyncState {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+}
+
+/// Persist the start or the end of a deferring spell, given whether payments
+/// were deferred at the previous poll. Returns whether they are deferred now.
+/// Called by the monitor after every observation: a spell that starts writes
+/// its start and clears the end; one that ends writes its end.
+pub async fn record_deferral_transition(
+    pool: &SqlitePool,
+    snapshot: &LndSyncSnapshot,
+    was_deferring: bool,
+    now: i64,
+) -> Result<bool, MostroError> {
+    let is_deferring = snapshot.defers_outgoing_payments(now);
+    if is_deferring && !was_deferring {
+        let started_at = snapshot.unhealthy_since.unwrap_or(now);
+        daemon_state::set(pool, KEY_DEFERRAL_STARTED_AT, &started_at.to_string()).await?;
+        daemon_state::set(pool, KEY_DEFERRAL_ENDED_AT, "").await?;
+    } else if was_deferring && !is_deferring {
+        let ended_at = snapshot.deferral_ended_at.unwrap_or(now);
+        daemon_state::set(pool, KEY_DEFERRAL_ENDED_AT, &ended_at.to_string()).await?;
+    }
+    Ok(is_deferring)
 }
 
 /// Log a transition at the level an operator needs to see it.
@@ -413,6 +492,141 @@ mod tests {
             state.observe(observation(synced), now);
             now += LND_SYNC_POLL_SECS as i64;
         }
+    }
+
+    async fn pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// Drive `record_deferral_transition` over a spell the way the monitor
+    /// does, one poll at a time.
+    async fn run_monitor(pool: &SqlitePool, state: &LndSyncState, polls: &[(bool, i64)]) {
+        let mut was = false;
+        for &(synced, at) in polls {
+            state.observe(observation(synced), at);
+            was = record_deferral_transition(pool, &state.snapshot(), was, at)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Codex review on #1065: a spell that ended while the daemon was down
+    /// (or before it restarted) must still excuse a payout sent before it.
+    #[tokio::test]
+    async fn a_closed_deferral_spell_survives_a_restart() {
+        let pool = pool().await;
+        let state = LndSyncState::new();
+        // Unsynced from T0 to T0+300 (deferring from T0+60), synced at T0+315.
+        let mut polls: Vec<(bool, i64)> = (0..=20).map(|i| (false, T0 + 15 * i)).collect();
+        polls.push((true, T0 + 315));
+        run_monitor(&pool, &state, &polls).await;
+        assert_eq!(
+            daemon_state::get(&pool, KEY_DEFERRAL_STARTED_AT)
+                .await
+                .unwrap(),
+            Some(T0.to_string())
+        );
+        assert_eq!(
+            daemon_state::get(&pool, KEY_DEFERRAL_ENDED_AT)
+                .await
+                .unwrap(),
+            Some((T0 + 315).to_string())
+        );
+
+        // Restart with LND synced: the history is loaded, nothing rewritten.
+        let restarted = LndSyncState::new();
+        restarted.observe_at_startup(observation(true), T0 + 1_000);
+        restarted
+            .load_deferral_history(&pool, T0 + 1_000)
+            .await
+            .unwrap();
+        let snapshot = restarted.snapshot();
+        assert_eq!(snapshot.deferral_ended_at, Some(T0 + 315));
+        assert!(
+            snapshot.deferred_since(T0 + 100, T0 + 1_000),
+            "sent during the spell"
+        );
+        assert!(
+            snapshot.deferred_since(T0 - 100, T0 + 1_000),
+            "sent before the spell"
+        );
+        assert!(
+            !snapshot.deferred_since(T0 + 400, T0 + 1_000),
+            "sent after it ended"
+        );
+        assert!(!restarted.defers_outgoing_payments(T0 + 1_000));
+    }
+
+    #[tokio::test]
+    async fn a_spell_open_at_shutdown_ends_at_startup_when_lnd_is_synced() {
+        let pool = pool().await;
+        let state = LndSyncState::new();
+        let polls: Vec<(bool, i64)> = (0..=6).map(|i| (false, T0 + 15 * i)).collect();
+        run_monitor(&pool, &state, &polls).await;
+        assert_eq!(
+            daemon_state::get(&pool, KEY_DEFERRAL_ENDED_AT)
+                .await
+                .unwrap(),
+            Some(String::new()),
+            "open at shutdown"
+        );
+
+        let restarted = LndSyncState::new();
+        restarted.observe_at_startup(observation(true), T0 + 500);
+        restarted
+            .load_deferral_history(&pool, T0 + 500)
+            .await
+            .unwrap();
+        assert_eq!(restarted.snapshot().deferral_ended_at, Some(T0 + 500));
+        assert!(restarted.snapshot().deferred_since(T0 + 50, T0 + 500));
+        assert_eq!(
+            daemon_state::get(&pool, KEY_DEFERRAL_ENDED_AT)
+                .await
+                .unwrap(),
+            Some((T0 + 500).to_string()),
+            "the end is persisted for the next restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spell_open_at_shutdown_continues_when_lnd_is_still_unsynced() {
+        let pool = pool().await;
+        let state = LndSyncState::new();
+        let polls: Vec<(bool, i64)> = (0..=6).map(|i| (false, T0 + 15 * i)).collect();
+        run_monitor(&pool, &state, &polls).await;
+
+        let restarted = LndSyncState::new();
+        restarted.observe_at_startup(observation(false), T0 + 500);
+        restarted
+            .load_deferral_history(&pool, T0 + 500)
+            .await
+            .unwrap();
+        let snapshot = restarted.snapshot();
+        assert_eq!(snapshot.unhealthy_since, Some(T0), "the real start is kept");
+        assert_eq!(snapshot.deferral_ended_at, None);
+        assert!(restarted.defers_outgoing_payments(T0 + 500));
+        // The monitor's first poll finds it deferring and rewrites the same start.
+        let was = record_deferral_transition(&pool, &snapshot, false, T0 + 500)
+            .await
+            .unwrap();
+        assert!(was);
+        assert_eq!(
+            daemon_state::get(&pool, KEY_DEFERRAL_STARTED_AT)
+                .await
+                .unwrap(),
+            Some(T0.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn no_history_loads_nothing() {
+        let pool = pool().await;
+        let state = LndSyncState::new();
+        state.observe_at_startup(observation(true), T0);
+        state.load_deferral_history(&pool, T0).await.unwrap();
+        assert_eq!(state.snapshot().deferral_ended_at, None);
     }
 
     #[test]

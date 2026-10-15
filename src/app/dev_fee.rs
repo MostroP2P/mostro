@@ -734,7 +734,8 @@ async fn handle_payment_failure(
             order_id, db_err
         );
     }
-    record_dev_fee_failure(pool, order_id, order.dev_fee_payment_hash.as_deref()).await;
+    // The hash is kept either way; on an error Phase 3 records it next cycle.
+    let _ = record_dev_fee_failure(pool, order_id, order.dev_fee_payment_hash.as_deref()).await;
 }
 
 async fn handle_payment_timeout(
@@ -833,22 +834,34 @@ pub(crate) fn dev_fee_retry_delay_secs(failed_attempts: i64, jitter: f64) -> i64
 /// failures never overwrite each other, and the deadline is written in the
 /// same transaction ([`count_dev_fee_failure`]). Callers release the claim
 /// or hash only after this returns.
+///
+/// Returns `Err` when nothing could be stored (the transaction rolled back):
+/// the caller must then **keep** the claim or the hash, so the order is not
+/// claimable without its deadline. A kept PENDING marker is reset by Phase 1
+/// after `CLEANUP_TTL_SECS`; a kept failed hash is cleared by Phase 3 on the
+/// next cycle, which records the failure again.
 pub(crate) async fn record_dev_fee_failure(
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     payment_hash: Option<&str>,
-) {
+) -> Result<(), sqlx::Error> {
     match count_dev_fee_failure(pool, order_id, payment_hash).await {
-        Ok(Some((failed_attempts, delay))) => info!(
-            "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
-            order_id, failed_attempts, delay
-        ),
+        Ok(Some((failed_attempts, delay))) => {
+            info!(
+                "Dev fee for order {} failed {} time(s) in a row; next attempt in {}s",
+                order_id, failed_attempts, delay
+            );
+            Ok(())
+        }
         // Paid, gone, or this hash's failure was already counted.
-        Ok(None) => {}
-        Err(e) => error!(
-            "Failed to record the dev fee failure for order {}: {:?}",
-            order_id, e
-        ),
+        Ok(None) => Ok(()),
+        Err(e) => {
+            error!(
+                "Failed to record the dev fee failure for order {}: {:?}",
+                order_id, e
+            );
+            Err(e)
+        }
     }
 }
 
@@ -897,7 +910,16 @@ async fn count_dev_fee_failure(
 /// set no cycle can claim the order, so there is no moment when it is
 /// claimable without its deadline.
 async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, existing_hash: &str) {
-    record_dev_fee_failure(pool, order_id, Some(existing_hash)).await;
+    if record_dev_fee_failure(pool, order_id, Some(existing_hash))
+        .await
+        .is_err()
+    {
+        warn!(
+            "Keeping failed payment hash for order {} until its backoff is stored",
+            order_id
+        );
+        return;
+    }
     // Targeted update: clear hash only if it still matches the one we checked.
     if let Err(e) = sqlx::query(
         "UPDATE orders
@@ -920,7 +942,14 @@ async fn clear_failed_payment_hash(pool: &SqlitePool, order_id: uuid::Uuid, exis
 /// its backoff while the PENDING claim is still held, then release the
 /// claim, so no other cycle can claim the order in between with no deadline.
 async fn release_failed_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_marker: &str) {
-    record_dev_fee_failure(pool, order_id, None).await;
+    if record_dev_fee_failure(pool, order_id, None).await.is_err() {
+        warn!(
+            "Keeping the PENDING claim on order {} until its backoff is stored \
+             (Phase 1 resets it once stale)",
+            order_id
+        );
+        return;
+    }
     release_pending_claim(pool, order_id, pending_marker).await;
 }
 
@@ -1926,7 +1955,11 @@ mod tests {
         .await
         .unwrap();
 
-        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+        assert!(
+            super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+                .await
+                .is_err()
+        );
 
         let row: (i64, Option<String>, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_failed_attempts, dev_fee_failed_hash, dev_fee_next_attempt_at \
@@ -1947,7 +1980,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH)).await;
+        super::record_dev_fee_failure(&pool, id, Some(VALID_HEX_HASH))
+            .await
+            .unwrap();
         let attempts: i64 =
             sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
                 .bind(id)
@@ -1955,6 +1990,50 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(attempts, 1);
+    }
+
+    /// Codex review on #1064 (round 5): when the backoff cannot be stored,
+    /// the failure paths must keep the claim or the hash instead of giving the
+    /// order back with no deadline.
+    #[tokio::test]
+    async fn a_failed_backoff_write_keeps_the_claim_and_the_hash() {
+        let pool = setup_orders_db().await;
+        sqlx::query(
+            "CREATE TRIGGER fail_deadline BEFORE UPDATE OF dev_fee_next_attempt_at ON orders \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unresolved = uuid::Uuid::new_v4();
+        insert_test_order(
+            &pool,
+            unresolved,
+            "success",
+            100,
+            false,
+            Some("PENDING-x-1"),
+        )
+        .await;
+        let failed = uuid::Uuid::new_v4();
+        insert_test_order(&pool, failed, "success", 100, false, Some(VALID_HEX_HASH)).await;
+
+        super::release_failed_claim(&pool, unresolved, "PENDING-x-1").await;
+        super::clear_failed_payment_hash(&pool, failed, VALID_HEX_HASH).await;
+
+        let hash = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT dev_fee_payment_hash FROM orders WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+        };
+        assert_eq!(
+            hash(unresolved).await.unwrap().as_deref(),
+            Some("PENDING-x-1")
+        );
+        assert_eq!(hash(failed).await.unwrap().as_deref(), Some(VALID_HEX_HASH));
+        assert!(super::find_unpaid_dev_fees(&pool).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1995,7 +2074,11 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         insert_test_order(&pool, id, "success", 100, false, None).await;
 
-        futures::future::join_all((0..5).map(|_| record_dev_fee_failure(&pool, id, None))).await;
+        for result in
+            futures::future::join_all((0..5).map(|_| record_dev_fee_failure(&pool, id, None))).await
+        {
+            result.unwrap();
+        }
 
         let attempts: i64 =
             sqlx::query_scalar("SELECT dev_fee_failed_attempts FROM orders WHERE id = ?")
@@ -2056,8 +2139,8 @@ mod tests {
         insert_test_order(&pool, healthy, "success", 100, false, None).await;
 
         let before = chrono::Utc::now().timestamp();
-        record_dev_fee_failure(&pool, failing, None).await;
-        record_dev_fee_failure(&pool, failing, None).await;
+        record_dev_fee_failure(&pool, failing, None).await.unwrap();
+        record_dev_fee_failure(&pool, failing, None).await.unwrap();
         let after = chrono::Utc::now().timestamp();
 
         let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
@@ -2107,7 +2190,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         insert_test_order(&pool, id, "success", 100, true, Some(VALID_HEX_HASH)).await;
 
-        record_dev_fee_failure(&pool, id, None).await;
+        record_dev_fee_failure(&pool, id, None).await.unwrap();
 
         let (attempts, next_at): (i64, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_failed_attempts, dev_fee_next_attempt_at FROM orders WHERE id = ?",

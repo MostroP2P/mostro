@@ -85,12 +85,22 @@ pub const PAYOUTS_STUCK_FAIL_SECS: i64 = 7_200;
 pub const PAYOUTS_STUCK_WARN_SECS: i64 = 1_800;
 /// Final attempts in the last hour needed before the failure rate counts.
 pub const PAYOUTS_MIN_ATTEMPTS_FOR_RATE: u64 = 3;
+/// Distinct orders with a failed attempt in the last hour needed before the
+/// failure rate counts: one order retried against one bad invoice is that
+/// buyer's problem, not the node's.
+pub const PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE: u64 = 2;
+/// A settled unpaid order older than this (seconds) is residue the daemon
+/// will not pay (settled on a previous node, say): reported for the operator,
+/// not a signal for the `payouts` check.
+pub const PAYOUTS_STALE_SECS: i64 = 7 * 86_400;
 
 /// What the `payouts` check is computed from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayoutFacts {
     pub succeeded_1h: u64,
     pub failed_1h: u64,
+    /// Distinct orders among `failed_1h`.
+    pub failed_orders_1h: u64,
     pub last_success_at: Option<i64>,
     /// Age of the oldest settled unpaid order, if any.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
@@ -305,6 +315,7 @@ mod tests {
         let facts = PayoutFacts {
             succeeded_1h: 1,
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Fail);
@@ -312,15 +323,37 @@ mod tests {
         let half = PayoutFacts {
             succeeded_1h: 2,
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&half), NOW), CheckState::Ok);
         // Too few attempts to judge a rate.
         let few = PayoutFacts {
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&few), NOW), CheckState::Ok);
+    }
+
+    /// Staging, 2026-10-15: one buyer's LN address failed all three retries
+    /// of one order, then a new invoice paid. Four failures and one success
+    /// in the hour, all on one order, is that buyer's problem, not ours.
+    #[test]
+    fn payouts_rate_needs_failures_on_more_than_one_order() {
+        let one_order = PayoutFacts {
+            succeeded_1h: 1,
+            failed_1h: 4,
+            failed_orders_1h: 1,
+            last_success_at: Some(NOW - 60),
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&one_order), NOW), CheckState::Ok);
+        let two_orders = PayoutFacts {
+            failed_orders_1h: 2,
+            ..one_order
+        };
+        assert_eq!(payouts_check(Some(&two_orders), NOW), CheckState::Fail);
     }
 
     #[test]

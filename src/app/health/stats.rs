@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
+use uuid::Uuid;
 
 /// Length of every `_1h` window, in seconds (protocol: `window_secs`).
 pub const WINDOW_SECS: i64 = 3_600;
@@ -49,7 +50,8 @@ pub fn failure_reason_key(reason: i32) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PayoutOutcome {
     Succeeded,
-    Failed(&'static str),
+    /// A failed attempt, with the order it was for and the reason key.
+    Failed(Uuid, &'static str),
 }
 
 /// Buyer payout attempts in the last hour.
@@ -57,6 +59,9 @@ enum PayoutOutcome {
 pub struct PayoutWindow {
     pub succeeded: u64,
     pub failed: u64,
+    /// Distinct orders with at least one failed attempt. The retries of one
+    /// order against one bad invoice are several `failed` but one order.
+    pub failed_orders: u64,
     /// Failed attempts by reason; reasons with no failures are absent.
     pub failure_reasons: BTreeMap<String, u64>,
 }
@@ -196,8 +201,8 @@ impl HealthStats {
 
     /// A buyer payout reached `Failed` in LND, with this protocol reason key
     /// (see [`failure_reason_key`]).
-    pub fn record_payout_failure(&self, now: i64, reason: &'static str) {
-        lock(&self.payouts).push(now, PayoutOutcome::Failed(reason));
+    pub fn record_payout_failure(&self, now: i64, order_id: Uuid, reason: &'static str) {
+        lock(&self.payouts).push(now, PayoutOutcome::Failed(order_id, reason));
     }
 
     /// Outcomes in the last [`WINDOW_SECS`] at `now`.
@@ -207,7 +212,7 @@ impl HealthStats {
         for outcome in guard.recent(now) {
             match outcome {
                 PayoutOutcome::Succeeded => window.succeeded += 1,
-                PayoutOutcome::Failed(reason) => {
+                PayoutOutcome::Failed(_, reason) => {
                     window.failed += 1;
                     *window
                         .failure_reasons
@@ -273,6 +278,10 @@ mod tests {
 
     const T0: i64 = 1_792_000_000;
 
+    fn order(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
     async fn pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
@@ -296,10 +305,10 @@ mod tests {
     #[tokio::test]
     async fn payout_window_counts_the_last_hour_only() {
         let stats = HealthStats::new();
-        stats.record_payout_failure(T0, "no_route");
+        stats.record_payout_failure(T0, order(1), "no_route");
         stats.record_payout_success(T0 + 10);
-        stats.record_payout_failure(T0 + 20, "incorrect_payment_details");
-        stats.record_payout_failure(T0 + 30, "incorrect_payment_details");
+        stats.record_payout_failure(T0 + 20, order(2), "incorrect_payment_details");
+        stats.record_payout_failure(T0 + 30, order(3), "incorrect_payment_details");
 
         let window = stats.payout_window(T0 + 60);
         assert_eq!(window.succeeded, 1);
@@ -317,6 +326,31 @@ mod tests {
         assert_eq!(window.failure_reasons.get("no_route"), None);
     }
 
+    /// Staging, 2026-10-15: one buyer's LN address failed every retry of a
+    /// single order. The window tells those retries apart from failures
+    /// across several orders.
+    #[test]
+    fn payout_window_counts_the_orders_that_failed() {
+        let stats = HealthStats::new();
+        stats.record_payout_failure(T0, order(1), "no_route");
+        stats.record_payout_failure(T0 + 60, order(1), "no_route");
+        stats.record_payout_failure(T0 + 120, order(1), "no_route");
+        stats.record_payout_failure(T0 + 180, order(2), "timeout");
+        stats.record_payout_success(T0 + 200);
+
+        let window = stats.payout_window(T0 + 300);
+        assert_eq!(window.failed, 4);
+        assert_eq!(window.failed_orders, 2);
+
+        // Once the first order's retries leave the window, one order is left.
+        let window = stats.payout_window(T0 + 150 + WINDOW_SECS);
+        assert_eq!(window.failed, 1);
+        assert_eq!(window.failed_orders, 1);
+        let window = stats.payout_window(T0 + 180 + WINDOW_SECS + 1);
+        assert_eq!(window.failed, 0);
+        assert_eq!(window.failed_orders, 0);
+    }
+
     /// Codex review on #1066: an outcome recorded late at its own (older)
     /// time is in the window only while that time is.
     #[test]
@@ -324,9 +358,9 @@ mod tests {
         let stats = HealthStats::new();
         let now = T0 + 3 * WINDOW_SECS;
         stats.record_payout_success(now - 10);
-        stats.record_payout_failure(now - 2 * WINDOW_SECS, "no_route");
+        stats.record_payout_failure(now - 2 * WINDOW_SECS, order(1), "no_route");
         stats.record_payout_success(now - 3 * WINDOW_SECS);
-        stats.record_payout_failure(now - 60, "no_route");
+        stats.record_payout_failure(now - 60, order(2), "no_route");
 
         let window = stats.payout_window(now);
         assert_eq!(window.succeeded, 1, "the hours-old success is out");
@@ -398,7 +432,7 @@ mod tests {
     #[test]
     fn clones_share_their_counters() {
         let stats = HealthStats::new();
-        stats.clone().record_payout_failure(T0, "timeout");
+        stats.clone().record_payout_failure(T0, order(1), "timeout");
         assert_eq!(stats.payout_window(T0).failed, 1);
     }
 

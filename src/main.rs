@@ -397,6 +397,26 @@ async fn main() -> Result<()> {
         tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
     }
 
+    // Asked again here, after the resubscriptions (which can take a while
+    // on a node with many open trades) and right before the admin RPC and
+    // the jobs start: a stale "synced" from boot must not let payouts out
+    // (#1063). The RPC and the event loop share this one monitored state.
+    let lnd_sync = app::health::lnd_sync::LndSyncState::new();
+    let startup_info = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ln_client.get_node_info(),
+    )
+    .await;
+    let now = chrono::Utc::now().timestamp();
+    match startup_info {
+        Ok(Ok(info)) => {
+            lnd_sync.observe_at_startup(app::health::lnd_sync::LndObservation::from(&info), now)
+        }
+        _ => lnd_sync.observe_unreachable_at_startup(now),
+    }
+    if lnd_sync.defers_outgoing_payments(now) {
+        tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
+    }
     // Start RPC server if enabled
     if RpcServer::is_enabled() {
         let rpc_server = RpcServer::new();
@@ -404,10 +424,17 @@ async fn main() -> Result<()> {
         let rpc_pool = get_db_pool();
         let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
         let rpc_maintenance = maintenance.clone();
+        let rpc_lnd_sync = lnd_sync.clone();
 
         tokio::spawn(async move {
             match rpc_server
-                .start(rpc_keys, rpc_pool, rpc_ln_client, rpc_maintenance)
+                .start(
+                    rpc_keys,
+                    rpc_pool,
+                    rpc_ln_client,
+                    rpc_maintenance,
+                    rpc_lnd_sync,
+                )
                 .await
             {
                 Ok(_) => tracing::info!("RPC server started successfully"),
@@ -430,25 +457,6 @@ async fn main() -> Result<()> {
     );
     // Payouts and dev fees must not go out against an unsynced node before
     // the sync monitor's first poll (#1063).
-    // Asked again here, right before the jobs start: the resubscriptions
-    // above can take a while on a node with many open trades, and a stale
-    // "synced" from boot must not let payouts out (#1063).
-    let lnd_sync = app::health::lnd_sync::LndSyncState::new();
-    let startup_info = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        ln_client.get_node_info(),
-    )
-    .await;
-    let now = chrono::Utc::now().timestamp();
-    match startup_info {
-        Ok(Ok(info)) => {
-            lnd_sync.observe_at_startup(app::health::lnd_sync::LndObservation::from(&info), now)
-        }
-        _ => lnd_sync.observe_unreachable_at_startup(now),
-    }
-    if lnd_sync.defers_outgoing_payments(now) {
-        tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
-    }
     let ctx = AppContext::new(
         get_db_pool(),
         client.clone(),

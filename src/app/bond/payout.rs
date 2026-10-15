@@ -123,7 +123,7 @@ pub async fn run_bond_payout_cycle(
             warn!("bond payout: stopping the pass, LND is not synced to chain or not reachable");
             break;
         }
-        if let Err(e) = process_one_bond(pool, ln_client, &bond).await {
+        if let Err(e) = process_one_bond(pool, ln_client, &bond, lnd_sync).await {
             warn!(
                 bond_id = %bond.id,
                 order_id = %bond.order_id,
@@ -200,6 +200,7 @@ async fn process_one_bond(
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
     bond: &Bond,
+    lnd_sync: &crate::app::health::lnd_sync::LndSyncState,
 ) -> Result<(), MostroError> {
     // Phase 6 — a child payout row (slice slash or maker refund) must not
     // be driven while its parent range bond is still `Locked`: the parent
@@ -262,6 +263,7 @@ async fn process_one_bond(
                 invoice,
                 max_retries,
                 claim_window_seconds,
+                lnd_sync,
             )
             .await
         }
@@ -551,6 +553,7 @@ async fn pay_counterparty(
     invoice: &str,
     max_retries: i64,
     claim_window_seconds: i64,
+    lnd_sync: &crate::app::health::lnd_sync::LndSyncState,
 ) -> Result<(), MostroError> {
     let counterparty_share = counterparty_share_sats(bond)?;
 
@@ -676,6 +679,19 @@ async fn pay_counterparty(
             None
         }
     };
+
+    // The slot claim above can take up to its timeout: if our node stopped
+    // being able to pay meanwhile, defer to a later tick like a held slot
+    // (nothing persisted, no retry consumed) instead of sending (#1063).
+    if lnd_sync.defers_outgoing_payments(chrono::Utc::now().timestamp()) {
+        info!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "bond payout: LND is not synced to chain or not reachable; deferring to next tick"
+        );
+        drop(reservation.take());
+        return Ok(());
+    }
 
     // Step 2 — persist routing-fee cap + payment_hash *before*
     // `send_payment`. The CAS is the idempotency anchor: from this
@@ -3477,7 +3493,14 @@ mod tests {
         let child = create_bond(&pool, child).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        process_one_bond(&pool, &mut ln, &child).await.unwrap();
+        process_one_bond(
+            &pool,
+            &mut ln,
+            &child,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(child.id)
@@ -3498,7 +3521,14 @@ mod tests {
         let bond = create_bond(&pool, bond).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+        process_one_bond(
+            &pool,
+            &mut ln,
+            &bond,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: (String,) = sqlx::query_as("SELECT state FROM bonds WHERE id = ?")
             .bind(bond.id)
@@ -3527,7 +3557,14 @@ mod tests {
 
         let before = count_add_bond_invoice_msgs(order_id).await;
         let mut ln = dead_lnd().await;
-        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+        process_one_bond(
+            &pool,
+            &mut ln,
+            &bond,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
         let after = count_add_bond_invoice_msgs(order_id).await;
         assert_eq!(after - before, 1);
     }
@@ -3557,7 +3594,14 @@ mod tests {
         let bond = create_bond(&pool, bond).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        process_one_bond(&pool, &mut ln, &bond).await.unwrap();
+        process_one_bond(
+            &pool,
+            &mut ln,
+            &bond,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
             .bind(bond.id)
@@ -3699,6 +3743,7 @@ mod tests {
             "not-an-invoice",
             5,
             CLAIM_WINDOW_SECONDS,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
         )
         .await
         .unwrap();
@@ -3710,6 +3755,56 @@ mod tests {
             .unwrap();
         assert_eq!(after.payout_attempts, 1, "terminal failure bumps attempts");
         assert_eq!(after.state, BondState::PendingPayout.to_string());
+    }
+
+    /// Codex review on #1065: the slot claim can take seconds and fails
+    /// open; if LND stopped being able to pay meanwhile, nothing is
+    /// persisted or sent and no retry is consumed.
+    #[tokio::test]
+    async fn pay_counterparty_defers_when_lnd_went_bad_during_the_slot_claim() {
+        init_test_settings();
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id, maker_pk(), taker_pk()).await;
+        let invoice = signed_test_invoice(5_000);
+        let bond = pending_payout_bond(
+            order_id,
+            taker_pk(),
+            10_000,
+            5_000,
+            Utc::now().timestamp(),
+            Some(&invoice),
+            None,
+        );
+        let bond = create_bond(&pool, bond).await.unwrap();
+        let stuck = crate::app::health::lnd_sync::LndSyncState::new();
+        stuck.observe_unreachable_at_startup(Utc::now().timestamp());
+
+        // The dead endpoint makes the slot count fail, which fails open.
+        let mut ln = dead_lnd().await;
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            &invoice,
+            5,
+            CLAIM_WINDOW_SECONDS,
+            &stuck,
+        )
+        .await
+        .unwrap();
+
+        let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
+            .bind(bond.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after.payout_payment_hash, None, "nothing persisted");
+        assert_eq!(
+            after.payout_attempts, bond.payout_attempts,
+            "no retry consumed"
+        );
+        assert_eq!(after.state, bond.state);
     }
 
     #[tokio::test]
@@ -3737,9 +3832,17 @@ mod tests {
         let bond = create_bond(&pool, bond).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
-            .await
-            .unwrap();
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            &invoice,
+            5,
+            CLAIM_WINDOW_SECONDS,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
             .bind(bond.id)
@@ -3781,9 +3884,17 @@ mod tests {
         let bond = create_bond(&pool, bond).await.unwrap();
 
         let mut ln = dead_lnd().await;
-        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
-            .await
-            .unwrap();
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            &invoice,
+            5,
+            CLAIM_WINDOW_SECONDS,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
             .bind(bond.id)
@@ -3821,9 +3932,17 @@ mod tests {
             .unwrap();
 
         let mut ln = dead_lnd().await;
-        pay_counterparty(&pool, &mut ln, &bond, &invoice, 5, CLAIM_WINDOW_SECONDS)
-            .await
-            .unwrap();
+        pay_counterparty(
+            &pool,
+            &mut ln,
+            &bond,
+            &invoice,
+            5,
+            CLAIM_WINDOW_SECONDS,
+            &crate::app::health::lnd_sync::LndSyncState::new(),
+        )
+        .await
+        .unwrap();
 
         let after: Bond = sqlx::query_as("SELECT * FROM bonds WHERE id = ?")
             .bind(bond.id)

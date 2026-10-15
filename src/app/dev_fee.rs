@@ -554,6 +554,17 @@ async fn process_new_dev_fee_payments(
             }
         };
 
+        // Resolving the invoice can take up to 20 s: check again before the
+        // real hash is stored (only a DB write separates it from the send),
+        // and give the order back if payments are deferred now. Nothing was
+        // sent, so this is not a failure. Releasing the PENDING marker rather
+        // than a real hash keeps it self-healing: if the release fails, Phase
+        // 1 resets the stale marker, whereas recovery leaves alone a real hash
+        // LND never saw.
+        if release_if_deferred(pool, lnd_sync, order_id, &pending_marker).await {
+            break;
+        }
+
         // STEP 2: Store real payment hash BEFORE sending payment (leave dev_fee_paid false).
         // If daemon crashes after this point, Phase 3 will find the hash
         // on the next cycle and verify with LND.
@@ -609,13 +620,6 @@ async fn process_new_dev_fee_payments(
                 updated_order
             }
         };
-
-        // Resolving the invoice can take up to 20 s: check again right
-        // before sending, and give the order back untouched if payments are
-        // deferred now. Nothing was sent, so this is not a failure.
-        if release_if_deferred(pool, lnd_sync, order_id, &payment_hash_hex).await {
-            break;
-        }
 
         // STEP 3: Send payment with pre-resolved invoice.
         match tokio::time::timeout(
@@ -974,14 +978,15 @@ async fn release_failed_claim(pool: &SqlitePool, order_id: uuid::Uuid, pending_m
     release_pending_claim(pool, order_id, pending_marker).await;
 }
 
-/// If payments are deferred now, release the claim (`stored_hash`, the
-/// real hash stored before sending) without counting a failure, since nothing
-/// was sent. Returns whether it did, in which case the pass must stop.
+/// If payments are deferred now, release the PENDING claim without
+/// counting a failure, since nothing was sent. Returns whether payments are
+/// deferred, in which case the pass must stop. A release that fails leaves
+/// the marker for Phase 1 to reset once stale.
 async fn release_if_deferred(
     pool: &SqlitePool,
     lnd_sync: &LndSyncState,
     order_id: uuid::Uuid,
-    stored_hash: &str,
+    pending_marker: &str,
 ) -> bool {
     if !lnd_sync.defers_outgoing_payments(Utc::now().timestamp()) {
         return false;
@@ -991,7 +996,7 @@ async fn release_if_deferred(
          releasing the claim and stopping the pass",
         order_id
     );
-    release_pending_claim(pool, order_id, stored_hash).await;
+    release_pending_claim(pool, order_id, pending_marker).await;
     true
 }
 
@@ -2765,10 +2770,11 @@ mod tests {
         use crate::app::health::lnd_sync::LndObservation;
         let pool = setup_orders_db().await;
         let id = uuid::Uuid::new_v4();
-        insert_test_order(&pool, id, "success", 100, false, Some(VALID_HEX_HASH)).await;
+        let marker = "PENDING-dev-fee-1792000000";
+        insert_test_order(&pool, id, "success", 100, false, Some(marker)).await;
 
         let healthy = LndSyncState::new();
-        assert!(!super::release_if_deferred(&pool, &healthy, id, VALID_HEX_HASH).await);
+        assert!(!super::release_if_deferred(&pool, &healthy, id, marker).await);
 
         let stuck = LndSyncState::new();
         let now = chrono::Utc::now().timestamp();
@@ -2785,7 +2791,7 @@ mod tests {
             },
             now,
         );
-        assert!(super::release_if_deferred(&pool, &stuck, id, VALID_HEX_HASH).await);
+        assert!(super::release_if_deferred(&pool, &stuck, id, marker).await);
 
         let row: (Option<String>, i64, Option<i64>) = sqlx::query_as(
             "SELECT dev_fee_payment_hash, dev_fee_failed_attempts, dev_fee_next_attempt_at \
@@ -2796,6 +2802,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, (None, 0, None), "released, not counted, no backoff");
+    }
+
+    /// Codex review on #1065: if the release fails, what is left is a
+    /// PENDING marker that Phase 1 resets once stale, never a real hash that
+    /// recovery would leave alone forever.
+    #[tokio::test]
+    async fn a_failed_deferred_release_leaves_a_self_healing_marker() {
+        let pool = setup_orders_db().await;
+        let id = uuid::Uuid::new_v4();
+        let stale = format!("PENDING-{}-{}", uuid::Uuid::new_v4(), 1_000_000_000);
+        insert_test_order(&pool, id, "success", 100, false, Some(&stale)).await;
+        sqlx::query(
+            "CREATE TRIGGER busy BEFORE UPDATE OF dev_fee_payment_hash ON orders \
+             BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stuck = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        stuck.observe_unreachable_at_startup(now);
+
+        assert!(super::release_if_deferred(&pool, &stuck, id, &stale).await);
+
+        sqlx::query("DROP TRIGGER busy")
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup_stale_pending_markers(&pool).await;
+        let hash: Option<String> =
+            sqlx::query_scalar("SELECT dev_fee_payment_hash FROM orders WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash, None, "Phase 1 reset the stale marker");
     }
 
     #[tokio::test]

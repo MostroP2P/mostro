@@ -1,5 +1,6 @@
 //! RPC server implementation for admin operations
 
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::app::maintenance::MaintenanceState;
 use crate::config::settings::Settings;
 use crate::lightning::LndConnector;
@@ -36,10 +37,11 @@ impl RpcServer {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
         maintenance: MaintenanceState,
+        lnd_sync: LndSyncState,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let addr = listen_socket_addr(&self.listen_address, self.port)?;
 
-        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client, maintenance);
+        let admin_service = AdminServiceImpl::new(my_keys, pool, ln_client, maintenance, lnd_sync);
 
         info!("Starting RPC server on {}", addr);
 
@@ -152,6 +154,7 @@ mod tests {
             Arc::new(pool),
             offline_ln_client().await,
             MaintenanceState::new(),
+            LndSyncState::new(),
         );
         // A successful bind keeps serving forever; a failed one returns
         // immediately. Give it a moment and treat "still serving" as success.
@@ -225,6 +228,7 @@ mod tests {
                 Arc::new(pool),
                 offline_ln_client().await,
                 MaintenanceState::new(),
+                LndSyncState::new(),
             )
             .await;
         assert!(result.is_err());
@@ -246,6 +250,7 @@ mod tests {
                 Arc::new(pool),
                 offline_ln_client().await,
                 MaintenanceState::new(),
+                LndSyncState::new(),
             )
             .await;
         assert!(result.is_err());

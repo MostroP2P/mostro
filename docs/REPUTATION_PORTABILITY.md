@@ -8,9 +8,9 @@ Status: **import implemented, export in review.** The specification, the
 shared types, the `since` rollout, mostrod as a destination (import and
 revocation), lnp2pBot as an issuer and the 2.x app (phase 5b) are merged.
 Exporting from mostrod (phase 4) and the 1.x app (phase 5) are in review.
-Section 11 tracks
-every pull request and explains how to operate what has landed. The open
-decisions were closed on 2026-10-03 with their defaults (section 10).
+Section 11 tracks every pull request and explains how to operate what has
+landed. The open decisions were closed on 2026-10-03 with their defaults
+(section 10).
 
 ## 1. Goals
 

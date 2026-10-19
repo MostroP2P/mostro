@@ -117,11 +117,38 @@ pub fn payouts_check(facts: Option<&PayoutFacts>, now: i64) -> CheckState {
     }
 }
 
+/// How long some configured relay may stay disconnected, while another is
+/// connected, before `relays` warns (seconds). Relays drop and reconnect on
+/// their own; the event still goes out through the others meanwhile.
+pub const RELAYS_MISSING_WARN_AFTER_SECS: i64 = 300;
+
+/// When the current uninterrupted spell with some configured relay
+/// disconnected began, given when it began at the previous evaluation. Only
+/// every relay connected ends it, so losing all of them in the middle never
+/// restarts the clock.
+pub fn relays_missing_since(
+    previous: Option<i64>,
+    configured: usize,
+    connected: usize,
+    now: i64,
+) -> Option<i64> {
+    (connected < configured).then(|| previous.unwrap_or(now))
+}
+
 /// The `relays` check over the relays the daemon is configured to use.
-pub fn relays_check(configured: usize, connected: usize) -> CheckState {
+/// `missing_since` is [`relays_missing_since`] at `now`.
+pub fn relays_check(
+    configured: usize,
+    connected: usize,
+    missing_since: Option<i64>,
+    now: i64,
+) -> CheckState {
+    // A spell nobody timed is not read as a short one.
+    let missing_long = missing_since
+        .is_none_or(|since| now.saturating_sub(since) >= RELAYS_MISSING_WARN_AFTER_SECS);
     if connected == 0 {
         CheckState::Fail
-    } else if connected >= configured {
+    } else if connected >= configured || !missing_long {
         CheckState::Ok
     } else {
         CheckState::Warn
@@ -284,10 +311,28 @@ mod tests {
 
     #[test]
     fn relays_check_follows_the_connections() {
-        assert_eq!(relays_check(3, 3), CheckState::Ok);
-        assert_eq!(relays_check(3, 1), CheckState::Warn);
-        assert_eq!(relays_check(3, 0), CheckState::Fail);
-        assert_eq!(relays_check(0, 0), CheckState::Fail);
+        let long_ago = Some(NOW - RELAYS_MISSING_WARN_AFTER_SECS);
+        assert_eq!(relays_check(3, 3, None, NOW), CheckState::Ok);
+        assert_eq!(relays_check(3, 1, long_ago, NOW), CheckState::Warn);
+        assert_eq!(relays_check(3, 0, long_ago, NOW), CheckState::Fail);
+        assert_eq!(relays_check(0, 0, None, NOW), CheckState::Fail);
+    }
+
+    #[test]
+    fn a_relay_missing_less_than_five_minutes_is_ok_but_none_connected_fails_at_once() {
+        let just_now = Some(NOW - RELAYS_MISSING_WARN_AFTER_SECS + 1);
+        assert_eq!(relays_check(3, 2, just_now, NOW), CheckState::Ok);
+        assert_eq!(relays_check(3, 0, just_now, NOW), CheckState::Fail);
+        // Not timed at all: read as long, never as short.
+        assert_eq!(relays_check(3, 2, None, NOW), CheckState::Warn);
+    }
+
+    #[test]
+    fn only_every_relay_connected_ends_a_missing_spell() {
+        assert_eq!(relays_missing_since(None, 3, 2, NOW), Some(NOW));
+        assert_eq!(relays_missing_since(Some(NOW), 3, 0, NOW + 60), Some(NOW));
+        assert_eq!(relays_missing_since(Some(NOW), 3, 2, NOW + 120), Some(NOW));
+        assert_eq!(relays_missing_since(Some(NOW), 3, 3, NOW + 180), None);
     }
 
     #[test]

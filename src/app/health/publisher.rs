@@ -1348,6 +1348,44 @@ mod tests {
         );
     }
 
+    /// Relays drop and reconnect on their own: one missing for a moment must
+    /// not make the instance degraded, one that stays missing must.
+    #[tokio::test]
+    async fn a_relay_missing_for_a_moment_is_not_a_warning() {
+        use nostr_sdk::local_relay::MockRelay;
+        use nostr_sdk::prelude::{Client, Keys};
+        crate::config::init_test_nostr_keys();
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let healthy = MockRelay::run().await.expect("mock relay");
+        let client = Client::default();
+        client.add_relay(healthy.url().await).await.unwrap();
+        // Nothing listens on port 1.
+        client.add_relay("ws://127.0.0.1:1").await.unwrap();
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(Keys::generate())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        let relays = |evaluation: &Evaluation| {
+            evaluation
+                .report
+                .checks
+                .iter()
+                .find(|(name, _, _)| *name == CheckName::Relays)
+                .map(|(_, state, _)| *state)
+        };
+
+        let first = publisher.evaluate(&ctx, NOW).await;
+        let five_minutes_on = publisher.evaluate(&ctx, NOW + 300).await;
+
+        assert_eq!(relays(&first), Some(CheckState::Ok));
+        assert_eq!(relays(&five_minutes_on), Some(CheckState::Warn));
+    }
+
     #[tokio::test]
     async fn nothing_is_published_without_a_connected_relay() {
         // The test client has no relay: the first evaluation at boot looks

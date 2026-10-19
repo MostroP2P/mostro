@@ -193,8 +193,9 @@ impl LndSyncSnapshot {
             (Some(last), _) if last.synced_to_chain => CheckState::Ok,
             (Some(_), Some(since)) if elapsed_at_least(since, now, fail_after) => CheckState::Fail,
             // Deferral, not `unsynced_since`, decides the warning: it already
-            // lets LND's few seconds between blocks through, and it counts an
-            // unknown spell (at startup, or after an outage) as a long one.
+            // lets LND's few seconds between blocks through, it counts time
+            // LND could not be reached as time unsynced, and at startup it
+            // reads a spell of unknown length as a long one.
             (Some(_), _) if self.defers_outgoing_payments(now) => CheckState::Warn,
             (Some(_), _) => CheckState::Ok,
         }
@@ -676,10 +677,18 @@ mod tests {
         assert_eq!(snapshot.sync_check(T0 + 75, 600), CheckState::Warn);
     }
 
-    /// A node unreachable and then unsynced has not been able to pay for the
-    /// whole spell, which is not a block arriving.
+    /// Time LND could not be reached counts as time unsynced: a node that
+    /// answers unsynced after an outage warns once the whole spell reaches
+    /// the deferral threshold, and not before, since it was synced less than
+    /// 60 s earlier (Codex and CodeRabbit review on #1073).
     #[test]
-    fn lnd_sync_warns_at_once_when_lnd_comes_back_unsynced_after_an_outage() {
+    fn an_outage_counts_toward_the_unsynced_spell() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        state.observe_unreachable(T0 + 15);
+        state.observe(observation(false), T0 + 30);
+        assert_eq!(state.snapshot().sync_check(T0 + 30, 600), CheckState::Ok);
+
         let state = LndSyncState::new();
         state.observe(observation(true), T0);
         state.observe_unreachable(T0 + 15);

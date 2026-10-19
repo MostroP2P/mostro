@@ -180,9 +180,10 @@ impl LndSyncSnapshot {
             .is_some_and(|at| now.saturating_sub(at) <= OBSERVATION_STALE_AFTER_SECS)
     }
 
-    /// The `lnd_sync` check: `ok` while synced, `warn` while unsynced for
-    /// less than `fail_after` seconds, `fail` after that, `unknown` when LND
-    /// cannot be reached or nothing recent is known.
+    /// The `lnd_sync` check: `ok` while synced, and while unsynced for too
+    /// short a time to defer payments; `warn` once outgoing payments are
+    /// deferred; `fail` after `fail_after` seconds unsynced; `unknown` when
+    /// LND cannot be reached or nothing recent is known.
     pub fn sync_check(&self, now: i64, fail_after: u64) -> CheckState {
         if !self.is_fresh(now) {
             return CheckState::Unknown;
@@ -191,7 +192,11 @@ impl LndSyncSnapshot {
             (None, _) => CheckState::Unknown,
             (Some(last), _) if last.synced_to_chain => CheckState::Ok,
             (Some(_), Some(since)) if elapsed_at_least(since, now, fail_after) => CheckState::Fail,
-            (Some(_), _) => CheckState::Warn,
+            // Deferral, not `unsynced_since`, decides the warning: it already
+            // lets LND's few seconds between blocks through, and it counts an
+            // unknown spell (at startup, or after an outage) as a long one.
+            (Some(_), _) if self.defers_outgoing_payments(now) => CheckState::Warn,
+            (Some(_), _) => CheckState::Ok,
         }
     }
 

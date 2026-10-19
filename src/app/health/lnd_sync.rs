@@ -180,9 +180,10 @@ impl LndSyncSnapshot {
             .is_some_and(|at| now.saturating_sub(at) <= OBSERVATION_STALE_AFTER_SECS)
     }
 
-    /// The `lnd_sync` check: `ok` while synced, `warn` while unsynced for
-    /// less than `fail_after` seconds, `fail` after that, `unknown` when LND
-    /// cannot be reached or nothing recent is known.
+    /// The `lnd_sync` check: `ok` while synced, and while unsynced for too
+    /// short a time to defer payments; `warn` once outgoing payments are
+    /// deferred; `fail` after `fail_after` seconds unsynced; `unknown` when
+    /// LND cannot be reached or nothing recent is known.
     pub fn sync_check(&self, now: i64, fail_after: u64) -> CheckState {
         if !self.is_fresh(now) {
             return CheckState::Unknown;
@@ -191,7 +192,12 @@ impl LndSyncSnapshot {
             (None, _) => CheckState::Unknown,
             (Some(last), _) if last.synced_to_chain => CheckState::Ok,
             (Some(_), Some(since)) if elapsed_at_least(since, now, fail_after) => CheckState::Fail,
-            (Some(_), _) => CheckState::Warn,
+            // Deferral, not `unsynced_since`, decides the warning: it already
+            // lets LND's few seconds between blocks through, it counts time
+            // LND could not be reached as time unsynced, and at startup it
+            // reads a spell of unknown length as a long one.
+            (Some(_), _) if self.defers_outgoing_payments(now) => CheckState::Warn,
+            (Some(_), _) => CheckState::Ok,
         }
     }
 
@@ -644,6 +650,52 @@ mod tests {
         assert_eq!(snapshot.unsynced_since, Some(T0));
         assert_eq!(snapshot.sync_check(T0 + 590, 600), CheckState::Warn);
         assert_eq!(snapshot.sync_check(T0 + 600, 600), CheckState::Fail);
+    }
+
+    /// LND reports `synced_to_chain = false` for a few seconds whenever a
+    /// block arrives; a poll that catches it must not report the instance
+    /// degraded.
+    #[test]
+    fn lnd_between_blocks_is_ok_while_payouts_still_go_out() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        poll(&state, false, T0 + 15, T0 + 60);
+        let snapshot = state.snapshot();
+        assert!(!snapshot.defers_outgoing_payments(T0 + 60));
+        assert_eq!(snapshot.sync_check(T0 + 60, 600), CheckState::Ok);
+        state.observe(observation(true), T0 + 75);
+        assert_eq!(state.snapshot().sync_check(T0 + 75, 600), CheckState::Ok);
+    }
+
+    #[test]
+    fn lnd_sync_warns_once_payouts_are_deferred() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        poll(&state, false, T0 + 15, T0 + 75);
+        let snapshot = state.snapshot();
+        assert!(snapshot.defers_outgoing_payments(T0 + 75));
+        assert_eq!(snapshot.sync_check(T0 + 75, 600), CheckState::Warn);
+    }
+
+    /// Time LND could not be reached counts as time unsynced: a node that
+    /// answers unsynced after an outage warns once the whole spell reaches
+    /// the deferral threshold, and not before, since it was synced less than
+    /// 60 s earlier (Codex and CodeRabbit review on #1073).
+    #[test]
+    fn an_outage_counts_toward_the_unsynced_spell() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        state.observe_unreachable(T0 + 15);
+        state.observe(observation(false), T0 + 30);
+        assert_eq!(state.snapshot().sync_check(T0 + 30, 600), CheckState::Ok);
+
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        state.observe_unreachable(T0 + 15);
+        state.observe_unreachable(T0 + 30);
+        state.observe_unreachable(T0 + 45);
+        state.observe(observation(false), T0 + 75);
+        assert_eq!(state.snapshot().sync_check(T0 + 75, 600), CheckState::Warn);
     }
 
     #[test]

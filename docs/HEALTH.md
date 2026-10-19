@@ -53,10 +53,12 @@ Computed from the sync state above; it is what turns automatic maintenance on (`
 
 | State | When |
 |---|---|
-| `ok` | `synced_to_chain` is `true` |
-| `warn` | `synced_to_chain` has been `false` for less than `lnd_unsynced_fail_after` seconds without interruption |
+| `ok` | `synced_to_chain` is `true`, or has been `false` for too short a time to defer outgoing payments (60 seconds) |
+| `warn` | outgoing payments are deferred (see above), and `synced_to_chain` has been `false` for less than `lnd_unsynced_fail_after` seconds without interruption |
 | `fail` | `synced_to_chain` has been `false` for `lnd_unsynced_fail_after` seconds or more without interruption |
 | `unknown` | `GetInfo` failed or timed out, or the last observation is stale |
+
+LND reports `synced_to_chain = false` for a few seconds whenever a block arrives. Payments already let that through, and so does the check: a poll that catches LND between blocks does not make the instance `degraded`. `warn` starts when payouts start waiting: after 60 seconds unsynced, where time LND could not be reached counts as time unsynced, so a node that answers unsynced after an outage warns once the outage and the unsynced answers together reach 60 seconds. A node that starts unsynced warns at once, since mostrod cannot tell how long it has been unsynced and does not read an unknown spell as a short one.
 
 ## The health event (kind 38389)
 

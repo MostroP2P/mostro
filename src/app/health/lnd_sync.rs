@@ -646,6 +646,44 @@ mod tests {
         assert_eq!(snapshot.sync_check(T0 + 600, 600), CheckState::Fail);
     }
 
+    /// LND reports `synced_to_chain = false` for a few seconds whenever a
+    /// block arrives; a poll that catches it must not report the instance
+    /// degraded.
+    #[test]
+    fn lnd_between_blocks_is_ok_while_payouts_still_go_out() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        poll(&state, false, T0 + 15, T0 + 60);
+        let snapshot = state.snapshot();
+        assert!(!snapshot.defers_outgoing_payments(T0 + 60));
+        assert_eq!(snapshot.sync_check(T0 + 60, 600), CheckState::Ok);
+        state.observe(observation(true), T0 + 75);
+        assert_eq!(state.snapshot().sync_check(T0 + 75, 600), CheckState::Ok);
+    }
+
+    #[test]
+    fn lnd_sync_warns_once_payouts_are_deferred() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        poll(&state, false, T0 + 15, T0 + 75);
+        let snapshot = state.snapshot();
+        assert!(snapshot.defers_outgoing_payments(T0 + 75));
+        assert_eq!(snapshot.sync_check(T0 + 75, 600), CheckState::Warn);
+    }
+
+    /// A node unreachable and then unsynced has not been able to pay for the
+    /// whole spell, which is not a block arriving.
+    #[test]
+    fn lnd_sync_warns_at_once_when_lnd_comes_back_unsynced_after_an_outage() {
+        let state = LndSyncState::new();
+        state.observe(observation(true), T0);
+        state.observe_unreachable(T0 + 15);
+        state.observe_unreachable(T0 + 30);
+        state.observe_unreachable(T0 + 45);
+        state.observe(observation(false), T0 + 75);
+        assert_eq!(state.snapshot().sync_check(T0 + 75, 600), CheckState::Warn);
+    }
+
     #[test]
     fn a_synced_observation_restarts_the_unsynced_clock() {
         let state = LndSyncState::new();

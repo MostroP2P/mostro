@@ -237,6 +237,18 @@ mod tests {
         assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Ok);
     }
 
+    /// A buyer whose wallet is offline makes mostrod retry for a while; that
+    /// alone is not the node being degraded.
+    #[test]
+    fn a_settled_order_waiting_twenty_minutes_is_not_a_warning() {
+        let facts = PayoutFacts {
+            oldest_settled_unpaid_age_secs: Some(1_200),
+            last_success_at: Some(NOW - 60),
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Ok);
+    }
+
     #[test]
     fn payouts_fail_when_stuck_two_hours_without_any_success() {
         // The 2026-10-14 incident: buyers waiting for hours, nothing paid.

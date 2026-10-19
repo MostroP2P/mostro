@@ -79,8 +79,10 @@ impl HealthStatus {
 /// A settled order older than this (seconds) with no successful payout in
 /// as long makes `payouts` fail.
 pub const PAYOUTS_STUCK_FAIL_SECS: i64 = 7_200;
-/// A settled order older than this (seconds) makes `payouts` warn.
-pub const PAYOUTS_STUCK_WARN_SECS: i64 = 900;
+/// A settled order older than this (seconds) makes `payouts` warn. Half an
+/// hour, not less: a buyer whose wallet is offline keeps the daemon retrying
+/// for a while, and that alone does not make the node degraded.
+pub const PAYOUTS_STUCK_WARN_SECS: i64 = 1_800;
 /// Final attempts in the last hour needed before the failure rate counts.
 pub const PAYOUTS_MIN_ATTEMPTS_FOR_RATE: u64 = 3;
 
@@ -223,15 +225,15 @@ mod tests {
     }
 
     #[test]
-    fn payouts_warn_on_a_settled_order_waiting_over_15_minutes() {
+    fn payouts_warn_on_a_settled_order_waiting_over_30_minutes() {
         let facts = PayoutFacts {
-            oldest_settled_unpaid_age_secs: Some(901),
+            oldest_settled_unpaid_age_secs: Some(1_801),
             last_success_at: Some(NOW - 60),
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Warn);
         let facts = PayoutFacts {
-            oldest_settled_unpaid_age_secs: Some(900),
+            oldest_settled_unpaid_age_secs: Some(1_800),
             ..facts
         };
         assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Ok);

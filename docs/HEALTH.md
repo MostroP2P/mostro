@@ -75,7 +75,7 @@ The spec is `health_event.md` in the protocol book (MostroP2P/protocol#84). most
 | `lnd_sync` | Lightning | see [above](#the-lnd_sync-check) |
 | `payouts` | Lightning | `fail` when a settled-but-unpaid order is over 2 h old and no payout succeeded in 2 h, or when more than half of at least 3 payout attempts in the last hour failed; `warn` when a settled-but-unpaid order is over 30 min old; otherwise `ok`; `unknown` if the database cannot be read |
 | `cashu_mint` | Cashu | probes `GET /v1/info` (10 s) on the `[cashu].mint_urls` allowlist plus the distinct mints currently holding escrow (an escrow token locked on an order that is not terminal; never a mint a pending order merely names), so a de-listed mint still holding escrow keeps being probed; only allowlisted mints are reached directly, any other passes the public-host check (a host that now resolves to a private address is never contacted and counts as unreachable) and is reached at the address that passed it; `ok` all answer (or none to probe), `warn` some, `fail` none, `unknown` when the orders cannot be read |
-| `relays` | both | `ok` all connected, `warn` some, `fail` none |
+| `relays` | both | `ok` all connected, or some disconnected for less than 5 min (relays drop and reconnect on their own, and the event goes out through the others meanwhile); `warn` some disconnected for 5 min or more without every one connecting in between; `fail` none connected, at once |
 | `database` | both | `SELECT 1` within 5 s |
 
 `status` is `down` when `lnd_sync` is `fail` or `unknown`, `cashu_mint`, `database` or `relays` is `fail`; otherwise `degraded` when any check is not `ok` or maintenance is on; otherwise `ok`.

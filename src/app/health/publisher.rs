@@ -9,8 +9,8 @@
 use crate::app::context::AppContext;
 use crate::app::dev_fee::dev_fee_payments_enabled;
 use crate::app::health::check::{
-    database_check, derive_status, payouts_check, relays_check, CheckName, CheckState,
-    CheckTracker, HealthStatus, PayoutFacts,
+    database_check, derive_status, payouts_check, relays_check, relays_missing_since, CheckName,
+    CheckState, CheckTracker, HealthStatus, PayoutFacts,
 };
 use crate::app::health::content::{
     nearest_htlc_expiry_blocks, ChannelFacts, DevFeeContent, HealthContent, LndContent,
@@ -324,6 +324,10 @@ pub struct Publisher {
     /// that began and ended between two publications).
     outage_unpublished: bool,
     had_relay_connection: bool,
+    /// When the current spell with some configured relay disconnected
+    /// began. Kept in memory only: after a restart the daemon has just
+    /// opened its connections, so the spell starts then.
+    relays_missing_since: Option<i64>,
     ln_client: Option<LndConnector>,
     /// Bound on the database probe and on every database operation after it.
     db_timeout: Duration,
@@ -342,6 +346,7 @@ impl Publisher {
             pending_outage: None,
             outage_unpublished: false,
             had_relay_connection: false,
+            relays_missing_since: None,
             ln_client: None,
             db_timeout: DATABASE_PROBE_TIMEOUT,
             last_publish: None,
@@ -460,6 +465,8 @@ impl Publisher {
             .values()
             .filter(|relay| relay.status().is_connected())
             .count();
+        self.relays_missing_since =
+            relays_missing_since(self.relays_missing_since, configured, connected, now);
 
         // Database: probed first, and every later read is skipped if it did
         // not answer. The probe and all the reads share one time budget, so
@@ -582,7 +589,10 @@ impl Publisher {
             };
             checks.push((CheckName::CashuMint, state));
         }
-        checks.push((CheckName::Relays, relays_check(configured, connected)));
+        checks.push((
+            CheckName::Relays,
+            relays_check(configured, connected, self.relays_missing_since, now),
+        ));
         checks.push((CheckName::Database, database_check(database_ok)));
 
         let status = derive_status(&checks, maintenance_enabled);
@@ -1346,6 +1356,49 @@ mod tests {
             "did not wait for the silent relay: {:?}",
             started.elapsed()
         );
+    }
+
+    /// Relays drop and reconnect on their own: one missing for a moment must
+    /// not make the instance degraded, one that stays missing must.
+    #[tokio::test]
+    async fn a_relay_missing_for_a_moment_is_not_a_warning() {
+        use nostr_sdk::local_relay::MockRelay;
+        use nostr_sdk::prelude::{Client, Keys};
+        crate::config::init_test_nostr_keys();
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let healthy = MockRelay::run().await.expect("mock relay");
+        let client = Client::default();
+        client.add_relay(healthy.url().await).await.unwrap();
+        // Nothing listens on port 1.
+        client.add_relay("ws://127.0.0.1:1").await.unwrap();
+        client.connect().and_wait(Duration::from_secs(5)).await;
+        let pool = pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(test_settings())
+            .with_nostr_client(client)
+            .with_keys(Keys::generate())
+            .build();
+        let mut publisher = Publisher::new(&ctx).await;
+        let relays = |evaluation: &Evaluation| {
+            evaluation
+                .report
+                .checks
+                .iter()
+                .find(|(name, _, _)| *name == CheckName::Relays)
+                .map(|(_, state, _)| *state)
+        };
+
+        let first = publisher.evaluate(&ctx, NOW).await;
+        let five_minutes_on = publisher
+            .evaluate(
+                &ctx,
+                NOW + crate::app::health::check::RELAYS_MISSING_WARN_AFTER_SECS,
+            )
+            .await;
+
+        assert_eq!(relays(&first), Some(CheckState::Ok));
+        assert_eq!(relays(&five_minutes_on), Some(CheckState::Warn));
     }
 
     #[tokio::test]

@@ -103,11 +103,12 @@ pub async fn export_reputation_action(
         export.lifetime_seconds,
     )
     .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+    // Name the trade key, as the import handler does: the identity and the
+    // destination together would tie two long-lived identities in the logs.
     tracing::info!(
-        "reputation: exported {} ratings of {} to {} (attestation {})",
+        "reputation: trade key {} exported {} ratings (attestation {})",
+        event.sender,
         native.reviews,
-        identity,
-        destination.to_hex(),
         attestation.id
     );
     enqueue_order_msg(

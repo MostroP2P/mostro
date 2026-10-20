@@ -1974,11 +1974,14 @@ where
 }
 
 /// The query behind [`completed_trades_for_identity`]: `?1` is the identity,
-/// `?2` the earliest start date that may become the first trade.
+/// `?2` the earliest start date that may become the first trade. `+status`
+/// keeps SQLite off `idx_orders_status`, which holds every `success` order,
+/// and on the two master-key indexes; the node never runs `ANALYZE`, so the
+/// planner cannot tell on its own.
 pub(crate) const COMPLETED_TRADES_QUERY: &str =
     "SELECT COUNT(*), MIN(CASE WHEN started >= ?2 THEN started END) FROM ( \
        SELECT CASE WHEN taken_at > 0 THEN taken_at ELSE created_at END AS started \
-       FROM orders WHERE status = 'success' \
+       FROM orders WHERE +status = 'success' \
        AND (master_buyer_pubkey = ?1 OR master_seller_pubkey = ?1))";
 
 /// An identity's completed trades on this node: how many `success` orders it

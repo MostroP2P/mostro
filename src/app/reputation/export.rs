@@ -407,7 +407,9 @@ mod handler_tests {
     use crate::app::context::test_utils::{self, test_settings, TestContextBuilder};
     use crate::app::reputation::import::import_reputation_action;
     use crate::config::types::{ReputationImportSettings, ReputationIssuer};
-    use crate::db::{add_new_user, is_user_present};
+    use crate::db::{
+        add_new_user, is_user_present, move_reputation_binding, move_reputation_binding_once,
+    };
     use mostro_core::db::Crud;
     use mostro_core::order::Order;
     use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
@@ -1094,6 +1096,130 @@ mod handler_tests {
                 Err(MostroInternalErr(ServiceError::DbAccessError(_)))
             ),
             "{result:?}"
+        );
+    }
+
+    /// The compare-and-set moves one account, and only from the value the
+    /// caller read: a stale `from` moves nothing, another account bound to
+    /// the same identity stays where it is, and an unbound account moves from
+    /// `None`.
+    #[tokio::test]
+    async fn moving_a_binding_touches_only_the_named_account_from_the_expected_value() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let (a, b, c) = (
+            eligible_identity(&ctx).await.public_key(),
+            eligible_identity(&ctx).await.public_key(),
+            eligible_identity(&ctx).await.public_key(),
+        );
+        let (x, y) = (Keys::generate().public_key(), Keys::generate().public_key());
+        for account in [&a, &b] {
+            export(&ctx, account, &x).await.unwrap();
+        }
+        let (x, y) = (x.to_hex(), y.to_hex());
+
+        let stale = move_reputation_binding(ctx.pool(), &a.to_hex(), Some(&y), &y, 1).await;
+        assert!(!stale.unwrap(), "a stale expected value moves nothing");
+        assert_eq!(bound_to(&ctx, &a).await, Some(x.clone()));
+
+        let moved = move_reputation_binding(ctx.pool(), &a.to_hex(), Some(&x), &y, 1).await;
+        assert!(moved.unwrap());
+        assert_eq!(bound_to(&ctx, &a).await, Some(y.clone()));
+        assert_eq!(bound_to(&ctx, &b).await, Some(x), "the other account stays");
+
+        let first = move_reputation_binding(ctx.pool(), &c.to_hex(), None, &y, 1).await;
+        assert!(first.unwrap(), "an unbound account moves from None");
+        assert_eq!(bound_to(&ctx, &c).await, Some(y));
+    }
+
+    /// A move that does not apply records nothing: the same authorisation
+    /// still moves the binding once the expected value is right.
+    #[tokio::test]
+    async fn a_move_that_does_not_apply_does_not_use_up_the_authorisation() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let a = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate().public_key(), Keys::generate().public_key());
+        export(&ctx, &a, &x).await.unwrap();
+        let (a, x, y) = (a.to_hex(), x.to_hex(), y.to_hex());
+        let id = "ab".repeat(32);
+        let valid_until = i64::MAX;
+
+        let stale = move_reputation_binding_once(ctx.pool(), &a, &y, &y, 1, &id, valid_until);
+        assert!(!stale.await.unwrap());
+        let moved = move_reputation_binding_once(ctx.pool(), &a, &x, &y, 1, &id, valid_until);
+        assert!(moved.await.unwrap());
+        let again = move_reputation_binding_once(ctx.pool(), &a, &y, &x, 1, &id, valid_until);
+        assert!(!again.await.unwrap(), "an authorisation moves once");
+        assert_eq!(
+            is_user_present(ctx.pool(), a)
+                .await
+                .unwrap()
+                .reputation_exported_to,
+            Some(y)
+        );
+    }
+
+    /// Two moves of one account at once, each with a valid authorisation
+    /// from the bound identity: one applies, the other is refused, the
+    /// binding is the winner's, the day of the move is recorded and the
+    /// account's ratings are untouched.
+    #[tokio::test]
+    async fn two_owner_moves_at_once_apply_exactly_one() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y, z) = (Keys::generate(), Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        sqlx::query("UPDATE users SET reputation_exported_at = 0 WHERE pubkey = ?1")
+            .bind(identity.to_hex())
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        let before = is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        let today = || day_truncate(Timestamp::now().as_secs() as i64) as i64;
+        let first_day = today();
+
+        let (m1, e1) = rebind_request(
+            &identity,
+            &y.public_key(),
+            authorisation(&x, &issuer.public_key(), &y.public_key()),
+        );
+        let (m2, e2) = rebind_request(
+            &identity,
+            &z.public_key(),
+            authorisation(&x, &issuer.public_key(), &z.public_key()),
+        );
+        let (r1, r2) = tokio::join!(
+            export_reputation_action(&ctx, m1, &e1),
+            export_reputation_action(&ctx, m2, &e2)
+        );
+        let last_day = today();
+        assert_eq!([r1.is_ok(), r2.is_ok()].iter().filter(|ok| **ok).count(), 1);
+        let (winner, lost) = if r1.is_ok() { (&y, r2) } else { (&z, r1) };
+        assert_eq!(refused(lost), CantDoReason::InvalidReputationRebind);
+        let after = is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.reputation_exported_to,
+            Some(winner.public_key().to_hex())
+        );
+        let day = after.reputation_exported_at.unwrap();
+        assert!(day == first_day || day == last_day, "{day}");
+        assert_eq!(
+            (
+                after.total_reviews,
+                after.total_rating,
+                after.native_rating_sum
+            ),
+            (
+                before.total_reviews,
+                before.total_rating,
+                before.native_rating_sum
+            )
         );
     }
 }

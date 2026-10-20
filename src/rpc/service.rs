@@ -1500,6 +1500,97 @@ mod tests {
         assert!(!message.contains("no account"), "{message}");
     }
 
+    #[tokio::test]
+    async fn rebind_reputation_export_refuses_non_loopback_even_with_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let (a, b) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        for ip in ["203.0.113.1", "2001:db8::1"] {
+            let err = service
+                .rebind_reputation_export(bearer(
+                    request_with_ip(rebind_req(&a, &b, "lost phone"), ip.parse().unwrap()),
+                    "s3cret",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert!(err.message().contains("RebindReputationExport"));
+        }
+    }
+
+    /// The move starts from the current value, which may be none: an
+    /// account that was never bound gets bound, with the day of the move.
+    #[tokio::test]
+    async fn rebind_reputation_export_binds_an_account_that_has_no_binding() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let new = Keys::generate().public_key().to_hex();
+        sqlx::query("INSERT INTO users (pubkey, created_at) VALUES (?1, 1700000000)")
+            .bind(&identity)
+            .execute(service.pool.as_ref())
+            .await
+            .unwrap();
+        let today = || {
+            mostro_core::user::day_truncate(nostr_sdk::prelude::Timestamp::now().as_secs() as i64)
+                as i64
+        };
+        let first_day = today();
+        let done = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new, "first binding by hand"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let last_day = today();
+        assert!(done.success, "{:?}", done.error_message);
+        assert_eq!(done.previous_identity, None);
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!(user.reputation_exported_to, Some(new));
+        let day = user.reputation_exported_at.unwrap();
+        assert!(day == first_day || day == last_day, "{day}");
+    }
+
+    /// §5.2: every admin rebind is logged with the old and new identity and
+    /// the reason.
+    #[tokio::test]
+    async fn rebind_reputation_export_logs_the_old_binding_the_new_one_and_the_reason() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let (old, new) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        sqlx::query(
+            "INSERT INTO users (pubkey, created_at, reputation_exported_to) VALUES (?1, 1700000000, ?2)",
+        )
+        .bind(&identity)
+        .bind(&old)
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        let (reply, logs) = crate::app::context::test_utils::logged_on_this_thread(
+            service.rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new, "support ticket 7"),
+                1,
+            )),
+        )
+        .await;
+        assert!(reply.unwrap().into_inner().success);
+        let line = logs
+            .lines()
+            .find(|line| line.contains("admin rebound"))
+            .unwrap_or_else(|| panic!("no audit line in {logs}"));
+        for expected in [identity.as_str(), &old, &new, "support ticket 7"] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
+    }
+
     #[test]
     fn constant_time_eq_semantics() {
         assert!(constant_time_eq(b"abc", b"abc"));

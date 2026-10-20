@@ -509,6 +509,28 @@ mod handler_tests {
         );
     }
 
+    /// A database failure is an operational failure, not a verdict on the
+    /// user: it must not reach them as `not_eligible_for_reputation_export`.
+    #[tokio::test]
+    async fn a_database_failure_is_not_reported_as_not_eligible() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        sqlx::query("ALTER TABLE users RENAME TO users_gone")
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        let (msg, event) = request(&identity, &Keys::generate().public_key().to_hex());
+        let result = export_reputation_action(&ctx, msg, &event).await;
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+            ),
+            "{result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn exactly_one_of_two_concurrent_bindings_wins() {
         let issuer = Keys::generate();

@@ -464,6 +464,45 @@ mod handler_tests {
         }
     }
 
+    thread_local! {
+        static LOGGED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// What this thread logs while `run` runs. A subscriber scoped to the
+    /// test with `set_default` would miss lines: while it is the only one
+    /// registered, a test on another thread that reaches the same log line
+    /// first caches it as disabled. A global one, installed once, is the
+    /// subscriber every thread sees; it keeps only the lines of a thread
+    /// that is capturing.
+    async fn logged_on_this_thread<F: std::future::Future>(run: F) -> (F::Output, String) {
+        struct ThreadWriter;
+        impl std::io::Write for ThreadWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LOGGED.with(|logged| {
+                    if let Some(logged) = logged.borrow_mut().as_mut() {
+                        logged.extend_from_slice(buf);
+                    }
+                });
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadWriter)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        LOGGED.with(|logged| *logged.borrow_mut() = Some(Vec::new()));
+        let output = run.await;
+        let logged = LOGGED.with(|logged| logged.borrow_mut().take().unwrap_or_default());
+        (output, String::from_utf8(logged).unwrap())
+    }
+
     fn refused<T: std::fmt::Debug>(result: Result<T, MostroError>) -> CantDoReason {
         match result {
             Err(MostroCantDo(reason)) => reason,
@@ -529,6 +568,26 @@ mod handler_tests {
             ),
             "{result:?}"
         );
+    }
+
+    /// The log line of a successful export names the trade key and the
+    /// attestation, never the identity nor the destination: together they
+    /// would tie two long-lived identities in the logs.
+    #[tokio::test]
+    async fn the_export_log_does_not_pair_the_identity_with_the_destination() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let destination = Keys::generate().public_key();
+        let (json, logs) = logged_on_this_thread(export(&ctx, &identity, &destination)).await;
+        let json = json.unwrap();
+
+        let (attestation, _) =
+            ReputationAttestation::parse_json(&json, Timestamp::now(), ATTESTATION_LIFETIME_SECS)
+                .unwrap();
+        assert!(logs.contains(&attestation.id.to_string()), "{logs}");
+        assert!(!logs.contains(&identity.to_hex()), "{logs}");
+        assert!(!logs.contains(&destination.to_hex()), "{logs}");
     }
 
     #[tokio::test]

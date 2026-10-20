@@ -4,7 +4,7 @@
 use crate::app::context::AppContext;
 use crate::config::types::ReputationExportSettings;
 use crate::db::{
-    bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey, is_user_present,
+    bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey,
     move_reputation_binding,
 };
 use crate::util::enqueue_order_msg;
@@ -160,9 +160,9 @@ async fn apply_rebind(
     trade_key: &PublicKey,
 ) -> Result<(), MostroError> {
     let invalid = || MostroCantDo(CantDoReason::InvalidReputationRebind);
-    let user = is_user_present(ctx.pool(), identity.to_string())
-        .await
-        .map_err(|_| MostroCantDo(CantDoReason::NotEligibleForReputationExport))?;
+    let user = find_user_by_pubkey(ctx.pool(), identity.to_string())
+        .await?
+        .ok_or(MostroCantDo(CantDoReason::NotEligibleForReputationExport))?;
     let rebind = ReputationRebind::parse_json(rebind, now).map_err(|_| invalid())?;
     let bound = user.reputation_exported_to.as_deref();
     let valid = rebind.issuer == issuer.public_key()

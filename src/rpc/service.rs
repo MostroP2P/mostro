@@ -626,9 +626,13 @@ impl AdminService for AdminServiceImpl {
         if req.reason.trim().is_empty() {
             return failure("a reason is required".to_string());
         }
-        let user = match crate::db::is_user_present(&self.pool, identity.to_hex()).await {
-            Ok(user) => user,
-            Err(_) => return failure(format!("no account for {}", identity.to_hex())),
+        let user = match crate::db::find_user_by_pubkey(&self.pool, identity.to_hex()).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return failure(format!("no account for {}", identity.to_hex())),
+            Err(e) => {
+                error!("RebindReputationExport failed: {e}");
+                return failure(e.to_string());
+            }
         };
         let previous = user.reputation_exported_to.clone();
         let today =

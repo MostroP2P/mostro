@@ -1010,15 +1010,21 @@ mod tests {
     mod reputation_import_intake_tests {
         use super::*;
         use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        use crate::config::types::ReputationImportSettings;
+        use crate::config::types::{ReputationExportSettings, ReputationImportSettings};
         use mostro_core::prelude::Payload;
         use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
+        /// A node with both reputation sections `enabled` or not.
         async fn context(enabled: bool) -> AppContext {
             let ctx = create_migrated_ctx().await;
             let mut settings = test_settings();
             settings.reputation_import = Some(ReputationImportSettings {
                 enabled,
+                ..Default::default()
+            });
+            settings.reputation_export = Some(ReputationExportSettings {
+                enabled,
+                issuer_keys: Some(create_test_keys()),
                 ..Default::default()
             });
             TestContextBuilder::new()
@@ -1028,8 +1034,16 @@ mod tests {
         }
 
         fn event(mostro: &Keys, trade: &Keys, payload: Option<Payload>) -> Event {
-            let message =
-                Message::new_order(None, Some(4127), None, Action::ImportReputation, payload);
+            action_event(mostro, trade, Action::ImportReputation, payload)
+        }
+
+        fn action_event(
+            mostro: &Keys,
+            trade: &Keys,
+            action: Action,
+            payload: Option<Payload>,
+        ) -> Event {
+            let message = Message::new_order(None, Some(4127), None, action, payload);
             wrap_message_nip44(
                 &message,
                 &create_test_keys(),
@@ -1076,6 +1090,39 @@ mod tests {
                     .unwrap();
                 assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
                 assert!(reply.get_inner_message_kind().id.is_none());
+            }
+        }
+
+        /// Core's `verify` rejects an `export-reputation` without its request
+        /// payload before dispatch, as it does for an import; the requester
+        /// is answered all the same, disabled before invalid payload.
+        #[tokio::test]
+        async fn export_intake_answers_missing_and_wrong_payloads() {
+            let mostro = create_test_keys();
+            for (enabled, reason) in [
+                (true, CantDoReason::InvalidPayload),
+                (false, CantDoReason::InvalidAction),
+            ] {
+                let ctx = context(enabled).await;
+                for payload in [None, Some(Payload::RatingUser(5))] {
+                    let trade = create_test_keys();
+                    let event = action_event(&mostro, &trade, Action::ExportReputation, payload);
+                    assert!(!accept(&ctx, &event, &mostro).await);
+                    assert_eq!(
+                        cant_do_reasons_for(&trade.public_key()).await,
+                        vec![reason.clone()],
+                        "export enabled: {enabled}"
+                    );
+                    let queue = crate::config::MESSAGE_QUEUES
+                        .queue_order_cantdo
+                        .read()
+                        .await;
+                    let (reply, _) = queue
+                        .iter()
+                        .find(|(_, pk)| *pk == trade.public_key())
+                        .unwrap();
+                    assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
+                }
             }
         }
 

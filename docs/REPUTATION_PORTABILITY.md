@@ -203,7 +203,9 @@ One request and one reply; there is no session.
    A later export to the bound identity is how a user re-obtains a lost
    attestation or a fresher one; an export to any other identity is refused
    unless the request carries a rebind authorisation.
-5. The issuer signs the attestation with its issuer key and returns it.
+5. The issuer signs the attestation with its issuer key and returns it. The
+   daemon signs before it binds and returns the attestation only if the
+   binding succeeded, so a failure to sign binds nothing.
 6. The client verifies the signature and shows the user the figures before
    importing.
 

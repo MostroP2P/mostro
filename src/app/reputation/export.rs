@@ -53,12 +53,13 @@ pub fn export_settings(ctx: &AppContext) -> Option<(&ReputationExportSettings, &
 
 /// `export-reputation`: attest the requester's native reputation on this
 /// node for the destination identity they name (§5.2). The source account is
-/// the identity the transport proved, never the payload. The account is bound
-/// to the destination with a compare-and-set before anything is signed: a
-/// request for the identity already bound is how a lost, expired or fresher
-/// attestation is obtained; one for another identity is refused. The client
-/// asked the user to confirm the destination before sending the request,
-/// which the source identity signs.
+/// the identity the transport proved, never the payload. The attestation is
+/// returned only once the account is bound to the destination with a
+/// compare-and-set: a request for the identity already bound is how a lost,
+/// expired or fresher attestation is obtained; one for another identity is
+/// refused. A failure to sign binds nothing. The client asked the user to
+/// confirm the destination before sending the request, which the source
+/// identity signs.
 pub async fn export_reputation_action(
     ctx: &AppContext,
     msg: Message,
@@ -85,13 +86,10 @@ pub async fn export_reputation_action(
     }
     let since = native.since.ok_or_else(not_eligible)?;
 
+    // Signed before the account is bound, and returned only once it is: a
+    // failure to sign must not bind the account to an identity that never
+    // received an attestation.
     let now = Timestamp::now();
-    let today = day_truncate(now.as_secs() as i64) as i64;
-    let bound = bind_reputation_export(ctx.pool(), &identity, &destination.to_hex(), today).await?;
-    if !bound {
-        return Err(MostroCantDo(CantDoReason::ReputationBoundToOtherIdentity));
-    }
-
     let attestation = ReputationAttestation::build(
         issuer,
         &destination,
@@ -103,6 +101,11 @@ pub async fn export_reputation_action(
         export.lifetime_seconds,
     )
     .map_err(|e| MostroInternalErr(ServiceError::UnexpectedError(e.to_string())))?;
+    let today = day_truncate(now.as_secs() as i64) as i64;
+    let bound = bind_reputation_export(ctx.pool(), &identity, &destination.to_hex(), today).await?;
+    if !bound {
+        return Err(MostroCantDo(CantDoReason::ReputationBoundToOtherIdentity));
+    }
     // Name the trade key, as the import handler does: the identity and the
     // destination together would tie two long-lived identities in the logs.
     tracing::info!(

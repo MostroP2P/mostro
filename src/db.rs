@@ -1973,24 +1973,32 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// The query behind [`completed_trades_for_identity`]: `?1` is the identity,
+/// `?2` the earliest start date that may become the first trade.
+pub(crate) const COMPLETED_TRADES_QUERY: &str =
+    "SELECT COUNT(*), MIN(CASE WHEN started >= ?2 THEN started END) FROM ( \
+       SELECT CASE WHEN taken_at > 0 THEN taken_at ELSE created_at END AS started \
+       FROM orders WHERE status = 'success' \
+       AND (master_buyer_pubkey = ?1 OR master_seller_pubkey = ?1))";
+
 /// An identity's completed trades on this node: how many `success` orders it
 /// was the master buyer or seller of, and when the first of them started —
-/// `taken_at`, or `created_at` for an order that never recorded it. Orders
-/// placed in full privacy mode carry no master key and are not counted, and
-/// nothing an import brought is either: this is native history only.
+/// `taken_at`, or `created_at` for an order that never recorded it — among
+/// those that started no earlier than `earliest_since`. An older one still
+/// counts as a trade but does not date the first. Orders placed in full
+/// privacy mode carry no master key and are not counted, and nothing an
+/// import brought is either: this is native history only.
 pub async fn completed_trades_for_identity(
     pool: &SqlitePool,
     identity: &str,
+    earliest_since: i64,
 ) -> Result<(i64, Option<i64>), MostroError> {
-    sqlx::query_as::<_, (i64, Option<i64>)>(
-        "SELECT COUNT(*), MIN(CASE WHEN taken_at > 0 THEN taken_at ELSE created_at END) \
-         FROM orders WHERE status = 'success' \
-         AND (master_buyer_pubkey = ?1 OR master_seller_pubkey = ?1)",
-    )
-    .bind(identity)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+    sqlx::query_as::<_, (i64, Option<i64>)>(COMPLETED_TRADES_QUERY)
+        .bind(identity)
+        .bind(earliest_since)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// The trust-list names that hold `issuer_key`: the names its imports were

@@ -3,6 +3,7 @@
 
 use crate::db::completed_trades_for_identity;
 use mostro_core::prelude::*;
+use mostro_core::reputation::MIN_ATTESTED_SINCE;
 use mostro_core::user::day_truncate;
 use sqlx::SqlitePool;
 
@@ -21,7 +22,9 @@ pub struct NativeReputation {
     pub rating: f64,
     /// Completed trades here; decides eligibility, not carried.
     pub completed_trades: i64,
-    /// UTC day start of the first completed trade here.
+    /// UTC day start of the first completed trade here that started no
+    /// earlier than [`MIN_ATTESTED_SINCE`]: an attestation cannot carry an
+    /// older date.
     pub since: Option<u64>,
 }
 
@@ -44,12 +47,13 @@ pub async fn native_reputation(
     user: &User,
 ) -> Result<NativeReputation, MostroError> {
     let (reviews, rating) = user.native_stats();
-    let (completed_trades, first_trade) = completed_trades_for_identity(pool, &user.pubkey).await?;
+    let (completed_trades, first_trade) =
+        completed_trades_for_identity(pool, &user.pubkey, MIN_ATTESTED_SINCE as i64).await?;
     Ok(NativeReputation {
         reviews,
         rating,
         completed_trades,
-        since: first_trade.filter(|t| *t > 0).map(day_truncate),
+        since: first_trade.map(day_truncate),
     })
 }
 

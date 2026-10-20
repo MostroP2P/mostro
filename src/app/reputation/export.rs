@@ -3,7 +3,7 @@
 
 use crate::app::context::AppContext;
 use crate::config::types::ReputationExportSettings;
-use crate::db::{bind_reputation_export, completed_trades_for_identity, is_user_present};
+use crate::db::{bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey};
 use crate::util::enqueue_order_msg;
 use mostro_core::prelude::*;
 use mostro_core::reputation::MIN_ATTESTED_SINCE;
@@ -76,9 +76,9 @@ pub async fn export_reputation_action(
 
     let identity = event.identity.to_hex();
     let not_eligible = || MostroCantDo(CantDoReason::NotEligibleForReputationExport);
-    let user = is_user_present(ctx.pool(), identity.clone())
-        .await
-        .map_err(|_| not_eligible())?;
+    let user = find_user_by_pubkey(ctx.pool(), identity.clone())
+        .await?
+        .ok_or_else(not_eligible)?;
     let native = native_reputation(ctx.pool(), &user).await?;
     if !native.is_eligible(&user) {
         return Err(not_eligible());
@@ -330,7 +330,7 @@ mod handler_tests {
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
     use crate::app::reputation::import::import_reputation_action;
     use crate::config::types::{ReputationImportSettings, ReputationIssuer};
-    use crate::db::add_new_user;
+    use crate::db::{add_new_user, is_user_present};
     use mostro_core::db::Crud;
     use mostro_core::order::Order;
     use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;

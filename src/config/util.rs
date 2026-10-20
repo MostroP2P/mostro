@@ -923,6 +923,20 @@ mod startup_validation_tests {
         }
     }
 
+    /// The export section is checked as part of startup validation, not only
+    /// by its own function.
+    #[test]
+    fn startup_validation_refuses_a_bad_export_section() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.reputation_export = Some(crate::config::types::ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings).expect_err("a zero lifetime is refused");
+        assert!(err.to_string().contains("[reputation_export]"));
+    }
+
     #[test]
     fn health_defaults_are_accepted() {
         let mut settings = base_settings();

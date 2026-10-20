@@ -350,6 +350,29 @@ mod tests {
             assert_eq!(export.issuer_key(), Some(issuer.public_key()));
         }
 
+        /// A value copied with a trailing newline or space still loads.
+        #[test]
+        fn a_key_with_surrounding_whitespace_still_loads() {
+            let issuer = Keys::generate();
+            let padded = format!("  {}\n", issuer.secret_key().to_secret_hex());
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_PADDED", Some(&padded));
+            attach_reputation_issuer_keys(&mut settings, &Keys::generate()).unwrap();
+            let export = settings.reputation_export.unwrap();
+            assert_eq!(export.issuer_key(), Some(issuer.public_key()));
+        }
+
+        /// The key is loaded and checked inside `init_mostro_settings`, so a
+        /// node with export enabled and no key never starts. It refuses
+        /// before setting `NOSTR_KEYS` or `MOSTRO_CONFIG`, which keeps this
+        /// test isolated from the others.
+        #[test]
+        fn initialising_the_settings_refuses_export_without_its_key() {
+            let settings = settings_with("MOSTRO_TEST_ISSUER_SK_INIT", None);
+            let err = init_mostro_settings(settings)
+                .expect_err("export enabled without its key must not start");
+            assert!(format!("{err:?}").contains("[reputation_export]"));
+        }
+
         #[test]
         fn a_disabled_section_needs_no_key() {
             let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_OFF", None);

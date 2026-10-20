@@ -13,6 +13,7 @@ use crate::config::wizard;
 use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
 use nostr_sdk::prelude::ToBech32;
 use std::fs;
 use std::io::IsTerminal;
@@ -103,6 +104,9 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
     if let Some(import) = settings.reputation_import.as_ref() {
         validate_reputation_import(import)?;
     }
+    if let Some(export) = settings.reputation_export.as_ref() {
+        validate_reputation_export(export)?;
+    }
 
     validate_health_settings(&settings.health)?;
 
@@ -184,6 +188,41 @@ fn validate_escrow_deadline_margin(
         ))));
     }
 
+    Ok(())
+}
+
+/// `[reputation_export]`: a lifetime core can sign, between 1 and
+/// [`ATTESTATION_LIFETIME_SECS`], and an environment variable name without
+/// surrounding spaces, since the variable is looked up as written. The key
+/// itself is loaded and checked when the settings are initialised
+/// (`attach_reputation_issuer_keys`).
+fn validate_reputation_export(
+    export: &crate::config::types::ReputationExportSettings,
+) -> Result<(), MostroError> {
+    let fail = |reason: &str| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_export] {reason}"
+        ))))
+    };
+    if export.lifetime_seconds == 0 {
+        return fail("lifetime_seconds must be greater than 0");
+    }
+    if export.lifetime_seconds > ATTESTATION_LIFETIME_SECS {
+        return fail(&format!(
+            "lifetime_seconds ({}) exceeds what an attestation can carry \
+             ({ATTESTATION_LIFETIME_SECS}, 7 days)",
+            export.lifetime_seconds
+        ));
+    }
+    let name = &export.issuer_key_env;
+    if name.trim().is_empty() {
+        return fail("issuer_key_env must name an environment variable");
+    }
+    if name.trim() != name {
+        return fail(&format!(
+            "issuer_key_env `{name}` has leading or trailing spaces"
+        ));
+    }
     Ok(())
 }
 
@@ -449,6 +488,7 @@ mod tests {
             reputation_import: None,
             payer_history: None,
             health: Default::default(),
+            reputation_export: None,
         }
     }
 
@@ -674,6 +714,44 @@ mod reputation_import_validation_tests {
     }
 
     #[test]
+    fn the_export_section_needs_a_lifetime_and_a_variable_name() {
+        use crate::config::types::ReputationExportSettings;
+        assert!(validate_reputation_export(&ReputationExportSettings::default()).is_ok());
+        let zero = ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&zero)).contains("lifetime_seconds"));
+        let unnamed = ReputationExportSettings {
+            issuer_key_env: " ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&unnamed)).contains("issuer_key_env"));
+        let padded = ReputationExportSettings {
+            issuer_key_env: " MOSTRO_REPUTATION_ISSUER_SK ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&padded)).contains("issuer_key_env"));
+    }
+
+    /// Core signs at most `ATTESTATION_LIFETIME_SECS` (7 days); a longer
+    /// value would boot, advertise the issuer key and fail on every export.
+    #[test]
+    fn the_export_lifetime_cannot_exceed_what_an_attestation_carries() {
+        use crate::config::types::ReputationExportSettings;
+        use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
+        let lifetime = |lifetime_seconds| ReputationExportSettings {
+            lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_export(&lifetime(ATTESTATION_LIFETIME_SECS)).is_ok());
+        assert!(reason(validate_reputation_export(&lifetime(
+            ATTESTATION_LIFETIME_SECS + 1
+        )))
+        .contains("lifetime_seconds"));
+    }
+
+    #[test]
     fn the_lifetime_cap_must_be_positive_even_while_disabled() {
         let settings = ReputationImportSettings {
             max_lifetime_seconds: 0,
@@ -863,6 +941,7 @@ mod startup_validation_tests {
             reputation_import: None,
             payer_history: None,
             health: Default::default(),
+            reputation_export: None,
         }
     }
 
@@ -880,6 +959,20 @@ mod startup_validation_tests {
             mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 15,
         }
+    }
+
+    /// The export section is checked as part of startup validation, not only
+    /// by its own function.
+    #[test]
+    fn startup_validation_refuses_a_bad_export_section() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.reputation_export = Some(crate::config::types::ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings).expect_err("a zero lifetime is refused");
+        assert!(err.to_string().contains("[reputation_export]"));
     }
 
     #[test]

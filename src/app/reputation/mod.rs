@@ -1,6 +1,7 @@
 //! Reputation portability (docs/REPUTATION_PORTABILITY.md): importing an
 //! attestation another issuer signed, and issuing one.
 
+pub mod export;
 pub mod import;
 pub mod revoke;
 

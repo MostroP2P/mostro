@@ -407,8 +407,9 @@ pub struct ReputationExportSettings {
     /// `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`.
     #[serde(default = "default_reputation_issuer_key_env")]
     pub issuer_key_env: String,
-    /// Lifetime of an attestation this node signs, in seconds. Destinations
-    /// cap it, 7 days by default, so keep it at or below that.
+    /// Lifetime of an attestation this node signs, in seconds, 1 to 7 days:
+    /// core signs no longer one, and destinations cap it at 7 days by
+    /// default.
     #[serde(default = "default_reputation_max_lifetime_seconds")]
     pub lifetime_seconds: u64,
     /// The issuer keys, loaded from `issuer_key_env` at startup. Never read

@@ -167,8 +167,8 @@ Configuration is loaded from `~/.mostro/settings.toml` (template: `settings.tpl.
 
 **Reputation export** (`[reputation_export]`, optional; absent ≡ disabled). Lets users carry the reputation they earned on this node to another Mostro, as an attestation of their native figures (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md)):
 - `enabled` (bool): Master switch. While enabled, the info event carries a `reputation_issuer` tag with the issuer's public key (default: false)
-- `issuer_key_env` (String): Environment variable holding the issuer's secret key, nsec or hex; read at startup like `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`. The boot stops when export is enabled and the variable is unset, empty or invalid, when it holds the node's own key, or when the key is also in `[reputation_import]` (default: `MOSTRO_REPUTATION_ISSUER_SK`)
-- `lifetime_seconds` (u64): Lifetime of an attestation; destinations cap it, 7 days by default. Must be > 0 (default: 604800)
+- `issuer_key_env` (String): Environment variable holding the issuer's secret key, nsec or hex; read at startup like `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`. The boot stops when export is enabled and the variable is unset, empty or invalid, when it holds the node's own key, or when the key is also in `[reputation_import]`. A name with leading or trailing spaces stops the load (default: `MOSTRO_REPUTATION_ISSUER_SK`)
+- `lifetime_seconds` (u64): Lifetime of an attestation; destinations cap it, 7 days by default, and an attestation cannot carry more. Between 1 and 604800, 7 days; a value outside the range stops the load (default: 604800)
 
 **Health** (`[health]`, optional; absent ≡ the defaults below; `HealthSettings` in `src/config/types.rs`). The health event, and how mostrod reacts when its Lightning node stops being synced to chain (see [HEALTH.md](HEALTH.md)):
 - `enabled` (bool): Publish the health event, kind 38389 (default: true)

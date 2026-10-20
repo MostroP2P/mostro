@@ -13,6 +13,7 @@ use crate::config::wizard;
 use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
 use nostr_sdk::prelude::ToBech32;
 use std::fs;
 use std::io::IsTerminal;
@@ -190,9 +191,11 @@ fn validate_escrow_deadline_margin(
     Ok(())
 }
 
-/// `[reputation_export]`: a positive lifetime and an environment variable
-/// name. The key itself is loaded and checked when the settings are
-/// initialised (`attach_reputation_issuer_keys`).
+/// `[reputation_export]`: a lifetime core can sign, between 1 and
+/// [`ATTESTATION_LIFETIME_SECS`], and an environment variable name without
+/// surrounding spaces, since the variable is looked up as written. The key
+/// itself is loaded and checked when the settings are initialised
+/// (`attach_reputation_issuer_keys`).
 fn validate_reputation_export(
     export: &crate::config::types::ReputationExportSettings,
 ) -> Result<(), MostroError> {
@@ -204,8 +207,21 @@ fn validate_reputation_export(
     if export.lifetime_seconds == 0 {
         return fail("lifetime_seconds must be greater than 0");
     }
-    if export.issuer_key_env.trim().is_empty() {
+    if export.lifetime_seconds > ATTESTATION_LIFETIME_SECS {
+        return fail(&format!(
+            "lifetime_seconds ({}) exceeds what an attestation can carry \
+             ({ATTESTATION_LIFETIME_SECS}, 7 days)",
+            export.lifetime_seconds
+        ));
+    }
+    let name = &export.issuer_key_env;
+    if name.trim().is_empty() {
         return fail("issuer_key_env must name an environment variable");
+    }
+    if name.trim() != name {
+        return fail(&format!(
+            "issuer_key_env `{name}` has leading or trailing spaces"
+        ));
     }
     Ok(())
 }

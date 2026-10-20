@@ -148,6 +148,35 @@ mod tests {
         assert!(!nine.is_eligible(&user));
     }
 
+    /// An attestation cannot carry a `since` before `MIN_ATTESTED_SINCE`, and
+    /// an order stored while the node's clock read 1970 has nothing better:
+    /// such a trade counts, does not hide a later first trade, and alone does
+    /// not make an identity eligible.
+    #[tokio::test]
+    async fn a_first_trade_dated_before_attestations_exist_is_ignored() {
+        let pool = pool().await;
+        let identity = Keys::generate().public_key().to_hex();
+        for _ in 0..9 {
+            order(&pool, &identity, true, Status::Success, 1_700_000_000).await;
+        }
+        order(&pool, &identity, true, Status::Success, 1_000).await;
+        let user = rated(&identity, &[5, 5, 5, 5, 5]);
+        let native = native_reputation(&pool, &user).await.unwrap();
+        assert_eq!(native.completed_trades, 10);
+        assert_eq!(native.since, Some(day_truncate(1_700_000_000)));
+        assert!(native.is_eligible(&user));
+
+        let wrong_clock = Keys::generate().public_key().to_hex();
+        for _ in 0..10 {
+            order(&pool, &wrong_clock, true, Status::Success, 1_000).await;
+        }
+        let user = rated(&wrong_clock, &[5, 5, 5, 5, 5]);
+        let native = native_reputation(&pool, &user).await.unwrap();
+        assert_eq!(native.completed_trades, 10);
+        assert_eq!(native.since, None);
+        assert!(!native.is_eligible(&user));
+    }
+
     #[tokio::test]
     async fn imported_ratings_never_count_or_travel() {
         let pool = pool().await;

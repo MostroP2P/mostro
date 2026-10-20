@@ -1473,6 +1473,29 @@ mod tests {
         assert!(!unknown.success);
     }
 
+    /// An unreadable database is not a missing account: the operator must
+    /// not be told there is no account when the lookup itself failed.
+    #[tokio::test]
+    async fn rebind_reputation_export_reports_a_database_failure_as_such() {
+        let service = offline_service().await;
+        let (identity, new) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        sqlx::query("ALTER TABLE users RENAME TO users_gone")
+            .execute(service.pool.as_ref())
+            .await
+            .unwrap();
+        let reply = service
+            .rebind_reputation_export(request_with_addr(rebind_req(&identity, &new, "x"), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.success);
+        let message = reply.error_message.unwrap();
+        assert!(!message.contains("no account"), "{message}");
+    }
+
     #[test]
     fn constant_time_eq_semantics() {
         assert!(constant_time_eq(b"abc", b"abc"));

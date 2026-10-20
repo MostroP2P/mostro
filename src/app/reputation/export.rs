@@ -1004,4 +1004,36 @@ mod handler_tests {
             assert!(!logs.contains(&key.to_hex()), "{logs}");
         }
     }
+
+    /// A database failure while the account is read for a move is an
+    /// operational failure, not a verdict on the account.
+    #[tokio::test]
+    async fn a_database_failure_while_rebinding_is_not_reported_as_not_eligible() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        sqlx::query("ALTER TABLE users RENAME TO users_gone")
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        let result = apply_rebind(
+            &ctx,
+            &issuer,
+            &identity.to_hex(),
+            &y.public_key(),
+            &authorisation(&x, &issuer.public_key(), &y.public_key()),
+            Timestamp::now(),
+            &Keys::generate().public_key(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+            ),
+            "{result:?}"
+        );
+    }
 }

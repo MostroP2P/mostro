@@ -963,4 +963,31 @@ mod handler_tests {
             Some(x.public_key().to_hex())
         );
     }
+
+    /// The log of an owner's move names the trade key and the authorisation,
+    /// never the account nor either binding: together they would tie three
+    /// long-lived identities in the logs.
+    #[tokio::test]
+    async fn the_owners_move_log_names_neither_the_account_nor_either_binding() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        let auth = authorisation(&x, &issuer.public_key(), &y.public_key());
+        let rebind_id = ReputationRebind::parse_json(&auth, Timestamp::now())
+            .unwrap()
+            .id
+            .to_hex();
+        let (msg, event) = rebind_request(&identity, &y.public_key(), auth);
+        let (result, logs) =
+            test_utils::logged_on_this_thread(export_reputation_action(&ctx, msg, &event)).await;
+        result.unwrap();
+
+        assert!(logs.contains(&rebind_id), "{logs}");
+        assert!(logs.contains(&event.sender.to_hex()), "{logs}");
+        for key in [identity, x.public_key(), y.public_key()] {
+            assert!(!logs.contains(&key.to_hex()), "{logs}");
+        }
+    }
 }

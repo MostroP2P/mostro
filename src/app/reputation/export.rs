@@ -112,10 +112,16 @@ pub async fn export_reputation_action(
         let Some(rebind) = request.rebind.as_deref() else {
             return Err(MostroCantDo(CantDoReason::ReputationBoundToOtherIdentity));
         };
-        let user = is_user_present(ctx.pool(), identity.clone())
-            .await
-            .map_err(|_| not_eligible())?;
-        apply_rebind(ctx, issuer, &user, &destination, rebind, now, &event.sender).await?;
+        apply_rebind(
+            ctx,
+            issuer,
+            &identity,
+            &destination,
+            rebind,
+            now,
+            &event.sender,
+        )
+        .await?;
     }
     // Name the trade key, as the import handler does: the identity and the
     // destination together would tie two long-lived identities in the logs.
@@ -141,17 +147,22 @@ pub async fn export_reputation_action(
 /// by the identity the account is bound to, naming this issuer and the
 /// requested destination, still valid. The move is a compare-and-set
 /// conditioned on that identity, so a replay finds it changed and is
-/// refused, and two racing moves cannot both apply.
+/// refused, and two racing moves cannot both apply. The account is read
+/// here, after the first binding failed, so the move starts from the
+/// binding as it is now.
 async fn apply_rebind(
     ctx: &AppContext,
     issuer: &Keys,
-    user: &User,
+    identity: &str,
     destination: &PublicKey,
     rebind: &str,
     now: Timestamp,
     trade_key: &PublicKey,
 ) -> Result<(), MostroError> {
     let invalid = || MostroCantDo(CantDoReason::InvalidReputationRebind);
+    let user = is_user_present(ctx.pool(), identity.to_string())
+        .await
+        .map_err(|_| MostroCantDo(CantDoReason::NotEligibleForReputationExport))?;
     let rebind = ReputationRebind::parse_json(rebind, now).map_err(|_| invalid())?;
     let bound = user.reputation_exported_to.as_deref();
     let valid = rebind.issuer == issuer.public_key()

@@ -1005,6 +1005,61 @@ mod handler_tests {
         }
     }
 
+    /// An authorisation moves a binding once (§5.2): replayed after the
+    /// binding came back to its signer, it is refused and the binding stays,
+    /// while a fresh one from the signer still moves it.
+    #[tokio::test]
+    async fn an_authorisation_moves_a_binding_once_even_after_it_comes_back() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        let move_to = |signer: &Keys, to: &Keys, auth: Option<String>| {
+            let auth = auth
+                .unwrap_or_else(|| authorisation(signer, &issuer.public_key(), &to.public_key()));
+            rebind_request(&identity, &to.public_key(), auth)
+        };
+
+        let x_to_y = authorisation(&x, &issuer.public_key(), &y.public_key());
+        let (msg, event) = move_to(&x, &y, Some(x_to_y.clone()));
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        let (msg, event) = move_to(&y, &x, None);
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(x.public_key().to_hex())
+        );
+
+        let (msg, event) = move_to(&x, &y, Some(x_to_y));
+        assert_eq!(
+            refused(export_reputation_action(&ctx, msg, &event).await),
+            CantDoReason::InvalidReputationRebind
+        );
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(x.public_key().to_hex())
+        );
+
+        // A new authorisation for the same move: another lifetime gives it
+        // another id even within the same second.
+        let fresh = ReputationRebind::build(
+            &x,
+            &issuer.public_key(),
+            &y.public_key(),
+            Timestamp::now(),
+            900,
+        )
+        .unwrap()
+        .as_json();
+        let (msg, event) = move_to(&x, &y, Some(fresh));
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(y.public_key().to_hex())
+        );
+    }
+
     /// A database failure while the account is read for a move is an
     /// operational failure, not a verdict on the account.
     #[tokio::test]

@@ -181,6 +181,31 @@ mod tests {
         assert!(!native.is_eligible(&user));
     }
 
+    /// The lookup goes through the two master-key indexes. Walking the
+    /// `status` index instead reads every `success` order on each export
+    /// request.
+    #[tokio::test]
+    async fn the_completed_trades_lookup_uses_both_master_key_indexes() {
+        let pool = pool().await;
+        let plan: Vec<String> = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
+            format!("EXPLAIN QUERY PLAN {}", crate::db::COMPLETED_TRADES_QUERY),
+        ))
+        .bind("identity")
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, _, detail)| detail)
+        .collect();
+        for index in [
+            "idx_orders_master_buyer_pubkey",
+            "idx_orders_master_seller_pubkey",
+        ] {
+            assert!(plan.iter().any(|d| d.contains(index)), "{plan:?}");
+        }
+    }
+
     #[tokio::test]
     async fn imported_ratings_never_count_or_travel() {
         let pool = pool().await;

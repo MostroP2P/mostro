@@ -5,11 +5,11 @@ use crate::app::context::AppContext;
 use crate::config::types::ReputationExportSettings;
 use crate::db::{
     bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey,
-    move_reputation_binding,
+    move_reputation_binding_once,
 };
 use crate::util::enqueue_order_msg;
 use mostro_core::prelude::*;
-use mostro_core::reputation::MIN_ATTESTED_SINCE;
+use mostro_core::reputation::{MAX_CLOCK_SKEW_SECS, MIN_ATTESTED_SINCE};
 use mostro_core::user::day_truncate;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -145,9 +145,10 @@ pub async fn export_reputation_action(
 
 /// Move the binding with a rebind authorisation (§5.2, "Rebinding"): signed
 /// by the identity the account is bound to, naming this issuer and the
-/// requested destination, still valid. The move is a compare-and-set
-/// conditioned on that identity, so a replay finds it changed and is
-/// refused, and two racing moves cannot both apply. The account is read
+/// requested destination, still valid, and not applied before. The move is
+/// a compare-and-set conditioned on that identity, so two racing moves
+/// cannot both apply, and it records the authorisation, so a replay is
+/// refused even once the binding is back at its signer. The account is read
 /// here, after the first binding failed, so the move starts from the
 /// binding as it is now.
 async fn apply_rebind(
@@ -164,20 +165,24 @@ async fn apply_rebind(
         .await?
         .ok_or(MostroCantDo(CantDoReason::NotEligibleForReputationExport))?;
     let rebind = ReputationRebind::parse_json(rebind, now).map_err(|_| invalid())?;
-    let bound = user.reputation_exported_to.as_deref();
+    let bound = rebind.bound_identity.to_hex();
     let valid = rebind.issuer == issuer.public_key()
         && rebind.new_identity == *destination
-        && bound == Some(rebind.bound_identity.to_hex().as_str());
+        && user.reputation_exported_to.as_deref() == Some(bound.as_str());
     if !valid {
         return Err(invalid());
     }
     let today = day_truncate(now.as_secs() as i64) as i64;
-    let moved = move_reputation_binding(
+    // Core accepts it until its expiration plus the clock skew allowance.
+    let valid_until = rebind.expiration.saturating_add(MAX_CLOCK_SKEW_SECS);
+    let moved = move_reputation_binding_once(
         ctx.pool(),
         &user.pubkey,
-        bound,
+        &bound,
         &destination.to_hex(),
         today,
+        &rebind.id.to_hex(),
+        i64::try_from(valid_until).unwrap_or(i64::MAX),
     )
     .await?;
     if !moved {

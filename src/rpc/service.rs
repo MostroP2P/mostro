@@ -638,7 +638,7 @@ impl AdminService for AdminServiceImpl {
         let today =
             mostro_core::user::day_truncate(nostr_sdk::prelude::Timestamp::now().as_secs() as i64);
         match crate::db::move_reputation_binding(
-            &self.pool,
+            self.pool.as_ref(),
             &user.pubkey,
             previous.as_deref(),
             &new_identity.to_hex(),

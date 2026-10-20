@@ -485,15 +485,20 @@ async fn accept_event(
     }
 
     if !message.verify() {
-        // Core rejects missing/wrong import payloads before dispatch, but the
-        // protocol requires a cant-do for these authenticated requests. Keep
-        // the handler's disabled-before-payload precedence, and leave other
-        // invalid message shapes on the ordinary drop path.
-        if inner_message.action == Action::ImportReputation
-            && matches!(&message, Message::Order(_))
-            && inner_message.id.is_none()
+        // Core rejects missing/wrong import and export payloads before
+        // dispatch, but the protocol requires a cant-do for these
+        // authenticated requests. Keep the handlers' disabled-before-payload
+        // precedence, and leave other invalid message shapes on the ordinary
+        // drop path.
+        let enabled = match inner_message.action {
+            Action::ImportReputation => Some(reputation::import::import_settings(ctx).is_some()),
+            Action::ExportReputation => Some(reputation::export::export_settings(ctx).is_some()),
+            _ => None,
+        };
+        if let Some(enabled) =
+            enabled.filter(|_| matches!(&message, Message::Order(_)) && inner_message.id.is_none())
         {
-            let reason = if reputation::import::import_settings(ctx).is_some() {
+            let reason = if enabled {
                 CantDoReason::InvalidPayload
             } else {
                 CantDoReason::InvalidAction

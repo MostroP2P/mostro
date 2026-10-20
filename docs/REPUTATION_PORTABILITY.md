@@ -253,7 +253,10 @@ Transport differs per issuer:
   protocol transport (v2: NIP-44 `kind: 14`, authored by a trade key with the
   identity proof inside the ciphertext), with the destination identity and
   an optional rebind authorisation in the payload; the daemon replies
-  `reputation-exported` with the attestation.
+  `reputation-exported` with the attestation. As for an import, a request in
+  the `order` wrapper with no order id and a missing or wrong payload
+  receives `cant-do` `invalid_payload` at intake, or `invalid_action` first
+  when export is disabled.
 
 A node advertises what it supports in its kind 38385 info event, as it already
 does for Serbero: `["reputation_import_issuers", "<hex>", …]` lists its trust

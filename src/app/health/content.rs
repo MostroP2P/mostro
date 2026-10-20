@@ -66,11 +66,21 @@ pub struct PayoutsContent {
     pub window_secs: i64,
     pub payouts_succeeded_1h: u64,
     pub payouts_failed_1h: u64,
+    /// Distinct orders among `payouts_failed_1h`.
+    pub payouts_failed_orders_1h: u64,
     pub failure_reasons_1h: BTreeMap<String, u64>,
     pub last_payout_success_at: Option<i64>,
     /// `null` only when the database could not be read (`payouts` check
     /// `unknown`, `database` check `fail`).
     pub settled_unpaid_orders: Option<u64>,
+    /// Among `settled_unpaid_orders`, those settled over
+    /// `PAYOUTS_STALE_SECS` ago, never attempted and with no payout in
+    /// flight: nothing in the daemon will pay them (settled on a previous
+    /// node, or left by an admin settle that failed before paying). They
+    /// keep the `payouts` check at `warn` for the operator to clear them.
+    /// `null` only when the database could not be read.
+    pub stale_settled_unpaid_orders: Option<u64>,
+    /// Age of the oldest settled unpaid order that is not stale.
     pub oldest_settled_unpaid_order_age_secs: Option<i64>,
     /// `null` only when the database could not be read.
     pub awaiting_buyer_invoice_orders: Option<u64>,
@@ -165,9 +175,11 @@ mod tests {
             window_secs: 3_600,
             payouts_succeeded_1h: 0,
             payouts_failed_1h: 0,
+            payouts_failed_orders_1h: 0,
             failure_reasons_1h: BTreeMap::new(),
             last_payout_success_at: None,
             settled_unpaid_orders: Some(0),
+            stale_settled_unpaid_orders: Some(0),
             oldest_settled_unpaid_order_age_secs: None,
             awaiting_buyer_invoice_orders: Some(0),
         };

@@ -85,15 +85,33 @@ pub const PAYOUTS_STUCK_FAIL_SECS: i64 = 7_200;
 pub const PAYOUTS_STUCK_WARN_SECS: i64 = 1_800;
 /// Final attempts in the last hour needed before the failure rate counts.
 pub const PAYOUTS_MIN_ATTEMPTS_FOR_RATE: u64 = 3;
+/// Distinct orders with a failed attempt in the last hour needed before the
+/// failure rate counts: one order retried against one bad invoice is that
+/// buyer's problem, not the node's. An `insufficient_balance` failure is the
+/// node's whatever the invoice, so with one the rate counts on one order.
+pub const PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE: u64 = 2;
+/// A settled unpaid order older than this (seconds), never attempted and
+/// with no payout in flight, is stale: nothing in the daemon will pay it
+/// (settled on a previous node, or left by an admin settle that failed
+/// before paying). It keeps `payouts` at `warn` for the operator to clear
+/// it, but never makes it fail.
+pub const PAYOUTS_STALE_SECS: i64 = 7 * 86_400;
 
 /// What the `payouts` check is computed from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PayoutFacts {
     pub succeeded_1h: u64,
     pub failed_1h: u64,
+    /// Distinct orders among `failed_1h`.
+    pub failed_orders_1h: u64,
+    /// Among `failed_1h`, those LND gave up on for `insufficient_balance`:
+    /// the node's own liquidity, whichever invoice it was paying.
+    pub insufficient_balance_1h: u64,
     pub last_success_at: Option<i64>,
-    /// Age of the oldest settled unpaid order, if any.
+    /// Age of the oldest settled unpaid order that is not stale, if any.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
+    /// Settled unpaid orders that are stale (see [`PAYOUTS_STALE_SECS`]).
+    pub stale_settled_unpaid: u64,
 }
 
 /// The `payouts` check. `facts` is `None` when they could not be read (for
@@ -108,11 +126,13 @@ pub fn payouts_check(facts: Option<&PayoutFacts>, now: i64) -> CheckState {
         .is_none_or(|at| now.saturating_sub(at) > PAYOUTS_STUCK_FAIL_SECS);
     let stuck = oldest > PAYOUTS_STUCK_FAIL_SECS && no_recent_success;
     let attempts = facts.succeeded_1h + facts.failed_1h;
+    let node_side = facts.failed_orders_1h >= PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE
+        || facts.insufficient_balance_1h > 0;
     let mostly_failing =
-        attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE && facts.failed_1h * 2 > attempts;
+        attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE && node_side && facts.failed_1h * 2 > attempts;
     if stuck || mostly_failing {
         CheckState::Fail
-    } else if oldest > PAYOUTS_STUCK_WARN_SECS {
+    } else if oldest > PAYOUTS_STUCK_WARN_SECS || facts.stale_settled_unpaid > 0 {
         CheckState::Warn
     } else {
         CheckState::Ok
@@ -305,6 +325,7 @@ mod tests {
         let facts = PayoutFacts {
             succeeded_1h: 1,
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Fail);
@@ -312,15 +333,81 @@ mod tests {
         let half = PayoutFacts {
             succeeded_1h: 2,
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&half), NOW), CheckState::Ok);
         // Too few attempts to judge a rate.
         let few = PayoutFacts {
             failed_1h: 2,
+            failed_orders_1h: 2,
             ..Default::default()
         };
         assert_eq!(payouts_check(Some(&few), NOW), CheckState::Ok);
+    }
+
+    /// Staging, 2026-10-15: one buyer's LN address failed all three retries
+    /// of one order, then a new invoice paid. Four failures and one success
+    /// in the hour, all on one order, is that buyer's problem, not ours.
+    #[test]
+    fn payouts_rate_needs_failures_on_more_than_one_order() {
+        let one_order = PayoutFacts {
+            succeeded_1h: 1,
+            failed_1h: 4,
+            failed_orders_1h: 1,
+            last_success_at: Some(NOW - 60),
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&one_order), NOW), CheckState::Ok);
+        let two_orders = PayoutFacts {
+            failed_orders_1h: 2,
+            ..one_order
+        };
+        assert_eq!(payouts_check(Some(&two_orders), NOW), CheckState::Fail);
+    }
+
+    /// ToRyVand on #1071: three `insufficient_balance` failures on the only
+    /// payout of the hour are the node unable to pay, not one bad invoice.
+    #[test]
+    fn payouts_rate_counts_one_order_the_node_cannot_fund() {
+        let facts = PayoutFacts {
+            failed_1h: 3,
+            failed_orders_1h: 1,
+            insufficient_balance_1h: 3,
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Fail);
+        // One of them is enough: the node ran short at least once.
+        let once = PayoutFacts {
+            insufficient_balance_1h: 1,
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&once), NOW), CheckState::Fail);
+        let bad_invoice = PayoutFacts {
+            insufficient_balance_1h: 0,
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&bad_invoice), NOW), CheckState::Ok);
+    }
+
+    /// ToRyVand on #1071: a stale order can be a buyer this node left
+    /// unpaid (an admin settle that failed between settling the hold invoice
+    /// and paying, #961), not only residue from a previous node. It keeps
+    /// the check at `warn` until the operator clears it, but never fails it.
+    #[test]
+    fn payouts_warn_while_stale_orders_are_left() {
+        let facts = PayoutFacts {
+            stale_settled_unpaid: 1,
+            last_success_at: None,
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Warn);
+        // A recent order stuck as well still fails the check.
+        let stuck = PayoutFacts {
+            oldest_settled_unpaid_age_secs: Some(7_201),
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&stuck), NOW), CheckState::Fail);
     }
 
     #[test]

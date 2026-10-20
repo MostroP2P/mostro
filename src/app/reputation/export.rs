@@ -572,8 +572,8 @@ mod handler_tests {
     }
 
     /// The plan's round trip: export from node A, import on node B, both in
-    /// process. B ends up with A's native figures, and cannot import them
-    /// twice.
+    /// process. B ends up with A's native figures, counts a resent
+    /// attestation once, and refuses a re-issued one.
     #[tokio::test]
     async fn an_export_from_one_node_imports_on_another() {
         let issuer = Keys::generate();
@@ -609,7 +609,32 @@ mod handler_tests {
         assert_eq!(on_b.created_at, 1_696_204_800);
         assert_eq!(on_b.native_stats(), (0, 0.0), "nothing native on B");
 
+        // The exact same attestation again is a replay: answered, counted once.
         let (msg, event) = import(json);
+        import_reputation_action(&b, msg, &event, &Keys::generate())
+            .await
+            .unwrap();
+        let on_b = is_user_present(b.pool(), identity.to_hex()).await.unwrap();
+        assert_eq!(on_b.total_reviews, 5);
+
+        // A re-issued attestation (a new id) is refused. A sixth rating on A
+        // changes the attested content, so the id differs without waiting.
+        let mut user = is_user_present(a.pool(), identity.to_hex()).await.unwrap();
+        user.update_rating(5);
+        crate::db::update_user_rating(
+            a.pool(),
+            identity.to_hex(),
+            user.last_rating,
+            user.min_rating,
+            user.max_rating,
+            user.total_reviews,
+            user.total_rating,
+            user.native_rating_sum,
+        )
+        .await
+        .unwrap();
+        let reissued = export(&a, &identity, &identity).await.unwrap();
+        let (msg, event) = import(reissued);
         assert_eq!(
             refused(import_reputation_action(&b, msg, &event, &Keys::generate()).await),
             CantDoReason::ReputationAlreadyImported

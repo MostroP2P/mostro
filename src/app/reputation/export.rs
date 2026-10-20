@@ -351,11 +351,17 @@ mod handler_tests {
 
     /// Node A, which exports with `issuer`.
     async fn issuer_node(issuer: &Keys) -> AppContext {
+        issuer_node_with(issuer, ATTESTATION_LIFETIME_SECS).await
+    }
+
+    /// Node A, issuing attestations that live `lifetime_seconds`.
+    async fn issuer_node_with(issuer: &Keys, lifetime_seconds: u64) -> AppContext {
         let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
         let mut settings = test_settings();
         settings.reputation_export = Some(ReputationExportSettings {
             enabled: true,
             issuer_keys: Some(issuer.clone()),
+            lifetime_seconds,
             ..Default::default()
         });
         TestContextBuilder::new()
@@ -589,6 +595,31 @@ mod handler_tests {
         assert!(logs.contains(&attestation.id.to_string()), "{logs}");
         assert!(!logs.contains(&identity.to_hex()), "{logs}");
         assert!(!logs.contains(&destination.to_hex()), "{logs}");
+    }
+
+    /// If the attestation cannot be signed, nothing is bound: the account
+    /// stays free to export to the identity the user actually wants.
+    #[tokio::test]
+    async fn a_failed_signature_does_not_leave_the_account_bound() {
+        let issuer = Keys::generate();
+        // Longer than an attestation can carry, so signing fails. Startup
+        // refuses this setting; any later failure to sign is the same case.
+        let ctx = issuer_node_with(&issuer, ATTESTATION_LIFETIME_SECS + 1).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (msg, event) = request(&identity, &Keys::generate().public_key().to_hex());
+        let result = export_reputation_action(&ctx, msg, &event).await;
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::UnexpectedError(_)))
+            ),
+            "{result:?}"
+        );
+        let user = is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(user.reputation_exported_to, None);
+        assert_eq!(user.reputation_exported_at, None);
     }
 
     #[tokio::test]

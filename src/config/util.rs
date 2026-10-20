@@ -711,6 +711,28 @@ mod reputation_import_validation_tests {
             ..Default::default()
         };
         assert!(reason(validate_reputation_export(&unnamed)).contains("issuer_key_env"));
+        let padded = ReputationExportSettings {
+            issuer_key_env: " MOSTRO_REPUTATION_ISSUER_SK ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&padded)).contains("issuer_key_env"));
+    }
+
+    /// Core signs at most `ATTESTATION_LIFETIME_SECS` (7 days); a longer
+    /// value would boot, advertise the issuer key and fail on every export.
+    #[test]
+    fn the_export_lifetime_cannot_exceed_what_an_attestation_carries() {
+        use crate::config::types::ReputationExportSettings;
+        use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
+        let lifetime = |lifetime_seconds| ReputationExportSettings {
+            lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_export(&lifetime(ATTESTATION_LIFETIME_SECS)).is_ok());
+        assert!(reason(validate_reputation_export(&lifetime(
+            ATTESTATION_LIFETIME_SECS + 1
+        )))
+        .contains("lifetime_seconds"));
     }
 
     #[test]

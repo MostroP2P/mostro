@@ -87,11 +87,14 @@ pub const PAYOUTS_STUCK_WARN_SECS: i64 = 1_800;
 pub const PAYOUTS_MIN_ATTEMPTS_FOR_RATE: u64 = 3;
 /// Distinct orders with a failed attempt in the last hour needed before the
 /// failure rate counts: one order retried against one bad invoice is that
-/// buyer's problem, not the node's.
+/// buyer's problem, not the node's. An `insufficient_balance` failure is the
+/// node's whatever the invoice, so with one the rate counts on one order.
 pub const PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE: u64 = 2;
-/// A settled unpaid order older than this (seconds) is residue the daemon
-/// will not pay (settled on a previous node, say): reported for the operator,
-/// not a signal for the `payouts` check.
+/// A settled unpaid order older than this (seconds), never attempted and
+/// with no payout in flight, is stale: nothing in the daemon will pay it
+/// (settled on a previous node, or left by an admin settle that failed
+/// before paying). It keeps `payouts` at `warn` for the operator to clear
+/// it, but never makes it fail.
 pub const PAYOUTS_STALE_SECS: i64 = 7 * 86_400;
 
 /// What the `payouts` check is computed from.
@@ -123,12 +126,13 @@ pub fn payouts_check(facts: Option<&PayoutFacts>, now: i64) -> CheckState {
         .is_none_or(|at| now.saturating_sub(at) > PAYOUTS_STUCK_FAIL_SECS);
     let stuck = oldest > PAYOUTS_STUCK_FAIL_SECS && no_recent_success;
     let attempts = facts.succeeded_1h + facts.failed_1h;
-    let mostly_failing = attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE
-        && facts.failed_orders_1h >= PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE
-        && facts.failed_1h * 2 > attempts;
+    let node_side = facts.failed_orders_1h >= PAYOUTS_MIN_FAILING_ORDERS_FOR_RATE
+        || facts.insufficient_balance_1h > 0;
+    let mostly_failing =
+        attempts >= PAYOUTS_MIN_ATTEMPTS_FOR_RATE && node_side && facts.failed_1h * 2 > attempts;
     if stuck || mostly_failing {
         CheckState::Fail
-    } else if oldest > PAYOUTS_STUCK_WARN_SECS {
+    } else if oldest > PAYOUTS_STUCK_WARN_SECS || facts.stale_settled_unpaid > 0 {
         CheckState::Warn
     } else {
         CheckState::Ok

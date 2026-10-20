@@ -74,9 +74,11 @@ pub struct PayoutsContent {
     /// `unknown`, `database` check `fail`).
     pub settled_unpaid_orders: Option<u64>,
     /// Among `settled_unpaid_orders`, those settled over
-    /// `PAYOUTS_STALE_SECS` ago: residue the daemon will not pay (settled
-    /// on a previous node, say), left out of the `payouts` check for the
-    /// operator to clean up. `null` only when the database could not be read.
+    /// `PAYOUTS_STALE_SECS` ago, never attempted and with no payout in
+    /// flight: nothing in the daemon will pay them (settled on a previous
+    /// node, or left by an admin settle that failed before paying). They
+    /// keep the `payouts` check at `warn` for the operator to clear them.
+    /// `null` only when the database could not be read.
     pub stale_settled_unpaid_orders: Option<u64>,
     /// Age of the oldest settled unpaid order that is not stale.
     pub oldest_settled_unpaid_order_age_secs: Option<i64>,

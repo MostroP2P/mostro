@@ -89,7 +89,8 @@ pub fn resolve_recipient(configured: &str) -> Option<PublicKey> {
 pub struct PayoutRows {
     pub settled_unpaid: u64,
     /// Among `settled_unpaid`, those settled over [`PAYOUTS_STALE_SECS`]
-    /// ago. They are not what the `payouts` check watches.
+    /// ago that were never attempted and have no payout in flight: nothing
+    /// in the daemon will pay them.
     pub stale_settled_unpaid: u64,
     /// Age of the oldest settled unpaid order that is not stale.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
@@ -131,10 +132,12 @@ pub async fn payout_rows(
 /// Settled orders, in one pass over `idx_orders_status`: those waiting on
 /// the buyer for a new invoice (attempts used up and no payout in flight, the
 /// state in which `check_failure_retries` sent `add-invoice`), the others
-/// (the daemon is still paying them), when the oldest of those settled
-/// after `?3` was settled, and how many of them settled before `?3` (stale:
-/// residue the daemon will not pay, see `PAYOUTS_STALE_SECS`). An order
-/// with no settle time at all is stale too.
+/// (the daemon is still paying them), when the oldest of those that is not
+/// stale was settled, and how many are stale: settled before `?3`, never
+/// attempted (`failed_payment` unset, so `job_retry_failed_payments` skips
+/// them) and with no payout in flight (nothing for reconciliation), see
+/// `PAYOUTS_STALE_SECS`. Age alone never makes an order stale. A
+/// never-attempted order with no settle time at all is stale too.
 const PAYOUT_ROWS_QUERY: &str = "SELECT \
        COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                           AND payment_attempts >= ?2 THEN 1 ELSE 0 END), 0), \
@@ -142,12 +145,13 @@ const PAYOUT_ROWS_QUERY: &str = "SELECT \
                           AND payment_attempts >= ?2 THEN 0 ELSE 1 END), 0), \
        MIN(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
                      AND payment_attempts >= ?2 THEN NULL \
-                WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN NULL \
+                WHEN COALESCE(failed_payment, 0) = 0 AND payout_payment_hash IS NULL \
+                     AND COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN NULL \
                 ELSE COALESCE(hold_settled_at, invoice_held_at) END), \
-       COALESCE(SUM(CASE WHEN failed_payment = 1 AND payout_payment_hash IS NULL \
-                          AND payment_attempts >= ?2 THEN 0 \
-                     WHEN COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 THEN 1 \
-                     ELSE 0 END), 0) \
+       COALESCE(SUM(CASE WHEN COALESCE(failed_payment, 0) = 0 \
+                          AND payout_payment_hash IS NULL \
+                          AND COALESCE(hold_settled_at, invoice_held_at, 0) < ?3 \
+                     THEN 1 ELSE 0 END), 0) \
      FROM orders WHERE status = ?1";
 
 /// Completed orders whose dev fee is not paid yet, from the partial index

@@ -101,9 +101,14 @@ pub struct PayoutFacts {
     pub failed_1h: u64,
     /// Distinct orders among `failed_1h`.
     pub failed_orders_1h: u64,
+    /// Among `failed_1h`, those LND gave up on for `insufficient_balance`:
+    /// the node's own liquidity, whichever invoice it was paying.
+    pub insufficient_balance_1h: u64,
     pub last_success_at: Option<i64>,
-    /// Age of the oldest settled unpaid order, if any.
+    /// Age of the oldest settled unpaid order that is not stale, if any.
     pub oldest_settled_unpaid_age_secs: Option<i64>,
+    /// Settled unpaid orders that are stale (see [`PAYOUTS_STALE_SECS`]).
+    pub stale_settled_unpaid: u64,
 }
 
 /// The `payouts` check. `facts` is `None` when they could not be read (for
@@ -355,6 +360,50 @@ mod tests {
             ..one_order
         };
         assert_eq!(payouts_check(Some(&two_orders), NOW), CheckState::Fail);
+    }
+
+    /// ToRyVand on #1071: three `insufficient_balance` failures on the only
+    /// payout of the hour are the node unable to pay, not one bad invoice.
+    #[test]
+    fn payouts_rate_counts_one_order_the_node_cannot_fund() {
+        let facts = PayoutFacts {
+            failed_1h: 3,
+            failed_orders_1h: 1,
+            insufficient_balance_1h: 3,
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Fail);
+        // One of them is enough: the node ran short at least once.
+        let once = PayoutFacts {
+            insufficient_balance_1h: 1,
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&once), NOW), CheckState::Fail);
+        let bad_invoice = PayoutFacts {
+            insufficient_balance_1h: 0,
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&bad_invoice), NOW), CheckState::Ok);
+    }
+
+    /// ToRyVand on #1071: a stale order can be a buyer this node left
+    /// unpaid (an admin settle that failed between settling the hold invoice
+    /// and paying, #961), not only residue from a previous node. It keeps
+    /// the check at `warn` until the operator clears it, but never fails it.
+    #[test]
+    fn payouts_warn_while_stale_orders_are_left() {
+        let facts = PayoutFacts {
+            stale_settled_unpaid: 1,
+            last_success_at: None,
+            ..Default::default()
+        };
+        assert_eq!(payouts_check(Some(&facts), NOW), CheckState::Warn);
+        // A recent order stuck as well still fails the check.
+        let stuck = PayoutFacts {
+            oldest_settled_unpaid_age_secs: Some(7_201),
+            ..facts
+        };
+        assert_eq!(payouts_check(Some(&stuck), NOW), CheckState::Fail);
     }
 
     #[test]

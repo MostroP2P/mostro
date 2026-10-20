@@ -26,6 +26,9 @@ const PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Failure reason for a failure that cannot be mapped to one of LND's.
 pub const REASON_OTHER: &str = "other";
 
+/// Failure reason for a payout the node could not fund.
+pub const REASON_INSUFFICIENT_BALANCE: &str = "insufficient_balance";
+
 /// Upper bound on the entries a window keeps, whatever the rate. A node
 /// failing faster than this per hour reports a capped (still alarming)
 /// count instead of growing without bound.
@@ -41,7 +44,7 @@ pub fn failure_reason_key(reason: i32) -> &'static str {
         Ok(PaymentFailureReason::FailureReasonIncorrectPaymentDetails) => {
             "incorrect_payment_details"
         }
-        Ok(PaymentFailureReason::FailureReasonInsufficientBalance) => "insufficient_balance",
+        Ok(PaymentFailureReason::FailureReasonInsufficientBalance) => REASON_INSUFFICIENT_BALANCE,
         Ok(PaymentFailureReason::FailureReasonCanceled) => "canceled",
         _ => REASON_OTHER,
     }

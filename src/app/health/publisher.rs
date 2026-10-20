@@ -21,7 +21,9 @@ use crate::app::health::event::{
     LndTags, PersistedHealth,
 };
 use crate::app::health::lnd_sync::LndSyncSnapshot;
-use crate::app::health::stats::{dev_fee_failures_1h, last_payout_success_at, WINDOW_SECS};
+use crate::app::health::stats::{
+    dev_fee_failures_1h, last_payout_success_at, REASON_INSUFFICIENT_BALANCE, WINDOW_SECS,
+};
 use crate::config::types::{DEFAULT_HEALTH_INTERVAL, HEALTH_INTERVAL_RANGE};
 use crate::lightning::LndConnector;
 use crate::LN_STATUS;
@@ -556,8 +558,14 @@ impl Publisher {
                     succeeded_1h: window.succeeded,
                     failed_1h: window.failed,
                     failed_orders_1h: window.failed_orders,
+                    insufficient_balance_1h: window
+                        .failure_reasons
+                        .get(REASON_INSUFFICIENT_BALANCE)
+                        .copied()
+                        .unwrap_or(0),
                     last_success_at,
                     oldest_settled_unpaid_age_secs: rows.oldest_settled_unpaid_age_secs,
+                    stale_settled_unpaid: rows.stale_settled_unpaid,
                 }),
                 _ => None,
             };
@@ -1034,6 +1042,42 @@ mod tests {
         assert_eq!(rows.settled_unpaid, 1);
         assert_eq!(rows.stale_settled_unpaid, 1);
         assert_eq!(rows.oldest_settled_unpaid_age_secs, None);
+    }
+
+    /// Codex and ToRyVand on #1071: age alone does not make an order
+    /// residue. One that `job_retry_failed_payments` still retries, or one
+    /// with a payout in flight for reconciliation to settle, is the daemon's
+    /// to pay however old it is.
+    #[tokio::test]
+    async fn payout_rows_keep_old_orders_the_daemon_still_pays() {
+        let old = NOW - PAYOUTS_STALE_SECS - 1;
+        // (case, failed_payment, payment_attempts, payout in flight)
+        let cases = [
+            ("retryable", true, 1, false),
+            ("in flight, never failed", false, 0, true),
+            ("in flight after the last attempt", true, 3, true),
+        ];
+        for (case, failed, attempts, in_flight) in cases {
+            let pool = pool().await;
+            insert(&pool, "settled-hold-invoice", failed, attempts, old).await;
+            if in_flight {
+                sqlx::query("UPDATE orders SET payout_payment_hash = 'h'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let rows = payout_rows(&pool, 3, NOW).await.unwrap();
+            assert_eq!(
+                rows,
+                PayoutRows {
+                    settled_unpaid: 1,
+                    stale_settled_unpaid: 0,
+                    oldest_settled_unpaid_age_secs: Some(PAYOUTS_STALE_SECS + 1),
+                    awaiting_buyer_invoice: 0,
+                },
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

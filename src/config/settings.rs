@@ -181,8 +181,15 @@ impl Settings {
     /// `issuer_keys` were loaded at startup. Like [`Settings::get_bond`],
     /// never panics before the configuration is initialised.
     pub fn get_reputation_export() -> Option<&'static ReputationExportSettings> {
-        MOSTRO_CONFIG
-            .get()?
+        Self::reputation_export_if_enabled(MOSTRO_CONFIG.get())
+    }
+
+    /// Selection logic behind [`Settings::get_reputation_export`], split out
+    /// like [`Settings::reputation_import_if_enabled`].
+    pub(crate) fn reputation_export_if_enabled(
+        settings: Option<&Settings>,
+    ) -> Option<&ReputationExportSettings> {
+        settings?
             .reputation_export
             .as_ref()
             .filter(|export| export.enabled)
@@ -196,7 +203,7 @@ impl Settings {
     /// Selection logic behind [`Settings::get_reputation_import`], split out
     /// so the `enabled` gate is unit-testable without touching the
     /// process-wide `MOSTRO_CONFIG`.
-    fn reputation_import_if_enabled(
+    pub(crate) fn reputation_import_if_enabled(
         settings: Option<&Settings>,
     ) -> Option<&ReputationImportSettings> {
         settings?

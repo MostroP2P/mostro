@@ -636,12 +636,23 @@ pub enum InfoEscrow<'a> {
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
 pub fn info_to_tags(escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
+    let settings = crate::config::MOSTRO_CONFIG
+        .get()
+        .expect("No Mostro settings found");
+    info_tags_from_settings(settings, escrow, maintenance)
+}
+
+/// [`info_to_tags`] for the settings passed in, so a unit test can check
+/// what each section contributes, such as the issuer key loaded at startup,
+/// without the process-wide `MOSTRO_CONFIG` OnceLock.
+fn info_tags_from_settings(settings: &Settings, escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
     build_info_tags(
-        Settings::get_mostro(),
-        Settings::get_ln(),
-        Settings::get_bond(),
-        Settings::get_reputation_import(),
-        Settings::get_reputation_export().and_then(|export| export.issuer_key()),
+        &settings.mostro,
+        &settings.lightning,
+        settings.anti_abuse_bond.as_ref(),
+        Settings::reputation_import_if_enabled(Some(settings)),
+        Settings::reputation_export_if_enabled(Some(settings))
+            .and_then(|export| export.issuer_key()),
         escrow,
         maintenance,
     )
@@ -1752,6 +1763,54 @@ mod tests {
             Some(issuer.to_hex())
         );
         assert_eq!(get_tag_value(&build(None), "reputation_issuer"), None);
+    }
+
+    /// Through the path `info_to_tags` takes: the issuer key loaded into the
+    /// settings at startup is the one advertised, and only while export is
+    /// enabled; likewise the trust list only while import is enabled.
+    #[test]
+    fn info_tags_advertise_the_reputation_sections_of_the_settings() {
+        use crate::config::types::{ReputationExportSettings, ReputationIssuer};
+        let issuer = Keys::generate();
+        let trusted = Keys::generate().public_key();
+        let mut settings = test_settings();
+        settings.reputation_export = Some(ReputationExportSettings {
+            enabled: true,
+            issuer_keys: Some(issuer.clone()),
+            ..Default::default()
+        });
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![ReputationIssuer {
+                name: "other-mostro".to_string(),
+                keys: vec![trusted.to_hex()],
+            }],
+            ..Default::default()
+        });
+        let ln_status = make_ln_status();
+        let tags = |settings: &crate::config::settings::Settings| {
+            super::info_tags_from_settings(
+                settings,
+                super::InfoEscrow::Lightning(&ln_status),
+                false,
+            )
+        };
+
+        let enabled = tags(&settings);
+        assert_eq!(
+            get_tag_value(&enabled, "reputation_issuer"),
+            Some(issuer.public_key().to_hex())
+        );
+        assert_eq!(
+            get_tag_value(&enabled, "reputation_import_issuers"),
+            Some(trusted.to_hex())
+        );
+
+        settings.reputation_export.as_mut().unwrap().enabled = false;
+        settings.reputation_import.as_mut().unwrap().enabled = false;
+        let disabled = tags(&settings);
+        assert_eq!(get_tag_value(&disabled, "reputation_issuer"), None);
+        assert_eq!(get_tag_value(&disabled, "reputation_import_issuers"), None);
     }
 
     #[test]

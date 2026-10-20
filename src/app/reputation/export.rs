@@ -60,9 +60,10 @@ pub fn export_settings(ctx: &AppContext) -> Option<(&ReputationExportSettings, &
 /// returned only once the account is bound to the destination with a
 /// compare-and-set: a request for the identity already bound is how a lost,
 /// expired or fresher attestation is obtained; one for another identity is
-/// refused. A failure to sign binds nothing. The client asked the user to
-/// confirm the destination before sending the request, which the source
-/// identity signs.
+/// refused unless it carries a rebind authorisation from the bound identity
+/// ([`apply_rebind`]). A failure to sign binds nothing. The client asked
+/// the user to confirm the destination before sending the request, which
+/// the source identity signs.
 pub async fn export_reputation_action(
     ctx: &AppContext,
     msg: Message,

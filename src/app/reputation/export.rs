@@ -393,11 +393,17 @@ mod handler_tests {
     /// An identity with 10 completed trades and native ratings 5, 4, 5, 5, 3
     /// on `ctx`'s node, first trade taken on 2023-10-02.
     async fn eligible_identity(ctx: &AppContext) -> Keys {
+        identity_with(ctx, 10, &[5, 4, 5, 5, 3]).await
+    }
+
+    /// An identity with `trades` completed trades and the given native
+    /// ratings on `ctx`'s node, first trade taken on 2023-10-02.
+    async fn identity_with(ctx: &AppContext, trades: i64, ratings: &[u8]) -> Keys {
         let identity = Keys::generate();
         let hex = identity.public_key().to_hex();
         let mut user = User::new(hex.clone(), 0, 0, 0, 0, 1);
-        for rating in [5, 4, 5, 5, 3] {
-            user.update_rating(rating);
+        for rating in ratings {
+            user.update_rating(*rating);
         }
         add_new_user(ctx.pool(), user.clone()).await.unwrap();
         crate::db::update_user_rating(
@@ -412,7 +418,7 @@ mod handler_tests {
         )
         .await
         .unwrap();
-        for i in 0..10 {
+        for i in 0..trades {
             Order {
                 id: Uuid::new_v4(),
                 status: Status::Success.to_string(),
@@ -526,7 +532,10 @@ mod handler_tests {
         let ctx = issuer_node(&issuer).await;
         let identity = eligible_identity(&ctx).await.public_key();
         let destination = Keys::generate().public_key();
+        let today = || day_truncate(Timestamp::now().as_secs() as i64) as i64;
+        let first_day = today();
         let json = export(&ctx, &identity, &destination).await.unwrap();
+        let last_day = today();
 
         let (attestation, _) =
             ReputationAttestation::parse_json(&json, Timestamp::now(), ATTESTATION_LIFETIME_SECS)
@@ -541,7 +550,55 @@ mod handler_tests {
             .await
             .unwrap();
         assert_eq!(user.reputation_exported_to, Some(destination.to_hex()));
-        assert_eq!(user.reputation_exported_at.unwrap() % 86_400, 0);
+        // The day of the export, whichever side of midnight it fell on.
+        let day = user.reputation_exported_at.unwrap();
+        assert!(day == first_day || day == last_day, "{day}");
+    }
+
+    /// `lifetime_seconds` is the attestation's lifetime.
+    #[tokio::test]
+    async fn the_configured_lifetime_is_the_attestations_lifetime() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node_with(&issuer, 3_600).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let json = export(&ctx, &identity, &Keys::generate().public_key())
+            .await
+            .unwrap();
+        let (attestation, _) =
+            ReputationAttestation::parse_json(&json, Timestamp::now(), ATTESTATION_LIFETIME_SECS)
+                .unwrap();
+        assert_eq!(attestation.expiration - attestation.created_at, 3_600);
+    }
+
+    /// Each floor refuses on its own. Every one of these identities has a
+    /// first trade on record, so the missing-`since` check cannot be what
+    /// refuses them.
+    #[tokio::test]
+    async fn every_floor_refuses_on_its_own() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let destination = Keys::generate().public_key();
+        let cases: [(i64, &[u8], bool); 3] = [
+            (9, &[5, 4, 5, 5, 3], false), // one trade short
+            (10, &[5, 4, 5, 5], false),   // one rating short
+            (10, &[5, 4, 5, 5, 3], true), // banned
+        ];
+        for (trades, ratings, banned) in cases {
+            let identity = identity_with(&ctx, trades, ratings).await.public_key();
+            if banned {
+                sqlx::query("UPDATE users SET is_banned = 1 WHERE pubkey = ?1")
+                    .bind(identity.to_hex())
+                    .execute(ctx.pool())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                refused(export(&ctx, &identity, &destination).await),
+                CantDoReason::NotEligibleForReputationExport,
+                "{trades} trades, {} ratings, banned: {banned}",
+                ratings.len()
+            );
+        }
     }
 
     #[tokio::test]
@@ -650,7 +707,10 @@ mod handler_tests {
             refused(export_reputation_action(&ctx, msg, &event).await),
             CantDoReason::ReputationIdentityRequired
         );
-        for bad in ["", "AB", &destination.to_hex().to_uppercase()] {
+        // `PublicKey::from_hex` accepts 128 hex characters, so the length
+        // check is what refuses a key followed by anything.
+        let too_long = format!("{0}{0}", destination.to_hex());
+        for bad in ["", "AB", &destination.to_hex().to_uppercase(), &too_long] {
             let (msg, event) = request(&identity, bad);
             assert_eq!(
                 refused(export_reputation_action(&ctx, msg, &event).await),

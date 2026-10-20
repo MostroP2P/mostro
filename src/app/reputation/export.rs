@@ -115,7 +115,7 @@ pub async fn export_reputation_action(
         let user = is_user_present(ctx.pool(), identity.clone())
             .await
             .map_err(|_| not_eligible())?;
-        apply_rebind(ctx, issuer, &user, &destination, rebind, now).await?;
+        apply_rebind(ctx, issuer, &user, &destination, rebind, now, &event.sender).await?;
     }
     // Name the trade key, as the import handler does: the identity and the
     // destination together would tie two long-lived identities in the logs.
@@ -149,6 +149,7 @@ async fn apply_rebind(
     destination: &PublicKey,
     rebind: &str,
     now: Timestamp,
+    trade_key: &PublicKey,
 ) -> Result<(), MostroError> {
     let invalid = || MostroCantDo(CantDoReason::InvalidReputationRebind);
     let rebind = ReputationRebind::parse_json(rebind, now).map_err(|_| invalid())?;
@@ -171,11 +172,13 @@ async fn apply_rebind(
     if !moved {
         return Err(invalid());
     }
+    // Name the trade key and the authorisation: the account and both
+    // bindings would tie three long-lived identities in the logs. Only the
+    // operator's move is logged with both identities (§5.2).
     tracing::warn!(
-        "reputation: {} rebound its export from {} to {} by its own authorisation",
-        user.pubkey,
-        rebind.bound_identity.to_hex(),
-        destination.to_hex()
+        "reputation: trade key {} moved its export binding (rebind authorisation {})",
+        trade_key,
+        rebind.id
     );
     Ok(())
 }

@@ -278,6 +278,9 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::Orders => orders_action(ctx, msg, event).await.map_err(|e| e.into()),
+        Action::ExportReputation => reputation::export::export_reputation_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into()),
         Action::ImportReputation => {
             reputation::import::import_reputation_action(ctx, msg, event, my_keys)
                 .await
@@ -482,15 +485,20 @@ async fn accept_event(
     }
 
     if !message.verify() {
-        // Core rejects missing/wrong import payloads before dispatch, but the
-        // protocol requires a cant-do for these authenticated requests. Keep
-        // the handler's disabled-before-payload precedence, and leave other
-        // invalid message shapes on the ordinary drop path.
-        if inner_message.action == Action::ImportReputation
-            && matches!(&message, Message::Order(_))
-            && inner_message.id.is_none()
+        // Core rejects missing/wrong import and export payloads before
+        // dispatch, but the protocol requires a cant-do for these
+        // authenticated requests. Keep the handlers' disabled-before-payload
+        // precedence, and leave other invalid message shapes on the ordinary
+        // drop path.
+        let enabled = match inner_message.action {
+            Action::ImportReputation => Some(reputation::import::import_settings(ctx).is_some()),
+            Action::ExportReputation => Some(reputation::export::export_settings(ctx).is_some()),
+            _ => None,
+        };
+        if let Some(enabled) =
+            enabled.filter(|_| matches!(&message, Message::Order(_)) && inner_message.id.is_none())
         {
-            let reason = if reputation::import::import_settings(ctx).is_some() {
+            let reason = if enabled {
                 CantDoReason::InvalidPayload
             } else {
                 CantDoReason::InvalidAction
@@ -729,8 +737,8 @@ async fn dispatch_cashu(
         | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
-        // Reputation import touches no escrow either.
-        Action::ImportReputation => {
+        // Reputation import and export touch no escrow either.
+        Action::ImportReputation | Action::ExportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
@@ -1007,15 +1015,21 @@ mod tests {
     mod reputation_import_intake_tests {
         use super::*;
         use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-        use crate::config::types::ReputationImportSettings;
+        use crate::config::types::{ReputationExportSettings, ReputationImportSettings};
         use mostro_core::prelude::Payload;
         use mostro_core::transport::{wrap_message_nip44, WrapOptions};
 
+        /// A node with both reputation sections `enabled` or not.
         async fn context(enabled: bool) -> AppContext {
             let ctx = create_migrated_ctx().await;
             let mut settings = test_settings();
             settings.reputation_import = Some(ReputationImportSettings {
                 enabled,
+                ..Default::default()
+            });
+            settings.reputation_export = Some(ReputationExportSettings {
+                enabled,
+                issuer_keys: Some(create_test_keys()),
                 ..Default::default()
             });
             TestContextBuilder::new()
@@ -1025,8 +1039,16 @@ mod tests {
         }
 
         fn event(mostro: &Keys, trade: &Keys, payload: Option<Payload>) -> Event {
-            let message =
-                Message::new_order(None, Some(4127), None, Action::ImportReputation, payload);
+            action_event(mostro, trade, Action::ImportReputation, payload)
+        }
+
+        fn action_event(
+            mostro: &Keys,
+            trade: &Keys,
+            action: Action,
+            payload: Option<Payload>,
+        ) -> Event {
+            let message = Message::new_order(None, Some(4127), None, action, payload);
             wrap_message_nip44(
                 &message,
                 &create_test_keys(),
@@ -1073,6 +1095,39 @@ mod tests {
                     .unwrap();
                 assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
                 assert!(reply.get_inner_message_kind().id.is_none());
+            }
+        }
+
+        /// Core's `verify` rejects an `export-reputation` without its request
+        /// payload before dispatch, as it does for an import; the requester
+        /// is answered all the same, disabled before invalid payload.
+        #[tokio::test]
+        async fn export_intake_answers_missing_and_wrong_payloads() {
+            let mostro = create_test_keys();
+            for (enabled, reason) in [
+                (true, CantDoReason::InvalidPayload),
+                (false, CantDoReason::InvalidAction),
+            ] {
+                let ctx = context(enabled).await;
+                for payload in [None, Some(Payload::RatingUser(5))] {
+                    let trade = create_test_keys();
+                    let event = action_event(&mostro, &trade, Action::ExportReputation, payload);
+                    assert!(!accept(&ctx, &event, &mostro).await);
+                    assert_eq!(
+                        cant_do_reasons_for(&trade.public_key()).await,
+                        vec![reason.clone()],
+                        "export enabled: {enabled}"
+                    );
+                    let queue = crate::config::MESSAGE_QUEUES
+                        .queue_order_cantdo
+                        .read()
+                        .await;
+                    let (reply, _) = queue
+                        .iter()
+                        .find(|(_, pk)| *pk == trade.public_key())
+                        .unwrap();
+                    assert_eq!(reply.get_inner_message_kind().request_id, Some(4127));
+                }
             }
         }
 
@@ -2307,14 +2362,14 @@ mod tests {
             }
         }
 
-        /// `import-reputation` reaches its handler on both routers. With import
-        /// enabled and no payload the handler answers `InvalidPayload`, which
-        /// neither the default arm (`Ok`) nor the Cashu block
-        /// (`InvalidAction`) produces.
+        /// `import-reputation` and `export-reputation` reach their handlers on
+        /// both routers. With both enabled and no payload each answers
+        /// `InvalidPayload`, which neither the default arm (`Ok`) nor the
+        /// Cashu block (`InvalidAction`) produces.
         #[tokio::test]
-        async fn routes_import_reputation_to_its_handler_in_both_modes() {
+        async fn routes_reputation_actions_to_their_handlers_in_both_modes() {
             use crate::app::context::test_utils::{test_settings, TestContextBuilder};
-            use crate::config::types::ReputationImportSettings;
+            use crate::config::types::{ReputationExportSettings, ReputationImportSettings};
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
@@ -2326,14 +2381,17 @@ mod tests {
                 enabled: true,
                 ..Default::default()
             });
+            settings.reputation_export = Some(ReputationExportSettings {
+                enabled: true,
+                issuer_keys: Some(create_test_keys()),
+                ..Default::default()
+            });
             let ctx = TestContextBuilder::new()
                 .with_pool(std::sync::Arc::new(pool))
                 .with_settings(settings)
                 .build();
             let my_keys = create_test_keys();
             let event = create_test_unwrapped_message();
-            let action = Action::ImportReputation;
-            let msg = create_test_message(action.clone(), None);
             let invalid_payload = |result: Result<()>| {
                 matches!(
                     result,
@@ -2341,12 +2399,20 @@ mod tests {
                         == Some(&MostroError::MostroCantDo(CantDoReason::InvalidPayload))
                 )
             };
-            assert!(invalid_payload(
-                handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx).await
-            ));
-            assert!(invalid_payload(
-                dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await
-            ));
+            for action in [Action::ImportReputation, Action::ExportReputation] {
+                let msg = create_test_message(action.clone(), None);
+                assert!(
+                    invalid_payload(
+                        handle_message_action_no_ln(&action, msg.clone(), &event, &my_keys, &ctx)
+                            .await
+                    ),
+                    "{action:?} on the Lightning router"
+                );
+                assert!(
+                    invalid_payload(dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await),
+                    "{action:?} on the Cashu router"
+                );
+            }
         }
     }
 

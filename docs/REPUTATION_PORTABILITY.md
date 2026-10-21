@@ -219,8 +219,11 @@ One request and one reply; there is no session.
   equals `reputation_exported_to`, that `issuer` names itself and that it has
   not expired, then moves the binding to the new identity with the same
   compare-and-set (conditioned on the old value) and exports to it. The
-  `issuer` tag keeps an authorisation from being replayed at another issuer;
-  the compare-and-set makes a replay at the same one a no-op.
+  `issuer` tag keeps an authorisation from being replayed at another issuer.
+  At the same one, the issuer records every authorisation it applied until
+  it expires, in the same transaction as the move, so each one moves a
+  binding once, even if the binding comes back to its signer meanwhile
+  (table `reputation_rebinds` in the daemon).
 - **Admin rebind.** A user who lost the bound identity cannot sign, so the
   operator can rebind by hand. Every admin rebind is logged with the old and
   new identity and the reason.

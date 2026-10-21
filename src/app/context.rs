@@ -173,6 +173,45 @@ pub mod test_utils {
     };
     use secrecy::SecretString;
 
+    thread_local! {
+        static LOGGED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// What this thread logs while `run` runs. A subscriber scoped to the
+    /// test with `set_default` would miss lines: while it is the only one
+    /// registered, a test on another thread that reaches the same log line
+    /// first caches it as disabled. A global one, installed once, is the
+    /// subscriber every thread sees; it keeps only the lines of a thread
+    /// that is capturing.
+    pub async fn logged_on_this_thread<F: std::future::Future>(run: F) -> (F::Output, String) {
+        struct ThreadWriter;
+        impl std::io::Write for ThreadWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LOGGED.with(|logged| {
+                    if let Some(logged) = logged.borrow_mut().as_mut() {
+                        logged.extend_from_slice(buf);
+                    }
+                });
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadWriter)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        LOGGED.with(|logged| *logged.borrow_mut() = Some(Vec::new()));
+        let output = run.await;
+        let logged = LOGGED.with(|logged| logged.borrow_mut().take().unwrap_or_default());
+        (output, String::from_utf8(logged).unwrap())
+    }
+
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
     pub struct MockOrderMsgQueue {

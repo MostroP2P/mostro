@@ -2028,6 +2028,76 @@ pub async fn bind_reputation_export(
     Ok(result.rows_affected() > 0)
 }
 
+/// Move an account's reputation binding from `from` (`None`: unbound) to
+/// `to`, as a compare-and-set on the current value, recording the day.
+/// Returns whether it moved: a concurrent move finds the binding already
+/// changed and does nothing.
+pub async fn move_reputation_binding<'e, E>(
+    executor: E,
+    identity: &str,
+    from: Option<&str>,
+    to: &str,
+    day: i64,
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(
+        "UPDATE users SET reputation_exported_to = ?3, reputation_exported_at = ?4 \
+         WHERE pubkey = ?1 AND reputation_exported_to IS ?2",
+    )
+    .bind(identity)
+    .bind(from)
+    .bind(to)
+    .bind(day)
+    .execute(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// [`move_reputation_binding`] with the rebind authorisation `authorisation`
+/// (its event id), once: the authorisation is recorded until `valid_until`
+/// in the same transaction as the move, so it moves a binding once even if
+/// the binding later comes back to its signer, and a move that does not
+/// apply records nothing. Returns whether it moved. Records past their
+/// `valid_until` are dropped on the way.
+pub async fn move_reputation_binding_once(
+    pool: &SqlitePool,
+    identity: &str,
+    from: &str,
+    to: &str,
+    day: i64,
+    authorisation: &str,
+    valid_until: i64,
+) -> Result<bool, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    // A write first: it takes SQLite's writer lock, so racing moves run one
+    // after the other.
+    sqlx::query(
+        "DELETE FROM reputation_rebinds WHERE valid_until < CAST(strftime('%s', 'now') AS INTEGER)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let recorded =
+        sqlx::query("INSERT OR IGNORE INTO reputation_rebinds (id, valid_until) VALUES (?1, ?2)")
+            .bind(authorisation)
+            .bind(valid_until)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+            > 0;
+    if !recorded || !move_reputation_binding(&mut *tx, identity, Some(from), to, day).await? {
+        tx.rollback().await.map_err(db_err)?;
+        return Ok(false);
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(true)
+}
+
 /// The trust-list names that hold `issuer_key`: the names its imports were
 /// recorded under, and the name it is bound to while an import is recorded
 /// under that name. A name no import uses has nothing to deduplicate, so it

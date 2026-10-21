@@ -3,10 +3,13 @@
 
 use crate::app::context::AppContext;
 use crate::config::types::ReputationExportSettings;
-use crate::db::{bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey};
+use crate::db::{
+    bind_reputation_export, completed_trades_for_identity, find_user_by_pubkey,
+    move_reputation_binding_once,
+};
 use crate::util::enqueue_order_msg;
 use mostro_core::prelude::*;
-use mostro_core::reputation::MIN_ATTESTED_SINCE;
+use mostro_core::reputation::{MAX_CLOCK_SKEW_SECS, MIN_ATTESTED_SINCE};
 use mostro_core::user::day_truncate;
 use nostr_sdk::prelude::*;
 use sqlx::SqlitePool;
@@ -57,9 +60,10 @@ pub fn export_settings(ctx: &AppContext) -> Option<(&ReputationExportSettings, &
 /// returned only once the account is bound to the destination with a
 /// compare-and-set: a request for the identity already bound is how a lost,
 /// expired or fresher attestation is obtained; one for another identity is
-/// refused. A failure to sign binds nothing. The client asked the user to
-/// confirm the destination before sending the request, which the source
-/// identity signs.
+/// refused unless it carries a rebind authorisation from the bound identity
+/// ([`apply_rebind`]). A failure to sign binds nothing. The client asked
+/// the user to confirm the destination before sending the request, which
+/// the source identity signs.
 pub async fn export_reputation_action(
     ctx: &AppContext,
     msg: Message,
@@ -104,7 +108,21 @@ pub async fn export_reputation_action(
     let today = day_truncate(now.as_secs() as i64) as i64;
     let bound = bind_reputation_export(ctx.pool(), &identity, &destination.to_hex(), today).await?;
     if !bound {
-        return Err(MostroCantDo(CantDoReason::ReputationBoundToOtherIdentity));
+        // Bound to another identity: only a rebind authorisation from it
+        // moves the binding.
+        let Some(rebind) = request.rebind.as_deref() else {
+            return Err(MostroCantDo(CantDoReason::ReputationBoundToOtherIdentity));
+        };
+        apply_rebind(
+            ctx,
+            issuer,
+            &identity,
+            &destination,
+            rebind,
+            now,
+            &event.sender,
+        )
+        .await?;
     }
     // Name the trade key, as the import handler does: the identity and the
     // destination together would tie two long-lived identities in the logs.
@@ -123,6 +141,62 @@ pub async fn export_reputation_action(
         None,
     )
     .await;
+    Ok(())
+}
+
+/// Move the binding with a rebind authorisation (§5.2, "Rebinding"): signed
+/// by the identity the account is bound to, naming this issuer and the
+/// requested destination, still valid, and not applied before. The move is
+/// a compare-and-set conditioned on that identity, so two racing moves
+/// cannot both apply, and it records the authorisation, so a replay is
+/// refused even once the binding is back at its signer. The account is read
+/// here, after the first binding failed, so the move starts from the
+/// binding as it is now.
+async fn apply_rebind(
+    ctx: &AppContext,
+    issuer: &Keys,
+    identity: &str,
+    destination: &PublicKey,
+    rebind: &str,
+    now: Timestamp,
+    trade_key: &PublicKey,
+) -> Result<(), MostroError> {
+    let invalid = || MostroCantDo(CantDoReason::InvalidReputationRebind);
+    let user = find_user_by_pubkey(ctx.pool(), identity.to_string())
+        .await?
+        .ok_or(MostroCantDo(CantDoReason::NotEligibleForReputationExport))?;
+    let rebind = ReputationRebind::parse_json(rebind, now).map_err(|_| invalid())?;
+    let bound = rebind.bound_identity.to_hex();
+    let valid = rebind.issuer == issuer.public_key()
+        && rebind.new_identity == *destination
+        && user.reputation_exported_to.as_deref() == Some(bound.as_str());
+    if !valid {
+        return Err(invalid());
+    }
+    let today = day_truncate(now.as_secs() as i64) as i64;
+    // Core accepts it until its expiration plus the clock skew allowance.
+    let valid_until = rebind.expiration.saturating_add(MAX_CLOCK_SKEW_SECS);
+    let moved = move_reputation_binding_once(
+        ctx.pool(),
+        &user.pubkey,
+        &bound,
+        &destination.to_hex(),
+        today,
+        &rebind.id.to_hex(),
+        i64::try_from(valid_until).unwrap_or(i64::MAX),
+    )
+    .await?;
+    if !moved {
+        return Err(invalid());
+    }
+    // Name the trade key and the authorisation: the account and both
+    // bindings would tie three long-lived identities in the logs. Only the
+    // operator's move is logged with both identities (§5.2).
+    tracing::warn!(
+        "reputation: trade key {} moved its export binding (rebind authorisation {})",
+        trade_key,
+        rebind.id
+    );
     Ok(())
 }
 
@@ -331,10 +405,12 @@ mod tests {
 #[cfg(test)]
 mod handler_tests {
     use super::*;
-    use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::app::context::test_utils::{self, test_settings, TestContextBuilder};
     use crate::app::reputation::import::import_reputation_action;
     use crate::config::types::{ReputationImportSettings, ReputationIssuer};
-    use crate::db::{add_new_user, is_user_present};
+    use crate::db::{
+        add_new_user, is_user_present, move_reputation_binding, move_reputation_binding_once,
+    };
     use mostro_core::db::Crud;
     use mostro_core::order::Order;
     use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
@@ -480,45 +556,6 @@ mod handler_tests {
         }
     }
 
-    thread_local! {
-        static LOGGED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// What this thread logs while `run` runs. A subscriber scoped to the
-    /// test with `set_default` would miss lines: while it is the only one
-    /// registered, a test on another thread that reaches the same log line
-    /// first caches it as disabled. A global one, installed once, is the
-    /// subscriber every thread sees; it keeps only the lines of a thread
-    /// that is capturing.
-    async fn logged_on_this_thread<F: std::future::Future>(run: F) -> (F::Output, String) {
-        struct ThreadWriter;
-        impl std::io::Write for ThreadWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                LOGGED.with(|logged| {
-                    if let Some(logged) = logged.borrow_mut().as_mut() {
-                        logged.extend_from_slice(buf);
-                    }
-                });
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(|| ThreadWriter)
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).unwrap();
-        });
-        LOGGED.with(|logged| *logged.borrow_mut() = Some(Vec::new()));
-        let output = run.await;
-        let logged = LOGGED.with(|logged| logged.borrow_mut().take().unwrap_or_default());
-        (output, String::from_utf8(logged).unwrap())
-    }
-
     fn refused<T: std::fmt::Debug>(result: Result<T, MostroError>) -> CantDoReason {
         match result {
             Err(MostroCantDo(reason)) => reason,
@@ -646,7 +683,8 @@ mod handler_tests {
         let ctx = issuer_node(&issuer).await;
         let identity = eligible_identity(&ctx).await.public_key();
         let destination = Keys::generate().public_key();
-        let (json, logs) = logged_on_this_thread(export(&ctx, &identity, &destination)).await;
+        let (json, logs) =
+            test_utils::logged_on_this_thread(export(&ctx, &identity, &destination)).await;
         let json = json.unwrap();
 
         let (attestation, _) =
@@ -814,6 +852,375 @@ mod handler_tests {
         assert_eq!(
             refused(import_reputation_action(&b, msg, &event, &Keys::generate()).await),
             CantDoReason::ReputationAlreadyImported
+        );
+    }
+
+    fn rebind_request(
+        identity: &PublicKey,
+        destination: &PublicKey,
+        rebind: String,
+    ) -> (Message, UnwrappedMessage) {
+        let msg = Message::new_order(
+            None,
+            None,
+            None,
+            Action::ExportReputation,
+            Some(Payload::ReputationExportRequest(ReputationExportRequest {
+                destination: destination.to_hex(),
+                rebind: Some(rebind),
+            })),
+        );
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
+            sender: Keys::generate().public_key(),
+            identity: *identity,
+            created_at: Timestamp::now(),
+        };
+        (msg, event)
+    }
+
+    fn authorisation(signer: &Keys, issuer: &PublicKey, new: &PublicKey) -> String {
+        ReputationRebind::build(signer, issuer, new, Timestamp::now(), 600)
+            .unwrap()
+            .as_json()
+    }
+
+    async fn bound_to(ctx: &AppContext, identity: &PublicKey) -> Option<String> {
+        is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap()
+            .reputation_exported_to
+    }
+
+    #[tokio::test]
+    async fn a_valid_authorisation_moves_the_binding_once_and_a_replay_changes_nothing() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+
+        let auth = authorisation(&x, &issuer.public_key(), &y.public_key());
+        let (msg, event) = rebind_request(&identity, &y.public_key(), auth.clone());
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(y.public_key().to_hex())
+        );
+
+        // Replayed as is: already bound to Y, so it only re-issues.
+        let (msg, event) = rebind_request(&identity, &y.public_key(), auth.clone());
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(y.public_key().to_hex())
+        );
+
+        // Once the binding moved on to Z, the old authorisation is refused.
+        let z = Keys::generate();
+        let (msg, event) = rebind_request(
+            &identity,
+            &z.public_key(),
+            authorisation(&y, &issuer.public_key(), &z.public_key()),
+        );
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        let (msg, event) = rebind_request(&identity, &y.public_key(), auth);
+        assert_eq!(
+            refused(export_reputation_action(&ctx, msg, &event).await),
+            CantDoReason::InvalidReputationRebind
+        );
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(z.public_key().to_hex())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authorisation_signed_by_any_other_key_or_for_anything_else_is_refused() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+
+        let stranger = Keys::generate();
+        let expired = ReputationRebind::build(
+            &x,
+            &issuer.public_key(),
+            &y.public_key(),
+            Timestamp::from(Timestamp::now().as_secs() - 7_200),
+            600,
+        )
+        .unwrap()
+        .as_json();
+        for (why, auth, destination) in [
+            (
+                "signed by another key",
+                authorisation(&stranger, &issuer.public_key(), &y.public_key()),
+                y.public_key(),
+            ),
+            (
+                "for another issuer",
+                authorisation(&x, &Keys::generate().public_key(), &y.public_key()),
+                y.public_key(),
+            ),
+            (
+                "for another identity",
+                authorisation(&x, &issuer.public_key(), &stranger.public_key()),
+                y.public_key(),
+            ),
+            ("expired", expired, y.public_key()),
+            ("not an event", "{}".to_string(), y.public_key()),
+        ] {
+            let (msg, event) = rebind_request(&identity, &destination, auth);
+            assert_eq!(
+                refused(export_reputation_action(&ctx, msg, &event).await),
+                CantDoReason::InvalidReputationRebind,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(x.public_key().to_hex())
+        );
+    }
+
+    /// The log of an owner's move names the trade key and the authorisation,
+    /// never the account nor either binding: together they would tie three
+    /// long-lived identities in the logs.
+    #[tokio::test]
+    async fn the_owners_move_log_names_neither_the_account_nor_either_binding() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        let auth = authorisation(&x, &issuer.public_key(), &y.public_key());
+        let rebind_id = ReputationRebind::parse_json(&auth, Timestamp::now())
+            .unwrap()
+            .id
+            .to_hex();
+        let (msg, event) = rebind_request(&identity, &y.public_key(), auth);
+        let (result, logs) =
+            test_utils::logged_on_this_thread(export_reputation_action(&ctx, msg, &event)).await;
+        result.unwrap();
+
+        assert!(logs.contains(&rebind_id), "{logs}");
+        assert!(logs.contains(&event.sender.to_hex()), "{logs}");
+        for key in [identity, x.public_key(), y.public_key()] {
+            assert!(!logs.contains(&key.to_hex()), "{logs}");
+        }
+    }
+
+    /// An authorisation moves a binding once (§5.2): replayed after the
+    /// binding came back to its signer, it is refused and the binding stays,
+    /// while a fresh one from the signer still moves it.
+    #[tokio::test]
+    async fn an_authorisation_moves_a_binding_once_even_after_it_comes_back() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        let move_to = |signer: &Keys, to: &Keys, auth: Option<String>| {
+            let auth = auth
+                .unwrap_or_else(|| authorisation(signer, &issuer.public_key(), &to.public_key()));
+            rebind_request(&identity, &to.public_key(), auth)
+        };
+
+        let x_to_y = authorisation(&x, &issuer.public_key(), &y.public_key());
+        let (msg, event) = move_to(&x, &y, Some(x_to_y.clone()));
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        let (msg, event) = move_to(&y, &x, None);
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(x.public_key().to_hex())
+        );
+
+        let (msg, event) = move_to(&x, &y, Some(x_to_y));
+        assert_eq!(
+            refused(export_reputation_action(&ctx, msg, &event).await),
+            CantDoReason::InvalidReputationRebind
+        );
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(x.public_key().to_hex())
+        );
+
+        // A new authorisation for the same move: another lifetime gives it
+        // another id even within the same second.
+        let fresh = ReputationRebind::build(
+            &x,
+            &issuer.public_key(),
+            &y.public_key(),
+            Timestamp::now(),
+            900,
+        )
+        .unwrap()
+        .as_json();
+        let (msg, event) = move_to(&x, &y, Some(fresh));
+        export_reputation_action(&ctx, msg, &event).await.unwrap();
+        assert_eq!(
+            bound_to(&ctx, &identity).await,
+            Some(y.public_key().to_hex())
+        );
+    }
+
+    /// A database failure while the account is read for a move is an
+    /// operational failure, not a verdict on the account.
+    #[tokio::test]
+    async fn a_database_failure_while_rebinding_is_not_reported_as_not_eligible() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        sqlx::query("ALTER TABLE users RENAME TO users_gone")
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        let result = apply_rebind(
+            &ctx,
+            &issuer,
+            &identity.to_hex(),
+            &y.public_key(),
+            &authorisation(&x, &issuer.public_key(), &y.public_key()),
+            Timestamp::now(),
+            &Keys::generate().public_key(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::DbAccessError(_)))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The compare-and-set moves one account, and only from the value the
+    /// caller read: a stale `from` moves nothing, another account bound to
+    /// the same identity stays where it is, and an unbound account moves from
+    /// `None`.
+    #[tokio::test]
+    async fn moving_a_binding_touches_only_the_named_account_from_the_expected_value() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let (a, b, c) = (
+            eligible_identity(&ctx).await.public_key(),
+            eligible_identity(&ctx).await.public_key(),
+            eligible_identity(&ctx).await.public_key(),
+        );
+        let (x, y) = (Keys::generate().public_key(), Keys::generate().public_key());
+        for account in [&a, &b] {
+            export(&ctx, account, &x).await.unwrap();
+        }
+        let (x, y) = (x.to_hex(), y.to_hex());
+
+        let stale = move_reputation_binding(ctx.pool(), &a.to_hex(), Some(&y), &y, 1).await;
+        assert!(!stale.unwrap(), "a stale expected value moves nothing");
+        assert_eq!(bound_to(&ctx, &a).await, Some(x.clone()));
+
+        let moved = move_reputation_binding(ctx.pool(), &a.to_hex(), Some(&x), &y, 1).await;
+        assert!(moved.unwrap());
+        assert_eq!(bound_to(&ctx, &a).await, Some(y.clone()));
+        assert_eq!(bound_to(&ctx, &b).await, Some(x), "the other account stays");
+
+        let first = move_reputation_binding(ctx.pool(), &c.to_hex(), None, &y, 1).await;
+        assert!(first.unwrap(), "an unbound account moves from None");
+        assert_eq!(bound_to(&ctx, &c).await, Some(y));
+    }
+
+    /// A move that does not apply records nothing: the same authorisation
+    /// still moves the binding once the expected value is right.
+    #[tokio::test]
+    async fn a_move_that_does_not_apply_does_not_use_up_the_authorisation() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let a = eligible_identity(&ctx).await.public_key();
+        let (x, y) = (Keys::generate().public_key(), Keys::generate().public_key());
+        export(&ctx, &a, &x).await.unwrap();
+        let (a, x, y) = (a.to_hex(), x.to_hex(), y.to_hex());
+        let id = "ab".repeat(32);
+        let valid_until = i64::MAX;
+
+        let stale = move_reputation_binding_once(ctx.pool(), &a, &y, &y, 1, &id, valid_until);
+        assert!(!stale.await.unwrap());
+        let moved = move_reputation_binding_once(ctx.pool(), &a, &x, &y, 1, &id, valid_until);
+        assert!(moved.await.unwrap());
+        let again = move_reputation_binding_once(ctx.pool(), &a, &y, &x, 1, &id, valid_until);
+        assert!(!again.await.unwrap(), "an authorisation moves once");
+        assert_eq!(
+            is_user_present(ctx.pool(), a)
+                .await
+                .unwrap()
+                .reputation_exported_to,
+            Some(y)
+        );
+    }
+
+    /// Two moves of one account at once, each with a valid authorisation
+    /// from the bound identity: one applies, the other is refused, the
+    /// binding is the winner's, the day of the move is recorded and the
+    /// account's ratings are untouched.
+    #[tokio::test]
+    async fn two_owner_moves_at_once_apply_exactly_one() {
+        let issuer = Keys::generate();
+        let ctx = issuer_node(&issuer).await;
+        let identity = eligible_identity(&ctx).await.public_key();
+        let (x, y, z) = (Keys::generate(), Keys::generate(), Keys::generate());
+        export(&ctx, &identity, &x.public_key()).await.unwrap();
+        sqlx::query("UPDATE users SET reputation_exported_at = 0 WHERE pubkey = ?1")
+            .bind(identity.to_hex())
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        let before = is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        let today = || day_truncate(Timestamp::now().as_secs() as i64) as i64;
+        let first_day = today();
+
+        let (m1, e1) = rebind_request(
+            &identity,
+            &y.public_key(),
+            authorisation(&x, &issuer.public_key(), &y.public_key()),
+        );
+        let (m2, e2) = rebind_request(
+            &identity,
+            &z.public_key(),
+            authorisation(&x, &issuer.public_key(), &z.public_key()),
+        );
+        let (r1, r2) = tokio::join!(
+            export_reputation_action(&ctx, m1, &e1),
+            export_reputation_action(&ctx, m2, &e2)
+        );
+        let last_day = today();
+        assert_eq!([r1.is_ok(), r2.is_ok()].iter().filter(|ok| **ok).count(), 1);
+        let (winner, lost) = if r1.is_ok() { (&y, r2) } else { (&z, r1) };
+        assert_eq!(refused(lost), CantDoReason::InvalidReputationRebind);
+        let after = is_user_present(ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.reputation_exported_to,
+            Some(winner.public_key().to_hex())
+        );
+        let day = after.reputation_exported_at.unwrap();
+        assert!(day == first_day || day == last_day, "{day}");
+        assert_eq!(
+            (
+                after.total_reviews,
+                after.total_rating,
+                after.native_rating_sum
+            ),
+            (
+                before.total_reviews,
+                before.total_rating,
+                before.native_rating_sum
+            )
         );
     }
 }

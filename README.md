@@ -757,7 +757,7 @@ nostreq --kinds 38385 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream 
 Mostro requires a client to interact with the daemon. Available clients:
 
 - **[mostro-cli](https://github.com/MostroP2P/mostro-cli)** - Command-line interface (recommended for testing)
-- **[Mostro Mobile](https://github.com/MostroP2P/mobile)** - Mobile app (beta)
+- **[Mostro App](https://github.com/MostroP2P/app)** - Mobile, desktop and web app (beta)
 - **[MostriX](https://github.com/MostroP2P/mostrix)** - Terminal UI client (work in progress)
 
 **Example: Creating an order with mostro-cli**:
@@ -840,8 +840,8 @@ cargo install --path .
 
 ---
 
-#### Mostro Mobile (Mobile App)
-**Repository**: https://github.com/MostroP2P/mobile
+#### Mostro App (Mobile, Desktop and Web)
+**Repository**: https://github.com/MostroP2P/app
 **Status**: Beta
 **Best For**: General users, accessibility
 
@@ -850,12 +850,12 @@ Features:
 - Encrypted P2P chat (ECDH shared key + NIP-44 kind-14 envelope, Blossom servers for multimedia)
 - Key management (NIP-06, unique keys per trade)
 - Real-time order book updates
-- Multi-language support (English, Spanish, Italian)
+- Multi-language support (English, Spanish, French, German, Italian, Dutch, Portuguese)
 - Push notifications
 - User rating system
 - Dispute resolution
 
-**Stack**: Flutter (Android)
+**Stack**: Flutter UI over a Rust core (Android, iOS, Linux, macOS, Windows, web)
 
 ---
 

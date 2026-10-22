@@ -842,6 +842,7 @@ cargo install --path .
 
 #### Mostro App (Mobile, Desktop and Web)
 **Repository**: https://github.com/MostroP2P/app
+**Download**: [GitHub Releases](https://github.com/MostroP2P/app/releases/latest) · [Zapstore](https://zapstore.dev/apps/foundation.mostro.app) · [Web](https://mostro.network/app/)
 **Status**: Beta
 **Best For**: General users, accessibility
 

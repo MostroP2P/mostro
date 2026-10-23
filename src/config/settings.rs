@@ -416,6 +416,26 @@ mod tests {
                 .contains("not the node's own key"));
         }
 
+        /// Two nodes that carry reputation both ways each export with their
+        /// own key and import from the other's: that boots.
+        #[test]
+        fn a_node_that_exports_can_import_from_another_issuer() {
+            let issuer = Keys::generate();
+            let hex = issuer.secret_key().to_secret_hex();
+            let mut settings = settings_with("MOSTRO_TEST_ISSUER_SK_BOTH", Some(&hex));
+            settings.reputation_import = Some(ReputationImportSettings {
+                enabled: true,
+                issuers: vec![ReputationIssuer {
+                    name: "other-mostro".to_string(),
+                    keys: vec![Keys::generate().public_key().to_hex()],
+                }],
+                ..Default::default()
+            });
+            attach_reputation_issuer_keys(&mut settings, &Keys::generate()).unwrap();
+            let export = settings.reputation_export.unwrap();
+            assert_eq!(export.issuer_key(), Some(issuer.public_key()));
+        }
+
         #[test]
         fn a_key_the_node_imports_from_is_never_its_issuer_key() {
             let issuer = Keys::generate();

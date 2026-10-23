@@ -466,6 +466,40 @@ mod handler_tests {
             .build()
     }
 
+    /// A node that exports with `own` and imports from `other`, trusted as
+    /// `other_name`: one of two nodes that carry reputation both ways.
+    async fn two_way_node(own: &Keys, other_name: &str, other: &Keys) -> AppContext {
+        let _ = crate::config::MOSTRO_CONFIG.set(test_settings());
+        let mut settings = test_settings();
+        settings.reputation_export = Some(ReputationExportSettings {
+            enabled: true,
+            issuer_keys: Some(own.clone()),
+            lifetime_seconds: ATTESTATION_LIFETIME_SECS,
+            ..Default::default()
+        });
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![ReputationIssuer {
+                name: other_name.to_string(),
+                keys: vec![other.public_key().to_hex()],
+            }],
+            ..Default::default()
+        });
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool().await))
+            .with_settings(settings)
+            .build()
+    }
+
+    /// Nodes A and B, each exporting with its own key and importing from
+    /// the other's.
+    async fn nodes_both_ways() -> (AppContext, AppContext) {
+        let (a_key, b_key) = (Keys::generate(), Keys::generate());
+        let a = two_way_node(&a_key, "node-b", &b_key).await;
+        let b = two_way_node(&b_key, "node-a", &a_key).await;
+        (a, b)
+    }
+
     /// An identity with 10 completed trades and native ratings 5, 4, 5, 5, 3
     /// on `ctx`'s node, first trade taken on 2023-10-02.
     async fn eligible_identity(ctx: &AppContext) -> Keys {
@@ -473,15 +507,39 @@ mod handler_tests {
     }
 
     /// An identity with `trades` completed trades and the given native
-    /// ratings on `ctx`'s node, first trade taken on 2023-10-02.
+    /// ratings on `ctx`'s node, first trade taken on 2023-10-02. Its row is
+    /// dated before that trade, as a real one is: `add_new_user` stamps it
+    /// with the test's clock.
     async fn identity_with(ctx: &AppContext, trades: i64, ratings: &[u8]) -> Keys {
         let identity = Keys::generate();
         let hex = identity.public_key().to_hex();
-        let mut user = User::new(hex.clone(), 0, 0, 0, 0, 1);
+        add_new_user(ctx.pool(), User::new(hex.clone(), 0, 0, 0, 0, 1))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET created_at = ?2, native_created_at = ?2 WHERE pubkey = ?1")
+            .bind(&hex)
+            .bind(1_696_200_000_i64)
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+        trade_and_rate(ctx, &identity.public_key(), trades, 1_696_250_000, ratings).await;
+        identity
+    }
+
+    /// Add `trades` completed trades, the first taken at `first_taken_at`,
+    /// and the given native ratings to `identity`'s row on `ctx`'s node.
+    async fn trade_and_rate(
+        ctx: &AppContext,
+        identity: &PublicKey,
+        trades: i64,
+        first_taken_at: i64,
+        ratings: &[u8],
+    ) {
+        let hex = identity.to_hex();
+        let mut user = is_user_present(ctx.pool(), hex.clone()).await.unwrap();
         for rating in ratings {
             user.update_rating(*rating);
         }
-        add_new_user(ctx.pool(), user.clone()).await.unwrap();
         crate::db::update_user_rating(
             ctx.pool(),
             hex.clone(),
@@ -502,8 +560,8 @@ mod handler_tests {
                 fiat_code: "USD".to_string(),
                 creator_pubkey: Keys::generate().public_key().to_string(),
                 amount: 10_000,
-                created_at: 1_696_200_000,
-                taken_at: 1_696_250_000 + i,
+                created_at: first_taken_at - 50_000,
+                taken_at: first_taken_at + i,
                 master_seller_pubkey: Some(hex.clone()),
                 ..Default::default()
             }
@@ -511,7 +569,6 @@ mod handler_tests {
             .await
             .unwrap();
         }
-        identity
     }
 
     fn request(identity: &PublicKey, destination: &str) -> (Message, UnwrappedMessage) {
@@ -853,6 +910,184 @@ mod handler_tests {
             refused(import_reputation_action(&b, msg, &event, &Keys::generate()).await),
             CantDoReason::ReputationAlreadyImported
         );
+    }
+
+    /// Send `json` to `ctx`'s node as `identity`'s `import-reputation`,
+    /// through a fresh trade key.
+    async fn import_on(
+        ctx: &AppContext,
+        identity: &PublicKey,
+        json: String,
+    ) -> Result<(), MostroError> {
+        let msg = Message::new_order(
+            None,
+            None,
+            None,
+            Action::ImportReputation,
+            Some(Payload::ReputationAttestation(json)),
+        );
+        let event = UnwrappedMessage {
+            message: msg.clone(),
+            signature: None,
+            sender: Keys::generate().public_key(),
+            identity: *identity,
+            created_at: Timestamp::now(),
+        };
+        import_reputation_action(ctx, msg, &event, &Keys::generate()).await
+    }
+
+    /// Export `identity`'s reputation on `from` for the same identity and
+    /// import it on `to`.
+    async fn carry(
+        from: &AppContext,
+        to: &AppContext,
+        identity: &PublicKey,
+    ) -> Result<(), MostroError> {
+        let json = export(from, identity, identity).await?;
+        import_on(to, identity, json).await
+    }
+
+    fn attested(json: &str) -> ReputationAttestation {
+        ReputationAttestation::parse_json(json, Timestamp::now(), ATTESTATION_LIFETIME_SECS)
+            .unwrap()
+            .0
+    }
+
+    /// When an identity's trading on B starts: a week before the test runs.
+    fn a_week_ago() -> i64 {
+        Timestamp::now().as_secs() as i64 - 7 * 86_400
+    }
+
+    /// Ratings carried from A count on B, but never towards exporting from
+    /// B: only B's own trades and ratings do, so its floors are met there or
+    /// not at all.
+    #[tokio::test]
+    async fn ratings_imported_from_a_never_make_b_export() {
+        let (a, b) = nodes_both_ways().await;
+        let identity = eligible_identity(&a).await.public_key();
+        carry(&a, &b, &identity).await.unwrap();
+        assert_eq!(
+            refused(export(&b, &identity, &identity).await),
+            CantDoReason::NotEligibleForReputationExport
+        );
+
+        // Ten trades and four ratings on B: nine ratings in all, four native.
+        trade_and_rate(&b, &identity, 10, a_week_ago(), &[5, 5, 4, 5]).await;
+        assert_eq!(
+            refused(export(&b, &identity, &identity).await),
+            CantDoReason::NotEligibleForReputationExport
+        );
+        trade_and_rate(&b, &identity, 0, 0, &[5]).await;
+        export(&b, &identity, &identity).await.unwrap();
+    }
+
+    /// The way back: an identity that carried its reputation from A to B and
+    /// traded on B for a week imports what it earned there into A. B attests
+    /// its native figures only, so A adds the week and not its own ratings a
+    /// second time, and keeps its native figures and its date.
+    #[tokio::test]
+    async fn reputation_earned_on_b_imports_back_into_a() {
+        let (a, b) = nodes_both_ways().await;
+        let identity = eligible_identity(&a).await.public_key();
+        carry(&a, &b, &identity).await.unwrap();
+        let week_ago = a_week_ago();
+        trade_and_rate(&b, &identity, 10, week_ago, &[5, 5, 4, 5, 5]).await;
+        let before = is_user_present(a.pool(), identity.to_hex()).await.unwrap();
+
+        let json = export(&b, &identity, &identity).await.unwrap();
+        let attestation = attested(&json);
+        let (_, b_issuer) = export_settings(&b).unwrap();
+        assert_eq!(attestation.issuer, b_issuer.public_key());
+        assert_eq!(attestation.subject, identity.to_hex());
+        assert_eq!(attestation.reviews, 5, "B's ratings, not the ten it shows");
+        assert_eq!(attestation.rating_text(), "4.80");
+        assert_eq!(attestation.since, day_truncate(week_ago));
+
+        import_on(&a, &identity, json).await.unwrap();
+        let after = is_user_present(a.pool(), identity.to_hex()).await.unwrap();
+        assert_eq!(after.total_reviews, 10);
+        let merged = (before.total_rating * 5.0 + 4.8 * 5.0) / 10.0;
+        assert!(
+            (after.total_rating - merged).abs() < 1e-9,
+            "{}",
+            after.total_rating
+        );
+        assert_eq!(after.native_stats(), before.native_stats());
+        assert_eq!(
+            after.created_at, before.created_at,
+            "A's first trade is older"
+        );
+    }
+
+    /// After the way back no rating counts twice on either node. A's next
+    /// attestation carries A's ratings only, and B refuses it as a second
+    /// import of the account; B's next one is refused by A the same way,
+    /// since a source is imported once.
+    #[tokio::test]
+    async fn after_the_way_back_no_rating_counts_twice() {
+        let (a, b) = nodes_both_ways().await;
+        let identity = eligible_identity(&a).await.public_key();
+        carry(&a, &b, &identity).await.unwrap();
+        trade_and_rate(&b, &identity, 10, a_week_ago(), &[5, 5, 4, 5, 5]).await;
+        carry(&b, &a, &identity).await.unwrap();
+
+        // A sixth rating on A changes what A attests, so its next
+        // attestation is a new one even within the same second.
+        trade_and_rate(&a, &identity, 0, 0, &[5]).await;
+        let json = export(&a, &identity, &identity).await.unwrap();
+        let attestation = attested(&json);
+        assert_eq!(attestation.reviews, 6, "A's ratings, not B's on top");
+        assert_eq!(attestation.rating_text(), "4.50");
+        assert_eq!(attestation.since, 1_696_204_800);
+        assert_eq!(
+            refused(import_on(&b, &identity, json).await),
+            CantDoReason::ReputationAlreadyImported
+        );
+
+        trade_and_rate(&b, &identity, 0, 0, &[5]).await;
+        assert_eq!(
+            refused(carry(&b, &a, &identity).await),
+            CantDoReason::ReputationAlreadyImported
+        );
+        // Each node: its own six ratings and the other's five, each counted once.
+        for (node, reviews) in [(&a, 11), (&b, 11)] {
+            let user = is_user_present(node.pool(), identity.to_hex())
+                .await
+                .unwrap();
+            assert_eq!(user.total_reviews, reviews);
+        }
+    }
+
+    /// The way back also works when the identity on B is another key: A
+    /// binds the account to that key, B binds the account it seeded to the
+    /// identity on A, and A records B's account as the source.
+    #[tokio::test]
+    async fn the_way_back_works_with_another_identity_on_b() {
+        let (a, b) = nodes_both_ways().await;
+        let on_a = eligible_identity(&a).await.public_key();
+        let on_b = Keys::generate().public_key();
+        let json = export(&a, &on_a, &on_b).await.unwrap();
+        import_on(&b, &on_b, json).await.unwrap();
+        trade_and_rate(&b, &on_b, 10, a_week_ago(), &[5, 5, 4, 5, 5]).await;
+
+        let json = export(&b, &on_b, &on_a).await.unwrap();
+        let attestation = attested(&json);
+        assert_eq!(attestation.subject, on_b.to_hex());
+        assert_eq!(attestation.destination, on_a);
+        import_on(&a, &on_a, json).await.unwrap();
+
+        let user = is_user_present(a.pool(), on_a.to_hex()).await.unwrap();
+        assert_eq!(user.total_reviews, 10);
+        assert_eq!(user.reputation_exported_to, Some(on_b.to_hex()));
+        let (subject,): (String,) =
+            sqlx::query_as("SELECT subject FROM reputation_imports WHERE identity_pubkey = ?1")
+                .bind(on_a.to_hex())
+                .fetch_one(a.pool())
+                .await
+                .unwrap();
+        assert_eq!(subject, on_b.to_hex());
+        let user = is_user_present(b.pool(), on_b.to_hex()).await.unwrap();
+        assert_eq!(user.reputation_exported_to, Some(on_a.to_hex()));
     }
 
     fn rebind_request(

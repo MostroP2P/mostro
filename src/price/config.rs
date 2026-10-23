@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::fiat::is_known_stablecoin;
+
 /// Top-level `[price]` configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriceSettings {
@@ -90,6 +92,27 @@ impl ProviderConfig {
         // id is still HTTP-only, so exempting it here would let a typo'd or
         // copy-pasted `trusted_nodes` mask a missing `url` past startup and
         // into a confusing per-tick HTTP failure instead.
+        //
+        // The `stablecoins` provider makes no network call at all (§11.8),
+        // so it needs no `url` either; what it does need is that every
+        // `only` / `except` entry be a coin from its table — a typo would
+        // otherwise quote nothing without a word.
+        if id == "stablecoins" {
+            let unknown: Vec<&String> = self
+                .only
+                .iter()
+                .chain(self.except.iter())
+                .flatten()
+                .filter(|code| !is_known_stablecoin(code))
+                .collect();
+            if let Some(code) = unknown.first() {
+                return Err(format!(
+                    "price provider '{id}': `{code}` is not a known stablecoin \
+                     (see docs/PRICE_PROVIDERS.md §11.8)"
+                ));
+            }
+            return Ok(());
+        }
         if self.enabled && self.url.trim().is_empty() {
             if id == "nostr" {
                 if self.trusted_nodes.is_empty() {
@@ -402,5 +425,78 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
         };
         assert!(cfg.allows_currency("USD"));
         assert!(cfg.allows_currency("CUP"));
+    }
+
+    fn stablecoins_cfg(only: Option<Vec<&str>>, except: Option<Vec<&str>>) -> ProviderConfig {
+        let to_vec = |v: Option<Vec<&str>>| v.map(|v| v.into_iter().map(String::from).collect());
+        ProviderConfig {
+            enabled: true,
+            url: String::new(),
+            fallback_urls: vec![],
+            api_key: None,
+            token: None,
+            only: to_vec(only),
+            except: to_vec(except),
+            trusted_nodes: vec![],
+        }
+    }
+
+    #[test]
+    fn enabled_stablecoins_provider_needs_no_url() {
+        stablecoins_cfg(None, None).validate("stablecoins").unwrap();
+        stablecoins_cfg(Some(vec!["USDT", "usdc"]), None)
+            .validate("stablecoins")
+            .unwrap();
+        stablecoins_cfg(None, Some(vec!["DOC"]))
+            .validate("stablecoins")
+            .unwrap();
+    }
+
+    #[test]
+    fn stablecoins_scoping_entry_outside_the_table_is_rejected() {
+        // A typo would otherwise quote nothing without a word (§11.8).
+        let err = stablecoins_cfg(Some(vec!["USTD"]), None)
+            .validate("stablecoins")
+            .unwrap_err();
+        assert!(err.contains("USTD"), "{err}");
+        assert!(stablecoins_cfg(None, Some(vec!["USD"]))
+            .validate("stablecoins")
+            .is_err());
+        // Even when disabled: the config is wrong either way.
+        let mut disabled = stablecoins_cfg(Some(vec!["EURC"]), None);
+        disabled.enabled = false;
+        assert!(disabled.validate("stablecoins").is_err());
+    }
+
+    #[test]
+    fn stablecoins_only_and_except_together_is_still_rejected() {
+        assert!(stablecoins_cfg(Some(vec!["USDT"]), Some(vec!["DOC"]))
+            .validate("stablecoins")
+            .is_err());
+    }
+
+    #[test]
+    fn stablecoins_block_parses_from_toml() {
+        #[derive(Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        let parsed: Stub = toml::from_str(
+            r#"
+[price]
+
+[price.providers.stablecoins]
+enabled = true
+only = ["USDT", "USDC"]
+"#,
+        )
+        .unwrap();
+        let p = parsed.price;
+        p.validate().unwrap();
+        let sc = &p.providers["stablecoins"];
+        assert!(sc.enabled);
+        assert!(sc.url.is_empty());
+        assert!(sc.allows_currency("usdt"));
+        assert!(!sc.allows_currency("DOC"));
     }
 }

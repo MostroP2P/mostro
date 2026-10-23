@@ -11,4 +11,5 @@ pub mod coingecko;
 pub mod currency_api;
 pub mod eltoque;
 pub mod nostr;
+pub mod stablecoins;
 pub mod yadio;

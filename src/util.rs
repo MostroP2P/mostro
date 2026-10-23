@@ -678,11 +678,6 @@ pub async fn send_dm(
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -703,6 +698,11 @@ pub async fn send_dm(
             .map(|secs| Timestamp::from_secs(secs as u64))
     });
 
+    // No party keys in the logs below: `receiver_pubkey` can be an identity
+    // key, and `payload` carries `Payload::Peer { pubkey }`. Routing fields
+    // only, on both outcomes of the wrap, so a failure is never silent.
+    let inner = message.get_inner_message_kind();
+
     // Mostro node holds a single keypair: it doubles as identity and trade key.
     // Server-originated messages are unsigned because clients don't track a
     // trade_index for the node.
@@ -718,20 +718,26 @@ pub async fn send_dm(
             ..WrapOptions::default()
         },
     )
-    .await?;
+    .await
+    .inspect_err(|e| {
+        tracing::warn!(
+            action = %inner.action,
+            order_id = ?inner.id,
+            request_id = ?inner.request_id,
+            error = %e,
+            "wrapping DM failed"
+        )
+    })?;
 
-    // Payer hashes and histories are identifiers that must stay inside the
-    // encrypted channel; log the action only.
-    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
-        "<payer-history payload redacted>"
-    } else {
-        payload
-    };
+    // `event_id` is the only join key to the relay copy. It links nothing the
+    // timestamp doesn't: the kind-14 is Mostro-signed, p-tagged to the
+    // receiver, with an untweaked `created_at`.
     info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        logged_payload
+        event_id = %event.id,
+        action = %inner.action,
+        order_id = ?inner.id,
+        request_id = ?inner.request_id,
+        "sending DM"
     );
 
     if let Ok(client) = get_nostr_client() {
@@ -1307,6 +1313,52 @@ pub(crate) fn is_order_take_window_closed(order: &Order, now: i64) -> bool {
 #[cfg(test)]
 pub(crate) static ORDERBOOK_QUEUE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+/// Test-only capture of everything the test binary logs through `tracing`, so
+/// a test can assert on the text of a log line. A `println!` never reaches it.
+///
+/// One process-wide subscriber, not one per test: `tracing` caches each
+/// callsite's interest globally, so a per-thread subscriber misses a line
+/// another test thread reached first. Tests share the buffer and must look
+/// only for values they generated themselves.
+#[cfg(test)]
+pub(crate) struct LogCapture;
+
+#[cfg(test)]
+static CAPTURED_LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOGS.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl LogCapture {
+    /// Idempotent. Call it before the code under test.
+    pub(crate) fn start() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            // ponytail: unbounded buffer; it lives as long as the test binary.
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(|| LogCapture)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the test binary");
+        });
+    }
+
+    pub(crate) fn text() -> String {
+        String::from_utf8_lossy(&CAPTURED_LOGS.lock().unwrap()).into_owned()
+    }
+}
 
 /// Test-only visibility into the republish queue.
 #[cfg(test)]
@@ -2882,6 +2934,79 @@ mod tests {
         // now just make it ok and then will make a better test
         let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
         assert!(result.is_err());
+    }
+
+    /// #836: the receiver can be an identity key and a `Peer` payload names
+    /// the counterparty, so neither may reach the log.
+    #[tokio::test]
+    async fn send_dm_logs_no_party_keys() {
+        init_globals();
+        LogCapture::start();
+        let receiver = Keys::generate().public_key();
+        let peer = Keys::generate().public_key();
+        let order_id = Uuid::new_v4();
+        let message = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::FiatSentOk,
+            Some(Payload::Peer(Peer {
+                pubkey: peer.to_string(),
+                reputation: None,
+            })),
+        ));
+
+        let _ = send_dm(
+            receiver,
+            &Keys::generate(),
+            &message.as_json().unwrap(),
+            None,
+        )
+        .await;
+
+        let logs = LogCapture::text();
+        assert!(logs.contains(&order_id.to_string()), "order id not logged");
+        assert!(!logs.contains(&receiver.to_hex()), "receiver key logged");
+        assert!(!logs.contains(&peer.to_hex()), "peer key logged");
+        // What stays for diagnosis: the join key to the relay copy and the action.
+        assert!(
+            logs.lines().any(|l| l.contains(&order_id.to_string())
+                && l.contains("event_id=")
+                && l.contains("FiatSentOk")),
+            "routing fields not logged"
+        );
+    }
+
+    /// The payload is not logged at all, so the payer hash stays out of this
+    /// line without a per-payload guard.
+    #[tokio::test]
+    async fn send_dm_logs_no_payer_hash() {
+        init_globals();
+        LogCapture::start();
+        let order_id = Uuid::new_v4();
+        let hash = Keys::generate().public_key().to_hex();
+        let message = Message::new_order(
+            Some(order_id),
+            None,
+            None,
+            Action::PayerDeclared,
+            Some(Payload::PayerDeclaration(PayerDeclaration::new(
+                hash.clone(),
+            ))),
+        );
+        let receiver = Keys::generate().public_key();
+
+        let _ = send_dm(
+            receiver,
+            &Keys::generate(),
+            &message.as_json().unwrap(),
+            None,
+        )
+        .await;
+
+        let logs = LogCapture::text();
+        assert!(logs.contains(&order_id.to_string()), "order id not logged");
+        assert!(!logs.contains(&hash), "payer hash logged");
     }
 
     #[tokio::test]

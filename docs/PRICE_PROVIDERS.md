@@ -427,6 +427,13 @@ heterogeneous providers safely comparable.
   (the currencies Mostro already validates for orders); everything else is
   dropped before aggregation and before the Nostr publish, keeping the
   store and the kind-30078 event lean.
+- **Stablecoin allowlist (§11.8).** A second, smaller table next to the
+  fiat one, `KNOWN_STABLECOINS`, maps each stablecoin code to the fiat it
+  is pegged 1:1 to (`USDT` → `USD`). Its codes pass the boundary **only
+  from the `stablecoins` provider**. A source that also lists crypto
+  (`currency-api`'s `usdt`) and a trusted node's relayed rate (`nostr`)
+  are still dropped for them. So nothing but the peg ever prices a
+  stablecoin, and a node that has not opted in never stores one.
 - **Per-provider currency scoping (`only` / `except`).** Some providers
   report a currency on a **different market** than others, and averaging
   across markets is wrong — not merely noisy. The motivating case is
@@ -499,6 +506,11 @@ enabled = false          # opt-in: requires a token
 url = "https://tasas.eltoque.com"
 # token = "xxxx"         # REQUIRED when enabled; provider refuses to start otherwise
 only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
+
+# No network call: quotes each stablecoin at 1:1 with its fiat (§11.8).
+[price.providers.stablecoins]
+enabled = false          # opt-in
+# only = ["USDT", "USDC"]  # optional; default: every coin in the table
 ```
 
 - Each `[price.providers.<id>]` sub-table is deserialized into a generic
@@ -513,7 +525,9 @@ only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 - Validation at startup: an enabled provider missing a required secret
   (El Toque without `token`) fails fast with a descriptive error rather
   than silently producing no quotes; `only` ∩ `except` set on the same
-  provider is rejected.
+  provider is rejected. The `stablecoins` provider needs no `url` (like
+  `nostr`), and its `only` / `except` entries must be codes from its
+  table (§11.8).
 
 ## 8. Phase overview
 
@@ -535,6 +549,11 @@ Phases 3 and 4 both depend on Phase 2 and can land in either order.
 > of an HTTP API, for operators in regions where the price APIs are
 > network-blocked. It slots into the existing registry (§5.4) like any
 > other provider and does not otherwise depend on Phase 5.
+
+> **Out-of-band addition — stablecoins (issue #1081, §11.8).** A provider
+> that makes no network call and quotes USDT, USDC and DOC at 1:1 with
+> USD through the §6.3 PerBase path, so a node that opts in can take
+> market-priced orders in them. It lands as its own PR on top of Phase 4.
 
 ---
 
@@ -948,6 +967,186 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
 - **Currency codes are re-upper-cased** (§6.6) even though a Mostro
   publisher already emits uppercase codes — a third-party trusted node is
   outside this codebase's control.
+
+### 11.8 Stablecoins (fixed 1:1 peg, opt-in) — issue #1081
+
+Mostro can trade bitcoin for stablecoins by using the coin as the order's
+currency: `f = USDT`, and the buyer pays in USDT instead of fiat. Each coin
+is treated as a currency pegged 1:1 to a fiat. This section covers how the
+node prices them. The wire side (the code list, the network in the payment
+method) is the protocol book's
+[stablecoin page](https://mostro.network/protocol/stablecoins.html); the
+clients' side is MostroP2P/app#884 and MostroP2P/mostro-cli#213.
+
+**What works without this.** `fiat_code` is a free string, checked only
+against `fiat_currencies_accepted`, so a fixed-price USDT order already
+passes wherever that list allows the code. A market-priced one fails: no
+provider quotes USDT, and the §6.6 fiat allowlist would drop it if one did,
+so `get_price("USDT")` returns `NoCurrency`.
+
+**The table.** In `src/price/fiat.rs`, next to `KNOWN_FIAT`:
+
+```rust
+/// Stablecoin code → the fiat it is pegged 1:1 to. Sorted by code.
+const KNOWN_STABLECOINS: &[(&str, &str)] = &[
+    ("DOC", "USD"),
+    ("USDC", "USD"),
+    ("USDT", "USD"),
+];
+```
+
+- Adding a coin is one row here and one in the protocol book's list.
+  `EURC` → `EUR` is the next candidate.
+- Tests hold that the table is sorted, that every peg is in `KNOWN_FIAT`,
+  and that no code is in both tables.
+
+**The provider.** `src/price/providers/stablecoins.rs`,
+`ProviderId::Stablecoins` (config key `stablecoins`). `fetch` makes no
+network call: it returns `Quote::PerBase { base: <peg>, value: 1.0 }` for
+every row of the table, and the §6.3 resolution turns that into the peg's
+aggregate per-BTC price. So:
+
+- a USDT market order is priced exactly like a USD one, premium included;
+- with no USD anchor this tick, USDT keeps its last-known-good value and is
+  refused past the TTL, the same dependency El Toque's CUP has (§11.3);
+- a USD anchor relayed over Nostr makes the coin `nostr_anchor_dependent`
+  (§6.4): stamped with the relayed observation and not republished, as any
+  fiat-cross;
+- the coins land in the store and in `mostro-rates` like any currency, which
+  is how clients learn which coins a node quotes.
+
+**Why a fixed peg and not a market price.**
+
+- **USDT and USDC** trade within about 0.1% of $1 on deep markets
+  (CoinGecko, October 2026: USDT 0.99895, USDC 0.99958). The order
+  `premium` is a whole percent, so an order cannot express the difference.
+- **DOC** has no market deep enough to price it. CoinGecko quotes it (0.9939
+  at the same time) from about $1,000 a day across two Rootstock DEX pools.
+  That is a thin market's spread, cheap to move, and CoinGecko is the only
+  source, so the median would not guard it.
+- **1:1 is how DOC is defined.** Money on Chain never prices DOC:
+  `MoCState.peg()` returns `1`, and the protocol mints and redeems DOC
+  against RBTC at the BTC/USD price of its OMoC oracle (a weighted median of
+  Coinbase, Bitstamp, Bitfinex, Kraken and Gemini). Every DOC is redeemable
+  outside settlement (`freeDoc() == totalSupply()`), which is what holds
+  the peg.
+
+**The boundary rule (§6.6).** At the manager boundary a code passes when it
+is a known fiat, or when it is a known stablecoin **and** comes from the
+`stablecoins` provider. `only` / `except` scoping then applies as for every
+provider. Two consequences:
+
+- `currency-api`'s `usdt`, or any API that also lists crypto, never
+  contributes a market price for a coin. The price stays the peg.
+- A trusted node's `mostro-rates`, relayed by the `nostr` provider (§11.7),
+  carries USDT if that node opted in. It is dropped here. Otherwise a node
+  that never opted in would start pricing USDT orders because a node it
+  trusts for USD did. A node that did opt in loses nothing: its own
+  `stablecoins` quote resolves against the relayed USD anchor.
+
+**Opt-in.** The provider ships disabled. A node that accepts USD and VES
+and wants USDT and USDC at market price, but not DOC:
+
+```toml
+[mostro]
+fiat_currencies_accepted = ['USD', 'VES', 'USDT', 'USDC']
+
+[price.providers.stablecoins]
+enabled = true
+only = ["USDT", "USDC"]   # optional; default: every coin in the table
+```
+
+- The two settings answer different questions, as for every currency:
+  `fiat_currencies_accepted` says which codes orders may use, the provider
+  which of them have a market price. CUP works the same way: listed in the
+  first, quoted by Yadio and El Toque.
+- A coin can be accepted at fixed price only: list it and do not quote it.
+- With the provider off, or no sub-table, the node behaves as today:
+  fixed-price orders in these codes pass where the list allows them, and
+  market-priced ones are refused for lack of a rate.
+- **Startup validation:** no `url` is required (as for `nostr`), and an
+  `only` / `except` entry that is not in the table is an error, since a
+  typo would otherwise quote nothing without a word.
+- **Startup warning:** when `fiat_currencies_accepted` is not empty and the
+  provider quotes a coin the list does not name, the node logs a `warn!`
+  once: it would publish a rate for that coin and refuse every order in it.
+  The reverse, listed but not quoted, is the fixed-price-only case and is
+  not warned.
+
+**The network.** A stablecoin transfer is only defined with its network,
+and a transfer sent on the wrong one can be lost. The network goes in the
+order's payment method (`USDT (Tron)`), as the protocol book's stablecoin
+page specifies; `pm` is a free string, so mostrod changes nothing for it. A
+structured field was set aside: mostro-core and every client would change,
+and a client that ignored the new tag would show "100 USDT" with no
+network, the very failure the field is meant to prevent. (The kind-38383
+event already has a `network` tag, for the Lightning network.)
+
+**Amounts.** `fiat_amount` is an `i64`, so orders are in whole units, as
+with fiat.
+
+**Depeg guard (follow-up S2, design open).** A fixed peg is wrong during a
+depeg: USDC traded around $0.87 in March 2023. The guard is a separate
+check, **not** part of the `stablecoins` provider: `fetch` stays
+network-free, so S1 adds no network dependency, and a failing check never
+takes the peg down with it. Proposed contract:
+
+- **When:** once per price tick, before aggregation.
+- **What it reads:**
+  - USDT and USDC: CoinGecko
+    (`simple/price?ids=tether,usd-coin&vs_currencies=usd`).
+  - DOC: a market price says nothing, so the signals are on Rootstock. The
+    contract is paused, or `globalCoverage()` is under its protected (1.5)
+    or liquidation (1.04) threshold (7.6 in October 2026).
+  - Later coins: their price against their own fiat, where a deep market
+    exists (EURC has one).
+- **On a depeg** (a coin more than a threshold, 3%?, off its fiat): the
+  guard drops the coin's quote from the tick **and** evicts the code from
+  the store, so market orders in it are refused at once. Dropping the quote
+  alone is not enough: last-known-good would keep serving 1:1 for
+  `max_price_staleness_seconds`. It logs at `warn`, and the coin comes back
+  once a check finds it within the threshold again.
+- **When the check itself fails** (CoinGecko or the Rootstock RPC is
+  unreachable): the coin keeps its 1:1 quote, and the failure is logged. An
+  outage of the checker is not a depeg, and failing closed would turn off
+  market orders in these coins whenever the keyless CoinGecko tier is
+  rate-limited.
+
+Until it lands, an operator handles a depeg by taking the coin out of
+`only`.
+
+**Rollout.**
+
+| Step | Repo | Scope | Depends on |
+|------|------|-------|------------|
+| S0 | protocol | Stablecoin page (codes, pegs, 1:1 rule, network in `pm`); `f` tag; `mostro-rates` | — |
+| S1 | mostro | `KNOWN_STABLECOINS`, the boundary rule, the `stablecoins` provider, its validation and startup warning, `settings.tpl.toml` | — |
+| C1 | mostro-cli | Market-price check against the node's `mostro-rates` instead of Yadio (#213) | — |
+| C2 | app | Design guide rule, catalogue, mark, default-currency rule, Market lock (#884, phase 1) | — |
+| C3 | app | Payment methods by network, then the trade hint (#884, phases 2–3) | C2 |
+| S2 | mostro | Depeg guard | S1 |
+| — | all | EURC: a row in the table, in the book and in the app's catalogue | S1 |
+
+S0, S1, C1 and C2 can land in any order. The book describes what a node
+does *if* it quotes a coin, so it can merge first; and until a node quotes
+one, the CLI refuses a market order in it and the app locks Market.
+
+**Acceptance / tests (S1)**
+
+- With the provider on and a USD anchor, `get_price("USDT")` equals
+  `get_price("USD")`.
+- No USD anchor: USDT serves last-known-good, then `PriceTooStale` past the
+  TTL.
+- `currency-api`'s `usdt` and a Nostr-relayed `USDT` are dropped at the
+  boundary; the provider's own quote is kept.
+- `only = ["USDT"]` quotes USDT and not USDC; `only = ["USTD"]` fails at
+  startup.
+- Provider off: no `USDT` in the store or in `mostro-rates`, and a
+  fixed-price USDT order still passes with an empty
+  `fiat_currencies_accepted`.
+- The startup warning fires for a quoted coin missing from a non-empty
+  list, and not for a listed coin that is not quoted.
+- The table tests above.
 
 ---
 

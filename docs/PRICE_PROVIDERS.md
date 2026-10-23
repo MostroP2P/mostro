@@ -1085,20 +1085,32 @@ event already has a `network` tag, for the Lightning network.)
 **Amounts.** `fiat_amount` is an `i64`, so orders are in whole units, as
 with fiat.
 
-**Depeg guard (follow-up, design open).** A fixed peg is wrong during a
-depeg: USDC traded around $0.87 in March 2023.
+**Depeg guard (follow-up S2, design open).** A fixed peg is wrong during a
+depeg: USDC traded around $0.87 in March 2023. The guard is a separate
+check, **not** part of the `stablecoins` provider: `fetch` stays
+network-free, so S1 adds no network dependency, and a failing check never
+takes the peg down with it. Proposed contract:
 
-- **USDT, USDC:** the provider checks CoinGecko
-  (`simple/price?ids=tether,usd-coin&vs_currencies=usd`) and stops quoting
-  a coin more than a threshold (3%?) off $1. Dropping it from the tick is
-  not enough on its own: last-known-good would keep serving 1:1 for
-  `max_price_staleness_seconds`, so the guard must evict the code from the
-  store.
-- **DOC:** a market price says nothing. The signals are on Rootstock: the
-  contract paused, or `globalCoverage()` under its protected (1.5) or
-  liquidation (1.04) threshold (7.6 in October 2026).
-- **Later coins** are checked against their own fiat, where a deep market
-  exists (EURC has one).
+- **When:** once per price tick, before aggregation.
+- **What it reads:**
+  - USDT and USDC: CoinGecko
+    (`simple/price?ids=tether,usd-coin&vs_currencies=usd`).
+  - DOC: a market price says nothing, so the signals are on Rootstock. The
+    contract is paused, or `globalCoverage()` is under its protected (1.5)
+    or liquidation (1.04) threshold (7.6 in October 2026).
+  - Later coins: their price against their own fiat, where a deep market
+    exists (EURC has one).
+- **On a depeg** (a coin more than a threshold, 3%?, off its fiat): the
+  guard drops the coin's quote from the tick **and** evicts the code from
+  the store, so market orders in it are refused at once. Dropping the quote
+  alone is not enough: last-known-good would keep serving 1:1 for
+  `max_price_staleness_seconds`. It logs at `warn`, and the coin comes back
+  once a check finds it within the threshold again.
+- **When the check itself fails** (CoinGecko or the Rootstock RPC is
+  unreachable): the coin keeps its 1:1 quote, and the failure is logged. An
+  outage of the checker is not a depeg, and failing closed would turn off
+  market orders in these coins whenever the keyless CoinGecko tier is
+  rate-limited.
 
 Until it lands, an operator handles a depeg by taking the coin out of
 `only`.

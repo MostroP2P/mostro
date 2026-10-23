@@ -28,7 +28,9 @@ pub mod store;
 
 pub use aggregate::{aggregate_tick, combine, resolve_per_base, AggregateResult};
 pub use config::{PriceSettings, ProviderConfig};
-pub use manager::{synthesise_legacy_price_settings, PriceManager, TickReport};
+pub use manager::{
+    quoted_but_unaccepted_stablecoins, synthesise_legacy_price_settings, PriceManager, TickReport,
+};
 pub use provider::{
     PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes, Quote,
 };

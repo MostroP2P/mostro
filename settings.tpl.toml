@@ -284,6 +284,20 @@ lnd_resynced_clear_after = 300
 # trusted_nodes = [
 #     # hex pubkeys of Mostro nodes you trust to publish accurate rates
 # ]
+#
+# # Stablecoins as order currencies (docs/PRICE_PROVIDERS.md §11.8). No
+# # network call: quotes each coin at 1:1 with the fiat it is pegged to
+# # (USDT, USDC, DOC → USD), resolved against the node's aggregated USD
+# # rate, so a USDT market order is priced exactly like a USD one. Opt-in:
+# # off, the node behaves as today (fixed-price orders in these codes pass
+# # where `fiat_currencies_accepted` allows them; market-priced ones are
+# # refused for lack of a rate). A non-empty `fiat_currencies_accepted`
+# # must also list the coins you quote, or every order in them is refused.
+# # The network of a transfer goes in the order's payment method
+# # ("USDT (Tron)"); the node does not check it.
+# [price.providers.stablecoins]
+# enabled = false
+# # only = ["USDT", "USDC"]   # optional; default: every coin in the table
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

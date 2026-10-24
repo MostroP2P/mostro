@@ -12,6 +12,7 @@
 pub mod crud;
 pub mod db;
 pub mod flow;
+pub mod horizon;
 pub mod math;
 pub mod model;
 pub mod payout;

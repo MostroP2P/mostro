@@ -349,6 +349,69 @@ pub async fn range_tree_fully_terminal(
     Ok(non_terminal == 0)
 }
 
+/// Order statuses that rest in the book. `WaitingTakerBond` publishes as
+/// `pending` (a prospective taker is still paying their bond), so both
+/// advertise the order, and both draw on the maker bond's time.
+const BOOK_ORDER_STATUSES: [Status; 2] = [Status::Pending, Status::WaitingTakerBond];
+
+/// Orders of the range tree rooted at `root_id` that rest in the book
+/// ([`BOOK_ORDER_STATUSES`]), oldest first. The maker-bond guardian (#1084)
+/// expires them when the bond on the root can no longer cover a trade;
+/// orders of the tree already in a trade are left out.
+///
+/// Walks `range_parent_id` downwards like [`range_tree_fully_terminal`],
+/// with the same `UNION` so a corrupt cycle terminates. A non-range order
+/// is a one-node tree.
+pub async fn find_book_orders_in_range_tree(
+    pool: &Pool<Sqlite>,
+    root_id: Uuid,
+) -> Result<Vec<Order>, MostroError> {
+    sqlx::query_as::<_, Order>(
+        "WITH RECURSIVE tree(id) AS ( \
+             SELECT id FROM orders WHERE id = ? \
+             UNION \
+             SELECT o.id FROM orders o JOIN tree t ON o.range_parent_id = t.id \
+         ) \
+         SELECT * FROM orders \
+         WHERE id IN (SELECT id FROM tree) AND status IN (?, ?) \
+         ORDER BY created_at ASC",
+    )
+    .bind(root_id)
+    .bind(BOOK_ORDER_STATUSES[0].to_string())
+    .bind(BOOK_ORDER_STATUSES[1].to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Close the take window of `order_id` at `now` (#1084): pull its
+/// `expires_at` forward, only while the order still rests in the book
+/// ([`BOOK_ORDER_STATUSES`]) and only when that ends it sooner. Take paths
+/// refuse an order past `expires_at` (`is_order_take_window_closed`) and
+/// the regular expiry job ends it on its next tick, so it leaves the book
+/// exactly as it would at its own expiration. The status guard makes this a
+/// CAS: an order taken since it was read is left alone. Returns whether the
+/// row changed.
+pub async fn close_book_window(
+    pool: &Pool<Sqlite>,
+    order_id: Uuid,
+    now: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET expires_at = ? \
+         WHERE id = ? AND status IN (?, ?) AND expires_at > ?",
+    )
+    .bind(now)
+    .bind(order_id)
+    .bind(BOOK_ORDER_STATUSES[0].to_string())
+    .bind(BOOK_ORDER_STATUSES[1].to_string())
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Update a bond row by primary key. Returns the persisted `Bond`.
 pub async fn update_bond(
     pool: &Pool<Sqlite>,
@@ -689,6 +752,129 @@ mod tests {
             .await
             .unwrap();
         assert!(range_tree_fully_terminal(&pool, a).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn book_orders_in_range_tree_walks_descendants_and_keeps_book_statuses() {
+        // root (settled, in trade) <- child (pending) <- grandchild
+        // (waiting-taker-bond) <- great-grandchild (active). Only the two
+        // orders in the book come back; an unrelated pending order does not.
+        let pool = setup_pool().await;
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let grandchild = Uuid::new_v4();
+        let great_grandchild = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        insert_order_with(&pool, root, Status::SettledHoldInvoice, None).await;
+        insert_order_with(&pool, child, Status::Pending, Some(root)).await;
+        insert_order_with(&pool, grandchild, Status::WaitingTakerBond, Some(child)).await;
+        insert_order_with(&pool, great_grandchild, Status::Active, Some(grandchild)).await;
+        insert_order_with(&pool, unrelated, Status::Pending, None).await;
+
+        let mut ids: Vec<Uuid> = find_book_orders_in_range_tree(&pool, root)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|order| order.id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![child, grandchild];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        // A non-range order is a one-node tree.
+        let lone = find_book_orders_in_range_tree(&pool, unrelated)
+            .await
+            .unwrap();
+        assert_eq!(lone.len(), 1);
+        assert_eq!(lone[0].id, unrelated);
+
+        // A tree with nothing in the book is empty.
+        let in_trade = Uuid::new_v4();
+        insert_order_with(&pool, in_trade, Status::Active, None).await;
+        assert!(find_book_orders_in_range_tree(&pool, in_trade)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn book_orders_in_range_tree_is_cycle_safe() {
+        // Same corrupt A↔B cycle as `range_tree_terminal_is_cycle_safe`:
+        // the walk must terminate and return each order once.
+        let pool = setup_pool().await;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        insert_order_with(&pool, a, Status::Pending, None).await;
+        insert_order_with(&pool, b, Status::Pending, None).await;
+        for (id, parent) in [(a, b), (b, a)] {
+            sqlx::query("UPDATE orders SET range_parent_id = ? WHERE id = ?")
+                .bind(parent)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let orders = find_book_orders_in_range_tree(&pool, a).await.unwrap();
+        assert_eq!(orders.len(), 2);
+    }
+
+    async fn expires_at_of(pool: &Pool<Sqlite>, id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT expires_at FROM orders WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_expires_at(pool: &Pool<Sqlite>, id: Uuid, expires_at: i64) {
+        sqlx::query("UPDATE orders SET expires_at = ? WHERE id = ?")
+            .bind(expires_at)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_book_window_pulls_expires_at_forward_for_book_orders() {
+        let pool = setup_pool().await;
+        let now = 1_700_000_000;
+        for status in [Status::Pending, Status::WaitingTakerBond] {
+            let id = Uuid::new_v4();
+            insert_order_with(&pool, id, status, None).await;
+            set_expires_at(&pool, id, now + 86_400).await;
+
+            assert!(close_book_window(&pool, id, now).await.unwrap());
+            assert_eq!(expires_at_of(&pool, id).await, now);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_book_window_leaves_an_order_taken_since_it_was_read() {
+        // The guardian read the order in the book, then a take moved it on:
+        // the status guard must leave the trade's row alone.
+        let pool = setup_pool().await;
+        let now = 1_700_000_000;
+        let id = Uuid::new_v4();
+        insert_order_with(&pool, id, Status::WaitingBuyerInvoice, None).await;
+        set_expires_at(&pool, id, now + 86_400).await;
+
+        assert!(!close_book_window(&pool, id, now).await.unwrap());
+        assert_eq!(expires_at_of(&pool, id).await, now + 86_400);
+    }
+
+    #[tokio::test]
+    async fn close_book_window_never_pushes_an_earlier_expiration_back() {
+        let pool = setup_pool().await;
+        let now = 1_700_000_000;
+        let id = Uuid::new_v4();
+        insert_order_with(&pool, id, Status::Pending, None).await;
+        set_expires_at(&pool, id, now - 30).await;
+
+        assert!(!close_book_window(&pool, id, now).await.unwrap());
+        assert_eq!(expires_at_of(&pool, id).await, now - 30);
     }
 
     #[tokio::test]

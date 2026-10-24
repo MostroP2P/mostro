@@ -184,7 +184,7 @@ pub async fn request_taker_bond(
     let expiry = taker_bond_invoice_expiry(Settings::get_ln());
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, expiry)
+        .create_hold_invoice_with_expiry(&memo, amount, expiry, cfg.bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -349,11 +349,13 @@ pub async fn request_maker_bond(
 
     // The invoice stops being payable when the maker's window closes, so LND
     // enforces the deadline even while the daemon is down (#942);
-    // `expire_unpaid_maker_bonds` enforces it on the order side.
+    // `expire_unpaid_maker_bonds` enforces it on the order side. The CLTV is
+    // the bond's own (#1084): the bond has to last while the order rests in
+    // the book and then through the trade, which the escrow's CLTV cannot.
     let expiry = i64::try_from(cfg.maker_bond_payment_timeout_seconds).unwrap_or(i64::MAX);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry))
+        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry), cfg.bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 

@@ -111,6 +111,28 @@ pub struct AntiAbuseBondSettings {
         deserialize_with = "deserialize_maker_bond_payment_timeout_seconds"
     )]
     pub maker_bond_payment_timeout_seconds: u64,
+    /// CLTV delta, in blocks, of the maker and taker bond hold invoices
+    /// (#1084). The escrow's `hold_invoice_cltv_delta` is not enough for a
+    /// maker bond: it locks before its order is published and stays locked
+    /// while the order rests in the book, then through the whole trade that
+    /// follows. An order rests in the book for at most
+    /// `bond_cltv_delta - hold_invoice_cltv_delta - BOND_TRADE_MARGIN_BLOCKS`
+    /// blocks, so its bond can still cover a full trade with margin when it
+    /// is taken. Startup fails unless it is above
+    /// `hold_invoice_cltv_delta + BOND_TRADE_MARGIN_BLOCKS` and at most
+    /// [`MAX_BOND_CLTV_DELTA`](crate::config::constants::MAX_BOND_CLTV_DELTA)
+    /// (Lightning mode only). A change applies to bonds created after it;
+    /// a locked bond keeps the CLTV it was created with.
+    #[serde(default = "default_bond_cltv_delta")]
+    pub bond_cltv_delta: u32,
+}
+
+/// 432 blocks ≈ 3 days. With the shipped `hold_invoice_cltv_delta = 144`
+/// an order rests in the book for up to 144 blocks (~24 h, the default
+/// `expiration_hours`), and when it is taken its bond still covers a full
+/// trade plus [`BOND_TRADE_MARGIN_BLOCKS`](crate::config::constants::BOND_TRADE_MARGIN_BLOCKS).
+fn default_bond_cltv_delta() -> u32 {
+    432
 }
 
 fn default_bond_amount_pct() -> f64 {
@@ -191,6 +213,7 @@ impl Default for AntiAbuseBondSettings {
             payout_max_retries: default_payout_max_retries(),
             payout_claim_window_days: default_payout_claim_window_days(),
             maker_bond_payment_timeout_seconds: default_maker_bond_payment_timeout_seconds(),
+            bond_cltv_delta: default_bond_cltv_delta(),
         }
     }
 }
@@ -1139,6 +1162,22 @@ mod anti_abuse_bond_tests {
         assert_eq!(cfg.payout_max_retries, 5);
         assert_eq!(cfg.slash_node_share_pct, 0.5);
         assert_eq!(cfg.payout_claim_window_days, 15);
+        assert_eq!(cfg.bond_cltv_delta, 432);
+    }
+
+    #[test]
+    fn toml_bond_cltv_delta_defaults_and_overrides() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            anti_abuse_bond: AntiAbuseBondSettings,
+        }
+        // An operator upgrading with an existing block gets the default.
+        let parsed: Stub =
+            toml::from_str("[anti_abuse_bond]\nenabled = true").expect("minimal block parses");
+        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, 432);
+        let parsed: Stub = toml::from_str("[anti_abuse_bond]\nbond_cltv_delta = 600")
+            .expect("an explicit value parses");
+        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, 600);
     }
 
     #[test]

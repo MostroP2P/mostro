@@ -311,6 +311,13 @@ lnd_resynced_clear_after = 300
 # # Seconds a maker has to pay the maker bond (apply_to = "make" | "both").
 # # Past it the unpublished order expires and the maker is told. Must be > 0.
 # maker_bond_payment_timeout_seconds = 900
+# # CLTV delta, in blocks, of the bond hold invoices. A maker bond lasts while
+# # its order rests in the book and then through the trade, so an order rests
+# # in the book for at most bond_cltv_delta - hold_invoice_cltv_delta - 144
+# # blocks (144, ~24 h, with the defaults); a longer expiration is cut to that
+# # when the bond locks. Must be above hold_invoice_cltv_delta + 144 and at
+# # most 864.
+# bond_cltv_delta = 432
 
 # Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
 # Opt-in, disabled by default. Mostro never sees the buyer's payer details:

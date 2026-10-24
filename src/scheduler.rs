@@ -1395,8 +1395,11 @@ async fn enforce_maker_bond_deadline_pass(
 /// in [`enforce_maker_bond_deadline_pass`]. A bond's book window is measured
 /// in blocks, so a stretch of fast blocks shortens it in wall-clock time;
 /// half the nominal window keeps bonds in view even at twice the 10-minute
-/// average block rate, as in the escrow guardian. A bond without
-/// `locked_at` (never written that way) stays a candidate.
+/// average block rate, as in the escrow guardian. The age counts from the
+/// bond row's `created_at`: the HTLC cannot predate the invoice the row was
+/// created with, while `locked_at` is when the daemon processed the
+/// payment, which can be long after it (the daemon was down when the maker
+/// paid).
 async fn maker_bond_deadline_candidates(
     pool: &sqlx::SqlitePool,
     bond_settings: &AntiAbuseBondSettings,
@@ -1404,11 +1407,11 @@ async fn maker_bond_deadline_candidates(
 ) -> Result<Vec<bond::Bond>, MostroError> {
     let book_blocks =
         bond::horizon::maker_bond_book_blocks(bond_settings.bond_cltv_delta, hold_cltv);
-    let locked_before = Utc::now().timestamp() - bond::horizon::book_window_secs(book_blocks) / 2;
+    let created_before = Utc::now().timestamp() - bond::horizon::book_window_secs(book_blocks) / 2;
     let bonds = bond::db::find_locked_maker_parent_bonds(pool).await?;
     Ok(bonds
         .into_iter()
-        .filter(|maker_bond| maker_bond.locked_at.is_none_or(|at| at <= locked_before))
+        .filter(|maker_bond| maker_bond.created_at <= created_before)
         .collect())
 }
 
@@ -2732,7 +2735,7 @@ mod tests {
 
     /// Bonds on for the maker with the shipped CLTVs: hold 144, bond 432,
     /// so 144 blocks (86 400 s) of book time, and the guardian looks at
-    /// bonds locked at least 43 200 s ago. The horizon is due once the bond
+    /// bonds created at least 43 200 s ago. The horizon is due once the bond
     /// HTLC is 288 blocks or less from expiry.
     async fn maker_bond_guardian_ctx() -> AppContext {
         init_test_settings();
@@ -2775,15 +2778,28 @@ mod tests {
         .unwrap()
     }
 
-    /// The `Locked` maker bond of `order_id`, locked `locked_secs_ago`
-    /// seconds ago.
+    /// The `Locked` maker bond of `order_id`, created and locked
+    /// `locked_secs_ago` seconds ago.
     async fn locked_maker_bond(pool: &sqlx::SqlitePool, order_id: Uuid, locked_secs_ago: i64) {
+        maker_bond_locked_after(pool, order_id, locked_secs_ago, locked_secs_ago).await;
+    }
+
+    /// The `Locked` maker bond of `order_id`, created `created_secs_ago`
+    /// and locked `locked_secs_ago` seconds ago.
+    async fn maker_bond_locked_after(
+        pool: &sqlx::SqlitePool,
+        order_id: Uuid,
+        created_secs_ago: i64,
+        locked_secs_ago: i64,
+    ) {
+        let now = Utc::now().timestamp();
         let mut maker_bond =
             bond::Bond::new_requested(order_id, hex_key(), bond::BondRole::Maker, 1_000);
         maker_bond.state = bond::BondState::Locked.to_string();
         maker_bond.hash = Some(hex_key());
         maker_bond.preimage = Some(hex_key());
-        maker_bond.locked_at = Some(Utc::now().timestamp() - locked_secs_ago);
+        maker_bond.created_at = now - created_secs_ago;
+        maker_bond.locked_at = Some(now - locked_secs_ago);
         bond::db::create_bond(pool, maker_bond).await.unwrap();
     }
 
@@ -2881,7 +2897,7 @@ mod tests {
 
     #[tokio::test]
     async fn maker_bond_deadline_skips_a_recently_locked_bond() {
-        // Locked 1 000 s ago, far inside half the 86 400 s book window: not
+        // Created 1 000 s ago, far inside half the 86 400 s book window: not
         // a candidate, so LND is not even asked (it would say due).
         let ctx = maker_bond_guardian_ctx().await;
         let order = maker_order(ctx.pool(), Status::Pending, None).await;
@@ -2898,6 +2914,29 @@ mod tests {
         );
         assert!(!take_window_closed(ctx.pool(), order.id).await);
         assert_eq!(escrow.probes, 0);
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_checks_a_bond_whose_lock_was_processed_late() {
+        // Arrange: the maker paid 50 000 s ago while the daemon was down;
+        // the restart resubscriber locked the bond just now (#1084). Its
+        // HTLC is as old as the payment, so the guardian must look at it.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        maker_bond_locked_after(ctx.pool(), order.id, 50_000, 0).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 288));
+
+        // Act
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(take_window_closed(ctx.pool(), order.id).await);
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
     }
 
     #[tokio::test]

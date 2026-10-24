@@ -531,31 +531,13 @@ async fn finalize_order_publication(
 /// across redeliveries is enforced by the caller, which only invokes this
 /// while the order is still in `WaitingMakerBond`.
 ///
-/// The order's `expires_at` is clamped to the time its maker bond leaves
-/// it in the book (#1084, [`crate::app::bond::horizon`]), so the published
-/// expiration is honest and the regular expiry job removes the order, and
-/// releases the bond, while the bond can still cover a full trade.
+/// `book_blocks` is how long the order may rest in the book on its maker
+/// bond (#1084, [`crate::app::bond::horizon`]), which the caller counts from
+/// the bond's HTLC. The order's `expires_at` is clamped to it, so the
+/// published expiration is honest and the regular expiry job removes the
+/// order, and releases the bond, while the bond can still cover a full
+/// trade. `None` leaves `expires_at` as the maker asked.
 pub async fn resume_publish_after_maker_bond(
-    pool: &SqlitePool,
-    keys: &Keys,
-    order: Order,
-    request_id: Option<u64>,
-) -> Result<(), MostroError> {
-    // Only a bonded maker gets here, so the block is present; without it
-    // there is no bond CLTV to clamp to.
-    let book_blocks = Settings::get_bond().map(|bond| {
-        crate::app::bond::horizon::maker_bond_book_blocks(
-            bond.bond_cltv_delta,
-            Settings::get_ln().hold_invoice_cltv_delta,
-        )
-    });
-    resume_publish_with_book_window(pool, keys, order, request_id, book_blocks).await
-}
-
-/// [`resume_publish_after_maker_bond`] with the bond's book window, in
-/// blocks, passed in rather than read from the global settings, so tests
-/// can drive the clamp. `None` leaves `expires_at` as the maker asked.
-async fn resume_publish_with_book_window(
     pool: &SqlitePool,
     keys: &Keys,
     mut order: Order,
@@ -3568,7 +3550,7 @@ mod tests {
         order.trade_index_seller = Some(1);
         let order = order.create(&pool).await.unwrap();
 
-        let res = resume_publish_after_maker_bond(&pool, &keys, order, Some(1)).await;
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, Some(1), None).await;
         // Offline broadcast failure — but the CAS must have flipped the row.
         assert!(matches!(
             res,
@@ -3594,7 +3576,7 @@ mod tests {
         order.trade_index_buyer = Some(1);
         let order = order.create(&pool).await.unwrap();
 
-        let res = resume_publish_after_maker_bond(&pool, &keys, order, None).await;
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, None, None).await;
         assert!(matches!(
             res,
             Err(MostroInternalErr(ServiceError::NostrError(_)))
@@ -3612,7 +3594,7 @@ mod tests {
             .create(&pool)
             .await
             .unwrap();
-        let res = resume_publish_after_maker_bond(&pool, &keys, order, None).await;
+        let res = resume_publish_after_maker_bond(&pool, &keys, order, None, None).await;
         assert!(res.is_ok(), "stale deferred publish must skip: {res:?}");
     }
 
@@ -3647,7 +3629,7 @@ mod tests {
         let order = parked_maker_order(&pool, now + 15 * 86_400).await;
 
         let res =
-            resume_publish_with_book_window(&pool, &keys, order.clone(), None, Some(144)).await;
+            resume_publish_after_maker_bond(&pool, &keys, order.clone(), None, Some(144)).await;
         // Offline broadcast failure, after the row was written.
         assert!(matches!(
             res,
@@ -3673,7 +3655,7 @@ mod tests {
         let order = parked_maker_order(&pool, requested).await;
 
         let res =
-            resume_publish_with_book_window(&pool, &keys, order.clone(), None, Some(144)).await;
+            resume_publish_after_maker_bond(&pool, &keys, order.clone(), None, Some(144)).await;
         assert!(matches!(
             res,
             Err(MostroInternalErr(ServiceError::NostrError(_)))

@@ -2406,11 +2406,18 @@ route), in Lightning mode with bonds enabled
 **Clamp at lock time.** When the maker bond locks,
 `resume_publish_after_maker_bond` (`src/util.rs`) cuts the order's
 `expires_at` to `now + book blocks × 600 s` if the maker asked for longer
-(up to `max_expiration_days`), before the order is published. The
-published expiration is therefore honest, and the regular expiry job
-(`job_expire_pending_older_orders`) removes the order and releases the
-bond on time. Range remainders copy their parent's `expires_at`
-(`create_base_order`), so they inherit the clamp.
+(up to `max_expiration_days`), before the order is published. The book
+blocks come from the bond's HTLC: `on_maker_bond_accepted`
+(`src/app/bond/flow.rs`) reads its expiry height and the chain tip from
+LND and cuts the configured window to what the HTLC still leaves before
+the guardian below would fire (`maker_bond_book_blocks_at_lock` in
+`src/app/bond/horizon.rs`). The daemon can process the payment long after
+the HTLC arrived (it was down when the maker paid), and the window must
+not restart then. Without a chain view the configured window counts from
+the lock. The published expiration is therefore honest, and the regular
+expiry job (`job_expire_pending_older_orders`) removes the order and
+releases the bond on time. Range remainders copy their parent's
+`expires_at` (`create_base_order`), so they inherit the clamp.
 
 **Chain-height guardian.** The clamp counts 10-minute blocks; faster
 blocks bring the bond's HTLC to its expiry sooner. Every 5 minutes,
@@ -2424,11 +2431,15 @@ those orders: `close_book_window` (`src/app/bond/db.rs`) pulls their
 `expires_at` forward to now, guarded by the book statuses so an order
 taken in the meantime is left alone. Takes refuse an order past its
 `expires_at`, and the regular expiry job ends it on its next tick,
-releasing the bond exactly as at the order's own expiration. It only
-looks at bonds locked at least half a
-nominal book window ago, it never touches an order in a trade (the
-escrow-deadline guardian covers those), and without a chain view it does
-nothing that tick, leaving the clamped `expires_at` as the deadline.
+releasing the bond exactly as at the order's own expiration. A taker
+bond that locks in between starts no trade either:
+`on_bond_invoice_accepted` releases it and tells the taker, and the
+promotion CAS (`cas_promote_taker_context` in `src/db.rs`) re-checks the
+take window. The guardian only looks at bonds created at least half a
+nominal book window ago (an HTLC cannot predate its bond row), it never
+touches an order in a trade (the escrow-deadline guardian covers those),
+and without a chain view it does nothing that tick, leaving the clamped
+`expires_at` as the deadline.
 
 In normal operation a bond HTLC keeps well over 100 blocks when its trade
 ends. Only a dispute left open for days can bring a maker bond close to

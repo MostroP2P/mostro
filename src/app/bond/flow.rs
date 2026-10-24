@@ -64,6 +64,7 @@ use crate::util::{
 };
 
 use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
+use super::horizon;
 use super::math::compute_bond_amount;
 use super::model::Bond;
 use super::types::{BondRole, BondState};
@@ -1281,8 +1282,39 @@ async fn on_maker_bond_accepted(
         return Ok(());
     }
 
+    // Only a bonded maker gets here, so the block is present; without it
+    // there is no bond CLTV to clamp to.
+    let book_blocks = match Settings::get_bond() {
+        Some(cfg) => Some(book_blocks_at_maker_lock(&current, hash, cfg.bond_cltv_delta).await),
+        None => None,
+    };
     let my_keys = get_keys()?;
-    crate::util::resume_publish_after_maker_bond(pool, my_keys, order, request_id).await
+    crate::util::resume_publish_after_maker_bond(pool, my_keys, order, request_id, book_blocks)
+        .await
+}
+
+/// Blocks the order of `bond`, a maker bond that has just locked, may rest
+/// in the book (#1084, [`horizon`]). Counted from the bond's accepted HTLC,
+/// so a lock processed late (the daemon was down when the maker paid) does
+/// not restart the window. Without a chain view the configured window
+/// counts from now, and the guardian (`job_enforce_maker_bond_deadline`)
+/// still checks the HTLC.
+async fn book_blocks_at_maker_lock(bond: &Bond, hash: &str, bond_cltv_delta: u32) -> u32 {
+    let hold_cltv = Settings::get_ln().hold_invoice_cltv_delta;
+    let configured = horizon::maker_bond_book_blocks(bond_cltv_delta, hold_cltv);
+    let probed = match LndConnector::new().await {
+        Ok(mut ln) => {
+            horizon::maker_bond_book_blocks_at_lock(&mut ln, hash, configured, hold_cltv).await
+        }
+        Err(e) => Err(e),
+    };
+    probed.unwrap_or_else(|e| {
+        warn!(
+            bond_id = %bond.id,
+            "no chain view when the maker bond locked ({e}); its book window counts from now"
+        );
+        configured
+    })
 }
 
 /// Message the taker of a losing concurrent bond that their take was

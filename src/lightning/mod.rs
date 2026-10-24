@@ -450,35 +450,39 @@ impl LndConnector {
         Ok(Self { client })
     }
 
+    /// Create the trade escrow's hold invoice, with
+    /// `hold_invoice_cltv_delta` as its CLTV delta.
     pub async fn create_hold_invoice(
         &mut self,
         description: &str,
         amount: i64,
     ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
-        self.create_hold_invoice_with_expiry(description, amount, None)
+        let cltv_delta = Settings::get_ln().hold_invoice_cltv_delta;
+        self.create_hold_invoice_with_expiry(description, amount, None, cltv_delta)
             .await
     }
 
     /// [`Self::create_hold_invoice`] with an explicit invoice expiry in
-    /// seconds. `None` leaves LND's default (86 400 s), which is what every
-    /// hold invoice got before #942.
+    /// seconds and CLTV delta in blocks. `None` leaves LND's default expiry
+    /// (86 400 s), which is what every hold invoice got before #942. Bond
+    /// invoices pass `bond_cltv_delta` (#1084): a maker bond outlives the
+    /// escrow by the time its order rests in the book.
     pub async fn create_hold_invoice_with_expiry(
         &mut self,
         description: &str,
         amount: i64,
         expiry_secs: Option<i64>,
+        cltv_delta: u32,
     ) -> Result<(AddHoldInvoiceResp, Vec<u8>, Vec<u8>), MostroError> {
         let mut preimage = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash = raw_sha256(preimage.to_vec());
-        let ln_settings = Settings::get_ln();
-        let cltv_expiry = ln_settings.hold_invoice_cltv_delta as u64;
 
         let invoice = AddHoldInvoiceRequest {
             hash: hash.to_vec(),
             memo: description.to_string(),
             value: amount,
-            cltv_expiry,
+            cltv_expiry: u64::from(cltv_delta),
             expiry: expiry_secs.unwrap_or_default(),
             ..Default::default()
         };

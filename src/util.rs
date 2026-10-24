@@ -530,11 +530,37 @@ async fn finalize_order_publication(
 /// (§3.1) — and hands off to [`finalize_order_publication`]. Idempotency
 /// across redeliveries is enforced by the caller, which only invokes this
 /// while the order is still in `WaitingMakerBond`.
+///
+/// The order's `expires_at` is clamped to the time its maker bond leaves
+/// it in the book (#1084, [`crate::app::bond::horizon`]), so the published
+/// expiration is honest and the regular expiry job removes the order, and
+/// releases the bond, while the bond can still cover a full trade.
 pub async fn resume_publish_after_maker_bond(
     pool: &SqlitePool,
     keys: &Keys,
     order: Order,
     request_id: Option<u64>,
+) -> Result<(), MostroError> {
+    // Only a bonded maker gets here, so the block is present; without it
+    // there is no bond CLTV to clamp to.
+    let book_blocks = Settings::get_bond().map(|bond| {
+        crate::app::bond::horizon::maker_bond_book_blocks(
+            bond.bond_cltv_delta,
+            Settings::get_ln().hold_invoice_cltv_delta,
+        )
+    });
+    resume_publish_with_book_window(pool, keys, order, request_id, book_blocks).await
+}
+
+/// [`resume_publish_after_maker_bond`] with the bond's book window, in
+/// blocks, passed in rather than read from the global settings, so tests
+/// can drive the clamp. `None` leaves `expires_at` as the maker asked.
+async fn resume_publish_with_book_window(
+    pool: &SqlitePool,
+    keys: &Keys,
+    mut order: Order,
+    request_id: Option<u64>,
+    book_blocks: Option<u32>,
 ) -> Result<(), MostroError> {
     // Atomically claim the deferred `WaitingMakerBond → Pending`
     // transition. The bond subscriber already re-read the row and saw
@@ -558,6 +584,24 @@ pub async fn resume_publish_after_maker_bond(
             order.id
         );
         return Ok(());
+    }
+    // The bond just locked: from here the order may rest in the book only
+    // while the bond can still cover a full trade (#1084). The full-row
+    // write in `finalize_order_publication` persists the clamp, and the
+    // NIP-33 tags and the maker's ack are built from the same row, so the
+    // book, the maker and the expiry job all see the same deadline. Range
+    // remainders copy it from their parent (`create_base_order`).
+    if let Some(book_blocks) = book_blocks {
+        let now = Timestamp::now().as_secs() as i64;
+        let clamped =
+            crate::app::bond::horizon::clamp_book_expiry(order.expires_at, now, book_blocks);
+        if clamped != order.expires_at {
+            info!(
+                "resume_publish_after_maker_bond: order {} expires_at {} clamped to {} — its maker bond covers {} blocks in the book",
+                order.id, order.expires_at, clamped, book_blocks
+            );
+            order.expires_at = clamped;
+        }
     }
     let kind = order.get_order_kind().map_err(MostroInternalErr)?;
     let (trade_pubkey, identity_pubkey, trade_index) = match kind {
@@ -2030,8 +2074,9 @@ pub async fn settle_seller_hold_invoice(
 /// approximation of the real, block-height-measured CLTV horizon — the
 /// escrow-deadline guardian consults the chain height and the accepted
 /// HTLC's actual expiry height when LND can answer, and falls back to
-/// this nominal clock only when it cannot.
-const SECS_PER_BLOCK: i64 = 600;
+/// this nominal clock only when it cannot. The maker-bond book window
+/// (`app::bond::horizon`) uses the same clock.
+pub(crate) const SECS_PER_BLOCK: i64 = 600;
 
 /// Seconds between the escrow payment and the moment the deadline
 /// guardian acts: `(cltv_delta - margin)` blocks. The margin is used as
@@ -3569,6 +3614,72 @@ mod tests {
             .unwrap();
         let res = resume_publish_after_maker_bond(&pool, &keys, order, None).await;
         assert!(res.is_ok(), "stale deferred publish must skip: {res:?}");
+    }
+
+    /// Sell order parked at `WaitingMakerBond` with the `expires_at` its
+    /// maker asked for (full-privacy maker).
+    async fn parked_maker_order(pool: &SqlitePool, expires_at: i64) -> Order {
+        let trade = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::WaitingMakerBond);
+        order.seller_pubkey = Some(trade.to_string());
+        order.master_seller_pubkey = Some(trade.to_string());
+        order.trade_index_seller = Some(1);
+        order.expires_at = expires_at;
+        order.create(pool).await.unwrap()
+    }
+
+    async fn stored_expires_at(pool: &SqlitePool, order_id: Uuid) -> i64 {
+        let (expires_at,): (i64,) = sqlx::query_as("SELECT expires_at FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        expires_at
+    }
+
+    #[tokio::test]
+    async fn resume_publish_after_maker_bond_clamps_a_long_expiration_to_the_book_window() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let now = Timestamp::now().as_secs() as i64;
+        // 15 days requested; the bond leaves 144 blocks (~24 h) in the book.
+        let order = parked_maker_order(&pool, now + 15 * 86_400).await;
+
+        let res =
+            resume_publish_with_book_window(&pool, &keys, order.clone(), None, Some(144)).await;
+        // Offline broadcast failure, after the row was written.
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+
+        // The persisted row is what the expiry job and the published event
+        // both read, so the clamp must be on it.
+        let expires_at = stored_expires_at(&pool, order.id).await;
+        let window_end = now + 144 * SECS_PER_BLOCK;
+        assert!(
+            (window_end..=window_end + 60).contains(&expires_at),
+            "expires_at {expires_at} must be clamped to ~{window_end}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_publish_after_maker_bond_keeps_an_expiration_inside_the_book_window() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let requested = Timestamp::now().as_secs() as i64 + 3_600;
+        let order = parked_maker_order(&pool, requested).await;
+
+        let res =
+            resume_publish_with_book_window(&pool, &keys, order.clone(), None, Some(144)).await;
+        assert!(matches!(
+            res,
+            Err(MostroInternalErr(ServiceError::NostrError(_)))
+        ));
+
+        assert_eq!(stored_expires_at(&pool, order.id).await, requested);
     }
 
     // ───────────────────── order event updates & ratings ─────────────────────

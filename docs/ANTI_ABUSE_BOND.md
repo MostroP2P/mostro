@@ -135,6 +135,13 @@ payout_claim_window_days = 15
 # never published, is closed as `expired` and the maker gets `canceled`
 # (see §10.1).
 maker_bond_payment_timeout_seconds = 900
+
+# CLTV delta, in blocks, of the bond hold invoices (see §14.6). A maker
+# bond lasts while its order rests in the book and then through the trade,
+# so an order rests in the book for at most
+# bond_cltv_delta - hold_invoice_cltv_delta - 144 blocks. Must be above
+# hold_invoice_cltv_delta + 144 and at most 864.
+bond_cltv_delta = 432
 ```
 
 Note: there is **no `slash_on_lost_dispute` flag**. Dispute slashes are
@@ -2370,6 +2377,64 @@ these requires a compatibility statement:
   solver decisions without reconstructing them from event traffic.
 - A structured log line on every state change is enough; no Prometheus
   wiring needed until we see real traffic.
+
+### 14.6 Bond CLTV and the time in the book (#1084)
+
+A bond hold invoice gets its own CLTV delta, `bond_cltv_delta` (default
+432 blocks, ~3 days), not the escrow's `hold_invoice_cltv_delta`. A maker
+bond needs the extra room: it locks before its order is published, stays
+locked while the order rests in the book, and then through the whole
+trade that follows, whose escrow alone can be held for
+`hold_invoice_cltv_delta` blocks. Taker bonds use the same CLTV.
+
+**Book window.** An order may rest in the book only while its maker bond
+can still cover a full trade with margin:
+
+```text
+book blocks = bond_cltv_delta - hold_invoice_cltv_delta - BOND_TRADE_MARGIN_BLOCKS
+            = 432 - 144 - 144 = 144 blocks (~24 h) with the defaults
+```
+
+`BOND_TRADE_MARGIN_BLOCKS` is 144 (`src/config/constants.rs`). Startup
+fails unless `bond_cltv_delta` is above
+`hold_invoice_cltv_delta + BOND_TRADE_MARGIN_BLOCKS` (no time in the book
+otherwise) and at most `MAX_BOND_CLTV_DELTA` = 864 (a payer whose routing
+caps the total timelock at 1008 blocks, LDK's default, must still find a
+route), in Lightning mode with bonds enabled
+(`validate_bond_cltv_delta` in `src/config/util.rs`).
+
+**Clamp at lock time.** When the maker bond locks,
+`resume_publish_after_maker_bond` (`src/util.rs`) cuts the order's
+`expires_at` to `now + book blocks × 600 s` if the maker asked for longer
+(up to `max_expiration_days`), before the order is published. The
+published expiration is therefore honest, and the regular expiry job
+(`job_expire_pending_older_orders`) removes the order and releases the
+bond on time. Range remainders copy their parent's `expires_at`
+(`create_base_order`), so they inherit the clamp.
+
+**Chain-height guardian.** The clamp counts 10-minute blocks; faster
+blocks bring the bond's HTLC to its expiry sooner. Every 5 minutes,
+`job_enforce_maker_bond_deadline` (`src/scheduler.rs`; started only when
+the maker side is bonded) looks at every `locked` maker bond with orders
+of its range tree in the book (`pending` / `waiting-taker-bond`) and reads
+the bond HTLC's expiry height from LND. When
+`chain tip + hold_invoice_cltv_delta + BOND_TRADE_MARGIN_BLOCKS >= expiry`,
+or no accepted HTLC backs the bond anymore, it closes the take window of
+those orders: `close_book_window` (`src/app/bond/db.rs`) pulls their
+`expires_at` forward to now, guarded by the book statuses so an order
+taken in the meantime is left alone. Takes refuse an order past its
+`expires_at`, and the regular expiry job ends it on its next tick,
+releasing the bond exactly as at the order's own expiration. It only
+looks at bonds locked at least half a
+nominal book window ago, it never touches an order in a trade (the
+escrow-deadline guardian covers those), and without a chain view it does
+nothing that tick, leaving the clamped `expires_at` as the deadline.
+
+In normal operation a bond HTLC keeps well over 100 blocks when its trade
+ends. Only a dispute left open for days can bring a maker bond close to
+its horizon; raising an alarm when LND cancels a locked bond is tracked in
+#920. `bond_cltv_delta` applies to bonds created after a change; a locked
+bond keeps the CLTV it was created with.
 
 ---
 

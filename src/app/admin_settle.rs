@@ -191,7 +191,8 @@ async fn admin_settle_action_with_settle(
 
     // Close the dispute row and publish its resolution. Best effort by
     // construction: the helper logs each failure instead of returning, which is
-    // what this position past the settle requires.
+    // what this position past the settle requires. A failed row write leaves
+    // the dispute open with nothing to close it later: #1086.
     close_dispute_after_resolution(
         ctx,
         &order_updated,
@@ -702,6 +703,7 @@ mod handler_tests {
             let dispute = crate::db::find_dispute_by_order_id(ctx.pool(), order.id)
                 .await
                 .unwrap();
+            // A failed close leaves the row open; fixing #1086 changes this.
             let expected_status = if fail_dispute_update {
                 DisputeStatus::InProgress
             } else {

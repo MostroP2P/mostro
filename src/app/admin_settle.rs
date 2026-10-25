@@ -680,6 +680,7 @@ mod handler_tests {
                 .unwrap();
             }
             let event = admin_event(admin.public_key());
+            let before = chrono::Utc::now().timestamp();
             let result = admin_settle_action_with_settle(
                 &ctx,
                 settle_msg(order.id),
@@ -707,6 +708,29 @@ mod handler_tests {
                 DisputeStatus::Settled
             };
             assert_eq!(dispute.status, expected_status.to_string());
+
+            // Each side is notified on its own: one bad pubkey must not cost the other its message.
+            if !invalid_seller {
+                assert!(queued_actions_for(seller)
+                    .await
+                    .contains(&Action::AdminSettled));
+            }
+            if !invalid_buyer {
+                assert!(queued_actions_for(buyer)
+                    .await
+                    .contains(&Action::AdminSettled));
+            }
+            // The payouts health check ages a settled order from this column.
+            let settled_at: Option<i64> =
+                sqlx::query_scalar("SELECT hold_settled_at FROM orders WHERE id = ?")
+                    .bind(order.id)
+                    .fetch_one(ctx.pool())
+                    .await
+                    .unwrap();
+            assert!(
+                settled_at.is_some_and(|t| t >= before),
+                "hold_settled_at must be written at settle time: {settled_at:?}"
+            );
         }
     }
 }

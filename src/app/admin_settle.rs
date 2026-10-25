@@ -140,7 +140,7 @@ async fn admin_settle_action_with_settle(
     // nothing has moved and the order stays `Dispute` for a retry. Not a
     // guarantee: an RPC timeout on a settle LND did apply returns `Err` with the
     // escrow already gone, and the retry then meets "invoice already settled",
-    // which this path does not tolerate. Out of scope here, noted in the PR.
+    // which this path does not tolerate. Tracked in #809.
     settle(event, ln_client, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?;
@@ -150,12 +150,12 @@ async fn admin_settle_action_with_settle(
     // The `Dispute` guard above rejects a retry, so an early return here has no
     // path back: it strands every `Locked` bond on the order and skips the
     // buyer's payout. Every step from the dispute close onwards therefore logs
-    // its failure and carries on. The two exits that remain above are `main`'s,
-    // and each says why it stays.
+    // its failure and carries on. Two exits remain before the dispute close, the
+    // event update and the status write, and each says why it stays.
 
     // `?` survives here only because this cannot fail for `SettledHoldInvoice`:
     // `create_status_tags` has no arm for it, so `order_to_tags` returns `None`
-    // and the whole publish body is skipped. ponytail: add an arm there and this
+    // and the whole publish body is skipped. If an arm is ever added there, this
     // becomes an abort past the settle — move it down with the rest.
     let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await

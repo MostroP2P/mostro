@@ -20,6 +20,7 @@ use chrono::Duration;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::prelude::*;
+use mostro_core::user::day_truncate;
 use nostr_sdk::prelude::*;
 use sqlx::Pool;
 use sqlx::QueryBuilder;
@@ -624,6 +625,7 @@ async fn prepare_new_order(
         buyer_invoice: new_order.buyer_invoice.clone(),
         created_at: Timestamp::now().as_secs() as i64,
         expires_at: expiry_date,
+        cashu_mint_url: new_order.cashu_mint_url.clone(),
         ..Default::default()
     };
 
@@ -718,11 +720,18 @@ pub async fn send_dm(
     )
     .await?;
 
+    // Payer hashes and histories are identifiers that must stay inside the
+    // encrypted channel; log the action only.
+    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
+        "<payer-history payload redacted>"
+    } else {
+        payload
+    };
     info!(
         "Sending message, Event ID: {} to {} with payload: {:#?}",
         event.id,
         receiver_pubkey.to_hex(),
-        payload
+        logged_payload
     );
 
     if let Ok(client) = get_nostr_client() {
@@ -840,10 +849,9 @@ pub fn get_keys() -> Result<&'static Keys, MostroError> {
 
 /// Build and enqueue a replaceable rating event for `user` (NIP-33 kind 38384).
 ///
-/// Callers must have already claimed the order's rating flag and persisted the
-/// aggregate user rating inside a committed transaction — this helper only
-/// publishes the Nostr side-effect after that durable claim. It does not write
-/// `buyer_sent_rate` / `seller_sent_rate`.
+/// Callers must have committed the aggregate user rating and its rating flag
+/// or import receipt. This helper queues the Nostr side-effect for the next
+/// rating-event tick; it does not change rating flags or persist the queue.
 pub async fn update_user_rating_event(
     user: &str,
     tags: Tags,
@@ -1152,6 +1160,30 @@ pub(crate) fn monotonic_info_event_timestamp(d_tag: &str, candidate: Timestamp) 
     Timestamp::from(monotonic_created_at(
         &mut last_ts,
         d_tag.to_owned(),
+        candidate.as_secs(),
+    ))
+}
+
+/// Last kind-38384 revision per node author and trade-key `d` tag. As with
+/// info/dispute events, the registry is process-local and bounded by the
+/// shared timestamp pruning policy.
+static RATING_EVENT_TIMESTAMPS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(PublicKey, String), u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Stamp a rating revision strictly after the previous event at the same
+/// Nostr address, so same-second imports/ratings cannot retain a stale total.
+pub(crate) fn monotonic_rating_event_timestamp(
+    author: PublicKey,
+    d_tag: &str,
+    candidate: Timestamp,
+) -> Timestamp {
+    let mut last_ts = RATING_EVENT_TIMESTAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Timestamp::from(monotonic_created_at(
+        &mut last_ts,
+        (author, d_tag.to_owned()),
         candidate.as_secs(),
     ))
 }
@@ -2002,21 +2034,12 @@ pub async fn settle_seller_hold_invoice(
 const SECS_PER_BLOCK: i64 = 600;
 
 /// Seconds between the escrow payment and the moment the deadline
-/// guardian acts: `(cltv_delta - margin)` blocks. A misconfigured margin
-/// `>= cltv_delta` would make the guardian fire on brand-new escrows, so
-/// it is clamped to half the window (loudly) instead of being honored.
+/// guardian acts: `(cltv_delta - margin)` blocks. The margin is used as
+/// configured, the same value the chain-height check compares against;
+/// startup validation guarantees `margin < cltv_delta`. Saturates at 0
+/// for settings built without that validation.
 pub fn escrow_guard_window_secs(cltv_delta_blocks: u32, margin_blocks: u32) -> i64 {
-    let effective_margin = if margin_blocks >= cltv_delta_blocks {
-        tracing::error!(
-            "escrow_deadline_margin_blocks ({margin_blocks}) must be below \
-             hold_invoice_cltv_delta ({cltv_delta_blocks}); clamping to half \
-             the window"
-        );
-        cltv_delta_blocks / 2
-    } else {
-        margin_blocks
-    };
-    i64::from(cltv_delta_blocks - effective_margin) * SECS_PER_BLOCK
+    i64::from(cltv_delta_blocks.saturating_sub(margin_blocks)) * SECS_PER_BLOCK
 }
 
 /// Unix timestamp from which the escrow-deadline guardian acts on an
@@ -2260,6 +2283,37 @@ pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<Str
     Ok(payment_request)
 }
 
+/// The `since` Mostro publishes for a user whose record was created at
+/// `created_at`: the date of their first trade, truncated to its UTC day by
+/// core so it cannot link the user's trade pubkeys together.
+///
+/// `None` when there is no real date (`created_at` unset or corrupt), so the
+/// field is omitted instead of reading as 1 January 1970.
+pub fn first_trade_since(created_at: i64) -> Option<u64> {
+    (created_at > 0).then(|| day_truncate(created_at))
+}
+
+/// Reputation as a `UserInfo`: sent to the counterparty in the `Peer`
+/// payload, and to the user themself in the `user-info` reply. Zeroed for a
+/// user Mostro does not know. `operating_days` stays next to `since` for the
+/// deprecation window; both emitters are listed in
+/// `docs/REPUTATION_PORTABILITY.md` §6.1 for its removal.
+pub(crate) fn peer_reputation(user: Option<&User>, now: u64) -> UserInfo {
+    match user {
+        Some(user) => UserInfo {
+            rating: user.total_rating,
+            reviews: user.total_reviews,
+            // Same rule as `days` on the published events: no date, no age.
+            operating_days: match user.created_at {
+                created_at if created_at > 0 => now.saturating_sub(created_at as u64) / 86400,
+                _ => 0,
+            },
+            since: first_trade_since(user.created_at),
+        },
+        None => UserInfo::default(),
+    }
+}
+
 pub async fn notify_taker_reputation(
     pool: &Pool<Sqlite>,
     order: &Order,
@@ -2277,24 +2331,8 @@ pub async fn notify_taker_reputation(
         None => return Err(MostroCantDo(CantDoReason::InvalidPubkey)),
     };
 
-    let reputation_data = match is_user_present(pool, master_key).await {
-        Ok(user) => {
-            let now = Timestamp::now().as_secs();
-            UserInfo {
-                rating: user.total_rating,
-                reviews: user.total_reviews,
-                operating_days: (now - user.created_at as u64) / 86400,
-                // Filled by the `since` rollout (REPUTATION_PORTABILITY.md, PR 1.2).
-                since: None,
-            }
-        }
-        Err(_) => UserInfo {
-            rating: 0.0,
-            reviews: 0,
-            operating_days: 0,
-            since: None,
-        },
-    };
+    let user = is_user_present(pool, master_key).await.ok();
+    let reputation_data = peer_reputation(user.as_ref(), Timestamp::now().as_secs());
 
     // Get order status
     let order_status = order.get_order_status().map_err(MostroInternalErr)?;
@@ -2360,6 +2398,59 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    // ───────────────── first-trade date (`since`) ─────────────────
+
+    #[test]
+    fn first_trade_since_truncates_to_the_utc_day() {
+        // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+        assert_eq!(first_trade_since(1_700_000_000), Some(1_699_920_000));
+        assert_eq!(first_trade_since(1_699_920_000), Some(1_699_920_000));
+    }
+
+    #[test]
+    fn first_trade_since_is_none_without_a_real_date() {
+        assert_eq!(first_trade_since(0), None);
+        assert_eq!(first_trade_since(-1), None);
+    }
+
+    #[test]
+    fn peer_reputation_fills_since_next_to_operating_days() {
+        let user = User {
+            total_rating: 4.5,
+            total_reviews: 7,
+            created_at: 1_700_000_000,
+            ..Default::default()
+        };
+        let now = 1_700_000_000 + 10 * 86_400;
+        let info = peer_reputation(Some(&user), now);
+        assert_eq!(info.rating, 4.5);
+        assert_eq!(info.reviews, 7);
+        assert_eq!(info.operating_days, 10);
+        assert_eq!(info.since, Some(1_699_920_000));
+    }
+
+    #[test]
+    fn peer_reputation_of_unknown_user_has_no_since() {
+        let info = peer_reputation(None, 1_700_000_000);
+        assert_eq!(info.reviews, 0);
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
+    }
+
+    #[test]
+    fn peer_reputation_without_a_first_trade_date_has_no_age() {
+        let user = User {
+            total_reviews: 2,
+            created_at: 0,
+            ..Default::default()
+        };
+        let info = peer_reputation(Some(&user), 1_700_000_000);
+        assert_eq!(info.reviews, 2);
+        // Not ~19,675 days since the epoch.
+        assert_eq!(info.operating_days, 0);
+        assert_eq!(info.since, None);
     }
 
     /// Regression: the CAS-miss repair timestamp must be strictly newer than
@@ -4049,10 +4140,12 @@ mod tests {
     fn escrow_deadline_math_matches_the_cltv_horizon() {
         // 10-minute blocks: (144 - 24) * 600.
         assert_eq!(escrow_guard_window_secs(144, 24), 72_000);
-        // A margin at/above the window clamps to half — never negative,
-        // never firing on brand-new escrows.
-        assert_eq!(escrow_guard_window_secs(144, 144), 43_200);
-        assert_eq!(escrow_guard_window_secs(144, 1_000), 43_200);
+        // The margin is not clamped: the window matches the chain-height
+        // check. Startup validation rejects these values; unvalidated
+        // settings saturate at 0 instead of underflowing.
+        assert_eq!(escrow_guard_window_secs(144, 143), 600);
+        assert_eq!(escrow_guard_window_secs(144, 144), 0);
+        assert_eq!(escrow_guard_window_secs(144, 1_000), 0);
         assert_eq!(escrow_action_deadline_unix(0, 144, 24), None);
         assert_eq!(
             escrow_action_deadline_unix(1_000, 144, 24),

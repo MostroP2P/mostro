@@ -1,10 +1,14 @@
 use crate::config::constants::NOSTR_EXCHANGE_RATES_EVENT_KIND;
 use crate::config::settings::Settings;
-use crate::config::types::{AntiAbuseBondSettings, BondApplyTo, LightningSettings, MostroSettings};
+use crate::config::types::{
+    AntiAbuseBondSettings, BondApplyTo, CashuSettings, LightningSettings, MostroSettings,
+    ReputationImportSettings,
+};
 use crate::lightning::LnStatus;
 use crate::util::{
-    get_expiration_timestamp_for_kind, get_keys, monotonic_dispute_event_timestamp,
-    monotonic_info_event_timestamp,
+    first_trade_since, get_expiration_timestamp_for_kind, get_keys,
+    monotonic_dispute_event_timestamp, monotonic_info_event_timestamp,
+    monotonic_rating_event_timestamp,
 };
 use crate::LN_STATUS;
 use mostro_core::prelude::*;
@@ -116,13 +120,15 @@ pub fn new_rating_event(
     identifier: String,
     extra_tags: Tags,
 ) -> Result<Event, Error> {
+    let created_at =
+        monotonic_rating_event_timestamp(keys.public_key(), &identifier, Timestamp::now());
     create_event(
         keys,
         content,
         identifier,
         extra_tags,
         NOSTR_RATING_EVENT_KIND,
-        None,
+        Some(created_at),
     )
 }
 
@@ -273,20 +279,23 @@ pub fn new_exchange_rates_event(
 fn create_rating_tag(reputation_data: Option<(f64, i64, i64)>) -> String {
     if let Some(data) = reputation_data {
         const SECONDS_IN_DAY: u64 = 86400;
-        // If operating day is 0, it means the user is new and we don't have a valid reputation data
-        let days = if data.2 != 0 {
-            let now = Timestamp::now();
-            (now.as_secs() - data.2 as u64) / SECONDS_IN_DAY
-        } else {
-            0
-        };
+        // No real creation date (0, or a corrupt negative value) means no age;
+        // a negative `as u64` cast would underflow the subtraction.
+        let days = u64::try_from(data.2)
+            .ok()
+            .filter(|ts| *ts > 0)
+            .map(|ts| Timestamp::now().as_secs().saturating_sub(ts) / SECONDS_IN_DAY)
+            .unwrap_or(0);
+
+        // `days` stays next to `since` for the deprecation window; `since` is
+        // omitted when the user has no first-trade date.
+        let mut rating = json!({"total_reviews": data.1, "total_rating": data.0, "days": days});
+        if let Some(since) = first_trade_since(data.2) {
+            rating["since"] = json!(since);
+        }
 
         // Create the json string
-        let json_data = json!([
-        "rating",
-            {"total_reviews": data.1, "total_rating": data.0, "days": days}
-        ]);
-        json_data.to_string()
+        json!(["rating", rating]).to_string()
     } else {
         "{}".to_string()
     }
@@ -555,6 +564,12 @@ pub fn order_to_tags(
         if let Some(source) = mostro_link {
             tags.insert(SOURCE_TAG_INDEX, Tag::custom("source", vec![source]));
         }
+        // Cashu orders name the mint the escrow will be locked on, so a taker
+        // sees it before taking the order (issue #1046). Appended after the
+        // positional inserts above.
+        if let Some(mint) = &order.cashu_mint_url {
+            tags.push(Tag::custom("cashu_mint_url", vec![mint.clone()]));
+        }
         Ok(Some(Tags::from_list(tags)))
     } else {
         Ok(None)
@@ -602,21 +617,75 @@ fn invoice_window_tags(ln_settings: &crate::config::LightningSettings) -> [Tag; 
     ]
 }
 
+/// The escrow backend a node runs, as the info event describes it. A node
+/// runs exactly one: Lightning (LND hold invoices, described by the node's
+/// `LnStatus`) or Cashu (NUT-11 escrow on the mint each order names).
+#[derive(Debug, Clone, Copy)]
+pub enum InfoEscrow<'a> {
+    Lightning(&'a LnStatus),
+    Cashu(&'a CashuSettings),
+}
+
 /// Transform mostro info fields to tags
 ///
 /// # Arguments
 ///
 ///
+/// `escrow` selects the escrow-specific tags: LND node stats and invoice
+/// windows for Lightning, the mint and locktime floor for Cashu.
 /// `maintenance` is the current maintenance (drain) flag; the tag is always
 /// emitted so clients can tell "maintenance off" from "older daemon".
-pub fn info_to_tags(ln_status: &LnStatus, maintenance: bool) -> Tags {
+pub fn info_to_tags(escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
+    let settings = crate::config::MOSTRO_CONFIG
+        .get()
+        .expect("No Mostro settings found");
+    info_tags_from_settings(settings, escrow, maintenance)
+}
+
+/// [`info_to_tags`] for the settings passed in, so a unit test can check
+/// what each section contributes, such as the issuer key loaded at startup,
+/// without the process-wide `MOSTRO_CONFIG` OnceLock.
+fn info_tags_from_settings(settings: &Settings, escrow: InfoEscrow<'_>, maintenance: bool) -> Tags {
     build_info_tags(
-        Settings::get_mostro(),
-        Settings::get_ln(),
-        Settings::get_bond(),
-        ln_status,
+        &settings.mostro,
+        &settings.lightning,
+        settings.anti_abuse_bond.as_ref(),
+        Settings::reputation_import_if_enabled(Some(settings)),
+        Settings::reputation_export_if_enabled(Some(settings))
+            .and_then(|export| export.issuer_key()),
+        escrow,
         maintenance,
     )
+}
+
+/// The `reputation_issuer` tag of the info event: the hex key this node
+/// signs reputation attestations with, when export is enabled. Clients send
+/// `export-reputation` only to a node that advertises it, and operators who
+/// trust this node add the key to their trust list.
+fn reputation_issuer_tags(issuer_key: Option<PublicKey>) -> Vec<Tag> {
+    issuer_key
+        .map(|key| Tag::custom("reputation_issuer", vec![key.to_hex()]))
+        .into_iter()
+        .collect()
+}
+
+/// The `reputation_import_issuers` tag of the info event: every key of every
+/// trust-list entry, one value per key, when reputation import is enabled.
+/// Clients send `import-reputation` only to a node that advertises it, so the
+/// tag is present (possibly with no values) exactly when the node imports.
+/// `import` is `None` when the section is absent or disabled.
+fn reputation_import_tags(import: Option<&ReputationImportSettings>) -> Vec<Tag> {
+    import
+        .map(|import| {
+            let keys: Vec<String> = import
+                .trusted_keys()
+                .iter()
+                .map(PublicKey::to_hex)
+                .collect();
+            Tag::custom("reputation_import_issuers", keys)
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Body of [`info_to_tags`] with the settings passed in, so unit tests can
@@ -626,7 +695,9 @@ fn build_info_tags(
     mostro_settings: &MostroSettings,
     ln_settings: &LightningSettings,
     bond_settings: Option<&AntiAbuseBondSettings>,
-    ln_status: &LnStatus,
+    reputation_import: Option<&ReputationImportSettings>,
+    reputation_issuer: Option<PublicKey>,
+    escrow: InfoEscrow<'_>,
     maintenance: bool,
 ) -> Tags {
     let protocol_version = mostro_settings.transport.protocol_version();
@@ -685,32 +756,75 @@ fn build_info_tags(
         // See docs/TRANSPORT_V2_SPEC.md §3.1.
         Tag::custom("protocol_version", vec![protocol_version.to_string()]),
         Tag::custom(
-            "hold_invoice_cltv_delta",
-            vec![ln_settings.hold_invoice_cltv_delta.to_string()],
-        ),
-        Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
-        Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
-        Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
-        Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
-        Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
-        Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
-        Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
-        Tag::custom(
             "y",
             create_platform_tag_values(mostro_settings.name.as_deref()),
         ),
         Tag::custom("z", vec!["info".to_string()]),
     ];
 
-    tags_vec.extend(invoice_window_tags(ln_settings));
+    tags_vec.extend(escrow_tags(escrow, ln_settings));
     tags_vec.extend(bond_policy_tags(bond_settings));
     tags_vec.extend(serbero_tags(mostro_settings));
+    tags_vec.extend(reputation_import_tags(reputation_import));
+    tags_vec.extend(reputation_issuer_tags(reputation_issuer));
     tags_vec.push(Tag::custom(
         "maintenance_mode",
         vec![maintenance.to_string()],
     ));
 
     Tags::from_list(tags_vec)
+}
+
+/// The escrow block of the info event. `escrow_mode` is always emitted so
+/// clients can tell the backend apart before starting a trade; daemons that
+/// predate the tag omit it, which clients treat as `"lightning"`.
+///
+/// Lightning nodes add their LND node stats, the hold-invoice CLTV delta, the
+/// escrow deadline margin and both invoice windows. The margin lets clients
+/// estimate when the escrow-deadline guardian acts on a trade: about
+/// `hold_invoice_cltv_delta - escrow_deadline_margin_blocks` blocks after the
+/// escrow is paid. Cashu nodes have no LND and no invoices, so those
+/// are omitted; they add the mints a maker may choose (all of them when the
+/// tag is absent) and the seller-recovery locktime floor a token must carry
+/// instead.
+fn escrow_tags(escrow: InfoEscrow<'_>, ln_settings: &LightningSettings) -> Vec<Tag> {
+    match escrow {
+        InfoEscrow::Lightning(ln_status) => {
+            let mut tags = vec![
+                Tag::custom("escrow_mode", vec!["lightning".to_string()]),
+                Tag::custom(
+                    "hold_invoice_cltv_delta",
+                    vec![ln_settings.hold_invoice_cltv_delta.to_string()],
+                ),
+                Tag::custom(
+                    "escrow_deadline_margin_blocks",
+                    vec![ln_settings.escrow_deadline_margin_blocks.to_string()],
+                ),
+                Tag::custom("lnd_version", vec![ln_status.version.to_string()]),
+                Tag::custom("lnd_node_pubkey", vec![ln_status.node_pubkey.to_string()]),
+                Tag::custom("lnd_commit_hash", vec![ln_status.commit_hash.to_string()]),
+                Tag::custom("lnd_node_alias", vec![ln_status.node_alias.to_string()]),
+                Tag::custom("lnd_chains", vec![ln_status.chains.join(",")]),
+                Tag::custom("lnd_networks", vec![ln_status.networks.join(",")]),
+                Tag::custom("lnd_uris", vec![ln_status.uris.join(",")]),
+            ];
+            tags.extend(invoice_window_tags(ln_settings));
+            tags
+        }
+        InfoEscrow::Cashu(cashu) => {
+            let mut tags = vec![Tag::custom("escrow_mode", vec!["cashu".to_string()])];
+            // Every mint a maker may choose, one per tag value. Omitted on an
+            // open node (`mint_urls = []`), which accepts any mint.
+            if !cashu.mint_urls.is_empty() {
+                tags.push(Tag::custom("cashu_mint_url", cashu.mint_urls.clone()));
+            }
+            tags.push(Tag::custom(
+                "cashu_escrow_locktime_days",
+                vec![cashu.escrow_locktime_days.to_string()],
+            ));
+            tags
+        }
+    }
 }
 
 /// The `serbero` tag of the info event: the hex pubkey of the node's
@@ -788,6 +902,7 @@ mod tests {
     use super::create_status_tags;
     use super::{info_to_tags, order_to_tags};
     use crate::app::context::test_utils::test_settings;
+    use crate::config::types::ReputationImportSettings;
     use crate::config::MOSTRO_CONFIG;
     use crate::lightning::LnStatus;
     use mostro_core::prelude::*;
@@ -1129,7 +1244,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         assert!(get_tag_value(&tags, "invoice_expiration_window").is_some());
         assert!(get_tag_value(&tags, "hold_invoice_expiration_window").is_some());
@@ -1140,7 +1255,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -1152,7 +1267,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         let y_values = get_y_tag_values(&tags).expect("info_to_tags must emit a y tag");
 
@@ -1173,7 +1288,7 @@ mod tests {
     fn info_to_tags_emits_maintenance_mode_false_by_default() {
         init_test_settings();
         let ln_status = make_ln_status();
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
         assert_eq!(
             tag_value(&tags, "maintenance_mode").as_deref(),
             Some("false")
@@ -1184,7 +1299,7 @@ mod tests {
     fn info_to_tags_emits_maintenance_mode_true_when_enabled() {
         init_test_settings();
         let ln_status = make_ln_status();
-        let tags = info_to_tags(&ln_status, true);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), true);
         assert_eq!(
             tag_value(&tags, "maintenance_mode").as_deref(),
             Some("true")
@@ -1199,15 +1314,74 @@ mod tests {
         let keys = Keys::generate();
         let id = keys.public_key().to_string();
         let ln_status = make_ln_status();
-        let first =
-            super::new_info_event(&keys, "", id.clone(), info_to_tags(&ln_status, false)).unwrap();
-        let second = super::new_info_event(&keys, "", id, info_to_tags(&ln_status, true)).unwrap();
+        let first = super::new_info_event(
+            &keys,
+            "",
+            id.clone(),
+            info_to_tags(super::InfoEscrow::Lightning(&ln_status), false),
+        )
+        .unwrap();
+        let second = super::new_info_event(
+            &keys,
+            "",
+            id,
+            info_to_tags(super::InfoEscrow::Lightning(&ln_status), true),
+        )
+        .unwrap();
         assert!(
             second.created_at > first.created_at,
             "{} !> {}",
             second.created_at,
             first.created_at
         );
+    }
+
+    #[test]
+    fn rating_events_strictly_order_consecutive_revisions() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        let events: Vec<_> = (1..=16)
+            .map(|reviews| {
+                super::new_rating_event(
+                    &keys,
+                    "",
+                    id.clone(),
+                    Tags::from_list(vec![Tag::custom("total_reviews", [reviews.to_string()])]),
+                )
+                .unwrap()
+            })
+            .collect();
+        for pair in events.windows(2) {
+            assert!(
+                pair[1].created_at > pair[0].created_at,
+                "a newer aggregate must supersede the previous rating event"
+            );
+        }
+    }
+
+    #[test]
+    fn rating_events_keep_independent_authors_and_trade_keys() {
+        init_test_settings();
+        let keys = Keys::generate();
+        let other_node = Keys::generate();
+        let id = Keys::generate().public_key().to_hex();
+        for _ in 0..16 {
+            super::new_rating_event(&keys, "", id.clone(), Tags::new()).unwrap();
+        }
+        let before = Timestamp::now();
+        let other_trade = super::new_rating_event(
+            &keys,
+            "",
+            Keys::generate().public_key().to_hex(),
+            Tags::new(),
+        )
+        .unwrap();
+        let other_author = super::new_rating_event(&other_node, "", id, Tags::new()).unwrap();
+        let after = Timestamp::now();
+        for event in [other_trade, other_author] {
+            assert!((before..=after).contains(&event.created_at));
+        }
     }
 
     #[test]
@@ -1222,7 +1396,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         // Expectations come from the settings actually installed in
         // `MOSTRO_CONFIG`, never from this module's `test_settings()` copy:
@@ -1294,11 +1468,349 @@ mod tests {
             &settings.mostro,
             &settings.lightning,
             settings.anti_abuse_bond.as_ref(),
-            &make_ln_status(),
+            None,
+            None,
+            super::InfoEscrow::Lightning(&make_ln_status()),
             false,
         );
 
         assert_eq!(get_tag_value(&tags, "serbero"), Some(serbero.to_hex()));
+    }
+
+    fn trust_list(entries: &[(&str, Vec<String>)]) -> ReputationImportSettings {
+        ReputationImportSettings {
+            enabled: true,
+            issuers: entries
+                .iter()
+                .map(|(name, keys)| crate::config::types::ReputationIssuer {
+                    name: name.to_string(),
+                    keys: keys.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Tags that only describe an LND node or its invoices. A Cashu node has
+    /// neither, so none of them may appear in its info event.
+    const LIGHTNING_ONLY_TAGS: [&str; 11] = [
+        "lnd_version",
+        "lnd_node_pubkey",
+        "lnd_commit_hash",
+        "lnd_node_alias",
+        "lnd_chains",
+        "lnd_networks",
+        "lnd_uris",
+        "hold_invoice_cltv_delta",
+        "escrow_deadline_margin_blocks",
+        "invoice_expiration_window",
+        "hold_invoice_expiration_window",
+    ];
+
+    fn make_cashu_settings() -> crate::config::types::CashuSettings {
+        crate::config::types::CashuSettings {
+            enabled: true,
+            mint_urls: vec!["https://mint.example.com".to_string()],
+            escrow_locktime_days: 21,
+        }
+    }
+
+    /// Every value of the first tag called `name`.
+    fn get_tag_values(tags: &Tags, name: &str) -> Option<Vec<String>> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            (vec.first().map(String::as_str) == Some(name)).then(|| vec[1..].to_vec())
+        })
+    }
+
+    #[test]
+    fn cashu_info_event_lists_every_allowed_mint() {
+        let settings = test_settings();
+        let mut cashu = make_cashu_settings();
+        cashu.mint_urls = vec![
+            "https://mint.example.com".to_string(),
+            "https://mint.example2.com".to_string(),
+        ];
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            None,
+            None,
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(
+            get_tag_values(&tags, "cashu_mint_url"),
+            Some(vec![
+                "https://mint.example.com".to_string(),
+                "https://mint.example2.com".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn open_cashu_node_omits_the_mint_tag() {
+        // An empty allow-list accepts any mint; the absent tag says so.
+        let settings = test_settings();
+        let mut cashu = make_cashu_settings();
+        cashu.mint_urls.clear();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            None,
+            None,
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "escrow_mode"), Some("cashu".into()));
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+        assert!(get_tag_value(&tags, "cashu_escrow_locktime_days").is_some());
+    }
+
+    #[test]
+    fn cashu_order_event_names_its_mint() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.cashu_mint_url = Some("https://mint.example2.com".to_string());
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        assert_eq!(
+            get_tag_value(&tags, "cashu_mint_url"),
+            Some("https://mint.example2.com".into())
+        );
+    }
+
+    #[test]
+    fn lightning_order_event_has_no_mint_tag() {
+        init_test_settings();
+        let order = make_pending_order();
+
+        let tags = order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .expect("order_to_tags must not error")
+            .expect("pending order must produce Some(tags)");
+
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+    }
+
+    #[test]
+    fn cashu_info_event_advertises_escrow_mode_and_mint() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            None,
+            None,
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        assert_eq!(get_tag_value(&tags, "escrow_mode"), Some("cashu".into()));
+        assert_eq!(
+            get_tag_value(&tags, "cashu_mint_url"),
+            Some("https://mint.example.com".into())
+        );
+        assert_eq!(
+            get_tag_value(&tags, "cashu_escrow_locktime_days"),
+            Some("21".into())
+        );
+        // The mode-agnostic tags clients need to talk to the node are kept.
+        for name in ["protocol_version", "pow_first_contact", "fee", "z"] {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn reputation_import_tag_lists_every_trusted_key_in_hex() {
+        let (a, b, c) = (
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+        );
+        let import = trust_list(&[
+            ("lnp2pbot", vec![a.to_bech32().unwrap()]),
+            ("other-mostro", vec![b.to_hex(), c.to_bech32().unwrap()]),
+        ]);
+        let tags = super::reputation_import_tags(Some(&import));
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags[0].clone().to_vec(),
+            vec![
+                "reputation_import_issuers".to_string(),
+                a.to_hex(),
+                b.to_hex(),
+                c.to_hex()
+            ]
+        );
+    }
+
+    #[test]
+    fn reputation_import_tag_is_present_but_empty_with_an_empty_trust_list() {
+        let tags = super::reputation_import_tags(Some(&trust_list(&[])));
+        assert_eq!(
+            tags[0].clone().to_vec(),
+            vec!["reputation_import_issuers".to_string()]
+        );
+    }
+
+    /// The info event itself carries the tag when import is enabled, and
+    /// leaves it out otherwise; `info_to_tags` passes only an enabled
+    /// section (`Settings::get_reputation_import`).
+    #[test]
+    fn info_event_advertises_reputation_import_only_when_enabled() {
+        let settings = test_settings();
+        let key = Keys::generate().public_key();
+        let import = trust_list(&[("lnp2pbot", vec![key.to_hex()])]);
+        let build = |import| {
+            super::build_info_tags(
+                &settings.mostro,
+                &settings.lightning,
+                settings.anti_abuse_bond.as_ref(),
+                import,
+                None,
+                super::InfoEscrow::Lightning(&make_ln_status()),
+                false,
+            )
+        };
+        assert_eq!(
+            get_tag_value(&build(Some(&import)), "reputation_import_issuers"),
+            Some(key.to_hex())
+        );
+        assert_eq!(
+            get_tag_value(&build(None), "reputation_import_issuers"),
+            None
+        );
+    }
+
+    #[test]
+    fn cashu_info_event_omits_lightning_only_tags() {
+        let settings = test_settings();
+        let cashu = make_cashu_settings();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            None,
+            None,
+            super::InfoEscrow::Cashu(&cashu),
+            false,
+        );
+
+        for name in LIGHTNING_ONLY_TAGS {
+            assert_eq!(get_tag_value(&tags, name), None, "unexpected {name}");
+        }
+    }
+
+    #[test]
+    fn lightning_info_event_advertises_escrow_mode_and_keeps_ln_tags() {
+        let settings = test_settings();
+        let ln_status = make_ln_status();
+
+        let tags = super::build_info_tags(
+            &settings.mostro,
+            &settings.lightning,
+            settings.anti_abuse_bond.as_ref(),
+            None,
+            None,
+            super::InfoEscrow::Lightning(&ln_status),
+            false,
+        );
+
+        assert_eq!(
+            get_tag_value(&tags, "escrow_mode"),
+            Some("lightning".into())
+        );
+        for name in LIGHTNING_ONLY_TAGS {
+            assert!(get_tag_value(&tags, name).is_some(), "missing {name}");
+        }
+        assert_eq!(
+            get_tag_value(&tags, "escrow_deadline_margin_blocks"),
+            Some(settings.lightning.escrow_deadline_margin_blocks.to_string())
+        );
+        assert_eq!(get_tag_value(&tags, "cashu_mint_url"), None);
+        assert_eq!(get_tag_value(&tags, "cashu_escrow_locktime_days"), None);
+    }
+
+    #[test]
+    fn info_event_names_the_issuer_key_only_when_export_is_enabled() {
+        let settings = test_settings();
+        let issuer = Keys::generate().public_key();
+        let build = |issuer| {
+            super::build_info_tags(
+                &settings.mostro,
+                &settings.lightning,
+                settings.anti_abuse_bond.as_ref(),
+                None,
+                issuer,
+                super::InfoEscrow::Lightning(&make_ln_status()),
+                false,
+            )
+        };
+        assert_eq!(
+            get_tag_value(&build(Some(issuer)), "reputation_issuer"),
+            Some(issuer.to_hex())
+        );
+        assert_eq!(get_tag_value(&build(None), "reputation_issuer"), None);
+    }
+
+    /// Through the path `info_to_tags` takes: the issuer key loaded into the
+    /// settings at startup is the one advertised, and only while export is
+    /// enabled; likewise the trust list only while import is enabled.
+    #[test]
+    fn info_tags_advertise_the_reputation_sections_of_the_settings() {
+        use crate::config::types::{ReputationExportSettings, ReputationIssuer};
+        let issuer = Keys::generate();
+        let trusted = Keys::generate().public_key();
+        let mut settings = test_settings();
+        settings.reputation_export = Some(ReputationExportSettings {
+            enabled: true,
+            issuer_keys: Some(issuer.clone()),
+            ..Default::default()
+        });
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![ReputationIssuer {
+                name: "other-mostro".to_string(),
+                keys: vec![trusted.to_hex()],
+            }],
+            ..Default::default()
+        });
+        let ln_status = make_ln_status();
+        let tags = |settings: &crate::config::settings::Settings| {
+            super::info_tags_from_settings(
+                settings,
+                super::InfoEscrow::Lightning(&ln_status),
+                false,
+            )
+        };
+
+        let enabled = tags(&settings);
+        assert_eq!(
+            get_tag_value(&enabled, "reputation_issuer"),
+            Some(issuer.public_key().to_hex())
+        );
+        assert_eq!(
+            get_tag_value(&enabled, "reputation_import_issuers"),
+            Some(trusted.to_hex())
+        );
+
+        settings.reputation_export.as_mut().unwrap().enabled = false;
+        settings.reputation_import.as_mut().unwrap().enabled = false;
+        let disabled = tags(&settings);
+        assert_eq!(get_tag_value(&disabled, "reputation_issuer"), None);
+        assert_eq!(get_tag_value(&disabled, "reputation_import_issuers"), None);
     }
 
     #[test]
@@ -1381,7 +1893,7 @@ mod tests {
         init_test_settings();
         let ln_status = make_ln_status();
 
-        let tags = info_to_tags(&ln_status, false);
+        let tags = info_to_tags(super::InfoEscrow::Lightning(&ln_status), false);
 
         assert_eq!(
             get_tag_value(&tags, "bond_enabled").as_deref(),
@@ -1781,6 +2293,35 @@ mod tests {
 
         // No reputation data at all → placeholder object.
         assert_eq!(super::create_rating_tag(None), "{}");
+    }
+
+    #[test]
+    fn create_rating_tag_publishes_day_truncated_since_next_to_days() {
+        // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+        let json = super::create_rating_tag(Some((4.5, 12, 1_700_000_000)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value[0], "rating");
+        assert_eq!(value[1]["since"], 1_699_920_000u64);
+        // `days` stays for the deprecation window.
+        assert!(value[1]["days"].as_u64().is_some());
+    }
+
+    #[test]
+    fn create_rating_tag_omits_since_without_a_first_trade_date() {
+        // created_at == 0: publishing `since: 0` would read as 1 January 1970.
+        let json = super::create_rating_tag(Some((0.0, 0, 0)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value[1].get("since").is_none());
+        assert_eq!(value[1]["days"], 0);
+    }
+
+    #[test]
+    fn create_rating_tag_gives_no_age_for_a_negative_creation_date() {
+        // A corrupt negative created_at must not underflow into a huge `days`.
+        let json = super::create_rating_tag(Some((4.0, 3, -1)));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value[1].get("since").is_none());
+        assert_eq!(value[1]["days"], 0);
     }
 
     // ── create_fiat_amt_array ────────────────────────────────────────────

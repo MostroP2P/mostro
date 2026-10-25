@@ -165,15 +165,18 @@ async fn admin_settle_action_with_settle(
     // release_action). `?` stays: without this write `claim_order_payout` cannot
     // claim (it requires `settled-hold-invoice`), so carrying on would not pay
     // the buyer anyway, and the solver is better told.
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status = ?")
-            .bind(&order_updated.status)
-            .bind(&order_updated.event_id)
-            .bind(order_updated.id)
-            .bind(Status::Dispute.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query(
+        "UPDATE orders SET status = ?, event_id = ?, hold_settled_at = ? \
+             WHERE id = ? AND status = ?",
+    )
+    .bind(&order_updated.status)
+    .bind(&order_updated.event_id)
+    .bind(chrono::Utc::now().timestamp())
+    .bind(order_updated.id)
+    .bind(Status::Dispute.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // A miss means another path owns the transition and completes the payout —
     // but not the solver's `BondResolution`: `release_action` releases the taker

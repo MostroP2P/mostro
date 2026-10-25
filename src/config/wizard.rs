@@ -77,6 +77,10 @@ fn run_setup_wizard(settings_dir: &Path, config_file_path: &Path) -> Result<Sett
         anti_abuse_bond: None,
         cashu: None,
         price: None,
+        reputation_import: None,
+        payer_history: None,
+        health: Default::default(),
+        reputation_export: None,
     };
 
     let toml_content = toml::to_string_pretty(&settings)

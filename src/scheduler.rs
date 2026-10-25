@@ -1,7 +1,7 @@
 use crate::app::bond;
 use crate::app::cancel::{cancel_escrow_idempotent, decide_escrow_cancel, EscrowCancelDecision};
 use crate::app::context::AppContext;
-use crate::app::dev_fee::run_dev_fee_cycle;
+use crate::app::dev_fee::{dev_fee_payments_enabled, run_dev_fee_cycle};
 use crate::app::release::{do_payment, reconcile_inflight_payout};
 use crate::config;
 use crate::db::*;
@@ -39,6 +39,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // that has no LND. Lightning mode is unaffected (`is_cashu_enabled()` is
     // `false`, so every job below still starts exactly as before).
     if !Settings::is_cashu_enabled() {
+        job_lnd_sync_monitor(ctx.clone()).await;
         job_cancel_orders(ctx.clone()).await;
         job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
@@ -50,9 +51,10 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
-    // Mode-agnostic jobs (the info event self-skips when LN status is absent).
+    // Mode-agnostic jobs.
     job_orderbook_reconciler(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
+    job_health_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
     job_update_bitcoin_prices().await;
     job_flush_messages_queue(ctx.clone()).await;
@@ -221,12 +223,17 @@ async fn job_info_event_send(ctx: AppContext) {
     let client = ctx.nostr_client().clone();
     let maintenance = ctx.maintenance().clone();
     let interval = ctx.settings().mostro.publish_mostro_info_interval as u64;
-    // The info event embeds LN node stats (`info_to_tags`). In Cashu mode there
-    // is no LND, so `LN_STATUS` is never set — skip the job rather than panic
-    // on `unwrap()`. A Cashu-aware info event is future work (CF-5).
-    let Some(ln_status) = LN_STATUS.get() else {
-        info!("Skipping mostro info event: no LN status (Cashu mode)");
-        return;
+    // A node runs exactly one escrow backend; the info event advertises it.
+    // Cashu mode has no LND, so it describes the mint instead of `LN_STATUS`.
+    let escrow = match Settings::get_cashu().filter(|cashu| cashu.enabled) {
+        Some(cashu) => crate::nip33::InfoEscrow::Cashu(cashu),
+        None => match LN_STATUS.get() {
+            Some(ln_status) => crate::nip33::InfoEscrow::Lightning(ln_status),
+            None => {
+                warn!("Skipping mostro info event: Lightning mode without LN status");
+                return;
+            }
+        },
     };
     tokio::spawn(async move {
         loop {
@@ -237,7 +244,7 @@ async fn job_info_event_send(ctx: AppContext) {
                 info!("Sending info about mostro");
             }
 
-            let tags = crate::nip33::info_to_tags(ln_status, in_maintenance);
+            let tags = crate::nip33::info_to_tags(escrow, in_maintenance);
             let id = mostro_keys.public_key().to_string();
 
             let info_ev = match crate::nip33::new_info_event(&mostro_keys, "", id, tags) {
@@ -256,6 +263,89 @@ async fn job_info_event_send(ctx: AppContext) {
     });
 }
 
+/// Poll LND's `GetInfo` every `LND_SYNC_POLL_SECS` into `ctx.lnd_sync()`,
+/// and apply the fail-closed maintenance rule (#1063). See
+/// [`crate::app::health::lnd_sync`].
+#[mutants::skip]
+async fn job_lnd_sync_monitor(ctx: AppContext) {
+    use crate::app::health::lnd_sync::{
+        apply_auto_maintenance, log_transition, record_deferral_transition, LndObservation,
+        LND_SYNC_POLL_SECS,
+    };
+    // Bounded so a hung LND counts as unreachable instead of stalling the
+    // monitor (and with it, the deferral of outgoing payments).
+    const GET_INFO_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+    tokio::spawn(async move {
+        let mut ln_client: Option<LndConnector> = None;
+        // Whether payments were deferred at the previous poll; `false` at
+        // start so a spell already open (seeded at startup) is persisted.
+        let mut was_deferring = false;
+        loop {
+            if ln_client.is_none() {
+                match LndConnector::new().await {
+                    Ok(client) => ln_client = Some(client),
+                    Err(e) => warn!("LND sync monitor: cannot connect to LND: {e}"),
+                }
+            }
+            let info = match ln_client.as_mut() {
+                Some(client) => {
+                    match tokio::time::timeout(GET_INFO_TIMEOUT, client.get_node_info()).await {
+                        Ok(Ok(info)) => Some(info),
+                        Ok(Err(e)) => {
+                            warn!("LND sync monitor: GetInfo failed: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            warn!(
+                                "LND sync monitor: GetInfo did not answer within {}s",
+                                GET_INFO_TIMEOUT.as_secs()
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let now = Utc::now().timestamp();
+            let transition = match &info {
+                Some(info) => ctx.lnd_sync().observe(LndObservation::from(info), now),
+                None => {
+                    // Reconnect on the next poll: a broken channel must not
+                    // leave the monitor reporting "unreachable" forever.
+                    ln_client = None;
+                    ctx.lnd_sync().observe_unreachable(now)
+                }
+            };
+            let snapshot = ctx.lnd_sync().snapshot();
+            if let Some(transition) = transition {
+                log_transition(transition, &snapshot);
+            }
+            // The spell's start and end are persisted so a restart does not
+            // forget it (#1065 review): on failure, keep the last known value
+            // and try again at the next transition.
+            match record_deferral_transition(ctx.pool(), &snapshot, was_deferring, now).await {
+                Ok(is_deferring) => was_deferring = is_deferring,
+                Err(e) => warn!("LND sync monitor: could not persist the deferral history: {e}"),
+            }
+
+            if let Err(e) = apply_auto_maintenance(&ctx, now).await {
+                error!("Automatic maintenance on LND sync failed: {e}");
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(LND_SYNC_POLL_SECS)).await;
+        }
+    });
+}
+
+/// Publish the health event (kind 38389) every `[health].interval`, and at
+/// once on a state change. See [`crate::app::health::publisher`].
+#[mutants::skip]
+async fn job_health_event_send(ctx: AppContext) {
+    tokio::spawn(crate::app::health::publisher::run_health_publisher(ctx));
+}
+
 async fn job_retry_failed_payments(ctx: AppContext) {
     let ln_settings = &ctx.settings().lightning;
     let retries_number = ln_settings.payment_attempts as i64;
@@ -267,6 +357,20 @@ async fn job_retry_failed_payments(ctx: AppContext) {
                 "I run async every {} seconds - checking for failed lightning payment",
                 interval
             );
+
+            // While our own node cannot pay, a retry would only fail and burn
+            // the buyer's attempts (#1063). `do_payment` defers too; skipping
+            // the whole pass here just keeps the logs quiet.
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!(
+                    "Skipping failed payment retries: LND is not synced to chain or not reachable"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
 
             if let Ok(payment_failed_list) = crate::db::find_failed_payment(ctx.pool()).await {
                 for payment_failed in payment_failed_list.into_iter() {
@@ -355,6 +459,22 @@ async fn job_reconcile_inflight_payouts(ctx: AppContext) {
     });
 }
 
+/// Publish one rating-event batch. The callback keeps queue concurrency
+/// testable independently of relay timing and connectivity.
+async fn flush_rating_events<F, Fut>(queue: &RwLock<Vec<nostr_sdk::prelude::Event>>, mut send: F)
+where
+    F: FnMut(nostr_sdk::prelude::Event) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Detach this batch before any network await. A producer can enqueue
+    // the next batch while sends are in progress, without a later clear()
+    // deleting events that this cycle never sent.
+    let batch = std::mem::take(&mut *queue.write().await);
+    for event in batch {
+        send(event).await;
+    }
+}
+
 async fn job_update_rate_events(ctx: AppContext) {
     // Clone for closure owning with Arc
     let queue_order_rate = MESSAGE_QUEUES.queue_order_rate.clone();
@@ -369,13 +489,13 @@ async fn job_update_rate_events(ctx: AppContext) {
                 interval / 60
             );
 
-            for ev in queue_order_rate.read().await.iter() {
-                // Send event to relay
-                let _ = client.send_event(&ev.clone()).await;
-            }
-
-            // Clear list after send events
-            queue_order_rate.write().await.clear();
+            flush_rating_events(&queue_order_rate, |ev| {
+                let client = &client;
+                async move {
+                    let _ = client.send_event(&ev).await;
+                }
+            })
+            .await;
 
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(
@@ -825,11 +945,13 @@ async fn job_cancel_orders(ctx: AppContext) {
 /// Guardian for the trade escrow's CLTV lifetime.
 ///
 /// A trade's escrow is a hold invoice whose HTLC LND auto-cancels
-/// `invoices.holdexpirydelta` blocks (default 12) before its CLTV expiry,
+/// `invoices.holdexpirydelta` blocks (default
+/// [`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+/// before its CLTV expiry,
 /// refunding the seller — while the order still reads `active` /
 /// `fiat-sent` and the buyer may still send (or already sent) the fiat
 /// leg. No other job covers those states, so without this pass the escrow
-/// silently evaporates ~`hold_invoice_cltv_delta - 12` blocks after the
+/// silently evaporates ~`hold_invoice_cltv_delta - holdexpirydelta` blocks after the
 /// seller paid (~22 h on defaults) and the trade can no longer settle:
 /// the buyer loses the fiat and the seller keeps both the fiat and the
 /// refunded sats.
@@ -1508,6 +1630,17 @@ async fn job_update_bitcoin_prices() {
 async fn job_process_dev_fee_payment(ctx: AppContext) {
     let interval = 60u64;
 
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        return info!(
+            "Lightning node is not on mainnet (networks: {:?}); dev fee payments are disabled",
+            networks
+        );
+    }
+
     let mut ln_client = if let Ok(client) = LndConnector::new().await {
         client
     } else {
@@ -1525,12 +1658,21 @@ async fn job_process_dev_fee_payment(ctx: AppContext) {
         let pool = ctx.pool();
         let keys = ctx.keys();
         loop {
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!("Skipping dev fee cycle: LND is not synced to chain or not reachable");
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
             run_dev_fee_cycle(
                 pool,
                 &mut ln_client,
                 &mut confirmed,
                 &mut unverifiable,
                 keys,
+                ctx.lnd_sync(),
             )
             .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
@@ -1577,7 +1719,15 @@ async fn job_process_bond_payouts(ctx: AppContext) {
 
         let pool = ctx.pool();
         loop {
-            bond::run_bond_payout_cycle(pool, &mut ln_client).await;
+            if ctx
+                .lnd_sync()
+                .defers_outgoing_payments(Utc::now().timestamp())
+            {
+                warn!("Skipping bond payout cycle: LND is not synced to chain or not reachable");
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                continue;
+            }
+            bond::run_bond_payout_cycle(pool, &mut ln_client, ctx.lnd_sync()).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });
@@ -2514,20 +2664,74 @@ mod tests {
 
     #[tokio::test]
     async fn rate_events_job_drains_the_rate_queue() {
-        let ctx = migrated_ctx().await;
-        // Seed a signed dummy event; the job publishes (best-effort, no
-        // relays) and clears the queue.
         let keys = nostr_sdk::prelude::Keys::generate();
         let event = nostr_sdk::prelude::EventBuilder::new(nostr::event::Kind::TextNote, "rate")
             .finalize(&keys)
             .unwrap();
-        MESSAGE_QUEUES.queue_order_rate.write().await.push(event);
+        let queue = RwLock::new(vec![event.clone()]);
+        let mut sent = Vec::new();
+        flush_rating_events(&queue, |ev| {
+            sent.push(ev.id);
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(sent, vec![event.id]);
+        assert!(queue.read().await.is_empty());
+    }
 
-        tokio::time::pause();
-        job_update_rate_events(ctx).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    #[tokio::test]
+    async fn rate_events_enqueued_during_a_flush_survive_for_the_next_batch() {
+        let event = |content| {
+            EventBuilder::new(NostrKind::TextNote, content)
+                .finalize(&Keys::generate())
+                .unwrap()
+        };
+        let first = event("first batch");
+        let second = event("next batch");
+        let queue = Arc::new(RwLock::new(vec![first.clone()]));
+        let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let flush = {
+            let queue = queue.clone();
+            let sent = sent.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                flush_rating_events(&queue, |ev| {
+                    let sent = sent.clone();
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        sent.lock().await.push(ev.id);
+                    }
+                })
+                .await;
+            })
+        };
+        started.notified().await;
 
-        assert!(MESSAGE_QUEUES.queue_order_rate.read().await.is_empty());
+        // Poll once while the first event is being sent. With the old read
+        // lock this writer queues ahead of the scheduler's final clear().
+        let mut enqueue = Box::pin(async { queue.write().await.push(second.clone()) });
+        let waiting = futures::poll!(enqueue.as_mut()).is_pending();
+        release.notify_one();
+        if waiting {
+            enqueue.await;
+        }
+        flush.await.unwrap();
+
+        assert_eq!(*sent.lock().await, vec![first.id]);
+        assert_eq!(queue.read().await.as_slice(), std::slice::from_ref(&second));
+        flush_rating_events(&queue, |ev| {
+            let sent = sent.clone();
+            async move { sent.lock().await.push(ev.id) }
+        })
+        .await;
+        assert_eq!(*sent.lock().await, vec![first.id, second.id]);
+        assert!(queue.read().await.is_empty());
     }
 
     #[tokio::test]

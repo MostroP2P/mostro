@@ -20,10 +20,11 @@ use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions, TagKind};
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, CurrencyUnit, PublicKey, SigFlag, State, Token,
 };
+use cdk::wallet::BaseHttpClient;
 use cdk::wallet::MintConnector;
-use cdk::HttpClient;
+use transport::MintTransport;
 
-/// Per-request bound on every mint HTTP call. `HttpClient` wraps a
+/// Per-request bound on every mint HTTP call. The HTTP client wraps a
 /// `reqwest` client with **no default timeout**, so without this a slow or
 /// unreachable mint could hang `connect`, `check_state` or the DLEQ keyset
 /// fetch indefinitely, stranding the calling handler.
@@ -69,7 +70,35 @@ impl From<CdkClientError> for Error {
 #[derive(Clone)]
 pub struct CashuClient {
     mint_url: MintUrl,
-    client: HttpClient,
+    client: BaseHttpClient<MintTransport>,
+}
+
+/// Whether the mint at `mint_url` answers its NUT-06 info endpoint
+/// (`GET /v1/info`) with a success status within [`MINT_REQUEST_TIMEOUT`].
+/// With `pinned`, the request goes to that address instead of resolving the
+/// host again (see [`CashuClient::connect_pinned`]). The health event's
+/// `cashu_mint` check (#1063).
+pub async fn mint_answers_info(mint_url: &str, pinned: Option<std::net::SocketAddr>) -> bool {
+    let Ok(url) = MintUrl::from_str(mint_url) else {
+        return false;
+    };
+    let transport = match pinned {
+        None => MintTransport::default(),
+        Some(addr) => {
+            let host = reqwest::Url::parse(mint_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string));
+            match host.map(|host| MintTransport::pinned(&host, addr)) {
+                Some(Ok(transport)) => transport,
+                _ => return false,
+            }
+        }
+    };
+    let client = BaseHttpClient::with_transport(url, transport, None);
+    matches!(
+        tokio::time::timeout(MINT_REQUEST_TIMEOUT, client.get_mint_info()).await,
+        Ok(Ok(_))
+    )
 }
 
 impl CashuClient {
@@ -84,9 +113,26 @@ impl CashuClient {
     /// serve other units are fine — the per-proof keyset-unit check in
     /// [`Self::verify_token_dleq`] keeps foreign-unit tokens out).
     pub async fn connect(mint_url: &str) -> Result<Self, Error> {
+        Self::connect_with(mint_url, MintTransport::default()).await
+    }
+
+    /// [`Self::connect`], with every request for the mint's host sent to
+    /// `addr` instead of resolving the name again. An open node uses it for
+    /// mints a maker chose, pinned to the address its host check accepted
+    /// (DNS rebinding, see [`transport`]).
+    pub async fn connect_pinned(mint_url: &str, addr: std::net::SocketAddr) -> Result<Self, Error> {
+        let host = reqwest::Url::parse(mint_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .ok_or_else(|| Error::InvalidMintUrl(format!("{mint_url}: no host")))?;
+        let transport = MintTransport::pinned(&host, addr).map_err(Error::Client)?;
+        Self::connect_with(mint_url, transport).await
+    }
+
+    async fn connect_with(mint_url: &str, transport: MintTransport) -> Result<Self, Error> {
         let url = MintUrl::from_str(mint_url).map_err(|e| Error::InvalidMintUrl(e.to_string()))?;
 
-        let client = HttpClient::new(url.clone(), None);
+        let client = BaseHttpClient::with_transport(url.clone(), transport, None);
         let cashu_client = Self {
             mint_url: url,
             client,
@@ -130,13 +176,21 @@ impl CashuClient {
         Ok(cashu_client)
     }
 
-    /// The mint URL this client is bound to.
-    ///
-    /// Track A's lock handler reads this to persist the order's
-    /// `cashu_mint_url` and to assert the seller's token was minted by the
-    /// operator-configured mint.
+    /// The mint URL this client is bound to. Token validation asserts the
+    /// seller's token was minted by it.
     pub fn mint_url(&self) -> &MintUrl {
         &self.mint_url
+    }
+
+    /// A client bound to `mint_url` that skips [`Self::connect`]'s network
+    /// checks, for tests that never reach the mint.
+    #[cfg(test)]
+    pub(crate) fn offline(mint_url: &str) -> Self {
+        let url = MintUrl::from_str(mint_url).expect("valid mint url");
+        Self {
+            mint_url: url.clone(),
+            client: BaseHttpClient::with_transport(url, MintTransport::default(), None),
+        }
     }
 
     /// Verify the escrow spending condition on every proof of a token
@@ -587,6 +641,10 @@ pub fn cashu_pubkey_from_xonly_hex(xonly_hex: &str) -> Result<PublicKey, Error> 
     PublicKey::from_hex(format!("02{xonly_hex}"))
         .map_err(|e| Error::Condition(format!("pubkey convert: {e}")))
 }
+
+pub mod mint_policy;
+pub mod mints;
+pub mod transport;
 
 /// Mint-backed end-to-end harness for the TA-1 escrow lock — `#[ignore]`d and
 /// env-gated, so it never runs in a plain `cargo test`.
@@ -1096,7 +1154,7 @@ mod tests {
         let url = MintUrl::from_str(mint_url).expect("valid mint url");
         CashuClient {
             mint_url: url.clone(),
-            client: HttpClient::new(url, None),
+            client: BaseHttpClient::with_transport(url, MintTransport::default(), None),
         }
     }
 

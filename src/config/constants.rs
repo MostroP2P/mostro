@@ -5,8 +5,35 @@ pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;
 /// Maximum development fee percentage (100% of Mostro fee)
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;
 
-/// Official Mostro development Lightning Address
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "pivotaldeborah52@walletofsatoshi.com";
+/// LND's default `invoices.holdexpirydelta`: LND auto-cancels an accepted
+/// hold invoice this many blocks before its HTLC expires, refunding the
+/// seller. `escrow_deadline_margin_blocks` must be above it, or LND refunds
+/// the escrow before the deadline guardian acts.
+pub const LND_DEFAULT_HOLD_EXPIRY_DELTA: u32 = 12;
+
+/// Blocks the escrow-deadline guardian keeps between its own action and
+/// LND's auto-cancel. The guardian ticks every 300 s, so with a single
+/// block of headroom LND wins the race about 1 in 5 times; the headroom
+/// also gives a solver time to settle a `fiat-sent` trade the guardian
+/// escalated to dispute.
+pub const MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS: u32 = 6;
+
+/// Smallest `escrow_deadline_margin_blocks` mostrod starts with. It assumes
+/// LND's default `holdexpirydelta`; mostrod cannot read the node's real
+/// value yet (#1058).
+pub const MIN_ESCROW_DEADLINE_MARGIN_BLOCKS: u32 =
+    LND_DEFAULT_HOLD_EXPIRY_DELTA + MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS;
+
+/// Ceiling on `[reputation_import] max_lifetime_seconds` (30 days). The cap
+/// keeps a faulty or compromised issuer from minting attestations that live
+/// for years, so a value above this (e.g. a digit too many on the 7-day
+/// default) stops the load instead of loading silently.
+pub const MAX_REPUTATION_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Official Mostro development Lightning Address.
+/// Self-custodial and served from a domain the project controls, so the
+/// backend behind it can change without a mostrod release.
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@pay.mostro.foundation";
 
 /// Nostr event kind for dev fee payment audit events
 /// Kind 8383 is in the regular events range (1000-9999) per NIP-01
@@ -36,3 +63,16 @@ pub const ENV_FILENAME: &str = ".env";
 /// Environment variable name used to override the Nostr private key from the
 /// process environment. Shared between the wizard and the loader.
 pub const NSEC_ENV_VAR: &str = "MOSTRO_NSEC_PRIVKEY";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_fee_address_is_self_hosted() {
+        // The previous custodial address was suspended by its custodian
+        // without notice (#1037); dev fees must go to the self-custodial
+        // address on a domain the project controls.
+        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@pay.mostro.foundation");
+    }
+}

@@ -51,6 +51,15 @@ name = "maintenance mode"
 paths = ["src/app/maintenance.rs", "src/app/daemon_state.rs"]
 tags = ["happy-path", "cancellation"]
 
+# The e2e regtest LND is always synced to chain, so these tags exercise the
+# sync gate's "synced, don't defer" path and the buyer payout and dev fee
+# paths it guards. The unsynced/deferral path and the automatic maintenance
+# have no e2e scenario; unit tests cover them.
+[[rule]]
+name = "health and LND sync gate"
+paths = ["src/app/health/**"]
+tags = ["happy-path", "payment-failure"]
+
 [[rule]]
 name = "cancellation"
 paths = ["src/app/cancel.rs"]
@@ -103,6 +112,11 @@ paths = ["src/rpc/**", "proto/**"]
 uncovered = "ortsom has no gRPC client; admin actions it exercises go over Nostr (see the dispute rule)"
 
 [[rule]]
+name = "reputation portability"
+paths = ["src/app/reputation/**"]
+uncovered = "ortsom has no reputation scenario; covered by unit tests and the two-daemon run in #1027"
+
+[[rule]]
 name = "cashu"
 paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
 uncovered = "covered by cashu.yml, not by ortsom"
@@ -113,13 +127,21 @@ paths = ["src/app/serbero.rs"]
 uncovered = "runs only when serbero_pubkey is set, which the ortsom stack does not do; covered by unit tests in src/app/serbero.rs"
 
 [[rule]]
+name = "payer history"
+paths = ["src/app/payer/**", "src/app/release_payer_tests.rs"]
+uncovered = "opt-in [payer_history] is off in the ortsom stack and no ortsom scenario declares a payer; covered by unit tests in src/app/payer and the fiat_sent / release tests"
+
+[[rule]]
 name = "settings template"
 paths = ["settings.tpl.toml"]
 uncovered = "the ortsom stack runs its own template (ci/regtest/mostro-settings.tpl.toml in Ortsom); mostrod embeds this one only to write a first-run settings.toml and for the wizard, covered by unit tests in src/config"
 
 [[rule]]
 name = "session restore and key bookkeeping"
-paths = ["src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs"]
+paths = [
+  "src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs",
+  "src/app/user_info.rs",
+]
 uncovered = "no ortsom scenario yet"
 
 [[rule]]

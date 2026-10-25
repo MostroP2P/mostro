@@ -87,6 +87,13 @@ pub struct Bond {
     /// has a concrete reason to publish it.
     #[serde(skip_serializing)]
     pub payout_payment_hash: Option<String>,
+    /// When the current `payout_payment_hash` was stamped, right before its
+    /// `send_payment`, in the same CAS; cleared with the hash. A failure
+    /// reported later is judged against the LND sync state since this
+    /// moment (#1063): one caused by our own node's unhealthy spell does
+    /// not consume `payout_attempts`. `None` on rows from before the
+    /// column existed, whose failures are never attributed to the node.
+    pub payout_sent_at: Option<i64>,
     /// Phase 3: portion of `amount_sats` that the node retains on slash.
     /// Frozen at the moment the bond enters `PendingPayout`. `None` until
     /// then; the counterparty share is always derived as
@@ -173,6 +180,7 @@ impl Bond {
             payout_invoice: None,
             payout_routing_fee_sats: None,
             payout_payment_hash: None,
+            payout_sent_at: None,
             node_share_sats: None,
 
             payout_recipient: None,

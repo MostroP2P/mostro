@@ -34,6 +34,8 @@ Summary of order lifecycle and key handlers.
 | `dispute` | https://github.com/MostroP2P/mostro/blob/main/src/app/dispute.rs#L141 | Open dispute and notify admin/solver |
 | `rate-user` | https://github.com/MostroP2P/mostro/blob/main/src/app/rate_user.rs | Record post-trade reputation update |
 | `orders` | https://github.com/MostroP2P/mostro/blob/main/src/app/orders.rs | Return order lists/history to requester |
+| `export-reputation` | https://github.com/MostroP2P/mostro/blob/main/src/app/reputation/export.rs | Check eligibility, sign a reputation attestation of the native figures, and return it once the account is bound to the destination identity (compare-and-set) |
+| `import-reputation` | https://github.com/MostroP2P/mostro/blob/main/src/app/reputation/import.rs | Verify an issuer's reputation attestation, record the import and merge it into the identity's reputation (see [REPUTATION_PORTABILITY.md](REPUTATION_PORTABILITY.md)) |
 | `trade-pubkey` | https://github.com/MostroP2P/mostro/blob/main/src/app/trade_pubkey.rs | Exchange or update per-trade pubkeys |
 | `restore-session` | https://github.com/MostroP2P/mostro/blob/main/src/app/restore_session.rs | Rehydrate client session and state |
 | `admin-cancel` | https://github.com/MostroP2P/mostro/blob/main/src/app/admin_cancel.rs | Admin cancel; optionally cancel hold invoice. Assigned solver must have `read-write` permission |
@@ -41,6 +43,7 @@ Summary of order lifecycle and key handlers.
 | `admin-add-solver` | https://github.com/MostroP2P/mostro/blob/main/src/app/admin_add_solver.rs | Register dispute solver key. `admin-add-solver` accepts a bare pubkey (defaults to read-write), `pubkey:read`, `pubkey:write` (alias for read-write), or `pubkey:read-write`; see the parser in `admin_add_solver.rs` for the accepted forms |
 | `admin-take-dispute` | https://github.com/MostroP2P/mostro/blob/main/src/app/admin_take_dispute.rs | Assign or take ownership of dispute |
 | `last-trade-index` | https://github.com/MostroP2P/mostro/blob/main/src/app/last_trade_index.rs | Retrieve user's last trade index from database |
+| `user-info` | https://github.com/MostroP2P/mostro/blob/main/src/app/user_info.rs | Return the requester's own reputation (`user_info` payload) to the trade key; zeros for an unknown identity, `reputation_identity_required` without an identity proof |
 
 ## Typical Flow
 1) Maker posts New Order (kind-14 protocol message).

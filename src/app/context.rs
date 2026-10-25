@@ -6,8 +6,10 @@
 //!
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
+use crate::app::health::lnd_sync::LndSyncState;
+use crate::app::health::stats::HealthStats;
 use crate::app::maintenance::MaintenanceState;
-use crate::cashu::CashuClient;
+use crate::cashu::mints::CashuMints;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
 use nostr_sdk::prelude::{Client, Keys, PublicKey};
@@ -40,22 +42,29 @@ pub struct AppContext {
     settings: Arc<Settings>,
     order_msg_queue: OrderMsgQueue,
     keys: Keys,
-    /// Connected Cashu mint client (docs/cashu/, CF-5). `Some` only in Cashu
-    /// mode, where `main.rs` connects the configured mint at boot and attaches
-    /// it here; `None` in the default Lightning mode. Track A's lock handler
-    /// reads it through [`AppContext::cashu_client`].
-    cashu_client: Option<Arc<CashuClient>>,
+    /// Cashu mint clients, one per mint (docs/cashu/, issue #1046). `Some`
+    /// only in Cashu mode, where `main.rs` connects the configured mints at
+    /// boot and attaches the registry here; `None` in the default Lightning
+    /// mode. Track A's lock handler reads it through
+    /// [`AppContext::cashu_mints`].
+    cashu_mints: Option<Arc<CashuMints>>,
     /// Maintenance (drain) mode flag. Defaults to a disabled, unpersisted
     /// flag; `main.rs` attaches the one loaded from `daemon_state` with
     /// [`AppContext::with_maintenance`].
     maintenance: MaintenanceState,
+    /// Whether the Lightning node is synced to chain and reachable, fed by
+    /// `job_lnd_sync_monitor`. Defaults to a state that knows nothing and
+    /// defers nothing (tests, Cashu mode).
+    lnd_sync: LndSyncState,
+    /// Buyer payout outcomes over the last hour, for the health event.
+    health_stats: HealthStats,
 }
 
 impl AppContext {
     /// Create a new application context.
     ///
-    /// The Cashu client defaults to `None` (Lightning mode). Cashu-mode boot
-    /// attaches a connected client with [`AppContext::with_cashu_client`].
+    /// The Cashu mints default to `None` (Lightning mode). Cashu-mode boot
+    /// attaches them with [`AppContext::with_cashu_mints`].
     pub fn new(
         pool: Arc<Pool<Sqlite>>,
         nostr_client: Client,
@@ -69,8 +78,10 @@ impl AppContext {
             settings,
             order_msg_queue,
             keys,
-            cashu_client: None,
+            cashu_mints: None,
             maintenance: MaintenanceState::new(),
+            lnd_sync: LndSyncState::new(),
+            health_stats: HealthStats::new(),
         }
     }
 
@@ -86,11 +97,26 @@ impl AppContext {
         &self.maintenance
     }
 
-    /// Attach a connected Cashu mint client (Cashu mode, CF-5). Returns a new
-    /// context; the Lightning path never calls this, so `cashu_client()` stays
-    /// `None` there.
-    pub fn with_cashu_client(mut self, cashu_client: Arc<CashuClient>) -> Self {
-        self.cashu_client = Some(cashu_client);
+    /// Attach a shared LND sync state (the one the monitor job feeds).
+    pub fn with_lnd_sync(mut self, lnd_sync: LndSyncState) -> Self {
+        self.lnd_sync = lnd_sync;
+        self
+    }
+
+    /// Whether the Lightning node is synced to chain and reachable.
+    pub fn lnd_sync(&self) -> &LndSyncState {
+        &self.lnd_sync
+    }
+
+    /// Buyer payout outcomes, recorded where payouts finish.
+    pub fn health_stats(&self) -> &HealthStats {
+        &self.health_stats
+    }
+
+    /// Attach the Cashu mint clients (Cashu mode). Returns a new context; the
+    /// Lightning path never calls this, so `cashu_mints()` stays `None` there.
+    pub fn with_cashu_mints(mut self, cashu_mints: Arc<CashuMints>) -> Self {
+        self.cashu_mints = Some(cashu_mints);
         self
     }
 
@@ -127,13 +153,13 @@ impl AppContext {
         &self.keys
     }
 
-    /// The connected Cashu mint client, if this node runs in Cashu mode.
+    /// The Cashu mint clients, if this node runs in Cashu mode.
     ///
-    /// `Some` only when `[cashu] enabled = true` and the mint connected at
-    /// boot (CF-5); `None` in Lightning mode. Track A's `add_cashu_escrow`
-    /// handler uses it to validate the seller's escrow token against the mint.
-    pub fn cashu_client(&self) -> Option<&Arc<CashuClient>> {
-        self.cashu_client.as_ref()
+    /// `Some` only when `[cashu] enabled = true`; `None` in Lightning mode.
+    /// Track A's `add_cashu_escrow` handler takes the client for the order's
+    /// mint from it to validate the seller's escrow token.
+    pub fn cashu_mints(&self) -> Option<&Arc<CashuMints>> {
+        self.cashu_mints.as_ref()
     }
 }
 
@@ -146,6 +172,45 @@ pub mod test_utils {
         RpcSettings,
     };
     use secrecy::SecretString;
+
+    thread_local! {
+        static LOGGED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// What this thread logs while `run` runs. A subscriber scoped to the
+    /// test with `set_default` would miss lines: while it is the only one
+    /// registered, a test on another thread that reaches the same log line
+    /// first caches it as disabled. A global one, installed once, is the
+    /// subscriber every thread sees; it keeps only the lines of a thread
+    /// that is capturing.
+    pub async fn logged_on_this_thread<F: std::future::Future>(run: F) -> (F::Output, String) {
+        struct ThreadWriter;
+        impl std::io::Write for ThreadWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LOGGED.with(|logged| {
+                    if let Some(logged) = logged.borrow_mut().as_mut() {
+                        logged.extend_from_slice(buf);
+                    }
+                });
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadWriter)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        LOGGED.with(|logged| *logged.borrow_mut() = Some(Vec::new()));
+        let output = run.await;
+        let logged = LOGGED.with(|logged| logged.borrow_mut().take().unwrap_or_default());
+        (output, String::from_utf8(logged).unwrap())
+    }
 
     /// Test helper wrapper for inspecting the shared order-message queue.
     #[derive(Debug, Clone)]
@@ -325,6 +390,10 @@ pub mod test_utils {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
+            payer_history: None,
+            health: Default::default(),
+            reputation_export: None,
         }
     }
 }

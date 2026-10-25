@@ -1,0 +1,15 @@
+-- Immutable "when did this order reach Success" stamp
+-- (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md §9).
+--
+-- Written by the same guarded UPDATE that performs the Success CAS in
+-- release::payment_success, on every node whether or not `[payer_history]`
+-- is enabled (D-10, item 2), and never touched again. Without it, a
+-- retroactive re-evaluation of payer-history snapshots (§10.7) could only
+-- filter on the CURRENT `status = 'success'`, which silently counts trades
+-- that succeeded AFTER the snapshot being recomputed.
+--
+-- NULL for every order that reached Success before this migration; those all
+-- predate every snapshot, so §10.7 treats NULL as "succeeded before any
+-- snapshot", which is exact rather than an approximation. Never sent anywhere:
+-- it is not part of the kind-38383 order event.
+ALTER TABLE orders ADD COLUMN success_at integer;

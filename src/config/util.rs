@@ -2,12 +2,18 @@
 /// This module provides utility functions for the config module.
 /// It includes functions to initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// It also includes functions to add a trailing slash to a path if it doesn't already have one.
-use crate::config::constants::{ENV_FILENAME, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+use crate::cashu::mint_policy::normalize_mint_url;
+use crate::config::constants::{
+    ENV_FILENAME, LND_DEFAULT_HOLD_EXPIRY_DELTA, MAX_DEV_FEE_PERCENTAGE,
+    MAX_REPUTATION_LIFETIME_SECONDS, MIN_DEV_FEE_PERCENTAGE, MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS,
+    MIN_ESCROW_DEADLINE_MARGIN_BLOCKS,
+};
 use crate::config::secret::read_nsec_env_var;
 use crate::config::wizard;
 use crate::config::{get_mostro_keys, init_mostro_settings, Settings};
 use mostro_core::error::MostroError::{self, *};
 use mostro_core::error::ServiceError;
+use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
 use nostr_sdk::prelude::ToBech32;
 use std::fs;
 use std::io::IsTerminal;
@@ -90,6 +96,191 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
 
     validate_serbero_pubkey(settings.mostro.serbero_pubkey.as_deref())?;
 
+    validate_escrow_deadline_margin(
+        &settings.lightning,
+        settings.cashu.as_ref().is_some_and(|cashu| cashu.enabled),
+    )?;
+
+    if let Some(import) = settings.reputation_import.as_ref() {
+        validate_reputation_import(import)?;
+    }
+    if let Some(export) = settings.reputation_export.as_ref() {
+        validate_reputation_export(export)?;
+    }
+
+    validate_health_settings(&settings.health)?;
+
+    Ok(())
+}
+
+/// `[health]`: `lnd_unsynced_fail_after` must exceed the 60 s after which
+/// outgoing payments already wait (`PAYMENT_DEFER_AFTER_SECS`). LND reports
+/// `synced_to_chain = false` for a few seconds whenever a block arrives, so a
+/// shorter threshold would turn maintenance on at every block, and each time
+/// it would stay on for `lnd_resynced_clear_after` seconds. That one must be
+/// positive, otherwise a single synced poll would lift maintenance.
+fn validate_health_settings(
+    health: &crate::config::types::HealthSettings,
+) -> Result<(), MostroError> {
+    use crate::app::health::lnd_sync::PAYMENT_DEFER_AFTER_SECS;
+
+    let fail_after = health.lnd_unsynced_fail_after;
+    if i64::try_from(fail_after).map_or(true, |secs| secs <= PAYMENT_DEFER_AFTER_SECS) {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "health.lnd_unsynced_fail_after ({fail_after}) must be greater than \
+             {PAYMENT_DEFER_AFTER_SECS}: LND reports synced_to_chain = false for a \
+             few seconds at every block, and outgoing payments already wait after \
+             {PAYMENT_DEFER_AFTER_SECS}s; a shorter threshold would enter maintenance \
+             mode at every block"
+        ))));
+    }
+
+    let clear_after = health.lnd_resynced_clear_after;
+    if clear_after == 0 || i64::try_from(clear_after).is_err() {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "health.lnd_resynced_clear_after ({clear_after}) must be between 1 and {}: with 0 \
+             a single synced poll lifts the automatic maintenance",
+            i64::MAX
+        ))));
+    }
+
+    Ok(())
+}
+
+/// `escrow_deadline_margin_blocks` must be at least
+/// [`MIN_ESCROW_DEADLINE_MARGIN_BLOCKS`] (LND's default `holdexpirydelta`
+/// plus headroom) and below `hold_invoice_cltv_delta`. Below the minimum,
+/// LND can refund the seller before the escrow-deadline guardian acts; at
+/// or above the CLTV delta, the guardian acts within a few blocks of the
+/// escrow being paid. Neither fails at runtime, so both stop the daemon at
+/// load. The minimum assumes LND's default `holdexpirydelta`: a node that
+/// raised it needs a larger margin, which mostrod cannot check yet (#1058).
+/// Skipped in Cashu mode, which runs no guardian and has no hold invoice.
+fn validate_escrow_deadline_margin(
+    lightning: &crate::config::types::LightningSettings,
+    cashu_enabled: bool,
+) -> Result<(), MostroError> {
+    if cashu_enabled {
+        return Ok(());
+    }
+
+    let margin = lightning.escrow_deadline_margin_blocks;
+    let cltv_delta = lightning.hold_invoice_cltv_delta;
+
+    if margin < MIN_ESCROW_DEADLINE_MARGIN_BLOCKS {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "escrow_deadline_margin_blocks ({margin}) must be at least \
+             {MIN_ESCROW_DEADLINE_MARGIN_BLOCKS} (LND's default \
+             invoices.holdexpirydelta {LND_DEFAULT_HOLD_EXPIRY_DELTA} plus \
+             {MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS} blocks of headroom): below it \
+             LND can refund the escrow before mostrod acts. If LND runs with a \
+             higher holdexpirydelta, the margin must exceed that value by the \
+             same headroom; mostrod does not check it"
+        ))));
+    }
+
+    if margin >= cltv_delta {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "escrow_deadline_margin_blocks ({margin}) must be below \
+             hold_invoice_cltv_delta ({cltv_delta}): at or above it mostrod \
+             acts on a trade within a few blocks of the escrow being paid, \
+             leaving the buyer no time to send the fiat"
+        ))));
+    }
+
+    Ok(())
+}
+
+/// `[reputation_export]`: a lifetime core can sign, between 1 and
+/// [`ATTESTATION_LIFETIME_SECS`], and an environment variable name without
+/// surrounding spaces, since the variable is looked up as written. The key
+/// itself is loaded and checked when the settings are initialised
+/// (`attach_reputation_issuer_keys`).
+fn validate_reputation_export(
+    export: &crate::config::types::ReputationExportSettings,
+) -> Result<(), MostroError> {
+    let fail = |reason: &str| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_export] {reason}"
+        ))))
+    };
+    if export.lifetime_seconds == 0 {
+        return fail("lifetime_seconds must be greater than 0");
+    }
+    if export.lifetime_seconds > ATTESTATION_LIFETIME_SECS {
+        return fail(&format!(
+            "lifetime_seconds ({}) exceeds what an attestation can carry \
+             ({ATTESTATION_LIFETIME_SECS}, 7 days)",
+            export.lifetime_seconds
+        ));
+    }
+    let name = &export.issuer_key_env;
+    if name.trim().is_empty() {
+        return fail("issuer_key_env must name an environment variable");
+    }
+    if name.trim() != name {
+        return fail(&format!(
+            "issuer_key_env `{name}` has leading or trailing spaces"
+        ));
+    }
+    Ok(())
+}
+
+/// `[reputation_import]`: every issuer has a non-empty, unique name and at
+/// least one key; every key parses (npub or hex) and belongs to one entry
+/// only; the lifetime cap is positive. Checked even while disabled, so
+/// turning the section on cannot surface a typo later. A key in two entries
+/// would let one source account be imported twice, once under each name.
+fn validate_reputation_import(
+    import: &crate::config::types::ReputationImportSettings,
+) -> Result<(), MostroError> {
+    let fail = |reason: String| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[reputation_import] {reason}"
+        ))))
+    };
+    if import.max_lifetime_seconds == 0 {
+        return fail("max_lifetime_seconds must be greater than 0".to_string());
+    }
+    if import.max_lifetime_seconds > MAX_REPUTATION_LIFETIME_SECONDS {
+        return fail(format!(
+            "max_lifetime_seconds ({}) exceeds the maximum ({MAX_REPUTATION_LIFETIME_SECONDS}, 30 days)",
+            import.max_lifetime_seconds
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut owners: std::collections::HashMap<nostr_sdk::prelude::PublicKey, &str> =
+        std::collections::HashMap::new();
+    for issuer in &import.issuers {
+        let name = issuer.name.trim();
+        if name.is_empty() {
+            return fail("an issuer has an empty name".to_string());
+        }
+        // The name is the deduplication key and is recorded as written, so
+        // it must not differ from its trimmed form.
+        if name != issuer.name {
+            return fail(format!(
+                "issuer name `{}` has leading or trailing spaces",
+                issuer.name
+            ));
+        }
+        if !names.insert(name) {
+            return fail(format!("issuer name `{name}` is used twice"));
+        }
+        if issuer.keys.is_empty() {
+            return fail(format!("issuer `{name}` has no keys"));
+        }
+        for key in &issuer.keys {
+            let Ok(parsed) = nostr_sdk::prelude::PublicKey::parse(key.trim()) else {
+                return fail(format!("issuer `{name}` has an invalid key `{key}`"));
+            };
+            if let Some(other) = owners.insert(parsed, name) {
+                return fail(format!(
+                    "key `{key}` belongs to both `{other}` and `{name}`; a key belongs to one issuer only"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -117,7 +308,9 @@ fn validate_serbero_pubkey(serbero_pubkey: Option<&str>) -> Result<(), MostroErr
 /// silently misbehave):
 /// - `cashu.enabled` and `anti_abuse_bond.enabled` are mutually exclusive
 ///   (locked decision §4.5).
-/// - When enabled, `mint_url` must be non-empty and parse as `http`/`https`.
+/// - When enabled, every `mint_urls` entry must be a usable `http`/`https`
+///   mint URL ([`normalize_mint_url`]). An empty list is valid: the node
+///   accepts any mint (issue #1046).
 /// - When enabled, `escrow_locktime_days >= 1` (the seller-recovery
 ///   locktime floor of Track A §4B cannot be zero).
 fn validate_cashu_settings(
@@ -139,17 +332,12 @@ fn validate_cashu_settings(
         )));
     }
 
-    let url = reqwest::Url::parse(&cashu.mint_url).map_err(|e| {
-        MostroInternalErr(ServiceError::IOError(format!(
-            "cashu.mint_url ({:?}) is not a valid URL: {e}",
-            cashu.mint_url
-        )))
-    })?;
-    if !crate::util::is_http_or_https(&url) {
-        return Err(MostroInternalErr(ServiceError::IOError(format!(
-            "cashu.mint_url must use http or https, got scheme {:?}",
-            url.scheme()
-        ))));
+    for mint_url in &cashu.mint_urls {
+        normalize_mint_url(mint_url).map_err(|reason| {
+            MostroInternalErr(ServiceError::IOError(format!(
+                "cashu.mint_urls entry {mint_url:?} {reason}"
+            )))
+        })?;
     }
 
     if cashu.escrow_locktime_days < 1 {
@@ -297,6 +485,10 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
+            payer_history: None,
+            health: Default::default(),
+            reputation_export: None,
         }
     }
 
@@ -423,6 +615,203 @@ mod tests {
 }
 
 #[cfg(test)]
+mod reputation_import_validation_tests {
+    use super::*;
+    use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+    use nostr_sdk::prelude::{Keys, PublicKey, ToBech32};
+
+    fn import(issuers: Vec<(&str, Vec<String>)>) -> ReputationImportSettings {
+        ReputationImportSettings {
+            enabled: true,
+            issuers: issuers
+                .into_iter()
+                .map(|(name, keys)| ReputationIssuer {
+                    name: name.to_string(),
+                    keys,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn reason(result: Result<(), MostroError>) -> String {
+        match result {
+            Err(MostroInternalErr(ServiceError::IOError(reason))) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_issuers_with_npub_or_hex_keys_are_valid() {
+        let (a, b, c) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let settings = import(vec![
+            ("lnp2pbot", vec![a.public_key().to_bech32().unwrap()]),
+            (
+                "other-mostro",
+                vec![b.public_key().to_hex(), c.public_key().to_hex()],
+            ),
+        ]);
+        assert!(validate_reputation_import(&settings).is_ok());
+        assert!(validate_reputation_import(&ReputationImportSettings::default()).is_ok());
+    }
+
+    #[test]
+    fn a_key_in_two_entries_is_refused_even_spelled_differently() {
+        let key = Keys::generate().public_key();
+        let settings = import(vec![
+            ("lnp2pbot", vec![key.to_hex()]),
+            ("renamed", vec![key.to_bech32().unwrap()]),
+        ]);
+        assert!(reason(validate_reputation_import(&settings)).contains("one issuer only"));
+    }
+
+    #[test]
+    fn names_must_be_present_and_unique() {
+        let key = || vec![Keys::generate().public_key().to_hex()];
+        assert!(
+            reason(validate_reputation_import(&import(vec![(" ", key())]))).contains("empty name")
+        );
+        assert!(reason(validate_reputation_import(&import(vec![
+            ("lnp2pbot", key()),
+            ("lnp2pbot", key()),
+        ])))
+        .contains("used twice"));
+    }
+
+    /// The name is what imports are deduplicated on, so it is kept exactly as
+    /// written: a padded name would be recorded padded and later clash with
+    /// the trimmed one at the boot check.
+    #[test]
+    fn a_name_with_surrounding_spaces_is_refused() {
+        let key = || vec![Keys::generate().public_key().to_hex()];
+        for name in [" lnp2pbot", "lnp2pbot ", "\tlnp2pbot"] {
+            assert!(
+                reason(validate_reputation_import(&import(vec![(name, key())]))).contains("spaces"),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_with_surrounding_spaces_is_read_trimmed() {
+        let key = Keys::generate().public_key();
+        let settings = import(vec![("lnp2pbot", vec![format!(" {} ", key.to_hex())])]);
+        assert!(validate_reputation_import(&settings).is_ok());
+        assert_eq!(settings.trusted_keys(), vec![key]);
+        assert_eq!(settings.issuer_for(&key), Some(&settings.issuers[0]));
+    }
+
+    #[test]
+    fn keys_must_be_present_and_parse() {
+        assert!(
+            reason(validate_reputation_import(&import(vec![("a", vec![])]))).contains("no keys")
+        );
+        assert!(reason(validate_reputation_import(&import(vec![(
+            "a",
+            vec!["npub1nope".to_string()]
+        )])))
+        .contains("invalid key"));
+    }
+
+    #[test]
+    fn the_export_section_needs_a_lifetime_and_a_variable_name() {
+        use crate::config::types::ReputationExportSettings;
+        assert!(validate_reputation_export(&ReputationExportSettings::default()).is_ok());
+        let zero = ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&zero)).contains("lifetime_seconds"));
+        let unnamed = ReputationExportSettings {
+            issuer_key_env: " ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&unnamed)).contains("issuer_key_env"));
+        let padded = ReputationExportSettings {
+            issuer_key_env: " MOSTRO_REPUTATION_ISSUER_SK ".to_string(),
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_export(&padded)).contains("issuer_key_env"));
+    }
+
+    /// Core signs at most `ATTESTATION_LIFETIME_SECS` (7 days); a longer
+    /// value would boot, advertise the issuer key and fail on every export.
+    #[test]
+    fn the_export_lifetime_cannot_exceed_what_an_attestation_carries() {
+        use crate::config::types::ReputationExportSettings;
+        use mostro_core::reputation::ATTESTATION_LIFETIME_SECS;
+        let lifetime = |lifetime_seconds| ReputationExportSettings {
+            lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_export(&lifetime(ATTESTATION_LIFETIME_SECS)).is_ok());
+        assert!(reason(validate_reputation_export(&lifetime(
+            ATTESTATION_LIFETIME_SECS + 1
+        )))
+        .contains("lifetime_seconds"));
+    }
+
+    #[test]
+    fn the_lifetime_cap_must_be_positive_even_while_disabled() {
+        let settings = ReputationImportSettings {
+            max_lifetime_seconds: 0,
+            ..Default::default()
+        };
+        assert!(reason(validate_reputation_import(&settings)).contains("max_lifetime_seconds"));
+    }
+
+    /// A cap of years would defeat its purpose; an extra digit on the
+    /// 7-day default (70 days) must not load silently.
+    #[test]
+    fn the_lifetime_cap_is_at_most_thirty_days() {
+        let thirty_days = MAX_REPUTATION_LIFETIME_SECONDS;
+        let cap = |max_lifetime_seconds| ReputationImportSettings {
+            max_lifetime_seconds,
+            ..Default::default()
+        };
+        assert!(validate_reputation_import(&cap(thirty_days)).is_ok());
+        for too_long in [thirty_days + 1, 6_048_000, u64::MAX] {
+            assert!(
+                reason(validate_reputation_import(&cap(too_long))).contains("max_lifetime_seconds"),
+                "{too_long} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_section_is_disabled() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            reputation_import: ReputationImportSettings,
+        }
+        let stub: Stub = toml::from_str("[reputation_import]\n").unwrap();
+        assert_eq!(stub.reputation_import, ReputationImportSettings::default());
+        assert!(!stub.reputation_import.enabled);
+    }
+
+    #[test]
+    fn the_section_parses_from_toml_with_its_defaults() {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            reputation_import: ReputationImportSettings,
+        }
+        let key = Keys::generate().public_key().to_hex();
+        let stub: Stub = toml::from_str(&format!(
+            "[reputation_import]\nenabled = true\n\n[[reputation_import.issuers]]\nname = \"lnp2pbot\"\nkeys = [\"{key}\"]\n"
+        ))
+        .unwrap();
+        assert!(stub.reputation_import.enabled);
+        assert_eq!(stub.reputation_import.max_lifetime_seconds, 604_800);
+        assert_eq!(stub.reputation_import.issuers[0].name, "lnp2pbot");
+        assert_eq!(
+            stub.reputation_import
+                .issuer_for(&PublicKey::from_hex(&key).unwrap()),
+            Some(&stub.reputation_import.issuers[0])
+        );
+    }
+}
+
+#[cfg(test)]
 mod cashu_validation_tests {
     use super::*;
     use crate::config::types::CashuSettings;
@@ -430,7 +819,7 @@ mod cashu_validation_tests {
     fn enabled(mint_url: &str, days: u32) -> CashuSettings {
         CashuSettings {
             enabled: true,
-            mint_url: mint_url.to_string(),
+            mint_urls: vec![mint_url.to_string()],
             escrow_locktime_days: days,
         }
     }
@@ -469,6 +858,43 @@ mod cashu_validation_tests {
     }
 
     #[test]
+    fn accepts_an_empty_mint_list() {
+        // No restriction: the node accepts any mint (issue #1046).
+        let cashu = CashuSettings {
+            enabled: true,
+            ..CashuSettings::default()
+        };
+        assert!(validate_cashu_settings(Some(&cashu), false).is_ok());
+    }
+
+    #[test]
+    fn accepts_several_valid_mints() {
+        let cashu = CashuSettings {
+            enabled: true,
+            mint_urls: vec![
+                "https://mint.example.com".to_string(),
+                "http://localhost:3338".to_string(),
+            ],
+            ..CashuSettings::default()
+        };
+        assert!(validate_cashu_settings(Some(&cashu), false).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_list_with_one_bad_entry() {
+        let cashu = CashuSettings {
+            enabled: true,
+            mint_urls: vec![
+                "https://mint.example.com".to_string(),
+                "ftp://mint.example.com".to_string(),
+            ],
+            ..CashuSettings::default()
+        };
+        let err = validate_cashu_settings(Some(&cashu), false).expect_err("bad entry");
+        assert!(err.to_string().contains("ftp://mint.example.com"));
+    }
+
+    #[test]
     fn rejects_non_http_scheme() {
         let cashu = enabled("ftp://mint.example.com", 15);
         assert!(validate_cashu_settings(Some(&cashu), false).is_err());
@@ -487,7 +913,10 @@ mod cashu_validation_tests {
 #[cfg(test)]
 mod startup_validation_tests {
     use super::*;
-    use crate::config::constants::{MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
+    use crate::config::constants::{
+        LND_DEFAULT_HOLD_EXPIRY_DELTA, MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE,
+        MIN_ESCROW_DEADLINE_MARGIN_BLOCKS,
+    };
     use crate::config::types::{
         AntiAbuseBondSettings, CashuSettings, DatabaseSettings, LightningSettings, MostroSettings,
         NostrSettings, RpcSettings,
@@ -496,7 +925,12 @@ mod startup_validation_tests {
     fn base_settings() -> Settings {
         Settings {
             database: DatabaseSettings::default(),
-            lightning: LightningSettings::default(),
+            // The shipped CLTV delta: `LightningSettings::default()` leaves it
+            // at 0, below any valid escrow deadline margin.
+            lightning: LightningSettings {
+                hold_invoice_cltv_delta: 144,
+                ..Default::default()
+            },
             nostr: NostrSettings::default(),
             mostro: MostroSettings::default(),
             rpc: RpcSettings::default(),
@@ -504,12 +938,185 @@ mod startup_validation_tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
+            payer_history: None,
+            health: Default::default(),
+            reputation_export: None,
         }
+    }
+
+    fn lightning(cltv_delta: u32, margin: u32) -> LightningSettings {
+        LightningSettings {
+            hold_invoice_cltv_delta: cltv_delta,
+            escrow_deadline_margin_blocks: margin,
+            ..Default::default()
+        }
+    }
+
+    fn enabled_cashu() -> CashuSettings {
+        CashuSettings {
+            enabled: true,
+            mint_urls: vec!["https://mint.example.com".to_string()],
+            escrow_locktime_days: 15,
+        }
+    }
+
+    /// The export section is checked as part of startup validation, not only
+    /// by its own function.
+    #[test]
+    fn startup_validation_refuses_a_bad_export_section() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.reputation_export = Some(crate::config::types::ReputationExportSettings {
+            lifetime_seconds: 0,
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings).expect_err("a zero lifetime is refused");
+        assert!(err.to_string().contains("[reputation_export]"));
+    }
+
+    #[test]
+    fn health_defaults_are_accepted() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        validate_mostro_settings(&settings).expect("defaults must load");
+    }
+
+    #[test]
+    fn health_fail_after_must_exceed_the_payment_deferral_threshold() {
+        use crate::app::health::lnd_sync::PAYMENT_DEFER_AFTER_SECS;
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+
+        settings.health.lnd_unsynced_fail_after = 0;
+        let err = validate_mostro_settings(&settings).expect_err("0 must be refused");
+        assert!(err.to_string().contains("lnd_unsynced_fail_after"));
+
+        settings.health.lnd_unsynced_fail_after = PAYMENT_DEFER_AFTER_SECS as u64;
+        assert!(
+            validate_mostro_settings(&settings).is_err(),
+            "equal to the deferral threshold must be refused"
+        );
+
+        settings.health.lnd_unsynced_fail_after = PAYMENT_DEFER_AFTER_SECS as u64 + 1;
+        validate_mostro_settings(&settings).expect("just above it is accepted");
+    }
+
+    #[test]
+    fn health_clear_after_must_be_positive() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.health.lnd_resynced_clear_after = 0;
+        let err = validate_mostro_settings(&settings).expect_err("0 must be refused");
+        assert!(err.to_string().contains("lnd_resynced_clear_after"));
+
+        // Codex review on #1065: a value above i64::MAX used to wrap negative.
+        settings.health.lnd_resynced_clear_after = u64::MAX;
+        assert!(validate_mostro_settings(&settings).is_err());
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, 72);
+        settings.health.lnd_unsynced_fail_after = u64::MAX;
+        assert!(validate_mostro_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn escrow_deadline_margin_inside_the_window_is_accepted() {
+        for margin in [MIN_ESCROW_DEADLINE_MARGIN_BLOCKS, 24, 143] {
+            assert!(
+                validate_escrow_deadline_margin(&lightning(144, margin), false).is_ok(),
+                "margin {margin} with cltv delta 144 must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn escrow_deadline_margin_at_or_above_cltv_delta_is_rejected() {
+        for margin in [144, 1_000] {
+            let err = validate_escrow_deadline_margin(&lightning(144, margin), false)
+                .expect_err("margin >= cltv delta must fail");
+            assert!(err
+                .to_string()
+                .contains("must be below hold_invoice_cltv_delta"));
+        }
+    }
+
+    #[test]
+    fn escrow_deadline_margin_below_the_minimum_is_rejected() {
+        // 13 clears LND's default holdexpirydelta by one block only, so the
+        // guardian would race LND for the escrow.
+        for margin in [
+            0,
+            LND_DEFAULT_HOLD_EXPIRY_DELTA,
+            LND_DEFAULT_HOLD_EXPIRY_DELTA + 1,
+            MIN_ESCROW_DEADLINE_MARGIN_BLOCKS - 1,
+        ] {
+            let err = validate_escrow_deadline_margin(&lightning(144, margin), false)
+                .expect_err("margin below the minimum must fail");
+            assert!(err.to_string().contains(&format!(
+                "must be at least {MIN_ESCROW_DEADLINE_MARGIN_BLOCKS}"
+            )));
+        }
+    }
+
+    #[test]
+    fn zero_cltv_delta_is_rejected_in_lightning_mode() {
+        let mut settings = base_settings();
+        settings.lightning = lightning(0, 24);
+        let err = validate_mostro_settings(&settings).expect_err("cltv delta 0 must fail");
+        assert!(err
+            .to_string()
+            .contains("must be below hold_invoice_cltv_delta"));
+    }
+
+    #[test]
+    fn disabled_cashu_section_still_validates_the_lightning_margin() {
+        // `[cashu]` present but `enabled = false` is a Lightning node: its
+        // margin is checked like any other.
+        let mut settings = base_settings();
+        settings.lightning = lightning(144, LND_DEFAULT_HOLD_EXPIRY_DELTA);
+        settings.cashu = Some(CashuSettings {
+            enabled: false,
+            ..enabled_cashu()
+        });
+        let err =
+            validate_mostro_settings(&settings).expect_err("lightning margin must be checked");
+        assert!(err.to_string().contains("must be at least"));
+    }
+
+    #[test]
+    fn cashu_mode_skips_escrow_deadline_margin_validation() {
+        // A Cashu node has no hold invoice, so its unused `[lightning]`
+        // values must not stop it from starting.
+        let mut settings = base_settings();
+        settings.lightning = LightningSettings::default();
+        settings.cashu = Some(enabled_cashu());
+        assert!(validate_mostro_settings(&settings).is_ok());
     }
 
     #[test]
     fn default_settings_pass_validation() {
         assert!(validate_mostro_settings(&base_settings()).is_ok());
+    }
+
+    /// Goes through `validate_mostro_settings`, as the daemon does, so
+    /// dropping the `[reputation_import]` check from startup is caught.
+    #[test]
+    fn a_key_listed_under_two_issuers_stops_the_load() {
+        use crate::config::types::{ReputationImportSettings, ReputationIssuer};
+        let key = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let issuer = |name: &str| ReputationIssuer {
+            name: name.to_string(),
+            keys: vec![key.clone()],
+        };
+        let mut settings = base_settings();
+        settings.reputation_import = Some(ReputationImportSettings {
+            enabled: true,
+            issuers: vec![issuer("lnp2pbot"), issuer("renamed")],
+            ..Default::default()
+        });
+        let err = validate_mostro_settings(&settings)
+            .expect_err("a key under two issuers must stop the load");
+        assert!(err.to_string().contains("one issuer only"));
     }
 
     #[test]
@@ -535,11 +1142,7 @@ mod startup_validation_tests {
             enabled: true,
             ..Default::default()
         });
-        settings.cashu = Some(CashuSettings {
-            enabled: true,
-            mint_url: "https://mint.example.com".to_string(),
-            escrow_locktime_days: 15,
-        });
+        settings.cashu = Some(enabled_cashu());
         assert!(validate_mostro_settings(&settings).is_err());
     }
 }

@@ -33,7 +33,13 @@ max_final_cltv_expiry_delta = 144
 # HTLC's expiry height (nominal 10-minute-block clock as fallback when
 # LND cannot answer), mostrod cancels the trade (Active) or opens a
 # dispute (FiatSent) while the escrow still exists. Must comfortably
-# exceed your node's holdexpirydelta.
+# exceed your node's holdexpirydelta. The buyer gets roughly
+# hold_invoice_cltv_delta - escrow_deadline_margin_blocks blocks to send
+# the fiat. mostrod refuses to start unless this value is at least 18
+# (LND's default holdexpirydelta of 12 plus 6 blocks of headroom) and
+# below hold_invoice_cltv_delta. The check assumes LND's default: if you
+# raised invoices.holdexpirydelta, keep this margin at least 6 blocks
+# above it yourself, since mostrod cannot read it yet (#1058).
 escrow_deadline_margin_blocks = 24
 # Ceiling on how many payments the node may have in flight before a new payout
 # waits its turn instead of adding another unresolved HTLC. A payee that never
@@ -179,10 +185,36 @@ port = 50051
 # Duration in seconds after which inactive rate-limiter entries are evicted
 # rate_limiter_stale_duration = 3600
 # Optional shared secret for the mutating admin RPCs (CancelOrder, SettleOrder,
-# AddSolver, TakeDispute, SetMaintenanceMode). Clients send it as gRPC
-# metadata `authorization: Bearer <token>`. Set it whenever the port is
-# reachable through a tunnel, sidecar or non-loopback bind.
+# AddSolver, TakeDispute, SetMaintenanceMode, RevokeReputationImports,
+# RebindReputationExport).
+# Clients send it as gRPC metadata `authorization: Bearer <token>`. Set it
+# whenever the port is reachable through a tunnel, sidecar or non-loopback
+# bind.
 # auth_token = ""
+
+# Health monitoring (docs/HEALTH.md). Absent section ≡ these defaults.
+[health]
+# Publish the health event (kind 38389): a signed report of whether this
+# instance is working (LND synced, buyers paid, relays, database), so a
+# watchdog or a status page can tell. Public tags are coarse; the detailed
+# metrics are only sent, encrypted, when `watchdog_pubkey` is set.
+enabled = true
+# Seconds between publications (30 to 3600). The event expires after three.
+interval = 60
+# Hex or npub pubkey of your watchdog. When set, liquidity, payout failure
+# rates and stuck orders are NIP-44 encrypted to it in `content`. Note that
+# the `p` tag then publicly links this instance to that key.
+watchdog_pubkey = ""
+# Seconds LND may report synced_to_chain = false without interruption before
+# it counts as a failure. Outgoing payments (buyer payouts, dev fees, bond
+# payouts) already wait after 60s, without consuming the buyer's attempts.
+lnd_unsynced_fail_after = 600
+# Fail closed: past that threshold, enter maintenance mode with reason
+# "lnd_unsynced" (no new orders or takes; open trades can finish), and leave
+# it again once LND has been synced for `lnd_resynced_clear_after` seconds.
+# Maintenance an operator set is never lifted by the daemon, whatever its reason.
+auto_maintenance_on_lnd_unsynced = true
+lnd_resynced_clear_after = 300
 
 # Multi-source price providers (see docs/PRICE_PROVIDERS.md).
 # Absent section ≡ legacy single-source behaviour synthesised from
@@ -280,15 +312,81 @@ port = 50051
 # # Past it the unpublished order expires and the maker is told. Must be > 0.
 # maker_bond_payment_timeout_seconds = 900
 
+# Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
+# Opt-in, disabled by default. Mostro never sees the buyer's payer details:
+# it stores an HMAC, keyed by this node's secret (`nsec_privkey`), of the hash
+# the buyer commits to, against the buyer's identity key. Keep the secret out
+# of database backups. Changing the node secret discards the stored history on
+# the next restart: rows keyed by the old secret can no longer be matched.
+#
+# [payer_history]
+# # Turning this off later keeps the stored history but stops reading and
+# # writing it; trades completed while it is off never enter it (docs D-10).
+# enabled = false
+# # When true, `fiat-sent` is rejected with `payer_not_declared` unless the
+# # buyer sent `declare-payer` first. Leave false unless your market relies
+# # on sender-verifiable rails only.
+# require_declaration = false
+# # "Experienced counterparty" thresholds (D-7): a seller qualifies for a
+# # buyer's history when, at the moment a trade with that buyer succeeds, it
+# # already had >= experienced_min_trades successful, undisputed trades with
+# # OTHER buyers ...
+# experienced_min_trades = 5
+# # ... and its first such trade was >= experienced_min_days days ago.
+# experienced_min_days = 30
+# # Changing either threshold re-evaluates EVERY stored snapshot under the new
+# # pair on the next restart (docs §10.7), so the advertised policy and the
+# # stored data never disagree. The change takes effect at restart, not on
+# # save.
+
 # Cashu escrow mode (docs/cashu/). Opt-in, disabled by default. When enabled
-# the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens
-# on the single mint configured below. Mutually exclusive with
-# [anti_abuse_bond] — enabling both is a startup error.
+# the node runs WITHOUT LND and escrows trades in NUT-11 2-of-3 Cashu tokens.
+# The maker of each order chooses the mint; the taker accepts it by taking
+# the order. Mutually exclusive with [anti_abuse_bond] — enabling both is a
+# startup error.
 #
 # [cashu]
 # enabled = false
-# # The one mint this node escrows on (http/https). Required when enabled.
-# mint_url = "https://mint.example.com"
+# # Mints this node accepts for new orders (http/https). Orders on any other
+# # mint are rejected. Leave empty ([]) to accept any mint with a public host.
+# mint_urls = ["https://mint.example.com", "https://mint.example2.com"]
 # # Seller-recovery locktime floor in days: escrow tokens must carry
 # # locktime >= now + this. Sellers may set a longer locktime, never shorter.
 # escrow_locktime_days = 15
+
+# Reputation import (docs/REPUTATION_PORTABILITY.md). Opt-in, disabled by
+# default. Lets users bring reputation earned elsewhere (another Mostro, or
+# lnp2pBot) by importing an attestation signed by an issuer listed here.
+# Each issuer is a stable local `name` — the key imports are deduplicated on,
+# so never rename an entry — with one or more signing keys (npub or hex). To
+# follow an issuer's key rotation, add its new key to the same entry and
+# remove the old one once its attestations have expired. A key belongs to
+# one entry only. The node advertises the keys in its info event.
+#
+# [reputation_import]
+# enabled = false
+# # Longest an attestation may live (expiration - created_at), in seconds.
+# # At most 2592000 (30 days).
+# max_lifetime_seconds = 604800
+#
+# [[reputation_import.issuers]]
+# name = "lnp2pbot"
+# keys = ["<lnp2pBot's reputation issuer pubkey>"]
+
+# Reputation export (docs/REPUTATION_PORTABILITY.md). Opt-in, disabled by
+# default. Lets users carry the reputation they earned on this node to
+# another Mostro: the node signs an attestation of their native figures
+# (ratings received here, their average, the day of their first trade here)
+# for an identity they confirm. Eligibility: not banned, 10 completed trades
+# and 5 ratings received here. The signing key is a dedicated one, never the
+# node's key, read from the environment variable named below (also from
+# <settings dir>/.env); the node announces its public key in its info event,
+# and operators who trust this node add it to their [reputation_import].
+#
+# [reputation_export]
+# enabled = false
+# issuer_key_env = "MOSTRO_REPUTATION_ISSUER_SK"
+# # Lifetime of an attestation, in seconds: 1 to 604800 (7 days). An
+# # attestation cannot carry more, and destinations cap it at 7 days by
+# # default.
+# lifetime_seconds = 604800

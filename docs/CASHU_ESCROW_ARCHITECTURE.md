@@ -158,7 +158,7 @@ This section turns the architecture above into a concrete, incremental engineeri
 These decisions scope the plan and should not be re-litigated per phase:
 
 1. **Global mode switch, not per-order.** A node runs in **one** escrow mode at a time: `lightning` (today's default) **or** `cashu`. The mode is fixed in `settings.toml`. When a node runs in `cashu` mode, the `fedimint-tonic-lnd` connector is **not initialized** at startup — the node needs no LND. There is no mixed mode where a single node offers both escrow types simultaneously.
-2. **Node-configured, fixed mint.** The operator sets a single `mint_url` in `settings.toml`. All Cashu trades on that node use that mint. Per-order mint negotiation is explicitly out of scope for this rollout (possible future work).
+2. **The maker chooses the mint; the node gates it.** *(Revised by issue #1046; the original decision was a single node-configured mint.)* The maker names the mint in `new-order`, and the node publishes the order only if `[cashu].mint_urls` accepts it: a non-empty list is an allow-list, an empty list accepts any mint with a public host. The taker accepts the mint by taking the order. There is no negotiation: the escrow is locked on the order's mint.
 3. **The daemon is a coordinator, not a wallet.** All wallet-side ecash operations — the seller swapping unencumbered ecash into a 2-of-3 locked token, and the buyer redeeming the locked token with two signatures — happen in the **client**. The daemon's responsibilities are narrow: validate a submitted locked token against the mint (`/v1/checkstate`), verify the 2-of-3 spending condition embeds the right three pubkeys, hold its own key `P_M`, and produce a `P_M` signature **only** during dispute resolution. Client work is documented here as an interface contract but implemented in the client repos, not here.
 4. **`mostro-core` changes ship first.** New `Action`/`Payload`/`CantDoReason` variants and any new `Status` live in the shared `mostro-core` crate. They are additive and must be released (and the daemon's dependency bumped) before the daemon can use them. During development the daemon points at the local `mostro-core` via a `path` dependency.
 5. **Bonds and Cashu mode are mutually exclusive (for now).** The anti-abuse bond is built on LN hold invoices and cannot function without LND. In `cashu` mode the bond feature is rejected at config-validation time. A Cashu-native bond is future work.
@@ -279,6 +279,6 @@ Runs alongside the tracks and closes the milestone:
 ## Open Questions / Future Work
 
 - **`SIG_INPUTS` vs `SIG_ALL`** is currently decided as `SIG_INPUTS` (see above). Revisit if malicious-mint resistance becomes a requirement.
-- **Per-order mint negotiation** and **multi-mint allow-lists** are deferred.
+- **Multi-mint allow-lists** landed with issue #1046 (the maker chooses, the node gates). Negotiating a mint between maker and taker is still out of scope.
 - **Cashu-native anti-abuse bond** to replace the LN bond in Cashu mode.
 - **Fee collection** in Cashu mode (today the Mostro fee is taken from the LN amounts) needs its own design — how/whether the operator collects a fee on a non-custodial ecash trade.

@@ -1,5 +1,6 @@
 // Mostro module for configurataion settings
 pub mod constants;
+pub mod payer_history;
 pub mod secret;
 pub mod settings;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
@@ -24,7 +25,8 @@ pub use secret::{parse_mostro_keys, read_nsec_env_var, take_nsec_for_init};
 pub use settings::{get_db_pool, get_mostro_keys, init_mostro_settings, Settings};
 pub use types::{
     AntiAbuseBondSettings, BondApplyTo, DatabaseSettings, ExpirationSettings, LightningSettings,
-    MostroSettings, NostrSettings,
+    MostroSettings, NostrSettings, ReputationExportSettings, ReputationImportSettings,
+    ReputationIssuer,
 };
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool

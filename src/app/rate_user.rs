@@ -1,6 +1,6 @@
 use crate::app::context::AppContext;
 use crate::db::{claim_order_rating_flag, update_user_rating};
-use crate::util::{enqueue_order_msg, get_order, update_user_rating_event};
+use crate::util::{enqueue_order_msg, first_trade_since, get_order, update_user_rating_event};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -163,6 +163,7 @@ pub async fn update_user_reputation_action(
         user_to_vote.max_rating,
         user_to_vote.total_reviews,
         user_to_vote.total_rating,
+        user_to_vote.native_rating_sum,
     )
     .await?;
 
@@ -173,19 +174,7 @@ pub async fn update_user_reputation_action(
     })?;
 
     // Create new rating event only after the claim+aggregate commit.
-    let reputation_event = Rating::new(
-        user_to_vote.total_reviews as u64,
-        user_to_vote.total_rating as f64,
-        user_to_vote.last_rating as u8,
-        user_to_vote.min_rating as u8,
-        user_to_vote.max_rating as u8,
-    )
-    .to_tags();
-
-    let days = calculate_days_since_creation(user_to_vote.created_at);
-    let mut tags: Vec<Tag> = reputation_event.into_iter().collect();
-    tags.push(Tag::custom("days", vec![days.to_string()]));
-    let reputation_event = Tags::from_list(tags);
+    let reputation_event = rating_event_tags(&user_to_vote);
 
     if buyer_rating || seller_rating {
         update_user_rating_event(&counterpart_trade_pubkey, reputation_event, my_keys).await?;
@@ -202,6 +191,28 @@ pub async fn update_user_reputation_action(
     }
 
     Ok(())
+}
+
+/// Tags of the kind 38384 rating event for `user`: core's `Rating` tags, with
+/// `since` when the user has a first-trade date, plus the deprecated `days`
+/// count kept for the deprecation window.
+pub(crate) fn rating_event_tags(user: &User) -> Tags {
+    let rating = Rating::new(
+        user.total_reviews as u64,
+        user.total_rating,
+        user.last_rating as u8,
+        user.min_rating as u8,
+        user.max_rating as u8,
+    );
+    let rating = match first_trade_since(user.created_at) {
+        Some(since) => rating.with_since(since),
+        None => rating,
+    };
+
+    let days = calculate_days_since_creation(user.created_at);
+    let mut tags: Vec<Tag> = rating.to_tags().into_iter().collect();
+    tags.push(Tag::custom("days", vec![days.to_string()]));
+    Tags::from_list(tags)
 }
 
 /// Calculate the number of days since user creation.
@@ -247,6 +258,10 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
+            payer_history: None,
+            health: Default::default(),
+            reputation_export: None,
         });
     }
 
@@ -426,6 +441,8 @@ mod tests {
         assert_eq!(seller_user.max_rating, 5);
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((seller_user.total_rating - 2.5).abs() < f64::EPSILON);
+        // The raw rating is kept undamped next to the average
+        assert!((seller_user.native_rating_sum - 5.0).abs() < f64::EPSILON);
 
         // Order buyer_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)
@@ -535,6 +552,8 @@ mod tests {
         assert_eq!(buyer_user.max_rating, 4);
         // First vote uses weight 1/2: total_rating = rating / 2.0
         assert!((buyer_user.total_rating - 2.0).abs() < f64::EPSILON);
+        // The raw rating is kept undamped next to the average
+        assert!((buyer_user.native_rating_sum - 4.0).abs() < f64::EPSILON);
 
         // Order seller_sent_rate flag must be set via the rating claim CAS
         let updated_order = Order::by_id(&pool, order.id)
@@ -665,6 +684,51 @@ mod tests {
         let can_rate_buyer = order.check_status(Status::Success).is_ok()
             || (order.check_status(Status::SettledHoldInvoice).is_ok() && !buyer_rating);
         assert!(!can_rate_buyer);
+    }
+
+    fn tag_value(tags: &Tags, name: &str) -> Option<String> {
+        tags.iter().find_map(|tag| {
+            let vec = tag.clone().to_vec();
+            if vec.first().map(String::as_str) == Some(name) {
+                vec.get(1).cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn rating_event_tags_publish_day_truncated_since_next_to_days() {
+        let user = User {
+            total_reviews: 3,
+            total_rating: 4.5,
+            last_rating: 5,
+            min_rating: 4,
+            max_rating: 5,
+            // 2023-11-14 22:13:20 UTC; its UTC day starts at 1_699_920_000.
+            created_at: 1_700_000_000,
+            ..Default::default()
+        };
+        let tags = rating_event_tags(&user);
+        assert_eq!(tag_value(&tags, "since").as_deref(), Some("1699920000"));
+        assert_eq!(tag_value(&tags, "total_reviews").as_deref(), Some("3"));
+        // `days` stays for the deprecation window.
+        let days = tag_value(&tags, "days").expect("days tag must stay");
+        assert_eq!(
+            days.parse::<u64>().unwrap(),
+            calculate_days_since_creation(user.created_at)
+        );
+    }
+
+    #[test]
+    fn rating_event_tags_omit_since_without_a_first_trade_date() {
+        let user = User {
+            created_at: 0,
+            ..Default::default()
+        };
+        let tags = rating_event_tags(&user);
+        assert_eq!(tag_value(&tags, "since"), None);
+        assert_eq!(tag_value(&tags, "days").as_deref(), Some("0"));
     }
 
     #[test]

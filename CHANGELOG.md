@@ -4,14 +4,12 @@ In order to verify the release, you'll need to have gpg or gpg2 installed on you
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/negrunch.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/arkanoider.asc | gpg --import
 curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/catrya.asc | gpg --import
-curl https://raw.githubusercontent.com/MostroP2P/mostro/main/keys/andreadiazcorreia.asc | gpg --import
 ```
-Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya, manifest.txt.sig.andreadiazcorreia and manifest.txt are in the current directory) with:
+Once you have the required PGP keys, you can verify the release (assuming manifest.txt.sig.negrunch, manifest.txt.sig.arkanoider, manifest.txt.sig.catrya and manifest.txt are in the current directory) with:
 ```bash
 gpg --verify manifest.txt.sig.negrunch manifest.txt
 gpg --verify manifest.txt.sig.arkanoider manifest.txt
 gpg --verify manifest.txt.sig.catrya manifest.txt
-gpg --verify manifest.txt.sig.andreadiazcorreia manifest.txt
 
 gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 1E41631D137BA2ADE55344F73852B843679AD6F0
@@ -25,35 +23,37 @@ gpg: Signature made fri 10 oct 2025 11:28:03 -03
 gpg:                using RSA key 9A718444050F091D3D24CF6CE15E232F243D73E6
 gpg: Good signature from "Catrya (github) <140891948+Catrya@users.noreply.github.com>" [ultimate]
 
-gpg: Signature made fri 10 oct 2025 11:28:03 -03
-gpg:                using EDDSA key 57376B6467F41F565ADDC65B1ED8B40E3A46E21D
-gpg: Good signature from "Andrea Diaz Correia <andrea.diaz.correia@gmail.com>" [ultimate]
-
 ```
 That will verify the signature of the manifest file, which ensures integrity and authenticity of the archive you've downloaded locally containing the binaries. Next, depending on your operating system, you should then re-compute the sha256 hash of the archive with `shasum -a 256 <filename>`, compare it with the corresponding one in the manifest file, and ensure they match exactly.
 
 
-## What's Changed in 0.19.1
+## What's Changed in 0.20.1
 
 ### 🚀 Features
 
 
-* feat: register and announce the node's Serbero by [@grunch](https://github.com/grunch) in [#1010](https://github.com/MostroP2P/mostro/pull/1010)
+* feat(reputation): rebind an exported reputation by [@grunch](https://github.com/grunch) in [#1035](https://github.com/MostroP2P/mostro/pull/1035)
+* feat(reputation): handle export-reputation by [@grunch](https://github.com/grunch) in [#1034](https://github.com/MostroP2P/mostro/pull/1034)
+* feat(reputation): add the export issuer key by [@grunch](https://github.com/grunch) in [#1033](https://github.com/MostroP2P/mostro/pull/1033)
 
 ### 🐛 Bug Fixes
 
 
-* fix: implement lookup_invoice_state for the bond CancelLightning impls by [@grunch](https://github.com/grunch) in [#1013](https://github.com/MostroP2P/mostro/pull/1013)
-* fix: let bond winners claim shares below the minimum by [@grunch](https://github.com/grunch) in [#1012](https://github.com/MostroP2P/mostro/pull/1012)
-* fix: never cancel a hold invoice the seller just paid by [@Catrya](https://github.com/Catrya) in [#910](https://github.com/MostroP2P/mostro/pull/910)
-* fix(dispute): make the dispute writes atomic (#921) by [@ToRyVand](https://github.com/ToRyVand) in [#923](https://github.com/MostroP2P/mostro/pull/923)
-* fix: build Ortsom PR images with the base's gate files by [@grunch](https://github.com/grunch) in [#1008](https://github.com/MostroP2P/mostro/pull/1008)
+* fix: keep one bad invoice and stale orders out of payouts check by [@grunch](https://github.com/grunch) in [#1071](https://github.com/MostroP2P/mostro/pull/1071)
+* fix: warn on a relay missing for 5 min, not at once by [@grunch](https://github.com/grunch) in [#1075](https://github.com/MostroP2P/mostro/pull/1075)
+* fix: warn on a payout waiting 30 min, not 15 by [@grunch](https://github.com/grunch) in [#1074](https://github.com/MostroP2P/mostro/pull/1074)
+* fix: keep lnd_sync ok while LND is between blocks by [@grunch](https://github.com/grunch) in [#1073](https://github.com/MostroP2P/mostro/pull/1073)
+
+### 📚 Documentation
+
+
+* docs: point the client list to the new Mostro App by [@grunch](https://github.com/grunch) in [#1077](https://github.com/MostroP2P/mostro/pull/1077)
+* docs(reputation): record the released app screen by [@grunch](https://github.com/grunch) in [#1070](https://github.com/MostroP2P/mostro/pull/1070)
+* docs(reputation): add the operator guide by [@grunch](https://github.com/grunch) in [#1036](https://github.com/MostroP2P/mostro/pull/1036)
 
 ## Contributors
-* [@grunch](https://github.com/grunch) made their contribution in [#1013](https://github.com/MostroP2P/mostro/pull/1013)
-* [@Catrya](https://github.com/Catrya) made their contribution in [#910](https://github.com/MostroP2P/mostro/pull/910)
-* [@ToRyVand](https://github.com/ToRyVand) made their contribution in [#923](https://github.com/MostroP2P/mostro/pull/923)
+* [@grunch](https://github.com/grunch) made their contribution in [#1077](https://github.com/MostroP2P/mostro/pull/1077)
 
-**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.19.0...0.19.1
+**Full Changelog**: https://github.com/MostroP2P/mostro/compare/v0.20.0...0.20.1
 
 <!-- generated by git-cliff -->

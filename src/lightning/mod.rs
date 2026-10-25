@@ -10,8 +10,8 @@ use fedimint_tonic_lnd::invoicesrpc::{
     SettleInvoiceMsg, SettleInvoiceResp,
 };
 use fedimint_tonic_lnd::lnrpc::{
-    invoice::InvoiceState, payment, GetInfoRequest, GetInfoResponse, InvoiceHtlcState, Payment,
-    PaymentHash,
+    invoice::InvoiceState, payment, Channel, GetInfoRequest, GetInfoResponse, InvoiceHtlcState,
+    ListChannelsRequest, Payment, PaymentHash,
 };
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::Client;
@@ -905,6 +905,20 @@ impl LndConnector {
         &mut self,
         payment_hash: &[u8],
     ) -> Result<Option<fedimint_tonic_lnd::lnrpc::payment::PaymentStatus>, MostroError> {
+        Ok(self
+            .lookup_payment(payment_hash)
+            .await?
+            .map(|payment| payment.status))
+    }
+
+    /// [`LndConnector::lookup_payment_status`], plus when the payment
+    /// reached its final state according to LND's own record
+    /// ([`payment_resolved_at`]). Reconciliation counts a recovered outcome
+    /// at that time, which may be long before it is recovered.
+    pub async fn lookup_payment(
+        &mut self,
+        payment_hash: &[u8],
+    ) -> Result<Option<PaymentLookup>, MostroError> {
         let track_req = TrackPaymentRequest {
             payment_hash: payment_hash.to_vec(),
             no_inflight_updates: false,
@@ -934,7 +948,11 @@ impl LndConnector {
                                 "Unknown payment status".to_string(),
                             ))
                         })?;
-                Ok(Some(status))
+                Ok(Some(PaymentLookup {
+                    status,
+                    resolved_at: payment_resolved_at(&payment),
+                    failure_reason: payment.failure_reason,
+                }))
             }
             Ok(None) => Ok(None),
             Err(status) => {
@@ -992,6 +1010,22 @@ impl LndConnector {
         }
     }
 
+    /// Liquidity and pending HTLCs over the node's channels, for the health
+    /// event (#1063).
+    pub async fn channel_facts(
+        &mut self,
+    ) -> Result<crate::app::health::content::ChannelFacts, MostroError> {
+        let channels = self
+            .client
+            .lightning()
+            .list_channels(ListChannelsRequest::default())
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())))?
+            .into_inner()
+            .channels;
+        Ok(channel_facts_of(&channels))
+    }
+
     pub async fn get_node_info(&mut self) -> Result<GetInfoResponse, MostroError> {
         let info = self.client.lightning().get_info(GetInfoRequest {}).await;
 
@@ -1013,6 +1047,28 @@ pub struct LnStatus {
     pub uris: Vec<String>,
 }
 
+/// Sum the balances of the active channels and gather their pending HTLCs.
+pub fn channel_facts_of(channels: &[Channel]) -> crate::app::health::content::ChannelFacts {
+    let mut facts = crate::app::health::content::ChannelFacts::default();
+    for channel in channels {
+        if channel.active {
+            facts.outbound_liquidity_sats += channel.local_balance;
+            facts.inbound_liquidity_sats += channel.remote_balance;
+        }
+        for htlc in &channel.pending_htlcs {
+            facts.pending_htlcs += 1;
+            facts.nearest_htlc_expiration_height = Some(
+                facts
+                    .nearest_htlc_expiration_height
+                    .map_or(htlc.expiration_height, |nearest| {
+                        nearest.min(htlc.expiration_height)
+                    }),
+            );
+        }
+    }
+    facts
+}
+
 impl LnStatus {
     pub fn from_get_info_response(info: GetInfoResponse) -> Self {
         Self {
@@ -1029,6 +1085,43 @@ impl LnStatus {
     }
 }
 
+/// A payment LND tracks: its status and, once final, when it got there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaymentLookup {
+    pub status: payment::PaymentStatus,
+    /// Unix seconds; see [`payment_resolved_at`].
+    pub resolved_at: Option<i64>,
+    /// LND's `PaymentFailureReason` as sent on the wire (`FAILURE_REASON_NONE`
+    /// unless the payment failed); the health event maps it with
+    /// `failure_reason_key`, as the live watcher does.
+    pub failure_reason: i32,
+}
+
+/// When `payment` reached its final state, from LND's record: for a success
+/// the latest resolution of a settled HTLC; for a failure the latest HTLC
+/// resolution, or its creation when no HTLC was attempted (no route), since
+/// pathfinding then fails within the payment timeout. `None` while it is in
+/// flight or when LND records no time.
+pub fn payment_resolved_at(payment: &Payment) -> Option<i64> {
+    use fedimint_tonic_lnd::lnrpc::htlc_attempt::HtlcStatus;
+    let latest_resolution = |settled_only: bool| {
+        payment
+            .htlcs
+            .iter()
+            .filter(|htlc| !settled_only || htlc.status == HtlcStatus::Succeeded as i32)
+            .map(|htlc| htlc.resolve_time_ns)
+            .filter(|ns| *ns > 0)
+            .max()
+    };
+    let ns = match payment::PaymentStatus::try_from(payment.status).ok()? {
+        payment::PaymentStatus::Succeeded => latest_resolution(true),
+        payment::PaymentStatus::Failed => latest_resolution(false)
+            .or((payment.creation_time_ns > 0).then_some(payment.creation_time_ns)),
+        _ => None,
+    }?;
+    Some(ns / 1_000_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1040,6 +1133,62 @@ mod tests {
     use crate::config::MOSTRO_CONFIG;
     use mostro_core::prelude::*;
     use std::sync::{Arc, Mutex};
+
+    /// Codex review on #1066: reconciliation counts a recovered payout at
+    /// the time LND resolved it.
+    #[test]
+    fn a_payments_resolution_time_comes_from_lnd() {
+        use super::{payment, payment_resolved_at, Payment};
+        use fedimint_tonic_lnd::lnrpc::{htlc_attempt::HtlcStatus, HtlcAttempt};
+        const S: i64 = 1_000_000_000;
+        let htlc = |status: HtlcStatus, resolved_s: i64| HtlcAttempt {
+            status: status as i32,
+            resolve_time_ns: resolved_s * S,
+            ..Default::default()
+        };
+        let paid = Payment {
+            status: payment::PaymentStatus::Succeeded as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![
+                htlc(HtlcStatus::Failed, 130),
+                htlc(HtlcStatus::Succeeded, 120),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&paid), Some(120), "the settled HTLC");
+
+        let failed = Payment {
+            status: payment::PaymentStatus::Failed as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![htlc(HtlcStatus::Failed, 140), htlc(HtlcStatus::Failed, 110)],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&failed), Some(140), "the last attempt");
+
+        let no_route = Payment {
+            status: payment::PaymentStatus::Failed as i32,
+            creation_time_ns: 100 * S,
+            ..Default::default()
+        };
+        assert_eq!(
+            payment_resolved_at(&no_route),
+            Some(100),
+            "no HTLC attempted"
+        );
+
+        let in_flight = Payment {
+            status: payment::PaymentStatus::InFlight as i32,
+            creation_time_ns: 100 * S,
+            htlcs: vec![htlc(HtlcStatus::Failed, 110)],
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&in_flight), None);
+        let unrecorded = Payment {
+            status: payment::PaymentStatus::Succeeded as i32,
+            ..Default::default()
+        };
+        assert_eq!(payment_resolved_at(&unrecorded), None);
+    }
 
     fn init_test_settings() {
         crate::config::init_test_nostr_keys();
@@ -1059,6 +1208,10 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            reputation_import: None,
+            payer_history: None,
+            health: Default::default(),
+            reputation_export: None,
         });
     }
 
@@ -1598,5 +1751,46 @@ mod offline_connector_tests {
         assert_eq!(status.chains, vec!["bitcoin".to_string()]);
         assert_eq!(status.networks, vec!["regtest".to_string()]);
         assert_eq!(status.uris, vec!["02abc@127.0.0.1:9735".to_string()]);
+    }
+
+    #[test]
+    fn channel_facts_sum_active_balances_and_find_the_nearest_htlc() {
+        use fedimint_tonic_lnd::lnrpc::{Channel, Htlc};
+        let htlc = |expiration_height| Htlc {
+            expiration_height,
+            ..Default::default()
+        };
+        let channels = vec![
+            Channel {
+                active: true,
+                local_balance: 1_000,
+                remote_balance: 200,
+                pending_htlcs: vec![htlc(971_806), htlc(971_640)],
+                ..Default::default()
+            },
+            Channel {
+                active: false,
+                local_balance: 50_000,
+                remote_balance: 7,
+                pending_htlcs: vec![htlc(971_700)],
+                ..Default::default()
+            },
+            Channel {
+                active: true,
+                local_balance: 300,
+                remote_balance: 4_000,
+                ..Default::default()
+            },
+        ];
+        let facts = super::channel_facts_of(&channels);
+        // Liquidity counts only active channels; HTLCs count on every channel.
+        assert_eq!(facts.outbound_liquidity_sats, 1_300);
+        assert_eq!(facts.inbound_liquidity_sats, 4_200);
+        assert_eq!(facts.pending_htlcs, 3);
+        assert_eq!(facts.nearest_htlc_expiration_height, Some(971_640));
+        assert_eq!(
+            super::channel_facts_of(&[]).nearest_htlc_expiration_height,
+            None
+        );
     }
 }

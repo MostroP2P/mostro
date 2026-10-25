@@ -23,6 +23,7 @@ pub mod util;
 pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
+use crate::app::dev_fee::{dev_fee_payments_enabled, release_all_pending_claims};
 use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
 use crate::app::serbero::{serbero_guard, SerberoDecision};
 use crate::app::{run, run_cashu};
@@ -120,6 +121,28 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Reputation import deduplicates on the trust-list name: a configured key
+    // known under another name, by its imports or an earlier boot, means an
+    // entry was renamed or a key moved, which would let those accounts import
+    // again.
+    if let Some(import) = Settings::get_reputation_import() {
+        let conflicts =
+            app::reputation::issuer_name_conflicts(get_db_pool().as_ref(), import).await?;
+        for conflict in &conflicts {
+            tracing::error!(
+                "REFUSING TO START: [reputation_import] key {} is in the entry `{}`, but it is \
+                 recorded under {:?}. Give the entry its original name back, or move the \
+                 key back to it.",
+                conflict.key,
+                conflict.configured,
+                conflict.recorded
+            );
+        }
+        if !conflicts.is_empty() {
+            exit(1);
+        }
+    }
+
     // Connect to relays
     if NOSTR_CLIENT.set(util::connect_nostr().await?).is_err() {
         tracing::error!("No connection to nostr relay - closing Mostro!");
@@ -196,29 +219,29 @@ async fn main() -> Result<()> {
 
     // Cashu escrow mode (docs/cashu/, CF-5): run the daemon with NO Lightning
     // node. Skip `LndConnector::new()` and the LN status probe entirely,
-    // connect the configured mint instead (fail fast if unreachable, mirroring
-    // the LND-refusal behaviour), attach the client to the context, and hand
-    // off to the Cashu event loop. Every trade action is still rejected with
+    // connect the configured mints instead, attach them to the context, and
+    // hand off to the Cashu event loop. Makers choose a mint per order, so an
+    // unreachable mint is a warning, not a reason to refuse to boot: orders
+    // on it fail to lock until it is back (issue #1046). Every trade action is still rejected with
     // `CantDo(InvalidAction)` until the feature tracks land. The default
     // Lightning path below is left byte-for-byte unchanged.
     if Settings::is_cashu_enabled() {
-        // `mint_url` non-emptiness + scheme were validated at config load
-        // (CF-1); this expect is unreachable for a validated config.
-        let mint_url = Settings::get_cashu()
-            .map(|c| c.mint_url.clone())
+        // The `mint_urls` entries were validated at config load (CF-1); this
+        // expect is unreachable for a validated config.
+        let mint_urls = Settings::get_cashu()
+            .map(|c| c.mint_urls.clone())
             .expect("cashu enabled but [cashu] settings missing after validation");
-        tracing::info!(
-            "Starting in Cashu escrow mode — connecting mint {mint_url} (LND not initialised)"
-        );
-        let cashu_client = match cashu::CashuClient::connect(&mint_url).await {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
-                tracing::error!(
-                    "No connection to Cashu mint {mint_url} - shutting down Mostro! ({e})"
-                );
-                exit(1);
-            }
-        };
+        if mint_urls.is_empty() {
+            tracing::info!(
+                "Starting in Cashu escrow mode — any mint accepted (LND not initialised)"
+            );
+        } else {
+            tracing::info!(
+                "Starting in Cashu escrow mode — connecting mints {} (LND not initialised)",
+                mint_urls.join(", ")
+            );
+        }
+        let cashu_mints = Arc::new(cashu::mints::CashuMints::connect_configured(&mint_urls).await);
 
         // The admin gRPC server takes a Lightning client that Cashu mode never
         // initialises, so it is not started here. Warn (rather than silently
@@ -242,7 +265,10 @@ async fn main() -> Result<()> {
                 .expect("MOSTRO_CONFIG not initialized")
                 .clone(),
         );
-        let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+        // There is no LND to resync in Cashu mode: maintenance the daemon
+        // turned on in a Lightning run because LND was unsynced would
+        // otherwise never be lifted (#1063). Operator maintenance stays.
+        let maintenance = MaintenanceState::load_for_cashu(get_db_pool().as_ref()).await?;
         if maintenance.is_enabled() {
             tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
         }
@@ -253,7 +279,7 @@ async fn main() -> Result<()> {
             MESSAGE_QUEUES.queue_order_msg.clone(),
             mostro_keys.clone(),
         )
-        .with_cashu_client(cashu_client)
+        .with_cashu_mints(cashu_mints)
         .with_maintenance(maintenance);
 
         start_scheduler(ctx.clone()).await;
@@ -274,6 +300,23 @@ async fn main() -> Result<()> {
     // them, so starting against a different node while escrow is still open
     // on the old one would strand every release/cancel. Refuse loudly here
     // instead of failing one order at a time (spec §3.6).
+    // Off mainnet the dev fee job never runs (#1039), so release the claims
+    // an interrupted run left behind before the guard below counts them as
+    // in-flight dev fees.
+    let networks = LN_STATUS
+        .get()
+        .map(|status| status.networks.clone())
+        .unwrap_or_default();
+    if !dev_fee_payments_enabled(&networks) {
+        match release_all_pending_claims(get_db_pool().as_ref()).await {
+            Ok(0) => {}
+            Ok(released) => tracing::info!(
+                "Released {released} interrupted dev fee claim(s) left by a previous run"
+            ),
+            Err(e) => tracing::warn!("Failed to release interrupted dev fee claims: {e}"),
+        }
+    }
+
     let allow_node_change = Settings::get_ln().allow_node_change;
     match node_identity_guard(get_db_pool().as_ref(), &node_pubkey, allow_node_change).await? {
         NodeIdentityDecision::FirstBoot => {
@@ -349,11 +392,46 @@ async fn main() -> Result<()> {
 
     // Maintenance (drain) flag: one instance shared by the admin RPC (which
     // flips it) and the event loop's AppContext (which gates on it).
-    let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+    // With `[health].auto_maintenance_on_lnd_unsynced` off, maintenance the
+    // daemon turned on in an earlier run is lifted here, since the sync job
+    // will not (#1063). Operator maintenance is kept.
+    let maintenance = MaintenanceState::load_for_lightning(
+        get_db_pool().as_ref(),
+        Settings::get_health().auto_maintenance_on_lnd_unsynced,
+    )
+    .await?;
     if maintenance.is_enabled() {
         tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
     }
 
+    // Asked again here, after the resubscriptions (which can take a while
+    // on a node with many open trades) and right before the admin RPC and
+    // the jobs start: a stale "synced" from boot must not let payouts out
+    // (#1063). The RPC and the event loop share this one monitored state.
+    let lnd_sync = app::health::lnd_sync::LndSyncState::new();
+    let startup_info = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ln_client.get_node_info(),
+    )
+    .await;
+    let now = chrono::Utc::now().timestamp();
+    match startup_info {
+        Ok(Ok(info)) => {
+            lnd_sync.observe_at_startup(app::health::lnd_sync::LndObservation::from(&info), now)
+        }
+        _ => lnd_sync.observe_unreachable_at_startup(now),
+    }
+    // A deferring spell from an earlier run (ended while the daemon was
+    // down, or still open) must still excuse the payouts sent before it.
+    if let Err(e) = lnd_sync
+        .load_deferral_history(get_db_pool().as_ref(), now)
+        .await
+    {
+        tracing::warn!("Could not load the LND deferral history: {e}");
+    }
+    if lnd_sync.defers_outgoing_payments(now) {
+        tracing::warn!("LND is not synced to chain at startup: outgoing payments wait until it is");
+    }
     // Start RPC server if enabled
     if RpcServer::is_enabled() {
         let rpc_server = RpcServer::new();
@@ -361,10 +439,17 @@ async fn main() -> Result<()> {
         let rpc_pool = get_db_pool();
         let rpc_ln_client = Arc::new(tokio::sync::Mutex::new(ln_client.clone()));
         let rpc_maintenance = maintenance.clone();
+        let rpc_lnd_sync = lnd_sync.clone();
 
         tokio::spawn(async move {
             match rpc_server
-                .start(rpc_keys, rpc_pool, rpc_ln_client, rpc_maintenance)
+                .start(
+                    rpc_keys,
+                    rpc_pool,
+                    rpc_ln_client,
+                    rpc_maintenance,
+                    rpc_lnd_sync,
+                )
                 .await
             {
                 Ok(_) => tracing::info!("RPC server started successfully"),
@@ -385,6 +470,8 @@ async fn main() -> Result<()> {
             .expect("MOSTRO_CONFIG not initialized")
             .clone(),
     );
+    // Payouts and dev fees must not go out against an unsynced node before
+    // the sync monitor's first poll (#1063).
     let ctx = AppContext::new(
         get_db_pool(),
         client.clone(),
@@ -392,7 +479,8 @@ async fn main() -> Result<()> {
         MESSAGE_QUEUES.queue_order_msg.clone(),
         mostro_keys.clone(),
     )
-    .with_maintenance(maintenance);
+    .with_maintenance(maintenance)
+    .with_lnd_sync(lnd_sync);
 
     // Start scheduler for tasks
     start_scheduler(ctx.clone()).await;

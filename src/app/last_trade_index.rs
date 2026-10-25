@@ -158,7 +158,9 @@ mod tests {
                 last_rating INTEGER NOT NULL DEFAULT 0,
                 max_rating INTEGER NOT NULL DEFAULT 0,
                 min_rating INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT 0
+                created_at INTEGER NOT NULL DEFAULT 0,
+                native_rating_sum REAL NOT NULL DEFAULT 0.0,
+                native_created_at INTEGER
             )
             "#,
         )

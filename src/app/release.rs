@@ -4,8 +4,8 @@ use crate::app::dispute::close_dispute_after_resolution;
 use crate::escrow::EscrowBackend;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::{
-    claim_payout_slot, LndConnector, PaymentMessage, PayoutCaps, PayoutGateReason, SlotVerdict,
-    PAYOUT_SEND_PAYMENT_TIMEOUT,
+    claim_payout_slot, LndConnector, PaymentLookup, PaymentMessage, PayoutCaps, PayoutGateReason,
+    SlotVerdict, PAYOUT_SEND_PAYMENT_TIMEOUT,
 };
 use crate::lnurl::resolv_ln_address;
 use crate::nip33::{new_order_event_with_created_at, order_to_tags};
@@ -138,7 +138,43 @@ async fn heartbeat_payout_claim(
 
 /// Run [`check_failure_retries`] and surface bookkeeping failures instead of
 /// silently dropping them. On success, preserves the existing retry-count log.
-async fn check_failure_retries_or_log(ctx: &AppContext, order: &Order, request_id: Option<u64>) {
+///
+/// While our own Lightning node cannot pay (not synced to chain, or not
+/// reachable — `ctx.lnd_sync()`), the failure is not the buyer's: it is
+/// recorded without consuming a payment attempt and without notifying the
+/// buyer, and `job_retry_failed_payments` pays the order once the node
+/// recovers (#1063). Before this, three failed retries during an LND stall
+/// sent the buyer an `add-invoice` for a payment that was never theirs to fix.
+///
+/// `attempt_started_at` is when the failed payment was sent (or claimed),
+/// when known: a failure that arrives after LND recovered is still not
+/// counted if payments were deferred at any moment since then.
+async fn check_failure_retries_or_log(
+    ctx: &AppContext,
+    order: &Order,
+    request_id: Option<u64>,
+    attempt_started_at: Option<i64>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let snapshot = ctx.lnd_sync().snapshot();
+    let ours = match attempt_started_at {
+        Some(started_at) => snapshot.deferred_since(started_at, now),
+        None => snapshot.defers_outgoing_payments(now),
+    };
+    if ours {
+        warn!(
+            "Order id {}: payout failed while LND is not synced to chain or not reachable; \
+             not counting it as a payment attempt",
+            order.id
+        );
+        if let Err(e) = defer_payout_durably(ctx.pool(), order.id).await {
+            tracing::error!(
+                "Order id {}: could not record the deferred payout: {e}",
+                order.id
+            );
+        }
+        return;
+    }
     match check_failure_retries(ctx, order, request_id).await {
         Ok(failed_payment) => {
             info!(
@@ -348,16 +384,19 @@ pub async fn release_action(
     // explicit write the settled-hold-invoice status only lived in memory and
     // was persisted as a side-effect of the full-row writes in
     // check_failure_retries / payment_success (now replaced by targeted updates).
-    let result =
-        sqlx::query("UPDATE orders SET status = ?, event_id = ? WHERE id = ? AND status IN (?, ?)")
-            .bind(&order.status)
-            .bind(&order.event_id)
-            .bind(order.id)
-            .bind(Status::FiatSent.to_string())
-            .bind(Status::Dispute.to_string())
-            .execute(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    let result = sqlx::query(
+        "UPDATE orders SET status = ?, event_id = ?, hold_settled_at = ? \
+             WHERE id = ? AND status IN (?, ?)",
+    )
+    .bind(&order.status)
+    .bind(&order.event_id)
+    .bind(chrono::Utc::now().timestamp())
+    .bind(order.id)
+    .bind(Status::FiatSent.to_string())
+    .bind(Status::Dispute.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
         tracing::warn!(
@@ -686,6 +725,19 @@ pub async fn do_payment(
     order: Order,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
+    // Our own node cannot pay right now (#1063): do not even try. The order
+    // is left where `job_retry_failed_payments` finds it once LND recovers,
+    // with no attempt consumed and no notice to the buyer.
+    if ctx
+        .lnd_sync()
+        .defers_outgoing_payments(chrono::Utc::now().timestamp())
+    {
+        warn!(
+            "Order id {}: deferring the buyer payout, LND is not synced to chain or not reachable",
+            order.id
+        );
+        return defer_payout_durably(ctx.pool(), order.id).await;
+    }
     // Single bookkeeping point for the pre-claim paths. An `Err` out of
     // `dispatch_payout` means the buyer was not paid *and* no payout marker
     // was left behind, so the order has to be marked `failed_payment` here:
@@ -696,7 +748,7 @@ pub async fn do_payment(
     match dispatch_payout(ctx, &order, request_id).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            check_failure_retries_or_log(ctx, &order, request_id).await;
+            check_failure_retries_or_log(ctx, &order, request_id, None).await;
             Err(e)
         }
     }
@@ -1022,6 +1074,13 @@ async fn dispatch_payout(
             }
         };
 
+        // The waits above can be long: if our node stopped being able to
+        // pay meanwhile, give the claim back as deferred instead of sending.
+        if defer_after_wait(&ctx, order.id, &payout_hash, payout_claimed_at).await {
+            return;
+        }
+        let send_started_at = chrono::Utc::now().timestamp();
+
         let (tx, mut rx) = channel::<PaymentMessage>(100);
 
         // Start the status watcher BEFORE `send_payment` and run them
@@ -1063,11 +1122,12 @@ async fn dispatch_payout(
                                     buyer_pubkey,
                                     &my_keys,
                                     request_id,
+                                    Some(chrono::Utc::now().timestamp()),
                                 )
                                 .await
                                 .unwrap_or(false)
                                 {
-                                    let _ = crate::db::clear_order_payout(
+                                    let _ = clear_payout_marker_durably(
                                         ctx.pool(),
                                         order.id,
                                         &payout_hash,
@@ -1081,7 +1141,6 @@ async fn dispatch_payout(
                                     "Order Id {}: Invoice with hash: {} has failed!",
                                     order.id, msg.payment.payment_hash
                                 );
-
                                 // Release our own claim (scoped to this hash and
                                 // the per-claim timestamp) and re-arm retry. Only
                                 // do the failure bookkeeping and buyer
@@ -1098,7 +1157,22 @@ async fn dispatch_payout(
                                 .await
                                 .unwrap_or(false)
                                 {
-                                    check_failure_retries_or_log(&ctx, &order, request_id).await;
+                                    // Counted once, by whoever wins the
+                                    // guarded re-arm.
+                                    ctx.health_stats().record_payout_failure(
+                                        chrono::Utc::now().timestamp(),
+                                        order.id,
+                                        crate::app::health::stats::failure_reason_key(
+                                            msg.payment.failure_reason,
+                                        ),
+                                    );
+                                    check_failure_retries_or_log(
+                                        &ctx,
+                                        &order,
+                                        request_id,
+                                        Some(send_started_at),
+                                    )
+                                    .await;
                                 }
                             }
                             _ => {}
@@ -1122,13 +1196,21 @@ async fn dispatch_payout(
         let lookup = match &send_outcome {
             Ok(Err(_)) => match Vec::<u8>::from_hex(&payout_hash) {
                 Ok(bytes) if bytes.len() == 32 => {
-                    Some(ln_client_payment.lookup_payment_status(&bytes).await)
+                    Some(ln_client_payment.lookup_payment(&bytes).await)
                 }
                 _ => None,
             },
             _ => None,
         };
 
+        // LND reports the payment failed although the send RPC errored: a
+        // final failed attempt for the health event's payout counters, at
+        // the time LND failed it and with its reason (Codex review on #1066).
+        let failed_lookup = match &lookup {
+            Some(Ok(Some(found))) if found.status == PaymentStatus::Failed => Some(*found),
+            _ => None,
+        };
+        let lookup = lookup.map(|result| result.map(|found| found.map(|found| found.status)));
         match classify_dispatch(send_outcome, lookup) {
             // The send stream ended. Usually a terminal update was delivered
             // and the watcher finishes the bookkeeping — but send_payment's
@@ -1158,13 +1240,145 @@ async fn dispatch_payout(
                 .await
                 .unwrap_or(false)
                 {
-                    check_failure_retries_or_log(&ctx, &order, request_id).await;
+                    // Counted only with LND's own time, as in reconciliation:
+                    // a record with no resolution time is not placed in the
+                    // window at an invented moment.
+                    if let Some((failed, at)) =
+                        failed_lookup.and_then(|failed| failed.resolved_at.map(|at| (failed, at)))
+                    {
+                        ctx.health_stats().record_payout_failure(
+                            at,
+                            order.id,
+                            crate::app::health::stats::failure_reason_key(failed.failure_reason),
+                        );
+                    }
+                    check_failure_retries_or_log(&ctx, &order, request_id, Some(send_started_at))
+                        .await;
                 }
             }
         }
     });
 
     Ok(())
+}
+
+/// [`crate::db::clear_order_payout`] after a finalized payout, retried with
+/// the same short backoff as [`defer_payout_durably`]. Once the order is
+/// `success`, `find_inflight_payouts` never revisits it, so a marker left by
+/// a single failed write would stay forever (inert, but misleading).
+async fn clear_payout_marker_durably(
+    pool: &Pool<Sqlite>,
+    order_id: uuid::Uuid,
+    payout_hash: &str,
+    claimed_at: Option<i64>,
+) -> Result<bool, MostroError> {
+    let mut last_error =
+        match crate::db::clear_order_payout(pool, order_id, payout_hash, claimed_at).await {
+            Ok(cleared) => return Ok(cleared),
+            Err(e) => e,
+        };
+    for delay in DEFER_PAYOUT_RETRY_DELAYS {
+        warn!(
+            "Order {order_id}: could not clear the payout marker ({last_error}); retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        match crate::db::clear_order_payout(pool, order_id, payout_hash, claimed_at).await {
+            Ok(cleared) => return Ok(cleared),
+            Err(e) => last_error = e,
+        }
+    }
+    tracing::error!(
+        "Order {order_id}: could not clear the payout marker of a finalized payout ({last_error})"
+    );
+    Err(last_error)
+}
+
+/// Pauses between the attempts of [`defer_payout_durably`].
+const DEFER_PAYOUT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+];
+
+/// [`crate::db::mark_payout_deferred`], retried with a short backoff. The
+/// mark is what makes a deferred payout discoverable by
+/// `job_retry_failed_payments` (`failed_payment = true`): `release` and
+/// `admin-settle` do not act on `do_payment`'s error, so a single busy
+/// SQLite would otherwise leave the order settled with no payout and no
+/// recovery job looking at it. Returns the last error if every attempt fails.
+async fn defer_payout_durably(
+    pool: &Pool<Sqlite>,
+    order_id: uuid::Uuid,
+) -> Result<(), MostroError> {
+    let mut last_error = match crate::db::mark_payout_deferred(pool, order_id).await {
+        Ok(marked) => {
+            warn_if_nothing_deferred(order_id, marked);
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    for delay in DEFER_PAYOUT_RETRY_DELAYS {
+        warn!(
+            "Order id {order_id}: could not mark the payout deferred ({last_error}); retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        match crate::db::mark_payout_deferred(pool, order_id).await {
+            Ok(marked) => {
+                warn_if_nothing_deferred(order_id, marked);
+                return Ok(());
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    tracing::error!(
+        "Order id {order_id}: could not mark the payout deferred after {} attempts ({last_error}); \
+         the buyer payout of this settled order needs attention",
+        DEFER_PAYOUT_RETRY_DELAYS.len() + 1
+    );
+    Err(last_error)
+}
+
+/// The mark found nothing to mark: the order is not `settled-hold-invoice`
+/// with no payout in flight. Not an error for the caller (the order is not
+/// ours to pay in that state), but said out loud, since no recovery job will
+/// look at it.
+fn warn_if_nothing_deferred(order_id: uuid::Uuid, marked: bool) {
+    if !marked {
+        warn!(
+            "Order id {order_id}: nothing to defer, the order is not settled-hold-invoice \
+             without a payout in flight"
+        );
+    }
+}
+
+/// After the slot gate and the dispatch semaphore, whose waits can be long:
+/// if payments are deferred now, release the claim as a deferred payout
+/// (`failed_payment` set, attempts untouched, buyer not notified) for
+/// `job_retry_failed_payments` to send once LND recovers. Returns whether it
+/// did, in which case nothing must be sent.
+async fn defer_after_wait(
+    ctx: &AppContext,
+    order_id: uuid::Uuid,
+    payout_hash: &str,
+    payout_claimed_at: i64,
+) -> bool {
+    if !ctx
+        .lnd_sync()
+        .defers_outgoing_payments(chrono::Utc::now().timestamp())
+    {
+        return false;
+    }
+    warn!(
+        "Order {order_id}: LND stopped being synced or reachable while this payout waited; \
+         deferring hash {payout_hash}"
+    );
+    if let Err(e) =
+        crate::db::fail_order_payout(ctx.pool(), order_id, payout_hash, Some(payout_claimed_at))
+            .await
+    {
+        warn!("Order {order_id}: could not release the deferred payout claim ({e}); reconciliation will");
+    }
+    true
 }
 
 /// What the dispatch task must do with its claim once the bounded send has
@@ -1241,12 +1455,19 @@ fn classify_dispatch(
 ///
 /// Buyer notifications (`PurchaseCompleted`, `Rate`) are enqueued only after a
 /// successful commit, so a retried finalization never spams the buyer.
+///
+/// `succeeded_at` is when LND settled the payout, for the health event: now
+/// for the live watcher, LND's own record for a payout recovered by
+/// reconciliation (possibly hours old). `None` when unknown: the success is
+/// then left out of the time-bounded health metrics (the one-hour window
+/// and the last successful payout) rather than counted as recent.
 async fn payment_success(
     ctx: &AppContext,
     order: &mut Order,
     buyer_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
+    succeeded_at: Option<i64>,
 ) -> Result<bool> {
     let pool = ctx.pool();
 
@@ -1282,6 +1503,18 @@ async fn payment_success(
         return Ok(true);
     }
 
+    // Committed by us: the payout is counted for the health event here,
+    // atomically with finalization in effect (only the task that wins this
+    // status CAS gets here), so it is counted once and never lost to a
+    // later cleanup failure.
+    // Memory only here; the time is persisted in the background, so the
+    // database cannot delay or fail the buyer's notifications below.
+    if let Some(at) = succeeded_at {
+        ctx.health_stats().record_payout_success(at);
+        ctx.health_stats()
+            .persist_last_success_in_background(ctx.pool_arc());
+    }
+
     // Committed by us — notify the buyer now.
     enqueue_order_msg(
         None,
@@ -1305,16 +1538,16 @@ async fn payment_success(
 }
 
 /// The one LND capability `reconcile_inflight_payout` needs: query a payment's
-/// status by hash. Behind a trait (mirroring [`crate::app::cancel`]'s
-/// `CancelLightning`) so the reconcile branches are unit-testable with a stub
-/// instead of a live node.
+/// status by hash, with the time it reached it. Behind a trait (mirroring
+/// [`crate::app::cancel`]'s `CancelLightning`) so the reconcile branches are
+/// unit-testable with a stub instead of a live node.
 pub trait PayoutStatusLookup {
-    fn lookup_payment_status<'a>(
+    fn lookup_payment<'a>(
         &'a mut self,
         payment_hash: &'a [u8],
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+            dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                 + Send
                 + 'a,
         >,
@@ -1322,17 +1555,17 @@ pub trait PayoutStatusLookup {
 }
 
 impl PayoutStatusLookup for LndConnector {
-    fn lookup_payment_status<'a>(
+    fn lookup_payment<'a>(
         &'a mut self,
         payment_hash: &'a [u8],
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+            dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                 + Send
                 + 'a,
         >,
     > {
-        Box::pin(async move { LndConnector::lookup_payment_status(self, payment_hash).await })
+        Box::pin(async move { LndConnector::lookup_payment(self, payment_hash).await })
     }
 }
 
@@ -1382,7 +1615,19 @@ pub async fn reconcile_inflight_payout(
         }
     };
 
-    match ln_client.lookup_payment_status(&hash_bytes).await {
+    let lookup = ln_client.lookup_payment(&hash_bytes).await;
+    // When LND says the payment reached its final state: an outcome
+    // recovered here may be hours old, so the health metrics count it at
+    // that time, or not at all when LND gives none.
+    let failure_reason = match &lookup {
+        Ok(Some(found)) => found.failure_reason,
+        _ => 0,
+    };
+    let resolved_at = match &lookup {
+        Ok(Some(found)) => found.resolved_at,
+        _ => None,
+    };
+    match lookup.map(|found| found.map(|found| found.status)) {
         Ok(Some(PaymentStatus::Succeeded)) => {
             // Clear the marker only once the order is actually finalized. If
             // finalization fails (or the buyer key is unreadable), keep the
@@ -1392,27 +1637,28 @@ pub async fn reconcile_inflight_payout(
                 Ok(Some(mut order)) => {
                     let my_keys = ctx.keys().clone();
                     match order.get_buyer_pubkey() {
-                        Ok(buyer_pubkey) => {
-                            payment_success(ctx, &mut order, buyer_pubkey, &my_keys, None)
-                                .await
-                                .unwrap_or(false)
-                        }
+                        Ok(buyer_pubkey) => payment_success(
+                            ctx,
+                            &mut order,
+                            buyer_pubkey,
+                            &my_keys,
+                            None,
+                            resolved_at,
+                        )
+                        .await
+                        .unwrap_or(false),
                         Err(_) => false,
                     }
                 }
                 _ => false,
             };
             if finalized {
-                crate::db::clear_order_payout(
-                    pool,
-                    order_id,
-                    payout_payment_hash,
-                    payout_claimed_at,
-                )
-                .await?;
+                clear_payout_marker_durably(pool, order_id, payout_payment_hash, payout_claimed_at)
+                    .await?;
             }
         }
-        Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None) => {
+        lookup
+        @ (Ok(Some(PaymentStatus::Failed)) | Ok(Some(PaymentStatus::Unknown)) | Ok(None)) => {
             // Snapshot the order *before* re-arming so the bookkeeping sees the
             // pre-failure state: `fail_order_payout` sets failed_payment = true,
             // and `count_failed_payment` treats an already-failed order as a
@@ -1426,8 +1672,22 @@ pub async fn reconcile_inflight_payout(
             if crate::db::fail_order_payout(pool, order_id, payout_payment_hash, payout_claimed_at)
                 .await?
             {
+                // Only a payment LND reports as Failed reached a final state
+                // (an unknown or missing record is not an attempt), and it is
+                // counted once, by whoever wins the guarded re-arm, at the
+                // time LND failed it.
+                if let Some(at) =
+                    resolved_at.filter(|_| matches!(lookup, Ok(Some(PaymentStatus::Failed))))
+                {
+                    ctx.health_stats().record_payout_failure(
+                        at,
+                        order_id,
+                        crate::app::health::stats::failure_reason_key(failure_reason),
+                    );
+                }
                 if let Some(order) = pre {
-                    check_failure_retries_or_log(ctx, &order, None).await;
+                    // The claim is stamped before the send, so it bounds it.
+                    check_failure_retries_or_log(ctx, &order, None, payout_claimed_at).await;
                 }
             }
         }
@@ -1749,6 +2009,252 @@ mod tests {
     // ---------------------------------------------------------------
     // check_failure_retries
     // ---------------------------------------------------------------
+
+    /// An LND sync state that has reported `synced_to_chain = false` for the
+    /// last `secs` seconds, polled like `job_lnd_sync_monitor` does.
+    fn lnd_unsynced_for(secs: i64) -> crate::app::health::lnd_sync::LndSyncState {
+        use crate::app::health::lnd_sync::{LndObservation, LndSyncState};
+        let state = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        let observation = LndObservation {
+            synced_to_chain: false,
+            block_height: 971_349,
+            best_header_timestamp: now - secs,
+            network: Some("mainnet".to_string()),
+            peers: 19,
+            channels_active: 8,
+            channels_inactive: 0,
+            channels_pending: 0,
+        };
+        let mut at = now - secs;
+        while at < now {
+            state.observe(observation.clone(), at);
+            at += 15;
+        }
+        state.observe(observation, now);
+        state
+    }
+
+    fn settled_order(seller: PublicKey, buyer: PublicKey) -> Order {
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.status = Status::SettledHoldInvoice.to_string();
+        order.buyer_invoice = Some("buyer@example.com".to_string());
+        order.payment_attempts = 0;
+        order.failed_payment = false;
+        order
+    }
+
+    #[tokio::test]
+    async fn payout_attempt_not_consumed_while_lnd_unsynced() {
+        // Arrange: our own node has been stuck on a stale chain for 2 min.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool).with_lnd_sync(lnd_unsynced_for(120));
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // Act: a payout fails (incorrect_payment_details, as on 2026-10-14).
+        check_failure_retries_or_log(&ctx, &order, None, None).await;
+
+        // Assert: left for the retry job, no attempt burned, buyer not told.
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "the retry job must still find it");
+        assert_eq!(db_order.payment_attempts, 0);
+        let queued = queued_actions_for(order.id).await;
+        assert!(!queued.contains(&Action::PaymentFailed));
+        assert!(!queued.contains(&Action::AddInvoice));
+    }
+
+    #[tokio::test]
+    async fn payout_attempt_counted_when_lnd_is_synced() {
+        let pool = create_test_pool().await;
+        // A few seconds of `false` while a block arrives is normal.
+        let ctx = build_ctx(&pool).with_lnd_sync(lnd_unsynced_for(10));
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        check_failure_retries_or_log(&ctx, &order, None, None).await;
+
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
+        assert_eq!(db_order.payment_attempts, 1);
+        assert!(queued_actions_for(order.id)
+            .await
+            .contains(&Action::PaymentFailed));
+    }
+
+    #[tokio::test]
+    async fn do_payment_defers_while_lnd_unsynced() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool).with_lnd_sync(lnd_unsynced_for(120));
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        // Nothing is sent: an LND call would fail in this test.
+        do_payment(&ctx, order.clone(), None).await.unwrap();
+
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        assert!(db_order.failed_payment, "the retry job picks it up later");
+        assert_eq!(db_order.payment_attempts, 0);
+        assert!(crate::db::find_failed_payment(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|o| o.id == order.id));
+        assert!(!queued_actions_for(order.id)
+            .await
+            .contains(&Action::PaymentFailed));
+    }
+
+    /// Codex review on #1065: a payout sent before LND went bad, whose
+    /// failure arrives after it recovered, is not the buyer's failure.
+    #[tokio::test]
+    async fn a_failure_after_recovery_is_not_counted_if_the_send_was_deferred() {
+        use crate::app::health::lnd_sync::{LndObservation, LndSyncState};
+        let pool = create_test_pool().await;
+        let now = chrono::Utc::now().timestamp();
+        let observation = |synced| LndObservation {
+            synced_to_chain: synced,
+            block_height: 971_349,
+            best_header_timestamp: now,
+            network: None,
+            peers: 1,
+            channels_active: 1,
+            channels_inactive: 0,
+            channels_pending: 0,
+        };
+        let state = LndSyncState::new();
+        let sent_at = now - 200;
+        state.observe(observation(true), sent_at);
+        let mut at = now - 180;
+        while at <= now - 30 {
+            state.observe(observation(false), at);
+            at += 15;
+        }
+        state.observe(observation(true), now);
+        let ctx = build_ctx(&pool).with_lnd_sync(state);
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+
+        check_failure_retries_or_log(&ctx, &order, None, Some(sent_at)).await;
+
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment);
+        assert_eq!(db_order.payment_attempts, 0, "not the buyer's attempt");
+
+        // A send that started after the spell ended counts as usual.
+        let later = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+        check_failure_retries_or_log(&ctx, &later, None, Some(now + 1)).await;
+        let db_later = Order::by_id(&pool, later.id).await.unwrap().unwrap();
+        assert_eq!(db_later.payment_attempts, 1);
+    }
+
+    /// Codex review on #1065: a payout that waited at the slot gate or the
+    /// dispatch semaphore while LND went bad is given back, not sent.
+    #[tokio::test]
+    async fn a_payout_that_waited_into_a_deferral_is_given_back() {
+        let pool = create_test_pool().await;
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+        let hash = "b".repeat(64);
+        let token = crate::db::claim_order_payout(&pool, order.id, &hash)
+            .await
+            .unwrap()
+            .expect("claimed");
+
+        let healthy = build_ctx(&pool);
+        assert!(!defer_after_wait(&healthy, order.id, &hash, token).await);
+        assert!(Order::by_id(&pool, order.id).await.unwrap().is_some());
+
+        let stuck = build_ctx(&pool).with_lnd_sync(lnd_unsynced_for(120));
+        assert!(defer_after_wait(&stuck, order.id, &hash, token).await);
+        let payout: Option<String> =
+            sqlx::query_scalar("SELECT payout_payment_hash FROM orders WHERE id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(payout, None, "claim released");
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "left for the retry job");
+        assert_eq!(db_order.payment_attempts, 0);
+    }
+
+    /// Codex review on #1066: a transient database error while marking a
+    /// deferred payout must not leave the order invisible to the retry job.
+    #[tokio::test]
+    async fn a_deferred_payout_mark_is_retried_until_it_lands() {
+        let pool = create_test_pool().await;
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+        for stmt in [
+            "CREATE TABLE busy (x INTEGER)",
+            "INSERT INTO busy VALUES (1)",
+            "CREATE TRIGGER busy_orders BEFORE UPDATE OF failed_payment ON orders \
+             WHEN (SELECT COUNT(*) FROM busy) > 0 BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+        // The database recovers shortly after the first attempt fails.
+        let unblock = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sqlx::query("DROP TRIGGER busy_orders")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        };
+
+        defer_payout_durably(&pool, order.id).await.unwrap();
+        unblock.await.unwrap();
+
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(db_order.failed_payment, "the retry job can find it");
+        assert!(crate::db::find_failed_payment(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|o| o.id == order.id));
+    }
+
+    #[tokio::test]
+    async fn mark_payout_deferred_never_touches_an_inflight_payout() {
+        let pool = create_test_pool().await;
+        let order = settled_order(Keys::generate().public_key(), Keys::generate().public_key())
+            .create(&pool)
+            .await
+            .unwrap();
+        crate::db::claim_order_payout(&pool, order.id, &"ab".repeat(32))
+            .await
+            .unwrap()
+            .expect("claimed");
+
+        let marked = crate::db::mark_payout_deferred(&pool, order.id)
+            .await
+            .unwrap();
+
+        assert!(!marked, "the caller is told nothing was marked");
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert!(!db_order.failed_payment);
+    }
 
     #[tokio::test]
     async fn check_failure_retries_notifies_buyer_on_first_failure() {
@@ -2858,7 +3364,15 @@ mod tests {
         let my_keys = Keys::generate();
 
         // Act
-        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+        let result = payment_success(
+            &ctx,
+            &mut order,
+            buyer,
+            &my_keys,
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await;
 
         // Assert: committed the transition (returns true) and notified the buyer.
         assert!(result.unwrap(), "a committed finalization returns true");
@@ -2883,7 +3397,15 @@ mod tests {
         let my_keys = Keys::generate();
 
         // Act
-        let result = payment_success(&ctx, &mut order, buyer, &my_keys, None).await;
+        let result = payment_success(
+            &ctx,
+            &mut order,
+            buyer,
+            &my_keys,
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await;
 
         // Assert: the guarded UPDATE matched no rows (already finalized
         // elsewhere), so the call reports terminal (`true`) — the caller may
@@ -2908,28 +3430,43 @@ mod tests {
     struct StubLnClient {
         status: Option<PaymentStatus>,
         error: bool,
+        /// When LND resolved the payment (`PaymentLookup::resolved_at`).
+        resolved_at: Option<i64>,
     }
 
+    /// LND's reason for every `Failed` the stub reports: `no_route`, so a
+    /// test can tell a mapped reason from the `other` fallback.
+    const STUB_FAILURE_REASON: i32 =
+        fedimint_tonic_lnd::lnrpc::PaymentFailureReason::FailureReasonNoRoute as i32;
+
     impl PayoutStatusLookup for StubLnClient {
-        fn lookup_payment_status<'a>(
+        fn lookup_payment<'a>(
             &'a mut self,
             _payment_hash: &'a [u8],
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<Option<PaymentStatus>, MostroError>>
+                dyn std::future::Future<Output = Result<Option<PaymentLookup>, MostroError>>
                     + Send
                     + 'a,
             >,
         > {
             let status = self.status;
             let error = self.error;
+            let resolved_at = self.resolved_at;
             Box::pin(async move {
                 if error {
                     Err(MostroInternalErr(ServiceError::LnPaymentError(
                         "stub".to_string(),
                     )))
                 } else {
-                    Ok(status)
+                    Ok(status.map(|status| PaymentLookup {
+                        status,
+                        resolved_at,
+                        failure_reason: match status {
+                            PaymentStatus::Failed => STUB_FAILURE_REASON,
+                            _ => 0,
+                        },
+                    }))
                 }
             })
         }
@@ -2970,6 +3507,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Succeeded),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3061,6 +3599,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::Failed),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3082,6 +3621,241 @@ mod tests {
         );
     }
 
+    /// Codex review on #1066: a failed payout is counted once, by whoever
+    /// wins the guarded re-arm. A second reconcile of the same (already
+    /// released) claim, or one with a stale token, must not count it again.
+    #[tokio::test]
+    async fn a_failed_payout_is_counted_once() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Failed),
+            error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        // The same snapshot reconciled again (another tick, or the watcher
+        // racing): the claim is already gone.
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        // A stale token that never owned the claim.
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token - 1))
+            .await
+            .unwrap();
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.failed, 1);
+        assert_eq!(window.succeeded, 0);
+        // Codex review on #1066: a reconciled failure keeps LND's reason
+        // instead of falling back to `other`.
+        assert_eq!(window.failure_reasons.get("no_route"), Some(&1));
+        assert_eq!(window.failure_reasons.get("other"), None);
+    }
+
+    /// Codex review on #1066: a success is counted when the order is
+    /// finalized, not when the marker is cleared, so a failing cleanup can
+    /// neither lose it nor count it twice; the cleanup is retried.
+    #[tokio::test]
+    async fn a_paid_payout_is_counted_even_if_the_marker_cleanup_fails() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        sqlx::query(
+            "CREATE TRIGGER busy_marker BEFORE UPDATE OF payout_payment_hash ON orders \
+             WHEN NEW.payout_payment_hash IS NULL BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unblock = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sqlx::query("DROP TRIGGER busy_marker")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        };
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        unblock.await.unwrap();
+
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 1);
+        assert!(marker_of(&pool, id).await.is_none(), "cleanup retried");
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+    }
+
+    /// Codex review on #1066: the success time's database write is off the
+    /// finalization path; if it fails, the buyer is still notified, the
+    /// claim is still cleared and the success is still known.
+    #[tokio::test]
+    async fn a_payout_is_finalized_even_if_the_success_time_cannot_be_saved() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        sqlx::query(
+            "CREATE TRIGGER no_last_success BEFORE INSERT ON daemon_state \
+             WHEN NEW.key = 'health_last_payout_success_at' \
+             BEGIN SELECT RAISE(ABORT, 'busy'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert!(marker_of(&pool, id).await.is_none());
+        assert!(queued_actions_for(id)
+            .await
+            .contains(&Action::PurchaseCompleted));
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 1);
+        assert!(ctx.health_stats().last_success_in_memory().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_paid_payout_is_counted_once() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.succeeded, 1);
+        assert_eq!(window.failed, 0);
+    }
+
+    /// Codex review on #1066: a payout recovered by reconciliation is
+    /// counted at the time LND resolved it, so an hours-old success neither
+    /// lands in the one-hour window nor looks like a recent payout.
+    #[tokio::test]
+    async fn a_reconciled_success_is_counted_at_lnds_time() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (id, hash, token) = settled_order_with_marker(&pool).await;
+        let now = chrono::Utc::now().timestamp();
+        let settled_at = now - 3 * 3600;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: Some(settled_at),
+        };
+
+        reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+            .await
+            .unwrap();
+
+        let db_order = Order::by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert_eq!(ctx.health_stats().payout_window(now).succeeded, 0);
+        assert_eq!(
+            ctx.health_stats().last_success_in_memory(),
+            Some(settled_at)
+        );
+    }
+
+    /// Without LND's time, a recovered outcome stays out of the
+    /// time-bounded metrics; the order is still finalized or re-armed.
+    #[tokio::test]
+    async fn a_reconciled_outcome_without_lnds_time_is_not_counted() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let now = chrono::Utc::now().timestamp();
+
+        let (paid, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Succeeded),
+            error: false,
+            resolved_at: None,
+        };
+        reconcile_inflight_payout(&ctx, &mut ln, paid, &hash, Some(token))
+            .await
+            .unwrap();
+        let db_order = Order::by_id(&pool, paid).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::Success.to_string());
+        assert!(ctx.health_stats().last_success_in_memory().is_none());
+
+        let (failed, hash, token) = settled_order_with_marker(&pool).await;
+        let mut ln = StubLnClient {
+            status: Some(PaymentStatus::Failed),
+            error: false,
+            resolved_at: None,
+        };
+        reconcile_inflight_payout(&ctx, &mut ln, failed, &hash, Some(token))
+            .await
+            .unwrap();
+        assert!(marker_of(&pool, failed).await.is_none(), "re-armed");
+
+        let window = ctx.health_stats().payout_window(now);
+        assert_eq!(window.attempts(), 0);
+    }
+
+    /// An hours-old failure recovered by reconciliation cannot trip the
+    /// failure-rate rule; a recent one counts.
+    #[tokio::test]
+    async fn a_reconciled_failure_is_counted_at_lnds_time() {
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let now = chrono::Utc::now().timestamp();
+        for resolved_at in [now - 3 * 3600, now - 60] {
+            let (id, hash, token) = settled_order_with_marker(&pool).await;
+            let mut ln = StubLnClient {
+                status: Some(PaymentStatus::Failed),
+                error: false,
+                resolved_at: Some(resolved_at),
+            };
+            reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(ctx.health_stats().payout_window(now).failed, 1);
+    }
+
     #[tokio::test]
     async fn reconcile_inflight_is_a_noop() {
         init_global_config();
@@ -3091,6 +3865,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: Some(PaymentStatus::InFlight),
             error: false,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
 
         reconcile_inflight_payout(&ctx, &mut ln, id, &hash, Some(token))
@@ -3132,6 +3907,7 @@ mod tests {
         let mut ln = StubLnClient {
             status: None,
             error: true,
+            resolved_at: Some(chrono::Utc::now().timestamp()),
         };
         reconcile_inflight_payout(&ctx, &mut ln, order.id, "abc", Some(1000))
             .await

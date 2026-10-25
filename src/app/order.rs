@@ -1,4 +1,5 @@
 use crate::app::context::AppContext;
+use crate::cashu::mint_policy::resolve_order_mint;
 use crate::db::update_user_trade_index;
 use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::prelude::*;
@@ -44,12 +45,39 @@ async fn calculate_and_check_quote(
     Ok(())
 }
 
+/// The order with its escrow mint settled (issue #1046).
+///
+/// In Cashu mode the maker chooses the mint and the node accepts or rejects
+/// it against `[cashu].mint_urls` ([`resolve_order_mint`]); the accepted mint
+/// is stored in canonical form. A Lightning node has no mint, so an order
+/// that names one is rejected rather than published with a field nobody
+/// honours.
+async fn with_escrow_mint(ctx: &AppContext, order: &SmallOrder) -> Result<SmallOrder, MostroError> {
+    let cashu = ctx.settings().cashu.as_ref().filter(|cashu| cashu.enabled);
+    let cashu_mint_url = match cashu {
+        Some(cashu) => Some(
+            resolve_order_mint(order.cashu_mint_url.as_deref(), &cashu.mint_urls)
+                .await
+                .map_err(MostroCantDo)?,
+        ),
+        None if order.cashu_mint_url.is_some() => {
+            return Err(MostroCantDo(CantDoReason::InvalidMintUrl));
+        }
+        None => None,
+    };
+    Ok(SmallOrder {
+        cashu_mint_url,
+        ..order.clone()
+    })
+}
+
 /// Processes a trading order message by validating, updating, and publishing the order.
 ///
 /// This asynchronous function inspects the provided message for an order and, if found, proceeds to:
 /// - Validate the associated invoice.
 /// - Check if fiat currency is accepted by mostro instance
 /// - Check order constraints such as range limits and zero-amount premium conditions.
+/// - Settle the escrow mint in Cashu mode (the maker's choice, if the node accepts it).
 /// - Calculate a valid quote (in satoshis) for each fiat amount in the order.
 /// - Determine the appropriate trade index, using a fallback when the sender matches the rumor's public key.
 /// - Update the user's trade index in the database and publish the order.
@@ -135,6 +163,10 @@ pub async fn order_action(
         if let Err(cause) = order.check_zero_amount_with_premium() {
             return Err(MostroCantDo(cause));
         }
+
+        // Settle the escrow mint after the cheap checks: on an open Cashu
+        // node it resolves the mint's host.
+        let order = &with_escrow_mint(ctx, order).await?;
 
         // Check quote in sats for each amount
         for fiat_amount in amount_vec.iter() {
@@ -668,6 +700,151 @@ mod tests {
                 matches!(result, Err(MostroInternalErr(ServiceError::NostrError(_)))),
                 "expected broadcast failure at the very end: {result:?}"
             );
+        }
+
+        // ── Mint choice (issue #1046) ────────────────────────────────────
+
+        const MINT_A: &str = "https://mint-a.example.com";
+        const MINT_B: &str = "https://mint-b.example.com";
+
+        async fn cashu_ctx(mint_urls: &[&str]) -> AppContext {
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            let mut settings = test_settings();
+            settings.cashu = Some(crate::config::types::CashuSettings {
+                enabled: true,
+                mint_urls: mint_urls.iter().map(|m| m.to_string()).collect(),
+                ..Default::default()
+            });
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(settings)
+                .build()
+        }
+
+        fn order_message_on_mint(mint: Option<&str>) -> Message {
+            let order = SmallOrder {
+                kind: Some(mostro_core::order::Kind::Sell),
+                amount: 1_000,
+                fiat_code: "USD".to_string(),
+                fiat_amount: 100,
+                payment_method: "SEPA".to_string(),
+                cashu_mint_url: mint.map(str::to_string),
+                ..Default::default()
+            };
+            Message::new_order(
+                None,
+                Some(1),
+                None,
+                Action::NewOrder,
+                Some(Payload::Order(order)),
+            )
+        }
+
+        /// Run `order_action` as a full-privacy maker and return the mint the
+        /// persisted order stores. The offline Nostr client fails the final
+        /// broadcast, after the row is written.
+        async fn persisted_mint(ctx: &AppContext, mint: Option<&str>) -> Option<String> {
+            let keys = create_test_keys();
+            let mut event = create_test_unwrapped_message();
+            event.identity = event.sender;
+            let result = order_action(ctx, order_message_on_mint(mint), &event, &keys).await;
+            assert!(
+                matches!(result, Err(MostroInternalErr(ServiceError::NostrError(_)))),
+                "expected the order to reach publication: {result:?}"
+            );
+            let (stored,): (Option<String>,) =
+                sqlx::query_as("SELECT cashu_mint_url FROM orders LIMIT 1")
+                    .fetch_one(ctx.pool())
+                    .await
+                    .expect("order row must be persisted");
+            stored
+        }
+
+        async fn rejection(ctx: &AppContext, mint: Option<&str>) -> MostroError {
+            let keys = create_test_keys();
+            let mut event = create_test_unwrapped_message();
+            event.identity = event.sender;
+            order_action(ctx, order_message_on_mint(mint), &event, &keys)
+                .await
+                .unwrap_err()
+        }
+
+        async fn order_count(ctx: &AppContext) -> i64 {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM orders")
+                .fetch_one(ctx.pool())
+                .await
+                .unwrap();
+            count
+        }
+
+        #[tokio::test]
+        async fn cashu_order_on_a_listed_mint_stores_that_mint() {
+            init_globals();
+            let ctx = cashu_ctx(&[MINT_A, MINT_B]).await;
+            let stored = persisted_mint(&ctx, Some("https://MINT-B.example.com/")).await;
+            assert_eq!(stored.as_deref(), Some(MINT_B));
+        }
+
+        #[tokio::test]
+        async fn cashu_order_on_an_unlisted_mint_is_not_published() {
+            init_globals();
+            let ctx = cashu_ctx(&[MINT_A]).await;
+            let err = rejection(&ctx, Some(MINT_B)).await;
+            assert!(matches!(err, MostroCantDo(CantDoReason::InvalidMintUrl)));
+            assert_eq!(order_count(&ctx).await, 0);
+        }
+
+        #[tokio::test]
+        async fn cashu_order_without_a_mint_defaults_to_the_only_one() {
+            init_globals();
+            let ctx = cashu_ctx(&[MINT_A]).await;
+            assert_eq!(persisted_mint(&ctx, None).await.as_deref(), Some(MINT_A));
+        }
+
+        #[tokio::test]
+        async fn cashu_order_without_a_mint_is_rejected_with_several() {
+            init_globals();
+            let ctx = cashu_ctx(&[MINT_A, MINT_B]).await;
+            let err = rejection(&ctx, None).await;
+            assert!(matches!(err, MostroCantDo(CantDoReason::InvalidMintUrl)));
+        }
+
+        #[tokio::test]
+        async fn open_cashu_node_accepts_any_public_mint() {
+            init_globals();
+            let ctx = cashu_ctx(&[]).await;
+            let stored = persisted_mint(&ctx, Some("https://8.8.8.8/")).await;
+            assert_eq!(stored.as_deref(), Some("https://8.8.8.8"));
+        }
+
+        #[tokio::test]
+        async fn open_cashu_node_rejects_a_loopback_mint() {
+            let _lock = crate::lnurl::AllowPrivateLnurlHostsGuard::lock_policy().await;
+            crate::lnurl::allow_private_lnurl_hosts_for_test(false);
+            init_globals();
+            let ctx = cashu_ctx(&[]).await;
+            let err = rejection(&ctx, Some("http://127.0.0.1:3338")).await;
+            assert!(matches!(err, MostroCantDo(CantDoReason::InvalidMintUrl)));
+            assert_eq!(order_count(&ctx).await, 0);
+        }
+
+        #[tokio::test]
+        async fn lightning_order_naming_a_mint_is_rejected() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            let err = rejection(&ctx, Some(MINT_A)).await;
+            assert!(matches!(err, MostroCantDo(CantDoReason::InvalidMintUrl)));
+        }
+
+        #[tokio::test]
+        async fn lightning_order_stores_no_mint() {
+            init_globals();
+            let ctx = create_migrated_ctx().await;
+            assert_eq!(persisted_mint(&ctx, None).await, None);
         }
     }
 

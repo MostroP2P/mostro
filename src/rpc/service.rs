@@ -1,22 +1,26 @@
 //! RPC service implementation for admin operations
 
+use crate::app::context::AppContext;
 use crate::app::daemon_state;
+use crate::app::health::lnd_sync::LndSyncState;
 use crate::app::maintenance::{
     drain_counters, MaintenanceState, KEY_LN_NODE_PUBKEY, KEY_REASON, KEY_SINCE,
 };
 use crate::config::settings::Settings;
-use crate::config::LN_STATUS;
+use crate::config::{LN_STATUS, MESSAGE_QUEUES};
 
 use crate::lightning::LndConnector;
 use crate::rpc::admin::{
     admin_service_server::AdminService, AddSolverRequest, AddSolverResponse, CancelOrderRequest,
     CancelOrderResponse, DrainCounters, GetMaintenanceStatusRequest, GetMaintenanceStatusResponse,
-    SetMaintenanceModeRequest, SetMaintenanceModeResponse, SettleOrderRequest, SettleOrderResponse,
-    TakeDisputeRequest, TakeDisputeResponse, ValidateDbPasswordRequest, ValidateDbPasswordResponse,
+    RebindReputationExportRequest, RebindReputationExportResponse, RevokeReputationImportsRequest,
+    RevokeReputationImportsResponse, SetMaintenanceModeRequest, SetMaintenanceModeResponse,
+    SettleOrderRequest, SettleOrderResponse, TakeDisputeRequest, TakeDisputeResponse,
+    ValidateDbPasswordRequest, ValidateDbPasswordResponse,
 };
 use crate::rpc::rate_limiter::RateLimiter;
 use mostro_core::transport::UnwrappedMessage;
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{Client, Keys};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
@@ -33,6 +37,10 @@ pub struct AdminServiceImpl {
     /// Same clone the event loop's `AppContext` holds, so a flip here is
     /// observed by the escrow gate immediately.
     maintenance: MaintenanceState,
+    /// The process-wide LND sync state the monitor job feeds: admin
+    /// settlements pay the buyer, and must defer exactly as the event loop
+    /// does while LND is unsynced (#1063).
+    lnd_sync: LndSyncState,
     /// `[rpc].auth_token`. When set, every mutating RPC requires
     /// `authorization: Bearer <token>`.
     auth_token: Option<SecretString>,
@@ -44,6 +52,7 @@ impl AdminServiceImpl {
         pool: Arc<Pool<Sqlite>>,
         ln_client: Arc<tokio::sync::Mutex<LndConnector>>,
         maintenance: MaintenanceState,
+        lnd_sync: LndSyncState,
     ) -> Self {
         let retention_secs = Settings::get_rpc().rate_limiter_stale_duration;
         Self {
@@ -52,8 +61,23 @@ impl AdminServiceImpl {
             ln_client,
             password_rate_limiter: Arc::new(RateLimiter::new(Duration::from_secs(retention_secs))),
             maintenance,
+            lnd_sync,
             auth_token: Settings::get_rpc().auth_token.clone(),
         }
+    }
+
+    /// The context an admin action runs in: the shared maintenance flag and
+    /// LND sync state, never fresh defaults.
+    fn app_context(&self, nostr_client: Client, settings: Arc<Settings>) -> AppContext {
+        AppContext::new(
+            self.pool.clone(),
+            nostr_client,
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            self.keys.clone(),
+        )
+        .with_maintenance(self.maintenance.clone())
+        .with_lnd_sync(self.lnd_sync.clone())
     }
 
     /// Application-layer check for the mutating RPCs. A no-op unless
@@ -87,11 +111,10 @@ impl AdminServiceImpl {
         }
     }
 
-    /// The admin service has no authentication interceptor; mutating the
-    /// maintenance flag is restricted to loopback peers so a non-loopback
-    /// `[rpc].listen_address` or a forwarded port cannot close or reopen the
-    /// book. Missing peer info is refused too (same as `validate_db_password`).
-    fn require_loopback<T>(request: &Request<T>) -> Result<std::net::IpAddr, Status> {
+    /// Restrict local administration RPCs to loopback peers. Forwarded
+    /// connections also need the configured bearer token; missing peer
+    /// information is refused rather than assumed local.
+    fn require_loopback<T>(request: &Request<T>, rpc: &str) -> Result<std::net::IpAddr, Status> {
         let ip = request
             .remote_addr()
             .ok_or_else(|| Status::internal("Unable to determine client address"))?
@@ -99,10 +122,10 @@ impl AdminServiceImpl {
         if ip.is_loopback() {
             Ok(ip)
         } else {
-            warn!("SetMaintenanceMode refused for non-loopback peer {ip}");
-            Err(Status::permission_denied(
-                "SetMaintenanceMode is only accepted from loopback peers",
-            ))
+            warn!("{rpc} refused for non-loopback peer {ip}");
+            Err(Status::permission_denied(format!(
+                "{rpc} is only accepted from loopback peers"
+            )))
         }
     }
 }
@@ -152,8 +175,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -166,13 +187,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         let mut ln_client = self.ln_client.lock().await;
         admin_cancel_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -239,8 +254,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -253,13 +266,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         let mut ln_client = self.ln_client.lock().await;
         admin_settle_action(&ctx, msg, &event, &self.keys, &mut ln_client)
             .await
@@ -293,8 +300,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -307,13 +312,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         admin_add_solver_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin add solver failed: {}", e))?;
@@ -347,8 +346,6 @@ impl AdminServiceImpl {
             created_at: Timestamp::now(),
         };
 
-        use crate::app::context::AppContext;
-        use crate::config::MESSAGE_QUEUES;
         use crate::config::MOSTRO_CONFIG;
         use crate::util::get_nostr_client;
 
@@ -361,13 +358,7 @@ impl AdminServiceImpl {
                 .ok_or_else(|| "MOSTRO_CONFIG not initialized".to_string())?
                 .clone(),
         );
-        let ctx = AppContext::new(
-            self.pool.clone(),
-            nostr_client,
-            settings,
-            MESSAGE_QUEUES.queue_order_msg.clone(),
-            self.keys.clone(),
-        );
+        let ctx = self.app_context(nostr_client, settings);
         admin_take_dispute_action(&ctx, msg, &event, &self.keys)
             .await
             .map_err(|e| format!("Admin take dispute failed: {}", e))?;
@@ -506,13 +497,28 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SetMaintenanceModeRequest>,
     ) -> Result<Response<SetMaintenanceModeResponse>, Status> {
-        let ip = Self::require_loopback(&request)?;
+        let ip = Self::require_loopback(&request, "SetMaintenanceMode")?;
         self.require_auth(&request, "SetMaintenanceMode")?;
         let req = request.into_inner();
         info!(
             "Received SetMaintenanceMode(enabled={}) from {ip}, request_id: {:?}",
             req.enabled, req.request_id
         );
+        // `lnd_unsynced` marks maintenance the daemon turned on by itself
+        // (#1063); an operator using it would make readers of the health and
+        // info events take their maintenance for the daemon's.
+        if req.reason.as_deref().map(str::trim)
+            == Some(crate::app::maintenance::REASON_LND_UNSYNCED)
+        {
+            warn!("SetMaintenanceMode refused: the reason is reserved for the daemon");
+            return Ok(Response::new(SetMaintenanceModeResponse {
+                success: false,
+                error_message: Some(format!(
+                    "the reason \"{}\" is reserved for maintenance the daemon enables by itself",
+                    crate::app::maintenance::REASON_LND_UNSYNCED
+                )),
+            }));
+        }
         match self
             .maintenance
             .set(&self.pool, req.enabled, req.reason.as_deref())
@@ -534,6 +540,130 @@ impl AdminService for AdminServiceImpl {
                     success: false,
                     error_message: Some(e.to_string()),
                 }))
+            }
+        }
+    }
+
+    async fn revoke_reputation_imports(
+        &self,
+        request: Request<RevokeReputationImportsRequest>,
+    ) -> Result<Response<RevokeReputationImportsResponse>, Status> {
+        let ip = Self::require_loopback(&request, "RevokeReputationImports")?;
+        self.require_auth(&request, "RevokeReputationImports")?;
+        let req = request.into_inner();
+        info!(
+            "Received RevokeReputationImports(key={}, imported_after={:?}) from {ip}, request_id: {:?}",
+            req.issuer_key, req.imported_after, req.request_id
+        );
+        let failure = |message: String| {
+            Ok(Response::new(RevokeReputationImportsResponse {
+                success: false,
+                error_message: Some(message),
+                revoked: 0,
+            }))
+        };
+        let Ok(key) = nostr_sdk::prelude::PublicKey::parse(req.issuer_key.trim()) else {
+            return failure(format!("invalid issuer key: {}", req.issuer_key));
+        };
+        if Settings::get_reputation_import().is_some_and(|import| import.issuer_for(&key).is_some())
+        {
+            warn!(
+                "RevokeReputationImports: issuer key {key} is still trusted; remove it from \
+                 [reputation_import] and restart, or new imports with it remain possible"
+            );
+        }
+        match crate::app::reputation::revoke::revoke_imports(
+            &self.pool,
+            &key,
+            req.imported_after,
+            &self.keys,
+        )
+        .await
+        {
+            Ok(rows) => {
+                warn!(
+                    "Revoked {} reputation imports signed by {} (reason: {})",
+                    rows.len(),
+                    key.to_hex(),
+                    req.reason.as_deref().unwrap_or("none given")
+                );
+                Ok(Response::new(RevokeReputationImportsResponse {
+                    success: true,
+                    error_message: None,
+                    revoked: rows.len() as u32,
+                }))
+            }
+            Err(e) => {
+                error!("RevokeReputationImports failed: {e}");
+                failure(e.to_string())
+            }
+        }
+    }
+
+    async fn rebind_reputation_export(
+        &self,
+        request: Request<RebindReputationExportRequest>,
+    ) -> Result<Response<RebindReputationExportResponse>, Status> {
+        let ip = Self::require_loopback(&request, "RebindReputationExport")?;
+        self.require_auth(&request, "RebindReputationExport")?;
+        let req = request.into_inner();
+        info!(
+            "Received RebindReputationExport from {ip}, request_id: {:?}",
+            req.request_id
+        );
+        let failure = |message: String| {
+            Ok(Response::new(RebindReputationExportResponse {
+                success: false,
+                error_message: Some(message),
+                previous_identity: None,
+            }))
+        };
+        let parse = |key: &str| nostr_sdk::prelude::PublicKey::parse(key.trim()).ok();
+        let (Some(identity), Some(new_identity)) = (parse(&req.identity), parse(&req.new_identity))
+        else {
+            return failure("identity and new_identity must be npub or hex keys".to_string());
+        };
+        if req.reason.trim().is_empty() {
+            return failure("a reason is required".to_string());
+        }
+        let user = match crate::db::find_user_by_pubkey(&self.pool, identity.to_hex()).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return failure(format!("no account for {}", identity.to_hex())),
+            Err(e) => {
+                error!("RebindReputationExport failed: {e}");
+                return failure(e.to_string());
+            }
+        };
+        let previous = user.reputation_exported_to.clone();
+        let today =
+            mostro_core::user::day_truncate(nostr_sdk::prelude::Timestamp::now().as_secs() as i64);
+        match crate::db::move_reputation_binding(
+            self.pool.as_ref(),
+            &user.pubkey,
+            previous.as_deref(),
+            &new_identity.to_hex(),
+            today as i64,
+        )
+        .await
+        {
+            Ok(true) => {
+                warn!(
+                    "reputation: admin rebound the export of {} from {} to {}: {}",
+                    user.pubkey,
+                    previous.as_deref().unwrap_or("none"),
+                    new_identity.to_hex(),
+                    req.reason.trim()
+                );
+                Ok(Response::new(RebindReputationExportResponse {
+                    success: true,
+                    error_message: None,
+                    previous_identity: previous,
+                }))
+            }
+            Ok(false) => failure("the binding changed meanwhile; try again".to_string()),
+            Err(e) => {
+                error!("RebindReputationExport failed: {e}");
+                failure(e.to_string())
             }
         }
     }
@@ -739,7 +869,13 @@ mod tests {
 
         let pool = Arc::new(pool);
         let maintenance = MaintenanceState::load(&pool).await.unwrap();
-        AdminServiceImpl::new(Keys::generate(), pool, ln_client, maintenance)
+        AdminServiceImpl::new(
+            Keys::generate(),
+            pool,
+            ln_client,
+            maintenance,
+            LndSyncState::new(),
+        )
     }
 
     fn request_with_addr<T>(inner: T, last_octet: u8) -> Request<T> {
@@ -835,6 +971,66 @@ mod tests {
         assert!(!status.enabled);
         assert_eq!(status.reason, None);
         assert_eq!(status.since, None);
+    }
+
+    /// Codex review on #1065: admin actions (SettleOrder pays the buyer)
+    /// must run with the process-wide LND sync state and maintenance flag,
+    /// not fresh defaults that never defer.
+    #[tokio::test]
+    async fn admin_contexts_share_the_monitored_state() {
+        use crate::app::health::lnd_sync::LndObservation;
+        let mut service = offline_service().await;
+        let lnd_sync = LndSyncState::new();
+        let now = chrono::Utc::now().timestamp();
+        lnd_sync.observe_at_startup(
+            LndObservation {
+                synced_to_chain: false,
+                block_height: 1,
+                best_header_timestamp: now,
+                network: None,
+                peers: 0,
+                channels_active: 0,
+                channels_inactive: 0,
+                channels_pending: 0,
+            },
+            now,
+        );
+        service.lnd_sync = lnd_sync;
+        service
+            .maintenance
+            .set(&service.pool, true, Some("upgrade"))
+            .await
+            .unwrap();
+
+        let ctx = service.app_context(
+            Client::default(),
+            Arc::new(crate::app::context::test_utils::test_settings()),
+        );
+
+        assert!(ctx.lnd_sync().defers_outgoing_payments(now));
+        assert!(ctx.maintenance().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn set_maintenance_mode_rejects_the_reserved_reason() {
+        let service = offline_service().await;
+
+        let resp = service
+            .set_maintenance_mode(request_with_addr(
+                SetMaintenanceModeRequest {
+                    enabled: true,
+                    reason: Some(" lnd_unsynced ".into()),
+                    request_id: None,
+                },
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(resp.error_message.unwrap().contains("reserved"));
+        assert!(!service.maintenance.is_enabled(), "nothing changed");
     }
 
     #[tokio::test]
@@ -985,6 +1181,8 @@ mod tests {
                 .code(),
             deny
         );
+        // RevokeReputationImports also requires a loopback peer, so it gets
+        // its own test (revoke_reputation_imports_needs_loopback_and_the_token).
         // Read-only calls stay open.
         assert!(service
             .get_maintenance_status(Request::new(GetMaintenanceStatusRequest {
@@ -992,6 +1190,405 @@ mod tests {
             }))
             .await
             .is_ok());
+    }
+
+    fn revoke_req(issuer_key: &str) -> RevokeReputationImportsRequest {
+        RevokeReputationImportsRequest {
+            issuer_key: issuer_key.to_string(),
+            imported_after: None,
+            reason: Some("key leaked".to_string()),
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_refuses_non_loopback_even_with_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key().to_hex();
+        for ip in ["203.0.113.1", "2001:db8::1"] {
+            let err = service
+                .revoke_reputation_imports(bearer(
+                    request_with_ip(revoke_req(&key), ip.parse().unwrap()),
+                    "s3cret",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert!(err.message().contains("RevokeReputationImports"));
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_preserves_the_cutoff_and_node_signature() {
+        use crate::db::{add_new_user, insert_reputation_import, ReputationImportRow};
+        use mostro_core::prelude::User;
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key();
+        let other_key = Keys::generate().public_key();
+        let mut cases = Vec::new();
+        for (issuer, imported_at, revoked) in [
+            (key, 199, false),
+            (key, 200, true),
+            (key, 201, true),
+            (other_key, 201, false),
+        ] {
+            let identity = Keys::generate().public_key().to_hex();
+            let trade = Keys::generate().public_key().to_hex();
+            let row = ReputationImportRow {
+                attestation_id: Keys::generate().public_key().to_hex(),
+                issuer: "fixture".to_string(),
+                issuer_key: issuer.to_hex(),
+                subject: identity.clone(),
+                identity_pubkey: identity.clone(),
+                trade_pubkey: Some(trade.clone()),
+                reviews: 5,
+                rating_hundredths: 450,
+                since: 1_696_204_800,
+                imported_at,
+            };
+            let mut user = User::new(identity.clone(), 0, 0, 0, 0, 1);
+            add_new_user(service.pool.as_ref(), user.clone())
+                .await
+                .unwrap();
+            user.apply_reputation_import(&row.figures().unwrap());
+            crate::db::update_user_reputation(service.pool.as_ref(), &user)
+                .await
+                .unwrap();
+            insert_reputation_import(service.pool.as_ref(), &row)
+                .await
+                .unwrap();
+            cases.push((identity, trade, revoked));
+        }
+        let mut req = revoke_req(&key.to_hex());
+        req.imported_after = Some(200);
+        let response = service
+            .revoke_reputation_imports(bearer(request_with_addr(req, 1), "s3cret"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{:?}", response.error_message);
+        assert_eq!(response.revoked, 2);
+        for (identity, trade, revoked) in cases {
+            let user = crate::db::is_user_present(service.pool.as_ref(), identity.clone())
+                .await
+                .unwrap();
+            assert_eq!(user.total_reviews, if revoked { 0 } else { 5 });
+            assert_eq!(
+                crate::db::reputation_imports_for_identity(service.pool.as_ref(), &identity)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                revoked
+            );
+            let events: Vec<_> = crate::config::MESSAGE_QUEUES
+                .queue_order_rate
+                .read()
+                .await
+                .iter()
+                .filter(|ev| {
+                    ev.tags
+                        .iter()
+                        .any(|tag| tag.as_slice() == ["d", trade.as_str()])
+                })
+                .cloned()
+                .collect();
+            assert_eq!(events.len(), usize::from(revoked));
+            if revoked {
+                events[0].verify().unwrap();
+                assert_eq!(events[0].pubkey, service.keys.public_key());
+                assert_eq!(
+                    events[0].kind.as_u16(),
+                    mostro_core::prelude::NOSTR_RATING_EVENT_KIND
+                );
+                assert!(events[0]
+                    .tags
+                    .iter()
+                    .any(|tag| tag.as_slice() == ["total_reviews", "0"]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_needs_loopback_and_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let key = Keys::generate().public_key().to_hex();
+        let no_addr = service
+            .revoke_reputation_imports(Request::new(revoke_req(&key)))
+            .await
+            .unwrap_err();
+        assert_eq!(no_addr.code(), tonic::Code::Internal);
+        let no_token = service
+            .revoke_reputation_imports(request_with_addr(revoke_req(&key), 1))
+            .await
+            .unwrap_err();
+        assert_eq!(no_token.code(), tonic::Code::PermissionDenied);
+        let ok = service
+            .revoke_reputation_imports(bearer(request_with_addr(revoke_req(&key), 1), "s3cret"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ok.success);
+        assert_eq!(ok.revoked, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_reputation_imports_refuses_an_invalid_key_and_reverses_the_imports() {
+        use crate::db::{insert_reputation_import, ReputationImportRow};
+        use nostr_sdk::prelude::ToBech32;
+        let service = offline_service().await;
+        let bad = service
+            .revoke_reputation_imports(request_with_addr(revoke_req("npub1nope"), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad.success);
+        assert!(bad.error_message.unwrap().contains("invalid issuer key"));
+
+        let key = Keys::generate().public_key();
+        let identity = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, total_reviews, total_rating, created_at, native_created_at, \
+             seeded_reviews, seeded_rating_sum, min_rating, max_rating, last_rating) \
+             VALUES (?1, 5, 4.5, 1696204800, 1790000000, 5, 22.5, 5, 5, 5)",
+        )
+        .bind(&identity)
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        insert_reputation_import(
+            service.pool.as_ref(),
+            &ReputationImportRow {
+                attestation_id: "a".repeat(64),
+                issuer: "lnp2pbot".to_string(),
+                issuer_key: key.to_hex(),
+                subject: "acct-1".to_string(),
+                identity_pubkey: identity.clone(),
+                trade_pubkey: None,
+                reviews: 5,
+                rating_hundredths: 450,
+                since: 1_696_204_800,
+                imported_at: 1_790_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        let done = service
+            .revoke_reputation_imports(request_with_addr(revoke_req(&key.to_bech32().unwrap()), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(done.success);
+        assert_eq!(done.revoked, 1);
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!((user.total_reviews, user.seeded_reviews), (0, 0));
+        assert_eq!(user.created_at, 1_790_000_000);
+        assert_eq!(
+            (user.min_rating, user.max_rating, user.last_rating),
+            (0, 0, 0)
+        );
+    }
+
+    fn rebind_req(
+        identity: &str,
+        new_identity: &str,
+        reason: &str,
+    ) -> RebindReputationExportRequest {
+        RebindReputationExportRequest {
+            identity: identity.to_string(),
+            new_identity: new_identity.to_string(),
+            reason: reason.to_string(),
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_reputation_export_needs_loopback_the_token_and_a_reason() {
+        let service = with_token(offline_service().await, "s3cret");
+        let (a, b) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        assert_eq!(
+            service
+                .rebind_reputation_export(Request::new(rebind_req(&a, &b, "lost phone")))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+        assert_eq!(
+            service
+                .rebind_reputation_export(request_with_addr(rebind_req(&a, &b, "lost phone"), 1))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let no_reason = service
+            .rebind_reputation_export(bearer(
+                request_with_addr(rebind_req(&a, &b, " "), 1),
+                "s3cret",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!no_reason.success);
+        assert!(no_reason.error_message.unwrap().contains("reason"));
+    }
+
+    #[tokio::test]
+    async fn rebind_reputation_export_moves_the_binding_and_reports_the_old_one() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let (old, new) = (Keys::generate().public_key(), Keys::generate().public_key());
+        sqlx::query(
+            "INSERT INTO users (pubkey, created_at, reputation_exported_to) VALUES (?1, 1700000000, ?2)",
+        )
+        .bind(&identity)
+        .bind(old.to_hex())
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        let done = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new.to_hex(), "support ticket 7"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(done.success);
+        assert_eq!(done.previous_identity, Some(old.to_hex()));
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!(user.reputation_exported_to, Some(new.to_hex()));
+
+        let unknown = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&Keys::generate().public_key().to_hex(), &new.to_hex(), "x"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!unknown.success);
+    }
+
+    /// An unreadable database is not a missing account: the operator must
+    /// not be told there is no account when the lookup itself failed.
+    #[tokio::test]
+    async fn rebind_reputation_export_reports_a_database_failure_as_such() {
+        let service = offline_service().await;
+        let (identity, new) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        sqlx::query("ALTER TABLE users RENAME TO users_gone")
+            .execute(service.pool.as_ref())
+            .await
+            .unwrap();
+        let reply = service
+            .rebind_reputation_export(request_with_addr(rebind_req(&identity, &new, "x"), 1))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.success);
+        let message = reply.error_message.unwrap();
+        assert!(!message.contains("no account"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn rebind_reputation_export_refuses_non_loopback_even_with_the_token() {
+        let service = with_token(offline_service().await, "s3cret");
+        let (a, b) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        for ip in ["203.0.113.1", "2001:db8::1"] {
+            let err = service
+                .rebind_reputation_export(bearer(
+                    request_with_ip(rebind_req(&a, &b, "lost phone"), ip.parse().unwrap()),
+                    "s3cret",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert!(err.message().contains("RebindReputationExport"));
+        }
+    }
+
+    /// The move starts from the current value, which may be none: an
+    /// account that was never bound gets bound, with the day of the move.
+    #[tokio::test]
+    async fn rebind_reputation_export_binds_an_account_that_has_no_binding() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let new = Keys::generate().public_key().to_hex();
+        sqlx::query("INSERT INTO users (pubkey, created_at) VALUES (?1, 1700000000)")
+            .bind(&identity)
+            .execute(service.pool.as_ref())
+            .await
+            .unwrap();
+        let today = || {
+            mostro_core::user::day_truncate(nostr_sdk::prelude::Timestamp::now().as_secs() as i64)
+                as i64
+        };
+        let first_day = today();
+        let done = service
+            .rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new, "first binding by hand"),
+                1,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let last_day = today();
+        assert!(done.success, "{:?}", done.error_message);
+        assert_eq!(done.previous_identity, None);
+        let user = crate::db::is_user_present(service.pool.as_ref(), identity)
+            .await
+            .unwrap();
+        assert_eq!(user.reputation_exported_to, Some(new));
+        let day = user.reputation_exported_at.unwrap();
+        assert!(day == first_day || day == last_day, "{day}");
+    }
+
+    /// §5.2: every admin rebind is logged with the old and new identity and
+    /// the reason.
+    #[tokio::test]
+    async fn rebind_reputation_export_logs_the_old_binding_the_new_one_and_the_reason() {
+        let service = offline_service().await;
+        let identity = Keys::generate().public_key().to_hex();
+        let (old, new) = (
+            Keys::generate().public_key().to_hex(),
+            Keys::generate().public_key().to_hex(),
+        );
+        sqlx::query(
+            "INSERT INTO users (pubkey, created_at, reputation_exported_to) VALUES (?1, 1700000000, ?2)",
+        )
+        .bind(&identity)
+        .bind(&old)
+        .execute(service.pool.as_ref())
+        .await
+        .unwrap();
+        let (reply, logs) = crate::app::context::test_utils::logged_on_this_thread(
+            service.rebind_reputation_export(request_with_addr(
+                rebind_req(&identity, &new, "support ticket 7"),
+                1,
+            )),
+        )
+        .await;
+        assert!(reply.unwrap().into_inner().success);
+        let line = logs
+            .lines()
+            .find(|line| line.contains("admin rebound"))
+            .unwrap_or_else(|| panic!("no audit line in {logs}"));
+        for expected in [identity.as_str(), &old, &new, "support ticket 7"] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
     }
 
     #[test]

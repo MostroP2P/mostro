@@ -5,7 +5,7 @@ use crate::config::constants::{
 };
 use crate::config::MOSTRO_CONFIG;
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::PublicKey;
+use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
 
 /// Scope of the anti-abuse bond enforcement.
@@ -202,16 +202,23 @@ impl Default for AntiAbuseBondSettings {
 /// default) every Cashu code path remains inert — the daemon behaves
 /// exactly as a Lightning node. Mutually exclusive with
 /// `[anti_abuse_bond]` (locked decision §4.5); enforced at startup.
+///
+/// Unknown keys are rejected. A misspelled key, or the pre-#1046
+/// `mint_url`, would otherwise be ignored and leave `mint_urls` empty,
+/// silently turning the node into one that accepts any mint.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CashuSettings {
     /// Master switch. When false, the node runs in Lightning mode.
     #[serde(default)]
     pub enabled: bool,
-    /// The one mint this node escrows on (locked decision §4.2:
-    /// node-configured, fixed — no per-order mint). Required (non-empty,
-    /// `http`/`https`) when `enabled = true`; validated at startup.
+    /// Mints this node accepts for new orders (issue #1046). The maker
+    /// chooses the mint per order; the node publishes the order only if the
+    /// mint is in this list. Empty means no restriction: any mint with a
+    /// public host is accepted. Every entry must be an `http`/`https` URL;
+    /// validated at startup.
     #[serde(default)]
-    pub mint_url: String,
+    pub mint_urls: Vec<String>,
     /// Seller-recovery locktime floor, in days (Track A §4B): escrow
     /// tokens must carry `locktime >= now + escrow_locktime_days`. The
     /// seller may set a longer locktime, never a shorter one. Must be
@@ -228,9 +235,208 @@ impl Default for CashuSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            mint_url: String::new(),
+            mint_urls: Vec::new(),
             escrow_locktime_days: default_escrow_locktime_days(),
         }
+    }
+}
+
+/// One issuer whose reputation attestations this node imports
+/// (docs/REPUTATION_PORTABILITY.md §5.3, "Issuer keys and rotation").
+///
+/// The node identifies the issuer by `name`, never by a key: the name is what
+/// it deduplicates imports on, so the issuer can rotate its key — the new key
+/// is added to the same entry — without reopening every account to a second
+/// import. Never rename an entry.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ReputationIssuer {
+    /// Stable local name of the issuer, e.g. `"lnp2pbot"`, without leading
+    /// or trailing spaces.
+    pub name: String,
+    /// The issuer's signing keys, npub or hex: its current key, and during a
+    /// planned rotation the previous one until its attestations expire.
+    pub keys: Vec<String>,
+}
+
+impl ReputationIssuer {
+    /// The entry's keys. Settings loading rejects a key that does not
+    /// parse, so none is dropped here.
+    pub fn public_keys(&self) -> Vec<PublicKey> {
+        self.keys
+            .iter()
+            .filter_map(|key| PublicKey::parse(key.trim()).ok())
+            .collect()
+    }
+}
+
+/// Reputation import (docs/REPUTATION_PORTABILITY.md, phase 3): which
+/// issuers' attestations this node accepts. Opt-in; an absent section or
+/// `enabled = false` means the node imports nothing and does not advertise
+/// `reputation_import_issuers`.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ReputationImportSettings {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Longest an attestation may live (`expiration - created_at`), in
+    /// seconds. Caps a faulty or compromised issuer. Must be > 0 and at most
+    /// `MAX_REPUTATION_LIFETIME_SECONDS` (30 days).
+    #[serde(default = "default_reputation_max_lifetime_seconds")]
+    pub max_lifetime_seconds: u64,
+    /// The trusted issuers. Names are unique, and a key belongs to one entry
+    /// only.
+    #[serde(default)]
+    pub issuers: Vec<ReputationIssuer>,
+}
+
+/// 7 days, the lifetime issuers give an attestation.
+fn default_reputation_max_lifetime_seconds() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+impl Default for ReputationImportSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lifetime_seconds: default_reputation_max_lifetime_seconds(),
+            issuers: Vec::new(),
+        }
+    }
+}
+
+impl ReputationImportSettings {
+    /// The trust-list entry a signing key belongs to.
+    pub fn issuer_for(&self, key: &PublicKey) -> Option<&ReputationIssuer> {
+        self.issuers
+            .iter()
+            .find(|issuer| issuer.public_keys().contains(key))
+    }
+
+    /// Every trusted key, across all entries, in configuration order.
+    pub fn trusted_keys(&self) -> Vec<PublicKey> {
+        self.issuers
+            .iter()
+            .flat_map(ReputationIssuer::public_keys)
+            .collect()
+    }
+}
+
+/// Health monitoring (`[health]`, issue #1063): the health event (kind
+/// 38389), how long LND may report `synced_to_chain = false` before it counts
+/// as a failure, and whether the daemon then fails closed by entering
+/// maintenance on its own. An absent section means the defaults.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct HealthSettings {
+    /// Publish the health event (docs/HEALTH.md).
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    /// Seconds between two publications of the health event, 30 to 3600.
+    /// The event's NIP-40 expiration is three times this.
+    #[serde(default = "default_health_interval")]
+    pub interval: u64,
+    /// Hex or npub pubkey of the operator's watchdog. When set, the detailed
+    /// metrics are NIP-44 encrypted to it in the event's `content`; when
+    /// empty, `content` is empty and only the public tags are published.
+    #[serde(default)]
+    pub watchdog_pubkey: String,
+    /// Seconds LND may report `synced_to_chain = false` without interruption
+    /// before the `lnd_sync` check turns from `warn` to `fail`.
+    #[serde(default = "default_lnd_unsynced_fail_after")]
+    pub lnd_unsynced_fail_after: u64,
+    /// Enter maintenance (reason `lnd_unsynced`) when `lnd_sync` reaches
+    /// `fail`, and leave it again once LND has been synced for
+    /// `lnd_resynced_clear_after` seconds. Maintenance an operator set is
+    /// never lifted.
+    #[serde(default = "default_auto_maintenance_on_lnd_unsynced")]
+    pub auto_maintenance_on_lnd_unsynced: bool,
+    /// Seconds LND must stay synced before automatic maintenance is lifted.
+    #[serde(default = "default_lnd_resynced_clear_after")]
+    pub lnd_resynced_clear_after: u64,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+/// Default seconds between health event publications.
+pub const DEFAULT_HEALTH_INTERVAL: u64 = 60;
+/// Allowed range of `[health].interval`, in seconds (protocol: 30 to 3600).
+pub const HEALTH_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 30..=3600;
+
+fn default_health_interval() -> u64 {
+    DEFAULT_HEALTH_INTERVAL
+}
+
+fn default_lnd_unsynced_fail_after() -> u64 {
+    600
+}
+
+fn default_auto_maintenance_on_lnd_unsynced() -> bool {
+    true
+}
+
+fn default_lnd_resynced_clear_after() -> u64 {
+    300
+}
+
+impl Default for HealthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            interval: default_health_interval(),
+            watchdog_pubkey: String::new(),
+            lnd_unsynced_fail_after: default_lnd_unsynced_fail_after(),
+            auto_maintenance_on_lnd_unsynced: default_auto_maintenance_on_lnd_unsynced(),
+            lnd_resynced_clear_after: default_lnd_resynced_clear_after(),
+        }
+    }
+}
+
+/// Reputation export (docs/REPUTATION_PORTABILITY.md, phase 4): this node
+/// issues attestations of the reputation its users earned here. Opt-in; an
+/// absent section or `enabled = false` means the node issues nothing and
+/// does not advertise `reputation_issuer`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ReputationExportSettings {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable holding the issuer's secret key (nsec or hex).
+    /// A key dedicated to issuance, never the node's own key, so either can
+    /// be rotated without the other; read at startup like
+    /// `MOSTRO_NSEC_PRIVKEY`, including from `<settings dir>/.env`.
+    #[serde(default = "default_reputation_issuer_key_env")]
+    pub issuer_key_env: String,
+    /// Lifetime of an attestation this node signs, in seconds, 1 to 7 days:
+    /// core signs no longer one, and destinations cap it at 7 days by
+    /// default.
+    #[serde(default = "default_reputation_max_lifetime_seconds")]
+    pub lifetime_seconds: u64,
+    /// The issuer keys, loaded from `issuer_key_env` at startup. Never read
+    /// from or written to `settings.toml`.
+    #[serde(skip)]
+    pub issuer_keys: Option<Keys>,
+}
+
+fn default_reputation_issuer_key_env() -> String {
+    "MOSTRO_REPUTATION_ISSUER_SK".to_string()
+}
+
+impl Default for ReputationExportSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer_key_env: default_reputation_issuer_key_env(),
+            lifetime_seconds: default_reputation_max_lifetime_seconds(),
+            issuer_keys: None,
+        }
+    }
+}
+
+impl ReputationExportSettings {
+    /// The key this node signs attestations with, once loaded.
+    pub fn issuer_key(&self) -> Option<PublicKey> {
+        self.issuer_keys.as_ref().map(Keys::public_key)
     }
 }
 
@@ -518,7 +724,11 @@ pub struct LightningSettings {
     /// Safety margin, in blocks, before the hold invoice's CLTV horizon at
     /// which the daemon cancels/escalates trades whose escrow is about to
     /// be auto-refunded by LND. Must exceed the node's
-    /// `invoices.holdexpirydelta` (LND default: 12) with room to spare.
+    /// `invoices.holdexpirydelta` (LND default:
+    /// [`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+    /// with room to spare. Startup fails unless it is at least
+    /// [`MIN_ESCROW_DEADLINE_MARGIN_BLOCKS`](crate::config::constants::MIN_ESCROW_DEADLINE_MARGIN_BLOCKS)
+    /// and below `hold_invoice_cltv_delta` (Lightning mode only).
     #[serde(default = "default_escrow_deadline_margin_blocks")]
     pub escrow_deadline_margin_blocks: u32,
     /// Ceiling on how many payments the node may have in flight before a new
@@ -614,9 +824,11 @@ fn default_max_inflight_payouts_per_destination() -> u32 {
     10
 }
 
-/// 24 blocks ≈ 4 hours at the nominal 10 min/block: twice LND's default
-/// `holdexpirydelta` (12) plus slack for block-time variance and the
-/// guardian job's tick.
+/// 24 blocks ≈ 4 hours at the nominal 10 min/block: LND's default
+/// `holdexpirydelta`
+/// ([`LND_DEFAULT_HOLD_EXPIRY_DELTA`](crate::config::constants::LND_DEFAULT_HOLD_EXPIRY_DELTA))
+/// plus 12 blocks of slack for block-time variance, the guardian job's tick
+/// and the solver of a disputed trade, twice the minimum headroom.
 fn default_escrow_deadline_margin_blocks() -> u32 {
     24
 }
@@ -684,7 +896,8 @@ pub struct RpcSettings {
     #[serde(default = "default_rate_limiter_stale_duration")]
     pub rate_limiter_stale_duration: u64,
     /// Optional shared secret for the mutating admin RPCs (`CancelOrder`,
-    /// `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`).
+    /// `SettleOrder`, `AddSolver`, `TakeDispute`, `SetMaintenanceMode`,
+    /// `RevokeReputationImports`, `RebindReputationExport`).
     /// When set, those calls must carry `authorization: Bearer <token>`
     /// metadata. Unset (default) keeps the historical bind-address-only
     /// model. Never serialized back to disk.
@@ -1130,7 +1343,7 @@ mod cashu_settings_tests {
     fn defaults_are_off() {
         let cfg = CashuSettings::default();
         assert!(!cfg.enabled);
-        assert!(cfg.mint_url.is_empty());
+        assert!(cfg.mint_urls.is_empty());
         assert_eq!(cfg.escrow_locktime_days, 15);
     }
 
@@ -1147,29 +1360,57 @@ mod cashu_settings_tests {
         let parsed: Stub = toml::from_str("[cashu]\n").expect("minimal block");
         let cashu = parsed.cashu.expect("block present");
         assert!(!cashu.enabled);
-        assert!(cashu.mint_url.is_empty());
+        assert!(cashu.mint_urls.is_empty());
         assert_eq!(cashu.escrow_locktime_days, 15);
     }
 
     #[test]
     fn toml_disabled_block() {
-        let parsed: Stub =
-            toml::from_str("[cashu]\nenabled = false\nmint_url = \"https://mint.example.com\"\n")
-                .expect("disabled block");
+        let parsed: Stub = toml::from_str(
+            "[cashu]\nenabled = false\nmint_urls = [\"https://mint.example.com\"]\n",
+        )
+        .expect("disabled block");
         let cashu = parsed.cashu.expect("block present");
         assert!(!cashu.enabled);
-        assert_eq!(cashu.mint_url, "https://mint.example.com");
+        assert_eq!(cashu.mint_urls, vec!["https://mint.example.com"]);
     }
 
     #[test]
     fn toml_enabled_block_with_overrides() {
         let parsed: Stub = toml::from_str(
-            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"\nescrow_locktime_days = 30\n",
+            "[cashu]\nenabled = true\nmint_urls = [\"https://mint.example.com\"]\nescrow_locktime_days = 30\n",
         )
         .expect("enabled block");
         let cashu = parsed.cashu.expect("block present");
         assert!(cashu.enabled);
-        assert_eq!(cashu.mint_url, "https://mint.example.com");
+        assert_eq!(cashu.mint_urls, vec!["https://mint.example.com"]);
         assert_eq!(cashu.escrow_locktime_days, 30);
+    }
+
+    #[test]
+    fn toml_rejects_the_legacy_single_mint_key() {
+        // Ignoring `mint_url` would leave `mint_urls` empty: an open node.
+        let err = toml::from_str::<Stub>(
+            "[cashu]\nenabled = true\nmint_url = \"https://mint.example.com\"\n",
+        )
+        .err()
+        .expect("legacy key must be rejected");
+        assert!(err.to_string().contains("mint_url"), "{err}");
+    }
+
+    #[test]
+    fn toml_accepts_several_mints_or_none() {
+        let several: Stub = toml::from_str(
+            "[cashu]\nenabled = true\nmint_urls = [\"https://mint.example.com\", \"https://mint.example2.com\"]\n",
+        )
+        .expect("several mints");
+        assert_eq!(
+            several.cashu.expect("block present").mint_urls,
+            vec!["https://mint.example.com", "https://mint.example2.com"]
+        );
+
+        let none: Stub =
+            toml::from_str("[cashu]\nenabled = true\nmint_urls = []\n").expect("no mints");
+        assert!(none.cashu.expect("block present").mint_urls.is_empty());
     }
 }

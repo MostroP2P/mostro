@@ -25,7 +25,7 @@ const ACTIVE_DISPUTE_STATUSES: &str = "'initiated','in-progress'";
 /// disputed order is still active (buyer, seller and the assigned solver keep
 /// messaging), so its trade keys must stay fast-pathed. See
 /// `find_active_trade_pubkeys` and docs/TRANSPORT_V2_SPEC.md §6 Phase 2.
-const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
+pub(crate) const TERMINAL_ORDER_STATUSES: &str = "'expired','success','canceled','canceled-by-admin','completed-by-admin','settled-by-admin','cooperatively-canceled'";
 
 /// Exception carved out of both terminal-status filters: a closed order can
 /// still owe a bond payout to the winning counterparty, so it stays visible
@@ -722,6 +722,10 @@ pub async fn update_order_to_initial_state(
     let preimage: Option<String> = None;
     let buyer_invoice: Option<String> = None;
 
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query(
         r#"
             UPDATE orders
@@ -748,10 +752,22 @@ pub async fn update_order_to_initial_state(
     .bind(0_i64)
     .bind(0_i64)
     .bind(order_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let rows_affected = result.rows_affected();
+
+    // The take is gone, and so is its payer declaration: the next take,
+    // even by the same trade key, starts with none (payer history, §10.2).
+    // Runs whatever `[payer_history]` says, like the prune job (D-10).
+    sqlx::query("DELETE FROM order_payer_declarations WHERE order_id = ?1")
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     Ok(rows_affected > 0)
 }
@@ -1427,6 +1443,26 @@ pub async fn fail_order_payout(
     Ok(result.rows_affected() > 0)
 }
 
+/// Leave a settled order's buyer payout for `job_retry_failed_payments`
+/// without counting a payment attempt: sets `failed_payment` (what that job
+/// selects on) and leaves `payment_attempts` alone. Used while our own LND
+/// cannot pay (#1063). Only touches a `settled-hold-invoice` order with no
+/// payout in flight, so it can never orphan a claimed payout. Returns whether
+/// a row was marked; `false` means the order is not in that state and the
+/// caller should say so, since nothing is left for the retry job.
+pub async fn mark_payout_deferred(pool: &SqlitePool, order_id: Uuid) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE orders SET failed_payment = true \
+         WHERE id = ?1 AND status = ?2 AND payout_payment_hash IS NULL",
+    )
+    .bind(order_id)
+    .bind(Status::SettledHoldInvoice.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Orders with a buyer payout in flight (marker set) that are old enough to
 /// reconcile: only those claimed at or before `claimed_before` (unix seconds)
 /// are returned, so a payout still inside its grace window — where LND may not
@@ -1474,6 +1510,9 @@ pub async fn find_inflight_payouts(
     Ok(out)
 }
 
+/// Orders whose dev fee is due for a new payment attempt: unpaid, unclaimed,
+/// and past any retry backoff (`dev_fee_next_attempt_at`, set by
+/// `dev_fee::record_dev_fee_failure` after a failed attempt).
 pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
     let orders = sqlx::query_as::<_, Order>(
         r#"
@@ -1483,8 +1522,10 @@ pub async fn find_unpaid_dev_fees(pool: &SqlitePool) -> Result<Vec<Order>, Mostr
             AND dev_fee > 0
             AND dev_fee_paid = 0
             AND (dev_fee_payment_hash IS NULL OR dev_fee_payment_hash = '')
+            AND (dev_fee_next_attempt_at IS NULL OR dev_fee_next_attempt_at <= ?)
         "#,
     )
+    .bind(chrono::Utc::now().timestamp())
     .fetch_all(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1512,8 +1553,25 @@ pub async fn find_solver_pubkey(
     Ok(user)
 }
 
+/// Looks up a user that must exist: a missing row is an error, reported as
+/// sqlx's `RowNotFound` like any other database failure. Callers that need
+/// to tell the two apart use [`find_user_by_pubkey`].
 pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<User, MostroError> {
-    let user = sqlx::query_as::<_, User>(
+    find_user_by_pubkey(pool, public_key).await?.ok_or_else(|| {
+        MostroInternalErr(ServiceError::DbAccessError(
+            sqlx::Error::RowNotFound.to_string(),
+        ))
+    })
+}
+
+/// Looks up a user by identity pubkey.
+///
+/// Returns `Ok(None)` when no row exists and propagates real database errors.
+pub async fn find_user_by_pubkey(
+    pool: &SqlitePool,
+    public_key: String,
+) -> Result<Option<User>, MostroError> {
+    sqlx::query_as::<_, User>(
         r#"
             SELECT *
             FROM users
@@ -1522,19 +1580,17 @@ pub async fn is_user_present(pool: &SqlitePool, public_key: String) -> Result<Us
         "#,
     )
     .bind(public_key)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    Ok(user)
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, MostroError> {
     let created_at: Timestamp = Timestamp::now();
     let _result = sqlx::query(
         "
-            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            INSERT INTO users (pubkey, is_admin,admin_password, is_solver, is_banned, category, last_trade_index, total_reviews, total_rating, last_rating, max_rating, min_rating, created_at, native_rating_sum, native_created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?13)
         ",
     )
     .bind(new_user.pubkey.clone())
@@ -1550,6 +1606,7 @@ pub async fn add_new_user(pool: &SqlitePool, new_user: User) -> Result<String, M
     .bind(new_user.max_rating)
     .bind(new_user.min_rating)
     .bind(created_at.as_secs() as i64)
+    .bind(new_user.native_rating_sum)
     .execute(pool)
     .await
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -1685,6 +1742,7 @@ pub async fn claim_order_rating_flag(
 /// flag claim and this write commit or roll back together.
 ///
 /// Returns `Ok(true)` when a matching `users` row was updated.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_user_rating<'e, E>(
     executor: E,
     public_key: String,
@@ -1693,6 +1751,7 @@ pub async fn update_user_rating<'e, E>(
     max_rating: i64,
     total_reviews: i64,
     total_rating: f64,
+    native_rating_sum: f64,
 ) -> Result<bool, MostroError>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -1720,9 +1779,12 @@ where
     if !(min_rating <= last_rating && last_rating <= max_rating) {
         return Err(MostroCantDo(CantDoReason::InvalidRating));
     }
+    if !native_rating_sum.is_finite() || native_rating_sum < 0.0 {
+        return Err(MostroCantDo(CantDoReason::InvalidRating));
+    }
     let result = sqlx::query(
         r#"
-            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5 WHERE pubkey = ?6
+            UPDATE users SET last_rating = ?1, min_rating = ?2, max_rating = ?3, total_reviews = ?4, total_rating = ?5, native_rating_sum = ?6 WHERE pubkey = ?7
         "#,
     )
     .bind(last_rating)
@@ -1730,6 +1792,7 @@ where
     .bind(max_rating)
     .bind(total_reviews)
     .bind(total_rating)
+    .bind(native_rating_sum)
     .bind(public_key)
     .execute(executor)
     .await
@@ -1737,6 +1800,370 @@ where
     let rows_affected = result.rows_affected();
 
     Ok(rows_affected > 0)
+}
+
+/// One row of `reputation_imports`: an attestation a user imported
+/// (docs/REPUTATION_PORTABILITY.md §5.3, §6). `issuer` is the trust-list
+/// entry's name, which deduplication is on; `issuer_key` is the key that
+/// signed. The figures are what reversing the import subtracts.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ReputationImportRow {
+    pub attestation_id: String,
+    pub issuer: String,
+    pub issuer_key: String,
+    pub subject: String,
+    pub identity_pubkey: String,
+    /// The trade key that sent the import, whose rating event shows it.
+    pub trade_pubkey: Option<String>,
+    pub reviews: i64,
+    pub rating_hundredths: i64,
+    pub since: i64,
+    pub imported_at: i64,
+}
+
+impl ReputationImportRow {
+    /// The figures the import merged, as core's merge and reversal take them.
+    /// A row whose figures do not fit them was not written by an import, so
+    /// it is an error, never a reversal that subtracts nothing.
+    pub fn figures(&self) -> Result<ReputationImport, MostroError> {
+        let out_of_range = || {
+            MostroInternalErr(ServiceError::DbAccessError(format!(
+                "reputation import {} has out-of-range figures",
+                self.attestation_id
+            )))
+        };
+        Ok(ReputationImport {
+            reviews: u32::try_from(self.reviews).map_err(|_| out_of_range())?,
+            rating_hundredths: u16::try_from(self.rating_hundredths).map_err(|_| out_of_range())?,
+            since: u64::try_from(self.since).map_err(|_| out_of_range())?,
+        })
+    }
+}
+
+const REPUTATION_IMPORT_COLUMNS: &str = "attestation_id, issuer, issuer_key, subject, \
+    identity_pubkey, trade_pubkey, reviews, rating_hundredths, since, imported_at";
+
+/// Record an import. The unique indexes on `(issuer, subject)` and
+/// `(issuer, identity_pubkey)` make a second import of the same source, or a
+/// second account from one issuer for the same identity, fail here even when
+/// two requests race: that failure is `ReputationAlreadyImported`.
+pub async fn insert_reputation_import<'e, E>(
+    executor: E,
+    row: &ReputationImportRow,
+) -> Result<(), MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO reputation_imports ({REPUTATION_IMPORT_COLUMNS}) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+    )))
+    .bind(&row.attestation_id)
+    .bind(&row.issuer)
+    .bind(&row.issuer_key)
+    .bind(&row.subject)
+    .bind(&row.identity_pubkey)
+    .bind(&row.trade_pubkey)
+    .bind(row.reviews)
+    .bind(row.rating_hundredths)
+    .bind(row.since)
+    .bind(row.imported_at)
+    .execute(executor)
+    .await
+    .map_err(|e| {
+        let unique = e
+            .as_database_error()
+            .is_some_and(|db| db.is_unique_violation());
+        if unique {
+            MostroCantDo(CantDoReason::ReputationAlreadyImported)
+        } else {
+            MostroInternalErr(ServiceError::DbAccessError(e.to_string()))
+        }
+    })?;
+    Ok(())
+}
+
+/// Write the reputation columns an import or its reversal changes.
+pub async fn update_user_reputation<'e, E>(executor: E, user: &User) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(
+        "UPDATE users SET total_reviews = ?1, total_rating = ?2, created_at = ?3, \
+         native_created_at = ?4, min_rating = ?5, max_rating = ?6, last_rating = ?7, \
+         seeded_reviews = ?8, seeded_rating_sum = ?9 WHERE pubkey = ?10",
+    )
+    .bind(user.total_reviews)
+    .bind(user.total_rating)
+    .bind(user.created_at)
+    .bind(user.native_created_at)
+    .bind(user.min_rating)
+    .bind(user.max_rating)
+    .bind(user.last_rating)
+    .bind(user.seeded_reviews)
+    .bind(user.seeded_rating_sum)
+    .bind(&user.pubkey)
+    .execute(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The imports made with `issuer_key`, oldest first; with `imported_after`,
+/// only those this node recorded at or after that time. This is what
+/// revoking a compromised key selects: by the key and the node's own clock.
+pub async fn reputation_imports_by_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+    imported_after: Option<i64>,
+) -> Result<Vec<ReputationImportRow>, MostroError> {
+    sqlx::query_as::<_, ReputationImportRow>(AssertSqlSafe(format!(
+        "SELECT {REPUTATION_IMPORT_COLUMNS} FROM reputation_imports \
+         WHERE issuer_key = ?1 AND imported_at >= ?2 ORDER BY imported_at, attestation_id"
+    )))
+    .bind(issuer_key)
+    .bind(imported_after.unwrap_or(i64::MIN))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Every import recorded for an identity.
+pub async fn reputation_imports_for_identity<'e, E>(
+    executor: E,
+    identity: &str,
+) -> Result<Vec<ReputationImportRow>, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_as::<_, ReputationImportRow>(AssertSqlSafe(format!(
+        "SELECT {REPUTATION_IMPORT_COLUMNS} FROM reputation_imports \
+         WHERE identity_pubkey = ?1 ORDER BY imported_at, attestation_id"
+    )))
+    .bind(identity)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Open orderbook entries advertising this maker's reputation. Revocation
+/// callers use their transaction to collect these before committing, then
+/// queue their IDs for the reconciler to rebuild from current DB state.
+pub async fn find_open_orders_by_maker<'e, E>(
+    executor: E,
+    identity: &str,
+) -> Result<Vec<Uuid>, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT id FROM orders WHERE status IN ('pending', 'waiting-taker-bond') \
+         AND ((kind = 'sell' AND master_seller_pubkey = ?1) \
+           OR (kind = 'buy' AND master_buyer_pubkey = ?1))",
+    )
+    .bind(identity)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Claim an import's reversal by deleting its receipt in the same
+/// transaction as the aggregate update. `false` means it was already gone.
+pub async fn delete_reputation_import<'e, E>(
+    executor: E,
+    attestation_id: &str,
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query("DELETE FROM reputation_imports WHERE attestation_id = ?1")
+        .bind(attestation_id)
+        .execute(executor)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The query behind [`completed_trades_for_identity`]: `?1` is the identity,
+/// `?2` the earliest start date that may become the first trade. `+status`
+/// keeps SQLite off `idx_orders_status`, which holds every `success` order,
+/// and on the two master-key indexes; the node never runs `ANALYZE`, so the
+/// planner cannot tell on its own.
+pub(crate) const COMPLETED_TRADES_QUERY: &str =
+    "SELECT COUNT(*), MIN(CASE WHEN started >= ?2 THEN started END) FROM ( \
+       SELECT CASE WHEN taken_at > 0 THEN taken_at ELSE created_at END AS started \
+       FROM orders WHERE +status = 'success' \
+       AND (master_buyer_pubkey = ?1 OR master_seller_pubkey = ?1))";
+
+/// An identity's completed trades on this node: how many `success` orders it
+/// was the master buyer or seller of, and when the first of them started —
+/// `taken_at`, or `created_at` for an order that never recorded it — among
+/// those that started no earlier than `earliest_since`. An older one still
+/// counts as a trade but does not date the first. Orders placed in full
+/// privacy mode carry no master key and are not counted, and nothing an
+/// import brought is either: this is native history only.
+pub async fn completed_trades_for_identity(
+    pool: &SqlitePool,
+    identity: &str,
+    earliest_since: i64,
+) -> Result<(i64, Option<i64>), MostroError> {
+    sqlx::query_as::<_, (i64, Option<i64>)>(COMPLETED_TRADES_QUERY)
+        .bind(identity)
+        .bind(earliest_since)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Bind an account's reputation, as an issuer, to `destination`: an atomic
+/// compare-and-set that succeeds only if the account is unbound or already
+/// bound to that identity, and records the day of the export. Of two
+/// concurrent requests for different identities, exactly one binds. Returns
+/// whether it did.
+pub async fn bind_reputation_export(
+    pool: &SqlitePool,
+    identity: &str,
+    destination: &str,
+    day: i64,
+) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE users SET reputation_exported_to = ?2, reputation_exported_at = ?3 \
+         WHERE pubkey = ?1 AND (reputation_exported_to IS NULL OR reputation_exported_to = ?2)",
+    )
+    .bind(identity)
+    .bind(destination)
+    .bind(day)
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Move an account's reputation binding from `from` (`None`: unbound) to
+/// `to`, as a compare-and-set on the current value, recording the day.
+/// Returns whether it moved: a concurrent move finds the binding already
+/// changed and does nothing.
+pub async fn move_reputation_binding<'e, E>(
+    executor: E,
+    identity: &str,
+    from: Option<&str>,
+    to: &str,
+    day: i64,
+) -> Result<bool, MostroError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(
+        "UPDATE users SET reputation_exported_to = ?3, reputation_exported_at = ?4 \
+         WHERE pubkey = ?1 AND reputation_exported_to IS ?2",
+    )
+    .bind(identity)
+    .bind(from)
+    .bind(to)
+    .bind(day)
+    .execute(executor)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// [`move_reputation_binding`] with the rebind authorisation `authorisation`
+/// (its event id), once: the authorisation is recorded until `valid_until`
+/// in the same transaction as the move, so it moves a binding once even if
+/// the binding later comes back to its signer, and a move that does not
+/// apply records nothing. Returns whether it moved. Records past their
+/// `valid_until` are dropped on the way.
+pub async fn move_reputation_binding_once(
+    pool: &SqlitePool,
+    identity: &str,
+    from: &str,
+    to: &str,
+    day: i64,
+    authorisation: &str,
+    valid_until: i64,
+) -> Result<bool, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    // A write first: it takes SQLite's writer lock, so racing moves run one
+    // after the other.
+    sqlx::query(
+        "DELETE FROM reputation_rebinds WHERE valid_until < CAST(strftime('%s', 'now') AS INTEGER)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let recorded =
+        sqlx::query("INSERT OR IGNORE INTO reputation_rebinds (id, valid_until) VALUES (?1, ?2)")
+            .bind(authorisation)
+            .bind(valid_until)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+            > 0;
+    if !recorded || !move_reputation_binding(&mut *tx, identity, Some(from), to, day).await? {
+        tx.rollback().await.map_err(db_err)?;
+        return Ok(false);
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(true)
+}
+
+/// The trust-list names that hold `issuer_key`: the names its imports were
+/// recorded under, and the name it is bound to while an import is recorded
+/// under that name. A name no import uses has nothing to deduplicate, so it
+/// holds no key.
+pub async fn reputation_issuer_names_for_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+) -> Result<Vec<String>, MostroError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT issuer FROM reputation_imports WHERE issuer_key = ?1 \
+         UNION SELECT k.issuer FROM reputation_issuer_keys k WHERE k.issuer_key = ?1 \
+         AND EXISTS (SELECT 1 FROM reputation_imports i WHERE i.issuer = k.issuer) \
+         ORDER BY issuer",
+    )
+    .bind(issuer_key)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Bind `issuer_key` to the trust-list name `issuer`. A key bound to a name
+/// an import is recorded under keeps that name and its date; one bound to a
+/// name no import uses moves to `issuer`, so a name mistyped before the
+/// first import can be corrected. Returns the name the key left, if it moved.
+pub async fn record_reputation_issuer_key(
+    pool: &SqlitePool,
+    issuer_key: &str,
+    issuer: &str,
+    seen_at: i64,
+) -> Result<Option<String>, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let bound: Option<String> =
+        sqlx::query_scalar("SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1")
+            .bind(issuer_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let written = sqlx::query(
+        "INSERT INTO reputation_issuer_keys (issuer_key, issuer, first_seen_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT (issuer_key) DO UPDATE \
+         SET issuer = excluded.issuer, first_seen_at = excluded.first_seen_at \
+         WHERE reputation_issuer_keys.issuer <> excluded.issuer AND NOT EXISTS \
+         (SELECT 1 FROM reputation_imports i WHERE i.issuer = reputation_issuer_keys.issuer)",
+    )
+    .bind(issuer_key)
+    .bind(issuer)
+    .bind(seen_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    tx.commit().await.map_err(db_err)?;
+    Ok(bound.filter(|_| written > 0))
 }
 
 /// Returns true only when the given `solver_pubkey` is assigned to the dispute
@@ -2155,11 +2582,32 @@ mod tests {
                 dev_fee integer default 0,
                 dev_fee_paid integer not null default 0,
                 dev_fee_payment_hash char(64),
+                dev_fee_failed_attempts integer not null default 0,
+                dev_fee_next_attempt_at integer,
+                dev_fee_failed_hash char(64),
                 cashu_mint_url text,
                 cashu_escrow_token text,
                 cashu_escrow_locked_at integer,
                 payout_payment_hash char(64),
-                payout_claimed_at integer
+                payout_claimed_at integer,
+                hold_settled_at integer
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        // Payer declarations: `update_order_to_initial_state` voids the
+        // order's declaration in the same transaction, so the table has to
+        // exist here. Same shape as the real migration.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS order_payer_declarations (
+                order_id char(36) PRIMARY KEY NOT NULL,
+                payment_hash char(64) NOT NULL,
+                declared_at integer NOT NULL,
+                buyer_pubkey char(64),
+                history_snapshot text
             )
             "#,
         )
@@ -3389,6 +3837,28 @@ mod tests {
             result.is_empty(),
             "Should not return orders with zero dev_fee"
         );
+    }
+
+    #[tokio::test]
+    async fn find_unpaid_dev_fees_excludes_orders_still_in_backoff() {
+        let pool = setup_orders_db().await.unwrap();
+        let waiting = uuid::Uuid::new_v4();
+        let due = uuid::Uuid::new_v4();
+        insert_test_order(&pool, waiting, "success", 100, false, None).await;
+        insert_test_order(&pool, due, "success", 100, false, None).await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, next_at) in [(waiting, now + 600), (due, now - 1)] {
+            sqlx::query("UPDATE orders SET dev_fee_next_attempt_at = ? WHERE id = ?")
+                .bind(next_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let result = super::find_unpaid_dev_fees(&pool).await.unwrap();
+        let ids: Vec<_> = result.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![due], "only the order past its backoff is due");
     }
 
     #[tokio::test]
@@ -4781,7 +5251,8 @@ mod tests {
                 last_rating integer not null default 0,
                 max_rating integer not null default 0,
                 min_rating integer not null default 0,
-                created_at integer not null
+                created_at integer not null,
+                native_rating_sum real not null default 0.0
             )"#,
         )
         .execute(&pool)
@@ -5032,7 +5503,8 @@ mod tests {
         insert_test_user(&pool, VALID_PUBKEY).await;
 
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_ok());
         assert!(result.unwrap(), "Should update existing user rating");
 
@@ -5055,8 +5527,30 @@ mod tests {
     async fn test_update_user_rating_invalid_pubkey() {
         let pool = setup_users_db().await.unwrap();
 
-        let result = super::update_user_rating(&pool, "short".to_string(), 4, 3, 5, 10, 40.0).await;
+        let result =
+            super::update_user_rating(&pool, "short".to_string(), 4, 3, 5, 10, 40.0, 0.0).await;
         assert!(result.is_err(), "Should reject invalid pubkey");
+    }
+
+    #[tokio::test]
+    async fn test_update_user_rating_rejects_invalid_native_rating_sum() {
+        let pool = setup_users_db().await.unwrap();
+        insert_test_user(&pool, VALID_PUBKEY).await;
+
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let result =
+                super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, bad)
+                    .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(mostro_core::error::MostroError::MostroCantDo(
+                        mostro_core::error::CantDoReason::InvalidRating
+                    ))
+                ),
+                "Should reject native_rating_sum {bad}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5066,12 +5560,14 @@ mod tests {
 
         // Rating > 5
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 6, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 6, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject rating > 5");
 
         // Rating < 0
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), -1, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), -1, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject negative rating");
     }
 
@@ -5081,7 +5577,8 @@ mod tests {
         insert_test_user(&pool, VALID_PUBKEY).await;
 
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, -1, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, -1, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject negative total_reviews");
     }
 
@@ -5092,7 +5589,7 @@ mod tests {
 
         // total_rating > total_reviews * 5
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 2, 11.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 2, 11.0, 0.0).await;
         assert!(result.is_err(), "Should reject total_rating > reviews * 5");
     }
 
@@ -5103,7 +5600,8 @@ mod tests {
 
         // min_rating > last_rating
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 2, 3, 5, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 2, 3, 5, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject min_rating > last_rating");
     }
 
@@ -5114,7 +5612,8 @@ mod tests {
 
         // last_rating > max_rating
         let result =
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 5, 3, 4, 10, 40.0).await;
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 5, 3, 4, 10, 40.0, 0.0)
+                .await;
         assert!(result.is_err(), "Should reject last_rating > max_rating");
     }
 
@@ -5460,7 +5959,7 @@ mod tests {
         insert_sentinel_user(&pool, DAEMON_PUBKEY).await;
 
         assert!(
-            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0)
+            super::update_user_rating(&pool, VALID_PUBKEY.to_string(), 4, 3, 5, 10, 40.0, 0.0)
                 .await
                 .unwrap()
         );
@@ -6424,17 +6923,17 @@ mod migration_and_query_tests {
         let pool = migrated_pool().await;
         // min_rating outside 0..=5
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 6, 5, 1, 5.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 6, 5, 1, 5.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
         // max_rating outside 0..=5
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 0, 9, 1, 5.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 5, 0, 9, 1, 5.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
         // last_rating below the MIN_RATING floor (0 < 1)
         assert!(matches!(
-            update_user_rating(&pool, HEX_KEY_A.to_string(), 0, 0, 5, 1, 0.0).await,
+            update_user_rating(&pool, HEX_KEY_A.to_string(), 0, 0, 5, 1, 0.0, 0.0).await,
             Err(MostroError::MostroCantDo(CantDoReason::InvalidRating))
         ));
     }
@@ -6683,5 +7182,174 @@ mod migration_and_query_tests {
         if stray.exists() {
             let _ = std::fs::remove_file(stray);
         }
+    }
+
+    // ── reputation imports ───────────────────────────────────────────────
+
+    fn import_row(
+        n: &str,
+        issuer: &str,
+        issuer_key: &str,
+        identity: &str,
+        imported_at: i64,
+    ) -> ReputationImportRow {
+        ReputationImportRow {
+            attestation_id: format!("{n:0>64}"),
+            issuer: issuer.to_string(),
+            issuer_key: issuer_key.to_string(),
+            subject: format!("subject-{n}"),
+            identity_pubkey: identity.to_string(),
+            trade_pubkey: None,
+            reviews: 5,
+            rating_hundredths: 450,
+            since: 1_696_204_800,
+            imported_at,
+        }
+    }
+
+    fn subjects(rows: &[ReputationImportRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.subject.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn imports_by_key_selects_that_key_from_the_cutoff_on() {
+        let pool = migrated_pool().await;
+        let (key, other_key) = ("e".repeat(64), "f".repeat(64));
+        for row in [
+            import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100),
+            import_row("2", "lnp2pbot", &key, HEX_KEY_B, 200),
+            import_row("3", "lnp2pbot", &key, &"c".repeat(64), 300),
+            import_row("4", "other-mostro", &other_key, HEX_KEY_A, 200),
+        ] {
+            insert_reputation_import(&pool, &row).await.unwrap();
+        }
+
+        let all = reputation_imports_by_key(&pool, &key, None).await.unwrap();
+        assert_eq!(subjects(&all), ["subject-1", "subject-2", "subject-3"]);
+        // The cutoff is inclusive: the import recorded at exactly 200 is selected.
+        let from_200 = reputation_imports_by_key(&pool, &key, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&from_200), ["subject-2", "subject-3"]);
+        let other = reputation_imports_by_key(&pool, &other_key, None)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&other), ["subject-4"]);
+    }
+
+    #[tokio::test]
+    async fn imports_for_identity_lists_only_that_identity() {
+        let pool = migrated_pool().await;
+        let key = "e".repeat(64);
+        for row in [
+            import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100),
+            import_row("2", "other-mostro", &key, HEX_KEY_A, 200),
+            import_row("3", "lnp2pbot", &key, HEX_KEY_B, 300),
+        ] {
+            insert_reputation_import(&pool, &row).await.unwrap();
+        }
+
+        let of_a = reputation_imports_for_identity(&pool, HEX_KEY_A)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&of_a), ["subject-1", "subject-2"]);
+        let of_b = reputation_imports_for_identity(&pool, HEX_KEY_B)
+            .await
+            .unwrap();
+        assert_eq!(subjects(&of_b), ["subject-3"]);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_import_removes_only_that_row() {
+        let pool = migrated_pool().await;
+        let key = "e".repeat(64);
+        let first = import_row("1", "lnp2pbot", &key, HEX_KEY_A, 100);
+        let second = import_row("2", "lnp2pbot", &key, HEX_KEY_B, 200);
+        insert_reputation_import(&pool, &first).await.unwrap();
+        insert_reputation_import(&pool, &second).await.unwrap();
+
+        assert!(delete_reputation_import(&pool, &first.attestation_id)
+            .await
+            .unwrap());
+        assert!(!delete_reputation_import(&pool, &first.attestation_id)
+            .await
+            .unwrap());
+        let left = reputation_imports_by_key(&pool, &key, None).await.unwrap();
+        assert_eq!(left, vec![second]);
+    }
+
+    #[test]
+    fn an_import_row_hands_core_the_figures_it_stored() {
+        let row = import_row("1", "lnp2pbot", &"e".repeat(64), HEX_KEY_A, 100);
+        let figures = row.figures().unwrap();
+        assert_eq!(figures.reviews, 5);
+        assert_eq!(figures.rating_hundredths, 450);
+        assert_eq!(figures.since, 1_696_204_800);
+    }
+
+    /// A row no import could have written is refused, not read as zeros
+    /// that a reversal would then subtract.
+    #[test]
+    fn an_import_row_out_of_range_has_no_figures() {
+        let row = import_row("1", "lnp2pbot", &"e".repeat(64), HEX_KEY_A, 100);
+        for bad in [
+            ReputationImportRow {
+                reviews: -5,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                reviews: 5_000_000_000,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                rating_hundredths: 70_000,
+                ..row.clone()
+            },
+            ReputationImportRow {
+                since: -1,
+                ..row.clone()
+            },
+        ] {
+            assert!(
+                matches!(bad.figures(), Err(MostroError::MostroInternalErr(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_user_reputation_persists_an_import_and_its_reversal() {
+        let pool = migrated_pool().await;
+        // A row whose native date is not stored yet: the import pins it.
+        sqlx::query("INSERT INTO users (pubkey, created_at) VALUES (?1, 1700000000)")
+            .bind(HEX_KEY_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut user = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(user.native_created_at, None);
+
+        let import = ReputationImport {
+            reviews: 5,
+            rating_hundredths: 450,
+            since: 1_600_000_000,
+        };
+        user.apply_reputation_import(&import);
+        assert!(update_user_reputation(&pool, &user).await.unwrap());
+        let stored = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(stored.total_reviews, 5);
+        assert_eq!(stored.total_rating, 4.5);
+        assert_eq!(stored.created_at, 1_600_000_000);
+        assert_eq!(stored.native_created_at, Some(1_700_000_000));
+        assert_eq!(stored.seeded_reviews, 5);
+        assert_eq!(stored.seeded_rating_sum, 22.5);
+
+        user.revert_reputation_import(&import, None);
+        assert!(update_user_reputation(&pool, &user).await.unwrap());
+        let reverted = is_user_present(&pool, HEX_KEY_A.to_string()).await.unwrap();
+        assert_eq!(reverted.total_reviews, 0);
+        assert_eq!(reverted.created_at, 1_700_000_000);
+        assert_eq!(reverted.seeded_reviews, 0);
+        assert_eq!(reverted.seeded_rating_sum, 0.0);
     }
 }

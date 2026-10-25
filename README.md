@@ -1,6 +1,6 @@
 # Mostro 🧌
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/crates/v/mostro)](https://crates.io/crates/mostro)
 [![Coverage](https://img.shields.io/endpoint?url=https://mostro.network/mostro/coverage/badge.json)](https://mostro.network/mostro/coverage/)
@@ -757,7 +757,7 @@ nostreq --kinds 38385 --limit 1 --authors YOUR_MOSTRO_PUBKEY | nostcat --stream 
 Mostro requires a client to interact with the daemon. Available clients:
 
 - **[mostro-cli](https://github.com/MostroP2P/mostro-cli)** - Command-line interface (recommended for testing)
-- **[Mostro Mobile](https://github.com/MostroP2P/mobile)** - Mobile app (beta)
+- **[Mostro App](https://github.com/MostroP2P/app)** - Mobile, desktop and web app (beta)
 - **[MostriX](https://github.com/MostroP2P/mostrix)** - Terminal UI client (work in progress)
 
 **Example: Creating an order with mostro-cli**:
@@ -840,8 +840,9 @@ cargo install --path .
 
 ---
 
-#### Mostro Mobile (Mobile App)
-**Repository**: https://github.com/MostroP2P/mobile
+#### Mostro App (Mobile, Desktop and Web)
+**Repository**: https://github.com/MostroP2P/app
+**Download**: [GitHub Releases](https://github.com/MostroP2P/app/releases/latest) · [Zapstore](https://zapstore.dev/apps/foundation.mostro.app) · [Web](https://mostro.network/app/)
 **Status**: Beta
 **Best For**: General users, accessibility
 
@@ -850,12 +851,12 @@ Features:
 - Encrypted P2P chat (ECDH shared key + NIP-44 kind-14 envelope, Blossom servers for multimedia)
 - Key management (NIP-06, unique keys per trade)
 - Real-time order book updates
-- Multi-language support (English, Spanish, Italian)
+- Multi-language support (English, Spanish, French, German, Italian, Dutch, Portuguese)
 - Push notifications
 - User rating system
 - Dispute resolution
 
-**Stack**: Flutter (Android)
+**Stack**: Flutter UI over a Rust core (Android, iOS, Linux, macOS, Windows, web)
 
 ---
 
@@ -1229,7 +1230,17 @@ Join the operator community:
 
 ## License
 
-Mostro is licensed under the [MIT License](LICENSE).
+Copyright (C) 2022-2026 Francisco Calderón and Mostro contributors.
+
+Mostro is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License](LICENSE) as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version (SPDX: `GPL-3.0-or-later`).
+
+Mostro was previously released under the MIT License. Code contributed before
+the switch to GPL keeps its original copyright and permission notice, which is
+preserved in [LICENSE-MIT](LICENSE-MIT). Releases already published under the
+MIT License remain available under those terms.
 
 ## Credits & Acknowledgments
 

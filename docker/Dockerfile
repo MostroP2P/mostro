@@ -1,18 +1,36 @@
-# Build stage
-FROM rust:1.86 AS builder
+# Toolchain stage, shared by the planner and the builder. Its Debian release
+# must match the runtime stage: a newer glibc here makes mostrod fail to start
+FROM rust:1.94-bookworm AS chef
 
 # Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends cmake build-essential libsqlite3-dev pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
-
 # Set working directory
 WORKDIR /mostro
 
-# Copy Cargo.toml and Cargo.lock to leverage Docker cache
-COPY Cargo.toml Cargo.lock ./
-RUN cargo fetch
+# The toolchain the project pins is installed here, once, so the dependencies
+# and Mostro are compiled by the same rustc: a different one in the final build
+# would recompile every dependency
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
+
+RUN cargo install cargo-chef --version 0.1.78 --locked
+
+# Planner stage: reduce the manifests to a recipe that only changes when the
+# dependencies do
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Build stage
+FROM chef AS builder
+
+# Compile the dependencies in their own layer, so a release that only changes
+# Mostro's sources reuses them from the cache
+COPY --from=planner /mostro/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # Copy source code
 COPY . .

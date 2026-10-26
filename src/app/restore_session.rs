@@ -270,4 +270,57 @@ mod tests {
             Err(MostroCantDo(CantDoReason::InvalidPubkey))
         ));
     }
+
+    /// `restore_session_action` must start the restore and answer the trade
+    /// key. Asserting only `is_ok()` lets a body that returns `Ok(())` pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_session_action_delivers_the_restore_response() {
+        let pool = create_test_pool().await;
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(test_settings())
+            .build();
+
+        let identity = Keys::generate().public_key();
+        let trade = Keys::generate().public_key();
+        let event = create_event(identity, trade);
+
+        restore_session_action(&ctx, &event).await.unwrap();
+
+        // The answer is queued by a background task: wait for it.
+        for _ in 0..50 {
+            if !queued_restore_msgs_for(&trade).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let queued = queued_restore_msgs_for(&trade).await;
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(
+            queued[0].get_inner_message_kind().payload,
+            Some(Payload::RestoreData(_))
+        ));
+    }
+
+    /// With no result ever arriving, the user is told about the timeout after
+    /// one hour (±1 s): nothing is queued at 3599 s, the reply is there by 3601 s.
+    #[tokio::test(start_paused = true)]
+    async fn handle_restore_session_results_times_out_after_one_hour() {
+        let trade_pubkey = Keys::generate().public_key();
+        // No worker is started, so `wait_for_result()` never resolves.
+        let manager = RestoreSessionManager::new();
+        let task = tokio::spawn(handle_restore_session_results(
+            manager,
+            trade_pubkey.to_string(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_secs(3599)).await;
+        assert!(queued_restore_msgs_for(&trade_pubkey).await.is_empty());
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        let queued = queued_restore_msgs_for(&trade_pubkey).await;
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].get_inner_message_kind().payload.is_none());
+    }
 }

@@ -261,9 +261,13 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
 /// valid `u16` but means "let the OS pick" to a listener, which would bind
 /// an arbitrary port while the URL built here still said `:0`.
 pub(crate) fn test_ln_port() -> u16 {
-    std::env::var("MOSTRO_TEST_LN_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
+    parse_test_ln_port(std::env::var("MOSTRO_TEST_LN_PORT").ok().as_deref())
+}
+
+/// The parsing alone, so the fallbacks can be tested without touching the
+/// process environment (other tests read it in parallel).
+fn parse_test_ln_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|v| v.parse::<u16>().ok())
         .filter(|p| *p != 0)
         .unwrap_or(8080)
 }
@@ -466,6 +470,19 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn parse_test_ln_port_uses_a_valid_override() {
+        assert_eq!(super::parse_test_ln_port(Some("18080")), 18080);
+    }
+
+    #[test]
+    fn parse_test_ln_port_falls_back_to_8080() {
+        assert_eq!(super::parse_test_ln_port(None), 8080);
+        assert_eq!(super::parse_test_ln_port(Some("0")), 8080);
+        assert_eq!(super::parse_test_ln_port(Some("not-a-port")), 8080);
+        assert_eq!(super::parse_test_ln_port(Some("65536")), 8080);
+    }
 
     #[test]
     fn ip_is_forbidden_rejects_loopback_private_and_link_local() {

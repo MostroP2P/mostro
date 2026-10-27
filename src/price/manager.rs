@@ -915,7 +915,9 @@ fn passes_allowlist(id: ProviderId, code: &str) -> bool {
 /// every order in it, which is worth one `warn!` at startup (§11.8). The
 /// reverse, listed but not quoted, is the fixed-price-only case and is
 /// legitimate. Empty when the provider is off or `accepted` is empty
-/// (every code is accepted then).
+/// (every code is accepted then). `accepted` is matched exactly, as
+/// mostro-core's `check_fiat_currency` matches it, so a lowercase `usdt`
+/// does not hide `USDT`.
 pub fn quoted_but_unaccepted_stablecoins(
     settings: &PriceSettings,
     accepted: &[String],
@@ -934,7 +936,7 @@ pub fn quoted_but_unaccepted_stablecoins(
         .iter()
         .map(|(code, _)| *code)
         .filter(|code| cfg.allows_currency(code))
-        .filter(|code| !accepted.iter().any(|a| a.eq_ignore_ascii_case(code)))
+        .filter(|code| !accepted.iter().any(|a| a == code))
         .map(String::from)
         .collect();
     missing.sort_unstable();
@@ -2024,10 +2026,11 @@ mod tests {
             quoted_but_unaccepted_stablecoins(&settings, &accepted(&["USD"])),
             vec!["DOC".to_string(), "USDC".into(), "USDT".into()]
         );
-        // The list is matched case-insensitively, as `allows_currency` is.
-        assert!(
-            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["usdt", "usdc", "doc"]))
-                .is_empty()
+        // The list is matched exactly, as `check_fiat_currency` matches it:
+        // a lowercase `usdt` does not admit a `USDT` order, so it warns.
+        assert_eq!(
+            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["usdt", "USDC", "doc"])),
+            vec!["DOC".to_string(), "USDT".into()]
         );
     }
 

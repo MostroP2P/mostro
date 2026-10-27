@@ -24,6 +24,13 @@
 //! Against the live Yadio feed this drops exactly `BTC`, `XAU`, `XAG`,
 //! `XPT` — the non-fiat tail — and nothing else, so Phase 2 does not
 //! silently remove a currency a node was publishing yesterday.
+//!
+//! A second, smaller table, [`KNOWN_STABLECOINS`], maps each stablecoin
+//! code to the fiat it is pegged 1:1 to (spec §11.8). Its codes pass the
+//! manager boundary **only** when the `stablecoins` provider quotes them:
+//! a source that also lists crypto (`currency-api`'s `usdt`) and a trusted
+//! node's relayed rate (`nostr`) are still dropped for them, so nothing but
+//! the peg ever prices a stablecoin.
 
 /// Sorted (binary-searchable) allowlist. Keep alphabetical — there is a
 /// test asserting the order so `binary_search` stays correct.
@@ -48,6 +55,31 @@ const KNOWN_FIAT: &[&str] = &[
 pub fn is_known_fiat(code: &str) -> bool {
     let upper = code.to_uppercase();
     KNOWN_FIAT.binary_search(&upper.as_str()).is_ok()
+}
+
+/// Stablecoin code → the fiat it is pegged 1:1 to (spec §11.8). Sorted by
+/// code — there is a test asserting the order so `binary_search` stays
+/// correct. Adding a coin is one row here and one in the protocol book's
+/// list; its peg must itself be in [`KNOWN_FIAT`] (tested).
+const KNOWN_STABLECOINS: &[(&str, &str)] = &[("DOC", "USD"), ("USDC", "USD"), ("USDT", "USD")];
+
+/// The fiat `code` (any casing) is pegged to, when it is a known stablecoin.
+pub fn stablecoin_peg(code: &str) -> Option<&'static str> {
+    let upper = code.to_uppercase();
+    KNOWN_STABLECOINS
+        .binary_search_by(|(c, _)| c.cmp(&upper.as_str()))
+        .ok()
+        .map(|i| KNOWN_STABLECOINS[i].1)
+}
+
+/// Whether `code` (any casing) is a known stablecoin.
+pub fn is_known_stablecoin(code: &str) -> bool {
+    stablecoin_peg(code).is_some()
+}
+
+/// Every known stablecoin with its peg, in table order.
+pub fn known_stablecoins() -> &'static [(&'static str, &'static str)] {
+    KNOWN_STABLECOINS
 }
 
 #[cfg(test)]
@@ -113,5 +145,41 @@ mod tests {
                 assert!(is_known_fiat(code), "{code} from live Yadio must pass");
             }
         }
+    }
+
+    #[test]
+    fn stablecoin_table_is_sorted_and_deduped() {
+        let codes: Vec<&str> = KNOWN_STABLECOINS.iter().map(|(c, _)| *c).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(codes, sorted);
+    }
+
+    #[test]
+    fn every_stablecoin_peg_is_a_known_fiat() {
+        for (code, peg) in KNOWN_STABLECOINS {
+            assert!(is_known_fiat(peg), "{code} is pegged to unknown fiat {peg}");
+        }
+    }
+
+    #[test]
+    fn no_code_is_both_fiat_and_stablecoin() {
+        for (code, _) in KNOWN_STABLECOINS {
+            assert!(!is_known_fiat(code), "{code} must not be in both tables");
+        }
+    }
+
+    #[test]
+    fn stablecoin_lookup_is_case_insensitive_and_rejects_others() {
+        assert_eq!(stablecoin_peg("USDT"), Some("USD"));
+        assert_eq!(stablecoin_peg("usdc"), Some("USD"));
+        assert_eq!(stablecoin_peg("Doc"), Some("USD"));
+        assert!(is_known_stablecoin("USDT"));
+        for code in ["USD", "BTC", "ETH", "EURC", "USTD", ""] {
+            assert!(!is_known_stablecoin(code), "{code} must be unknown");
+            assert_eq!(stablecoin_peg(code), None);
+        }
+        assert_eq!(known_stablecoins().len(), 3);
     }
 }

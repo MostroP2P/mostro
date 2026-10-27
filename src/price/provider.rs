@@ -40,6 +40,8 @@ pub enum ProviderId {
     Blockchain,
     ElToque,
     Nostr,
+    /// Fixed 1:1 peg quoter for stablecoins, no network call (spec §11.8).
+    Stablecoins,
 }
 
 impl fmt::Display for ProviderId {
@@ -51,6 +53,7 @@ impl fmt::Display for ProviderId {
             ProviderId::Blockchain => "blockchain",
             ProviderId::ElToque => "eltoque",
             ProviderId::Nostr => "nostr",
+            ProviderId::Stablecoins => "stablecoins",
         };
         f.write_str(s)
     }
@@ -67,6 +70,7 @@ impl FromStr for ProviderId {
             "blockchain" => Ok(ProviderId::Blockchain),
             "eltoque" => Ok(ProviderId::ElToque),
             "nostr" => Ok(ProviderId::Nostr),
+            "stablecoins" => Ok(ProviderId::Stablecoins),
             other => Err(format!("unknown price provider id: {other}")),
         }
     }
@@ -222,6 +226,7 @@ mod tests {
             ProviderId::Blockchain,
             ProviderId::ElToque,
             ProviderId::Nostr,
+            ProviderId::Stablecoins,
         ] {
             let s = id.to_string();
             assert_eq!(ProviderId::from_str(&s).unwrap(), id, "roundtrip {s}");

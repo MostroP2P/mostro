@@ -521,7 +521,9 @@ async fn install_spam_gate() {
 /// `publish_exchange_rates_to_nostr`) so existing `settings.toml` files keep
 /// working byte-for-byte (spec §10.1).
 fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    use crate::price::{synthesise_legacy_price_settings, PriceManager};
+    use crate::price::{
+        quoted_but_unaccepted_stablecoins, synthesise_legacy_price_settings, PriceManager,
+    };
 
     let mostro_settings = Settings::get_mostro();
     let price_settings = match Settings::get_price() {
@@ -557,6 +559,23 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
             mostro_settings.publish_exchange_rates_to_nostr,
         ),
     };
+
+    // §11.8: a stablecoin the provider quotes but a non-empty
+    // `fiat_currencies_accepted` does not name would get a rate published
+    // and every order in it refused. Say so once, here, where both
+    // settings are in hand.
+    let unaccepted = quoted_but_unaccepted_stablecoins(
+        &price_settings,
+        &mostro_settings.fiat_currencies_accepted,
+    );
+    if !unaccepted.is_empty() {
+        tracing::warn!(
+            "price: the stablecoins provider quotes {} but `fiat_currencies_accepted` does not \
+             list them — their rates will be published and every order in them refused \
+             (see docs/PRICE_PROVIDERS.md §11.8)",
+            unaccepted.join(", ")
+        );
+    }
 
     let manager = PriceManager::from_settings(price_settings)
         .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;

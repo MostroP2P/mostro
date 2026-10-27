@@ -36,7 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use super::aggregate::{aggregate_tick, combine, AggregateResult};
 use super::config::{PriceSettings, ProviderConfig};
-use super::fiat::is_known_fiat;
+use super::fiat::{is_known_fiat, is_known_stablecoin, known_stablecoins};
 use super::provider::{
     PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes, Quote,
 };
@@ -45,6 +45,7 @@ use super::providers::coingecko::CoinGeckoProvider;
 use super::providers::currency_api::CurrencyApiProvider;
 use super::providers::eltoque::ElToqueProvider;
 use super::providers::nostr::NostrProvider;
+use super::providers::stablecoins::StablecoinsProvider;
 use super::providers::yadio::YadioProvider;
 use super::store::{PriceError, PriceStore};
 
@@ -279,7 +280,11 @@ impl PriceManager {
         // stays purely numeric:
         //  1. fiat allowlist — drop crypto/metals/non-ISO junk (e.g.
         //     currency-api's `eth`, Yadio's `XAU`) before they can form
-        //     single-source aggregates or bloat the Nostr event;
+        //     single-source aggregates or bloat the Nostr event. A known
+        //     stablecoin passes only from the `stablecoins` provider
+        //     (§11.8): `currency-api`'s `usdt` would price it off a thin
+        //     market, and a trusted node's relayed `USDT` would turn market
+        //     orders on for a node that never opted in;
         //  2. per-provider `only`/`except` scoping — a mis-marketed source
         //     (currency-api's official-rate CUP) never enters the median.
         let filtered_with_ids: Vec<(ProviderId, ProviderQuotes)> = quotes_by_provider
@@ -288,7 +293,7 @@ impl PriceManager {
                 let before = quotes.len();
                 let fiat_only: ProviderQuotes = quotes
                     .into_iter()
-                    .filter(|(code, _)| is_known_fiat(code))
+                    .filter(|(code, _)| passes_allowlist(id, code))
                     .collect();
                 let dropped = before - fiat_only.len();
                 if dropped > 0 {
@@ -897,6 +902,47 @@ fn sources_to_tag(ids: &[ProviderId]) -> String {
     names.join(",")
 }
 
+/// The §6.6 boundary rule: a code passes when it is a known fiat, or when
+/// it is a known stablecoin **and** the `stablecoins` provider quoted it
+/// (§11.8). Pure, so the two drops the spec names are unit-testable.
+fn passes_allowlist(id: ProviderId, code: &str) -> bool {
+    is_known_fiat(code) || (id == ProviderId::Stablecoins && is_known_stablecoin(code))
+}
+
+/// The stablecoins the `stablecoins` provider would quote under `settings`
+/// that a non-empty `accepted` (`[mostro].fiat_currencies_accepted`) does
+/// not name — sorted. The node would publish a rate for each and refuse
+/// every order in it, which is worth one `warn!` at startup (§11.8). The
+/// reverse, listed but not quoted, is the fixed-price-only case and is
+/// legitimate. Empty when the provider is off or `accepted` is empty
+/// (every code is accepted then). `accepted` is matched exactly, as
+/// mostro-core's `check_fiat_currency` matches it, so a lowercase `usdt`
+/// does not hide `USDT`.
+pub fn quoted_but_unaccepted_stablecoins(
+    settings: &PriceSettings,
+    accepted: &[String],
+) -> Vec<String> {
+    if accepted.is_empty() {
+        return Vec::new();
+    }
+    let Some(cfg) = settings
+        .providers
+        .get(&ProviderId::Stablecoins.to_string())
+        .filter(|cfg| cfg.enabled)
+    else {
+        return Vec::new();
+    };
+    let mut missing: Vec<String> = known_stablecoins()
+        .iter()
+        .map(|(code, _)| *code)
+        .filter(|code| cfg.allows_currency(code))
+        .filter(|code| !accepted.iter().any(|a| a == code))
+        .map(String::from)
+        .collect();
+    missing.sort_unstable();
+    missing
+}
+
 /// Single designated extension point (spec §5.4 Step 3). Adding a new
 /// provider adds exactly one match arm here — the aggregation core, the
 /// store, the scheduler, and every order handler stay untouched.
@@ -925,6 +971,9 @@ fn build_provider(
             provider_timeout_seconds,
             max_price_staleness_seconds,
         )?)),
+        // Fixed 1:1 peg, no network (§11.8). Its `only` / `except` entries
+        // were checked against the table by `ProviderConfig::validate`.
+        ProviderId::Stablecoins => Ok(Box::new(StablecoinsProvider::new(cfg))),
     }
 }
 
@@ -1700,6 +1749,309 @@ mod tests {
         let r = manager.update_all().await;
         assert_eq!(r.servable_currencies, 0);
         assert!(manager.get_price("USD").is_err());
+    }
+
+    fn usd_anchor(value: f64) -> ProviderQuotes {
+        let mut q = ProviderQuotes::new();
+        q.insert("USD".into(), Quote::PerBtc(value));
+        q
+    }
+
+    fn peg_quotes(codes: &[&str]) -> ProviderQuotes {
+        codes
+            .iter()
+            .map(|c| {
+                (
+                    c.to_string(),
+                    Quote::PerBase {
+                        base: "USD".into(),
+                        value: 1.0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// §11.8 acceptance: with the provider on and a USD anchor, a USDT
+    /// market order is priced exactly like a USD one.
+    #[tokio::test]
+    async fn stablecoin_is_priced_exactly_as_its_peg() {
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(usd_anchor(50_000.0))]),
+            ScriptedProvider::new(
+                ProviderId::Stablecoins,
+                vec![Ok(peg_quotes(&["USDT", "USDC", "DOC"]))],
+            ),
+        ]);
+        let report = manager.update_all().await;
+        assert_eq!(report.servable_currencies, 4);
+        let usd = manager.get_price("USD").unwrap();
+        for coin in ["USDT", "USDC", "DOC"] {
+            assert_eq!(manager.get_price(coin).unwrap(), usd, "{coin} == USD");
+        }
+        // Lower-case lookups, as an order's fiat_code may arrive.
+        assert_eq!(manager.get_price("usdt").unwrap(), usd);
+    }
+
+    /// §11.8 acceptance: no USD anchor this tick keeps last-known-good,
+    /// and past the TTL the coin is refused — the CUP dependency (§11.3).
+    #[tokio::test]
+    async fn stablecoin_without_an_anchor_serves_last_known_good_then_refuses() {
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![
+                    Ok(usd_anchor(50_000.0)),
+                    Err(ProviderError::Http("down".into())),
+                ],
+            ),
+            ScriptedProvider::new(
+                ProviderId::Stablecoins,
+                vec![Ok(peg_quotes(&["USDT"])), Ok(peg_quotes(&["USDT"]))],
+            ),
+        ]);
+        manager.update_all().await;
+        assert_eq!(manager.get_price("USDT").unwrap(), 50_000.0);
+
+        // Tick 2: the peg is quoted but nothing anchors it. The store keeps
+        // tick 1's value.
+        let r = manager.update_all().await;
+        assert_eq!(r.failures.len(), 1);
+        assert_eq!(manager.get_price("USDT").unwrap(), 50_000.0);
+
+        // Past the TTL it is refused, like any currency.
+        let ttl = manager.settings.max_price_staleness_seconds;
+        let now = Utc::now().timestamp();
+        assert!(matches!(
+            manager.store.get("USDT", ttl, now + ttl + 1),
+            Err(PriceError::TooStale)
+        ));
+    }
+
+    /// §11.8 acceptance: a stablecoin code from any provider but
+    /// `stablecoins` is dropped at the boundary.
+    #[test]
+    fn boundary_admits_a_stablecoin_only_from_the_stablecoins_provider() {
+        assert!(passes_allowlist(ProviderId::Stablecoins, "USDT"));
+        assert!(passes_allowlist(ProviderId::Stablecoins, "doc"));
+        assert!(!passes_allowlist(ProviderId::CurrencyApi, "usdt"));
+        assert!(!passes_allowlist(ProviderId::Nostr, "USDT"));
+        assert!(!passes_allowlist(ProviderId::Yadio, "USDC"));
+        // Fiat passes from anyone, including the stablecoins provider
+        // (it never emits one, but the rule is about codes).
+        assert!(passes_allowlist(ProviderId::Nostr, "USD"));
+        assert!(passes_allowlist(ProviderId::Stablecoins, "USD"));
+        // Junk is still junk.
+        assert!(!passes_allowlist(ProviderId::Stablecoins, "ETH"));
+    }
+
+    #[tokio::test]
+    async fn currency_api_and_nostr_stablecoin_quotes_never_reach_the_store() {
+        // currency-api lists `usdt` at a thin market price; a trusted node
+        // relays `USDT` at 1:1. Neither may price the coin here.
+        let mut ca = usd_anchor(50_000.0);
+        ca.insert("usdt".into(), Quote::PerBtc(49_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USDT".into(), Quote::PerBtc(50_000.0));
+        nostr.insert("ARS".into(), Quote::PerBtc(105_000_000.0));
+
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::CurrencyApi, vec![Ok(ca)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]),
+        ]);
+        manager.update_all().await;
+        assert!(manager.get_price("USD").is_ok());
+        assert!(manager.get_price("ARS").is_ok(), "fiat relay still works");
+        assert!(
+            manager.get_price("USDT").is_err(),
+            "a node that did not opt in never stores a stablecoin"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_providers_own_stablecoin_quote_survives_a_relayed_one() {
+        // A node that opted in loses nothing when a trusted node also
+        // relays USDT: its own peg quote resolves against the relayed USD
+        // anchor, and the relayed USDT is dropped (§11.8).
+        let mut nostr = usd_anchor(50_000.0);
+        nostr.insert("USDT".into(), Quote::PerBtc(48_000.0));
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]),
+            ScriptedProvider::new(ProviderId::Stablecoins, vec![Ok(peg_quotes(&["USDT"]))]),
+        ]);
+        manager.update_all().await;
+        assert_eq!(manager.get_price("USDT").unwrap(), 50_000.0);
+    }
+
+    /// §11.8 acceptance: `only = ["USDT"]` quotes USDT and not USDC.
+    #[tokio::test]
+    async fn stablecoins_only_scopes_the_coins() {
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(usd_anchor(50_000.0))]),
+            ScriptedProvider::new(
+                ProviderId::Stablecoins,
+                vec![Ok(peg_quotes(&["USDT", "USDC", "DOC"]))],
+            ),
+        ]);
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::Stablecoins.to_string())
+            .unwrap()
+            .only = Some(vec!["USDT".into()]);
+        manager.update_all().await;
+        assert!(manager.get_price("USDT").is_ok());
+        assert!(manager.get_price("USDC").is_err());
+        assert!(manager.get_price("DOC").is_err());
+    }
+
+    /// §11.8 acceptance: `only = ["USTD"]` fails at startup.
+    #[test]
+    fn from_settings_rejects_a_stablecoins_typo_in_only() {
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Stablecoins.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: Some(vec!["USTD".into()]),
+                except: None,
+                trusted_nodes: vec![],
+            },
+        );
+        let err = match PriceManager::from_settings(settings) {
+            Ok(_) => panic!("a typo in `only` must fail at startup"),
+            Err(e) => e,
+        };
+        assert!(err.contains("USTD"), "{err}");
+    }
+
+    #[test]
+    fn from_settings_builds_stablecoins_without_url() {
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Stablecoins.to_string(),
+            ProviderConfig {
+                enabled: true,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: None,
+                except: None,
+                trusted_nodes: vec![],
+            },
+        );
+        let m = PriceManager::from_settings(settings).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(m.providers.len(), 1);
+        assert_eq!(m.providers[0].id, ProviderId::Stablecoins);
+    }
+
+    /// §11.8 acceptance: provider off → no USDT in the store or in
+    /// `mostro-rates`, and a fixed-price USDT order still passes with an
+    /// empty `fiat_currencies_accepted`.
+    #[tokio::test]
+    async fn provider_off_stores_and_publishes_no_stablecoin() {
+        let manager = manager_with_many(vec![ScriptedProvider::new(
+            ProviderId::Yadio,
+            vec![Ok(usd_anchor(50_000.0))],
+        )]);
+        manager.update_all().await;
+        assert!(manager.get_price("USD").is_ok());
+        assert!(matches!(
+            manager.get_price("USDT"),
+            Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse))
+        ));
+        // What `publish_rates_to_nostr` would carry.
+        let rates = republishable_rates(&HashMap::from([(
+            "USD".to_string(),
+            AggregateResult {
+                value: 50_000.0,
+                sources: 1,
+                contributors: vec![ProviderId::Yadio],
+                nostr_anchor_dependent: false,
+            },
+        )]));
+        assert!(!rates.contains_key("USDT"));
+
+        // The order path is untouched: an empty list accepts any code.
+        let order = mostro_core::order::SmallOrder {
+            fiat_code: "USDT".into(),
+            ..Default::default()
+        };
+        assert!(order.check_fiat_currency(&[]).is_ok());
+        assert!(order.check_fiat_currency(&["USD".into()]).is_err());
+        assert!(order
+            .check_fiat_currency(&["USD".into(), "USDT".into()])
+            .is_ok());
+    }
+
+    fn stablecoins_settings(enabled: bool, only: Option<Vec<&str>>) -> PriceSettings {
+        let mut settings = PriceSettings::default();
+        settings.providers.insert(
+            ProviderId::Stablecoins.to_string(),
+            ProviderConfig {
+                enabled,
+                url: String::new(),
+                fallback_urls: vec![],
+                api_key: None,
+                token: None,
+                only: only.map(|v| v.into_iter().map(String::from).collect()),
+                except: None,
+                trusted_nodes: vec![],
+            },
+        );
+        settings
+    }
+
+    fn accepted(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// §11.8 acceptance: the startup warning fires for a quoted coin
+    /// missing from a non-empty list …
+    #[test]
+    fn warns_for_a_quoted_coin_the_accepted_list_does_not_name() {
+        let settings = stablecoins_settings(true, Some(vec!["USDT", "USDC"]));
+        assert_eq!(
+            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["USD", "VES", "USDT"])),
+            vec!["USDC".to_string()]
+        );
+        // Default scope: every coin in the table.
+        let settings = stablecoins_settings(true, None);
+        assert_eq!(
+            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["USD"])),
+            vec!["DOC".to_string(), "USDC".into(), "USDT".into()]
+        );
+        // The list is matched exactly, as `check_fiat_currency` matches it:
+        // a lowercase `usdt` does not admit a `USDT` order, so it warns.
+        assert_eq!(
+            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["usdt", "USDC", "doc"])),
+            vec!["DOC".to_string(), "USDT".into()]
+        );
+    }
+
+    /// … and not for a listed coin that is not quoted (fixed-price only),
+    /// nor with the provider off, nor with an empty list.
+    #[test]
+    fn does_not_warn_for_listed_but_unquoted_or_when_nothing_applies() {
+        let settings = stablecoins_settings(true, Some(vec!["USDT"]));
+        assert!(
+            quoted_but_unaccepted_stablecoins(&settings, &accepted(&["USD", "USDT", "DOC"]))
+                .is_empty(),
+            "DOC is accepted at fixed price only; legitimate"
+        );
+        let off = stablecoins_settings(false, None);
+        assert!(quoted_but_unaccepted_stablecoins(&off, &accepted(&["USD"])).is_empty());
+        let on = stablecoins_settings(true, None);
+        assert!(quoted_but_unaccepted_stablecoins(&on, &[]).is_empty());
+        assert!(
+            quoted_but_unaccepted_stablecoins(&PriceSettings::default(), &accepted(&["USD"]))
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -1075,6 +1075,35 @@ pub fn synthesise_legacy_price_settings(
     }
 }
 
+/// `price` with the legacy single source added (#1099), when it enables no
+/// provider that fetches a market price: none, or only `pegged`. Any
+/// `[price.*]` table switches the node to multi-source pricing, so a
+/// `[price.providers.pegged]` block on its own left it with no fiat rate,
+/// every market-priced order refused and no USD to price the stablecoins,
+/// while the template presents the block as an opt-in that adds the pegged
+/// codes. The legacy source is the Yadio provider at
+/// `bitcoin_price_api_url`, as [`synthesise_legacy_price_settings`] builds
+/// it. `None` when a market provider is enabled, or when the operator wrote
+/// a `yadio` table, which stays as written.
+pub fn with_legacy_market_source(
+    price: &PriceSettings,
+    bitcoin_price_api_url: &str,
+) -> Option<PriceSettings> {
+    let pegged = ProviderId::Pegged.to_string();
+    let has_market_provider = price
+        .providers
+        .iter()
+        .any(|(id, cfg)| cfg.enabled && *id != pegged);
+    let yadio = ProviderId::Yadio.to_string();
+    if has_market_provider || price.providers.contains_key(&yadio) {
+        return None;
+    }
+    let legacy = synthesise_legacy_price_settings(bitcoin_price_api_url, 0, false);
+    let mut kept = price.clone();
+    kept.providers.extend(legacy.providers);
+    Some(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

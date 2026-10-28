@@ -29,7 +29,8 @@ pub mod store;
 pub use aggregate::{aggregate_tick, combine, resolve_per_base, AggregateResult};
 pub use config::{PriceSettings, ProviderConfig};
 pub use manager::{
-    quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, PriceManager, TickReport,
+    quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, with_legacy_market_source,
+    PriceManager, TickReport,
 };
 pub use provider::{
     PriceProvider, ProviderError, ProviderHealth, ProviderId, ProviderQuotes, Quote,

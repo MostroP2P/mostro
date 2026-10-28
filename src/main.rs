@@ -522,12 +522,26 @@ async fn install_spam_gate() {
 /// working byte-for-byte (spec §10.1).
 fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
     use crate::price::{
-        quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, PriceManager,
+        quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, with_legacy_market_source,
+        PriceManager,
     };
 
     let mostro_settings = Settings::get_mostro();
-    let price_settings = match Settings::get_price() {
-        Some(p) => {
+    let legacy_url = &mostro_settings.bitcoin_price_api_url;
+    let configured = Settings::get_price();
+    let kept = configured.and_then(|p| with_legacy_market_source(p, legacy_url));
+    let price_settings = match (configured, kept) {
+        // No provider fetches a market price (#1099): keep the legacy source
+        // next to the pegged one, or the node has no fiat rate at all.
+        (Some(_), Some(kept)) => {
+            tracing::warn!(
+                "price: `[price]` enables no market price provider, so the legacy \
+                 `bitcoin_price_api_url` = \"{legacy_url}\" stays in use next to it; \
+                 add a `[price.providers.*]` market provider to choose your own"
+            );
+            kept
+        }
+        (Some(p), None) => {
             // Multi-source mode: the `[price.providers.*]` tables drive
             // aggregation, so the legacy `[mostro].bitcoin_price_api_url` is
             // not consulted here. Surface that explicitly so an operator who
@@ -553,8 +567,8 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
             );
             p.clone()
         }
-        None => synthesise_legacy_price_settings(
-            &mostro_settings.bitcoin_price_api_url,
+        (None, _) => synthesise_legacy_price_settings(
+            legacy_url,
             mostro_settings.exchange_rates_update_interval_seconds,
             mostro_settings.publish_exchange_rates_to_nostr,
         ),

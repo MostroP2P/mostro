@@ -291,7 +291,9 @@ lnd_resynced_clear_after = 300
 # # §11.9). No network call: each code is quoted at 1:1 with what it is
 # # pegged to. Opt-in: off, the node behaves as today (fixed-price orders in
 # # these codes pass where `fiat_currencies_accepted` allows them;
-# # market-priced ones are refused for lack of a rate).
+# # market-priced ones are refused for lack of a rate). With no market
+# # provider enabled next to it, the legacy `bitcoin_price_api_url` stays in
+# # use for every other currency; enable one above to choose your own.
 # #
 # # Stablecoins, pegged to a fiat. `fa` is in whole coins, priced from the
 # # node's rate for that fiat, so a USDT market order is priced like a USD

@@ -427,13 +427,14 @@ heterogeneous providers safely comparable.
   (the currencies Mostro already validates for orders); everything else is
   dropped before aggregation and before the Nostr publish, keeping the
   store and the kind-30078 event lean.
-- **Stablecoin allowlist (§11.8).** A second, smaller table next to the
-  fiat one, `KNOWN_STABLECOINS`, maps each stablecoin code to the fiat it
-  is pegged 1:1 to (`USDT` → `USD`). Its codes pass the boundary **only
-  from the `stablecoins` provider**. A source that also lists crypto
-  (`currency-api`'s `usdt`) and a trusted node's relayed rate (`nostr`)
-  are still dropped for them. So nothing but the peg ever prices a
-  stablecoin, and a node that has not opted in never stores one.
+- **Pegged-code allowlist (§11.8, §11.9).** A second, smaller table next
+  to the fiat one, `KNOWN_PEGGED`, maps each pegged code to what it is
+  pegged 1:1 to: a fiat for a stablecoin (`USDT` → `USD`), or bitcoin for
+  bitcoin on another network (`RBTC`). Its codes pass the boundary **only
+  from the `pegged` provider**. A source that also lists crypto
+  (`currency-api`'s `usdt`, Yadio's `BTC`) and a trusted node's relayed
+  rate (`nostr`) are still dropped for them. So nothing but the peg ever
+  prices a pegged code, and a node that has not opted in never stores one.
 - **Per-provider currency scoping (`only` / `except`).** Some providers
   report a currency on a **different market** than others, and averaging
   across markets is wrong — not merely noisy. The motivating case is
@@ -507,10 +508,11 @@ url = "https://tasas.eltoque.com"
 # token = "xxxx"         # REQUIRED when enabled; provider refuses to start otherwise
 only = ["CUP", "MLC"]    # El Toque is only meaningful for these (§6.6)
 
-# No network call: quotes each stablecoin at 1:1 with its fiat (§11.8).
-[price.providers.stablecoins]
+# No network call: quotes each pegged code at 1:1 with its peg, a fiat
+# (§11.8) or bitcoin (§11.9).
+[price.providers.pegged]
 enabled = false          # opt-in
-# only = ["USDT", "USDC"]  # optional; default: every coin in the table
+# only = ["USDT", "RBTC"]  # optional; default: every code in the table
 ```
 
 - Each `[price.providers.<id>]` sub-table is deserialized into a generic
@@ -525,9 +527,9 @@ enabled = false          # opt-in
 - Validation at startup: an enabled provider missing a required secret
   (El Toque without `token`) fails fast with a descriptive error rather
   than silently producing no quotes; `only` ∩ `except` set on the same
-  provider is rejected. The `stablecoins` provider needs no `url` (like
+  provider is rejected. The `pegged` provider needs no `url` (like
   `nostr`), and its `only` / `except` entries must be codes from its
-  table (§11.8).
+  table (§11.8, §11.9).
 
 ## 8. Phase overview
 
@@ -554,6 +556,12 @@ Phases 3 and 4 both depend on Phase 2 and can land in either order.
 > that makes no network call and quotes USDT, USDC and DOC at 1:1 with
 > USD through the §6.3 PerBase path, so a node that opts in can take
 > market-priced orders in them. It lands as its own PR on top of Phase 4.
+> It shipped as `stablecoins` (#1083); §11.9 renames it `pegged`.
+
+> **Out-of-band addition — bitcoin on other networks (issue #1088,
+> §11.9).** The same provider, renamed `pegged`, quotes on-chain BTC,
+> L-BTC and RBTC at 10⁸ units per BTC, a unit being a sat, so a node that
+> opts in can take market-priced orders that swap Lightning sats for them.
 
 ---
 
@@ -978,33 +986,39 @@ method) is the protocol book's
 [stablecoin page](https://mostro.network/protocol/stablecoins.html); the
 clients' side is MostroP2P/app#884 and MostroP2P/mostro-cli#213.
 
+> **Renamed by §11.9.** S1 (#1083) shipped the provider as `stablecoins`
+> and the table as `KNOWN_STABLECOINS`. §11.9 renames them `pegged` and
+> `KNOWN_PEGGED`, before any release carries the old names, so that the
+> same provider also quotes bitcoin on other networks. This section uses
+> the new names. The stablecoin rules do not change.
+
 **What works without this.** `fiat_code` is a free string, checked only
 against `fiat_currencies_accepted`, so a fixed-price USDT order already
 passes wherever that list allows the code. A market-priced one fails: no
 provider quotes USDT, and the §6.6 fiat allowlist would drop it if one did,
 so `get_price("USDT")` returns `NoCurrency`.
 
-**The table.** In `src/price/fiat.rs`, next to `KNOWN_FIAT`:
+**The table.** In `src/price/fiat.rs`, next to `KNOWN_FIAT`, a stablecoin
+is a `Peg::Fiat` row of `KNOWN_PEGGED` (the whole table and its `Peg` type
+are in §11.9):
 
 ```rust
-/// Stablecoin code → the fiat it is pegged 1:1 to. Sorted by code.
-const KNOWN_STABLECOINS: &[(&str, &str)] = &[
-    ("DOC", "USD"),
-    ("USDC", "USD"),
-    ("USDT", "USD"),
-];
+// The stablecoin rows of KNOWN_PEGGED: code → the fiat it is pegged 1:1 to.
+("DOC", Peg::Fiat("USD")),
+("USDC", Peg::Fiat("USD")),
+("USDT", Peg::Fiat("USD")),
 ```
 
 - Adding a coin is one row here and one in the protocol book's list.
   `EURC` → `EUR` is the next candidate.
-- Tests hold that the table is sorted, that every peg is in `KNOWN_FIAT`,
-  and that no code is in both tables.
+- Tests hold that the table is sorted, that every `Peg::Fiat` peg is in
+  `KNOWN_FIAT`, and that no code is in both tables.
 
-**The provider.** `src/price/providers/stablecoins.rs`,
-`ProviderId::Stablecoins` (config key `stablecoins`). `fetch` makes no
-network call: it returns `Quote::PerBase { base: <peg>, value: 1.0 }` for
-every row of the table, and the §6.3 resolution turns that into the peg's
-aggregate per-BTC price. So:
+**The provider.** `src/price/providers/pegged.rs`, `ProviderId::Pegged`
+(config key `pegged`). `fetch` makes no network call: it returns
+`Quote::PerBase { base: <peg>, value: 1.0 }` for every `Peg::Fiat` row of
+the table, and the §6.3 resolution turns that into the peg's aggregate
+per-BTC price. So:
 
 - a USDT market order is priced exactly like a USD one, premium included;
 - with no USD anchor this tick, USDT keeps its last-known-good value and is
@@ -1032,8 +1046,8 @@ aggregate per-BTC price. So:
   the peg.
 
 **The boundary rule (§6.6).** At the manager boundary a code passes when it
-is a known fiat, or when it is a known stablecoin **and** comes from the
-`stablecoins` provider. `only` / `except` scoping then applies as for every
+is a known fiat, or when it is a known pegged code **and** comes from the
+`pegged` provider. `only` / `except` scoping then applies as for every
 provider. Two consequences:
 
 - `currency-api`'s `usdt`, or any API that also lists crypto, never
@@ -1042,7 +1056,7 @@ provider. Two consequences:
   carries USDT if that node opted in. It is dropped here. Otherwise a node
   that never opted in would start pricing USDT orders because a node it
   trusts for USD did. A node that did opt in loses nothing: its own
-  `stablecoins` quote resolves against the relayed USD anchor.
+  `pegged` quote resolves against the relayed USD anchor.
 
 **Opt-in.** The provider ships disabled. A node that accepts USD and VES
 and wants USDT and USDC at market price, but not DOC:
@@ -1051,9 +1065,9 @@ and wants USDT and USDC at market price, but not DOC:
 [mostro]
 fiat_currencies_accepted = ['USD', 'VES', 'USDT', 'USDC']
 
-[price.providers.stablecoins]
+[price.providers.pegged]
 enabled = true
-only = ["USDT", "USDC"]   # optional; default: every coin in the table
+only = ["USDT", "USDC"]   # optional; default: every code in the table
 ```
 
 - The two settings answer different questions, as for every currency:
@@ -1083,11 +1097,11 @@ network, the very failure the field is meant to prevent. (The kind-38383
 event already has a `network` tag, for the Lightning network.)
 
 **Amounts.** `fiat_amount` is an `i64`, so orders are in whole units, as
-with fiat.
+with fiat. (The BTC-pegged codes count sats instead, §11.9.)
 
 **Depeg guard (follow-up S2, design open).** A fixed peg is wrong during a
 depeg: USDC traded around $0.87 in March 2023. The guard is a separate
-check, **not** part of the `stablecoins` provider: `fetch` stays
+check, **not** part of the `pegged` provider: `fetch` stays
 network-free, so S1 adds no network dependency, and a failing check never
 takes the peg down with it. Proposed contract:
 
@@ -1120,7 +1134,7 @@ Until it lands, an operator handles a depeg by taking the coin out of
 | Step | Repo | Scope | Depends on |
 |------|------|-------|------------|
 | S0 | protocol | Stablecoin page (codes, pegs, 1:1 rule, network in `pm`); `f` tag; `mostro-rates` | — |
-| S1 | mostro | `KNOWN_STABLECOINS`, the boundary rule, the `stablecoins` provider, its validation and startup warning, `settings.tpl.toml` | — |
+| S1 | mostro | The table, the boundary rule, the provider, its validation and startup warning, `settings.tpl.toml` (done, #1083, under the names §11.9 replaces) | — |
 | C1 | mostro-cli | Market-price check against the node's `mostro-rates` instead of Yadio (#213) | — |
 | C2 | app | Design guide rule, catalogue, mark, default-currency rule, Market lock (#884, phase 1) | — |
 | C3 | app | Payment methods by network, then the trade hint (#884, phases 2–3) | C2 |
@@ -1147,6 +1161,352 @@ one, the CLI refuses a market order in it and the app locks Market.
 - The startup warning fires for a quoted coin missing from a non-empty
   list, and not for a listed coin that is not quoted.
 - The table tests above.
+
+### 11.9 Bitcoin on other networks (1:1 in sats, opt-in) — issue #1088
+
+Mostro can swap Lightning sats for bitcoin on another network the way it
+trades stablecoins (§11.8): the asset is the order's currency, and the
+buyer pays in it. There are three codes, each pegged 1:1 to bitcoin itself:
+
+| Code | Asset | Network | Decimals |
+|------|-------|---------|---------:|
+| `BTC` | bitcoin | Bitcoin, on-chain | 8 |
+| `LBTC` | L-BTC | Liquid | 8 |
+| `RBTC` | RBTC | Rootstock | 18 |
+
+This section covers the unit, the price, the rename that lets §11.8's
+provider quote these codes, and a rounding fix they need. The wire side is
+the protocol book's (step B0 below).
+
+**What works without this.** As for USDT, a fixed-price `RBTC` order
+already passes wherever `fiat_currencies_accepted` allows the code, and a
+market-priced one fails with `NoCurrency`. The §6.6 allowlist also drops
+Yadio's `BTC` self-quote (bitcoin priced in bitcoin), and must keep doing
+so: that rate would price a sat-denominated `fa` 10⁸ off. What nothing
+defines today is what `fa` counts for these codes.
+
+**The unit is the sat.** `fiat_amount` is an `i64`, so in whole units the
+smallest order would be 1 BTC. For a BTC-pegged code, `fa` (and a range
+order's `min` and `max`) counts sats of the asset: `f = RBTC`,
+`fa = 100000` is 0.001 RBTC.
+
+- Nothing changes type in mostro-core, the database or the wire.
+- BTC and L-BTC have 8 decimals, so the sat is their smallest unit. RBTC
+  has 18; a client rounds an RBTC amount to 10⁻⁸ before it builds the
+  order. mostrod only sees `fa`.
+- `min_payment_amount` and `max_order_amount` bound the order's sats as
+  they do today. Here the sats are `fa` less the premium.
+
+**The table and the rename.** §11.8's provider already makes no network
+call, and the boundary admits its codes only from it, which is what these
+codes need. So the provider takes them too, and its names change to say
+what its codes share. In `src/price/fiat.rs`:
+
+```rust
+/// What a pegged code is pegged 1:1 to.
+pub enum Peg {
+    /// A fiat in `KNOWN_FIAT`; `fa` in whole units (§11.8).
+    Fiat(&'static str),
+    /// Bitcoin; `fa` in sats (§11.9).
+    Btc,
+}
+
+/// Pegged code → its peg. Sorted by code.
+const KNOWN_PEGGED: &[(&str, Peg)] = &[
+    ("BTC", Peg::Btc),
+    ("DOC", Peg::Fiat("USD")),
+    ("LBTC", Peg::Btc),
+    ("RBTC", Peg::Btc),
+    ("USDC", Peg::Fiat("USD")),
+    ("USDT", Peg::Fiat("USD")),
+];
+```
+
+| Shipped in #1083 | Renamed to |
+|------------------|------------|
+| `[price.providers.stablecoins]` | `[price.providers.pegged]` |
+| `ProviderId::Stablecoins` | `ProviderId::Pegged` |
+| `src/price/providers/stablecoins.rs`, `StablecoinsProvider` | `src/price/providers/pegged.rs`, `PeggedProvider` |
+| `KNOWN_STABLECOINS` | `KNOWN_PEGGED` |
+| `stablecoin_peg`, `is_known_stablecoin`, `known_stablecoins` | `peg_of`, `is_known_pegged`, `known_pegged` |
+| `quoted_but_unaccepted_stablecoins` | `quoted_but_unaccepted_pegged` |
+
+- **No alias.** #1083 is in no release (0.20.1 predates it), so no
+  operator's settings carry the old key. B1 has to land before the next
+  release; if it does not, the old key needs an alias for a release.
+- A `stablecoins` sub-table left from a build of `main` becomes an unknown
+  id: `PriceManager::from_settings` warns and ignores it, and its coins
+  lose their market price until the key is renamed.
+- **Why `pegged` and not `cryptocurrency`.** ETH and XMR are
+  cryptocurrencies, and a fixed peg cannot price them. A name that promises
+  them invites `only = ["ETH"]`, which validation rejects. What these codes
+  share is the peg.
+- Table tests: the table is sorted, every `Peg::Fiat` peg is in
+  `KNOWN_FIAT`, and no code is in both `KNOWN_FIAT` and `KNOWN_PEGGED`.
+
+**The quote.** `fetch` returns, for each row:
+
+- `Peg::Fiat(peg)`: `Quote::PerBase { base: peg, value: 1.0 }`, as in
+  §11.8;
+- `Peg::Btc`: `Quote::PerBtc(100_000_000.0)`, 10⁸ units per BTC, a unit
+  being a sat.
+
+So, for a BTC-pegged code:
+
+- `get_market_quote` gives `sats = fa × (1 − premium/100)`. A sell order
+  with `f = RBTC`, `fa = 100000`, market price and a 1% premium: the seller
+  locks 99,000 Lightning sats and receives 100,000 sats of RBTC. The
+  premium is the price of the swap.
+- The quote needs no other rate. It is not a fiat-cross, so no anchor,
+  relayed or not, makes it `nostr_anchor_dependent` (§6.4).
+- The provider quotes it every tick, so it stays fresh while the scheduler
+  runs, and goes stale like any code if the scheduler stops.
+- It lands in the store and in `mostro-rates` at 100000000, which is how
+  clients learn which codes a node quotes.
+
+**Why 1:1.**
+
+- **BTC** on-chain is bitcoin. There is no peg to price.
+- **L-BTC and RBTC** exist against BTC locked in their pegs (the Liquid
+  Federation and Rootstock's PowPeg) and are redeemed 1:1 through them.
+  Crossing a peg costs fees and time. The order `premium` is where a maker
+  prices that, and a market feed for it would add a network dependency to
+  price a difference the premium already carries.
+
+**The boundary rule (§6.6).** Unchanged:
+`is_known_fiat(code) || (id == ProviderId::Pegged && is_known_pegged(code))`.
+For these codes it means:
+
+- Yadio's `BTC` self-quote, or any API that lists bitcoin among its
+  currencies, never prices them.
+- A trusted node's relayed `RBTC` is dropped, as a relayed `USDT` is. A
+  node that opted in loses nothing: its own quote needs no anchor.
+
+**Opt-in.** As in §11.8, the provider ships disabled, and two settings
+answer two questions: `fiat_currencies_accepted` says which codes orders
+may use, and the provider says which of them have a market price.
+
+- Without `only`, the provider quotes every code in the table, of both
+  kinds. An operator who turns it on for USDT alone also quotes RBTC. With
+  a non-empty `fiat_currencies_accepted` those orders are still refused and
+  the startup warning names the codes; with an empty one they are
+  accepted. Whether the default should stay "every code" is open in #1088.
+- The startup validation and warning cover the new codes unchanged.
+
+**Configuration examples.**
+
+1. Swaps only. A node that keeps trading fiat and adds Lightning ↔
+   Liquid and Lightning ↔ Rootstock swaps at market price:
+
+   ```toml
+   [mostro]
+   fiat_currencies_accepted = ['USD', 'VES', 'LBTC', 'RBTC']
+
+   [price.providers.pegged]
+   enabled = true
+   only = ["LBTC", "RBTC"]
+   ```
+
+2. Stablecoins and swaps:
+
+   ```toml
+   [mostro]
+   fiat_currencies_accepted = ['USD', 'VES', 'USDT', 'LBTC', 'RBTC']
+
+   [price.providers.pegged]
+   enabled = true
+   only = ["USDT", "LBTC", "RBTC"]
+   ```
+
+3. On-chain BTC at fixed price only. The code is accepted but not quoted:
+   a maker sets both amounts, and a market-priced `BTC` order is refused.
+
+   ```toml
+   [mostro]
+   fiat_currencies_accepted = ['USD', 'BTC']
+
+   [price.providers.pegged]
+   enabled = false
+   ```
+
+4. Everything. An empty list accepts every code, and the provider without
+   `only` quotes every code in the table:
+
+   ```toml
+   [mostro]
+   fiat_currencies_accepted = []
+
+   [price.providers.pegged]
+   enabled = true
+   ```
+
+5. A mistake the startup warning catches. RBTC is quoted but not accepted,
+   so the node would publish its rate and refuse every order in it:
+
+   ```toml
+   [mostro]
+   fiat_currencies_accepted = ['USD', 'LBTC']
+
+   [price.providers.pegged]
+   enabled = true
+   only = ["LBTC", "RBTC"]   # warns: RBTC is quoted but not accepted
+   ```
+
+**Orders under example 1.** `amt` is the order's sats (`amount`); `0`
+means market price.
+
+| Order | `f` | `fa` | `amt` | `premium` | Sats of the order |
+|-------|-----|------|------:|----------:|-------------------|
+| Market, with premium | `RBTC` | `100000` | `0` | `1` | 99,000 |
+| Market, no premium | `LBTC` | `250000` | `0` | `0` | 250,000 |
+| Fixed price | `LBTC` | `100000` | `99500` | — | 99,500 |
+| Range, market | `RBTC` | `min 50000`, `max 200000` | `0` | `0` | the `fa` the taker picks, in sats |
+| Market, refused | `BTC` | `100000` | `0` | `0` | — (`BTC` is not accepted) |
+
+**`settings.tpl.toml` (B1).** B1 replaces the template's `stablecoins`
+block with this one, so an operator learns from the template alone what
+each kind of code is, its unit, and how to pick codes:
+
+```toml
+# # Pegged currencies as order currencies (docs/PRICE_PROVIDERS.md §11.8,
+# # §11.9). No network call: each code is quoted at 1:1 with what it is
+# # pegged to. Opt-in: off, the node behaves as today (fixed-price orders in
+# # these codes pass where `fiat_currencies_accepted` allows them;
+# # market-priced ones are refused for lack of a rate).
+# #
+# # Stablecoins, pegged to a fiat. `fa` is in whole coins, priced from the
+# # node's rate for that fiat, so a USDT market order is priced like a USD
+# # one. The network goes in the order's payment method ("USDT (Tron)",
+# # "DOC (Rootstock)"); the node does not check it.
+# #   USDT, USDC, DOC -> USD
+# #
+# # Bitcoin on other networks, pegged to bitcoin. `fa` is in SATS of the
+# # asset (fa = 100000 is 0.001 RBTC). At market price the order is `fa`
+# # sats less the premium. The code names the network.
+# #   BTC (on-chain), LBTC (Liquid), RBTC (Rootstock)
+# #
+# # A non-empty `fiat_currencies_accepted` must also list every code you
+# # quote, or every order in it is refused; the node warns at startup.
+# # To accept a code at fixed price only, list it there and leave it out
+# # of `only`.
+# #
+# # `only` picks the codes; without it, every code above is quoted:
+# #   only = ["USDT", "USDC"]          # dollar stablecoins
+# #   only = ["LBTC", "RBTC"]          # Lightning <-> Liquid / Rootstock swaps
+# #   only = ["USDT", "BTC", "RBTC"]   # both kinds
+# [price.providers.pegged]
+# enabled = false
+# # only = ["USDT", "USDC"]
+```
+
+The `[mostro]` comment on `fiat_currencies_accepted` names the pegged
+codes too:
+
+```toml
+# Currencies accepted for orders: ISO 4217 fiat codes, plus the pegged codes
+# of [price.providers.pegged] (stablecoins such as USDT; BTC, LBTC and RBTC,
+# whose amounts are in sats). Leave empty [] to accept every code.
+fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
+```
+
+**Rounding.** The fiat-to-sats conversion truncates (`as i64`) in four
+places:
+
+- `get_market_quote` (`src/util.rs`);
+- both branches of `maker_bond_notional_sats` (`src/util.rs`);
+- `calculate_and_check_quote` (`src/app/order.rs`).
+
+At 10⁸ units per BTC the float error shows: `(fa / 1e8) × 1e8` falls just
+under `fa` for 159,879 of the amounts from 1 to 2,000,000, and truncation
+then loses a sat (`fa = 29` gives 28). The four sites round to the nearest
+sat instead, once and after the premium, through one shared helper.
+Rounding gets every amount from 1 to 2,000,000 right, and every amount in
+a random sample of 200,000 up to 21M BTC.
+
+For fiat orders, the change moves about half of the quotes up one sat
+(4,836 of the amounts from 1 to 10,000 at 108,000 per BTC).
+`maker_bond_notional_range_sizes_against_max_at_price` pins 166,666, which
+becomes 166,667.
+
+**The network is the code.** `BTC`, `LBTC` and `RBTC` each name their
+network, so unlike `USDT (Tron)` the payment method needs no network.
+
+**Settlement and disputes.** Nothing here changes mostrod. It is for the
+book, the clients and the solver guide.
+
+- **Confirmations.** The seller releases only after the transfer confirms,
+  never on zero confirmations. The deadline is not the hold invoice's full
+  life. Once the chain tip is within `escrow_deadline_margin_blocks` of
+  the accepted HTLC's expiry, `enforce_escrow_deadline_pass`
+  (`src/scheduler.rs`) cancels an `active` trade or opens a dispute on a
+  `fiat-sent` one, while the escrow still exists. With the template
+  defaults that is `hold_invoice_cltv_delta − escrow_deadline_margin_blocks`
+  = 144 − 24 = 120 blocks (about 20 hours) after the seller's payment is
+  accepted, and the transfer has to confirm and the seller release inside
+  it. Liquid and Rootstock confirm in minutes. An on-chain BTC transfer
+  with a low fee can stay unconfirmed for longer, so a client tells the
+  sender to pay a fee that confirms within a few hours, which leaves the
+  rest of the window for the release or a dispute.
+- **Fees.** As for stablecoins, the sender pays the network fee and the
+  receiver gets the full amount. On-chain, the fee can be a large share of
+  a small order.
+- **Disputes.** BTC and RBTC transfers are public, and a solver checks them
+  in an explorer. Liquid transactions are confidential (amounts and assets
+  are blinded), so the solver needs the unblinded link from the sender.
+
+**Compatibility.** A NIP-69 client that checks for ISO codes ignores these
+orders. A client that shows any code but does not know the unit would show
+"100000 RBTC" for 0.001 RBTC. The provider ships off, and the book and the
+clients land first. Any client can publish a fixed-price order in these
+codes today, so the unit rule matters before any node quotes them.
+
+**Peg guard (follow-up B2, design open).** On-chain BTC needs none. L-BTC
+depends on the Liquid Federation and RBTC on the PowPeg, and a failure of
+either breaks the 1:1. Like §11.8's depeg guard (S2), the guard would be
+a separate check that
+drops and evicts the code on a failure signal, and keeps the quote when
+the check itself fails. Which signals to read is open. Until it lands, an
+operator removes the code from `only`.
+
+**Rollout.**
+
+| Step | Repo | Scope | Depends on |
+|------|------|-------|------------|
+| B0 | protocol | The BTC-pegged codes (codes, 1:1 rule, `fa` in sats), on the stablecoin page or a sibling; `f` and `fa` tags; `mostro-rates` | — |
+| R1 | mostro | Rounding: a `test:` commit that fails on `main`, then the shared helper | — |
+| B1 | mostro | The rename, `Peg`, the `Peg::Btc` rows and their quote, the `settings.tpl.toml` text above; before the next release | R1 |
+| C4 | mostro-cli | The three codes, amounts in sats; the market check is C1's | C1 |
+| C5 | app | The codes in the catalogue with marks, sats entry and display, the Market lock of C2 | C2 |
+| B2 | mostro | Peg guard for L-BTC and RBTC | B1 |
+
+B0 and R1 can land in any order. Until a node quotes a code, the CLI
+refuses a market order in it and the app locks Market, as for stablecoins.
+
+**Acceptance / tests (R1)**
+
+- At a price of 10⁸ per BTC with no premium, `get_market_quote` returns
+  `fa` for every `fa` from 1 to 2,000,000. On `main` it returns 28 for 29.
+- With a 1% premium, `fa = 100000` gives 99,000.
+- `maker_bond_notional_sats` and `calculate_and_check_quote` round the
+  same way.
+
+**Acceptance / tests (B1)**
+
+- Provider on, no other provider and no USD anchor: `get_price("RBTC")` is
+  10⁸, and `get_market_quote(&100_000, "RBTC", 1)` is 99,000.
+- Yadio's `BTC` and a Nostr-relayed `RBTC` are dropped at the boundary;
+  the provider's own quote is kept.
+- `only = ["RBTC"]` quotes RBTC and no stablecoin; `only = ["RBT"]` fails
+  at startup.
+- Provider off: no `RBTC` in the store or in `mostro-rates`, and a
+  fixed-price RBTC order still passes with an empty
+  `fiat_currencies_accepted`.
+- The startup warning names a quoted BTC-pegged code missing from a
+  non-empty list.
+- The template's `pegged` block, uncommented, loads, and each of its
+  `only` examples passes validation.
+- §11.8's S1 tests pass under the new names, and the table tests above
+  hold.
 
 ---
 

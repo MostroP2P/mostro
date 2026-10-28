@@ -32,6 +32,12 @@ pub const MIN_ESCROW_DEADLINE_MARGIN_BLOCKS: u32 =
 /// has auto-canceled the HTLC near its expiry. 144 blocks is ~24 h.
 pub const BOND_TRADE_MARGIN_BLOCKS: u32 = 144;
 
+/// Blocks an order may rest in the book on its maker bond when the operator
+/// leaves `[anti_abuse_bond] bond_cltv_delta` unset (#1098): 144, ~24 h, the
+/// default `expiration_hours`. The default bond CLTV adds it to
+/// `hold_invoice_cltv_delta` and [`BOND_TRADE_MARGIN_BLOCKS`].
+pub const DEFAULT_BOND_BOOK_BLOCKS: u32 = 144;
+
 /// Ceiling on `[anti_abuse_bond] bond_cltv_delta`. The payer's route adds
 /// its own hops' deltas on top of the bond's final CLTV delta, and wallets
 /// cap the total timelock they accept: LDK's default is 1008 blocks. 864

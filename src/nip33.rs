@@ -1944,7 +1944,7 @@ mod tests {
             payout_max_retries: 5,
             payout_claim_window_days: 30,
             maker_bond_payment_timeout_seconds: 900,
-            bond_cltv_delta: 432,
+            bond_cltv_delta: Some(432),
         };
 
         let tags = bond_tags(Some(&bond));
@@ -2555,7 +2555,7 @@ mod tests {
             payout_max_retries: 3,
             payout_claim_window_days: 14,
             maker_bond_payment_timeout_seconds: 900,
-            bond_cltv_delta: 432,
+            bond_cltv_delta: Some(432),
         };
 
         let take_tags = bond_tags(Some(&base));

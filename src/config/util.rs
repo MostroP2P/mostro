@@ -221,8 +221,8 @@ fn validate_bond_cltv_delta(
         return Ok(());
     }
 
-    let bond_cltv_delta = bond.bond_cltv_delta;
     let hold_cltv_delta = lightning.hold_invoice_cltv_delta;
+    let bond_cltv_delta = bond.cltv_delta(hold_cltv_delta);
     let floor = hold_cltv_delta.saturating_add(BOND_TRADE_MARGIN_BLOCKS);
 
     if floor >= MAX_BOND_CLTV_DELTA {
@@ -1203,7 +1203,7 @@ mod startup_validation_tests {
     fn enabled_bond(bond_cltv_delta: u32) -> AntiAbuseBondSettings {
         AntiAbuseBondSettings {
             enabled: true,
-            bond_cltv_delta,
+            bond_cltv_delta: Some(bond_cltv_delta),
             ..Default::default()
         }
     }
@@ -1301,7 +1301,7 @@ mod startup_validation_tests {
         let lightning = lightning(144, 24);
         let disabled = AntiAbuseBondSettings {
             enabled: false,
-            bond_cltv_delta: 0,
+            bond_cltv_delta: Some(0),
             ..Default::default()
         };
         assert!(validate_bond_cltv_delta(Some(&disabled), &lightning, false).is_ok());

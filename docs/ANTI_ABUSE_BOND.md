@@ -140,8 +140,9 @@ maker_bond_payment_timeout_seconds = 900
 # bond lasts while its order rests in the book and then through the trade,
 # so an order rests in the book for at most
 # bond_cltv_delta - hold_invoice_cltv_delta - 144 blocks. Must be above
-# hold_invoice_cltv_delta + 144 and at most 864.
-bond_cltv_delta = 432
+# hold_invoice_cltv_delta + 144 and at most 864. Unset, it is
+# hold_invoice_cltv_delta + 288, at most 864 (432 with the shipped 144).
+# bond_cltv_delta = 432
 ```
 
 Note: there is **no `slash_on_lost_dispute` flag**. Dispute slashes are
@@ -2380,8 +2381,10 @@ these requires a compatibility statement:
 
 ### 14.6 Bond CLTV and the time in the book (#1084)
 
-A bond hold invoice gets its own CLTV delta, `bond_cltv_delta` (default
-432 blocks, ~3 days), not the escrow's `hold_invoice_cltv_delta`. A maker
+A bond hold invoice gets its own CLTV delta, `bond_cltv_delta`, not the
+escrow's `hold_invoice_cltv_delta`. Unset, it is `hold_invoice_cltv_delta`
+plus 288 blocks (the 144-block trade margin and 144 blocks, ~24 h, in the
+book), at most 864: 432 blocks, ~3 days, with the shipped 144 (#1098). A maker
 bond needs the extra room: it locks before its order is published, stays
 locked while the order rests in the book, and then through the whole
 trade that follows, whose escrow alone can be held for

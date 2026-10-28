@@ -1343,6 +1343,32 @@ mod tests {
             );
         }
 
+        /// The reply is for the request shape without an order id. With one the
+        /// request is not answered, whatever its payload: a request that names
+        /// an order is not an import request, so the intake drops it silently.
+        #[tokio::test]
+        async fn import_intake_does_not_answer_a_request_that_names_an_order() {
+            let ctx = context(true).await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            let message = Message::new_order(
+                Some(uuid::Uuid::new_v4()),
+                Some(4127),
+                None,
+                Action::ImportReputation,
+                None,
+            );
+            let event = wrap_message_nip44(
+                &message,
+                &create_test_keys(),
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .unwrap();
+            assert!(!accept(&ctx, &event, &mostro).await);
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
+        }
+
         #[tokio::test]
         async fn import_intake_does_not_answer_a_forged_event() {
             let ctx = context(true).await;

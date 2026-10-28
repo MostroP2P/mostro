@@ -1219,6 +1219,26 @@ mod startup_validation_tests {
     }
 
     #[test]
+    fn an_unset_bond_cltv_delta_follows_hold_invoice_cltv_delta() {
+        // #1098: no node had `bond_cltv_delta` before 0.20.2, so a node
+        // running with a `hold_invoice_cltv_delta` of 288 or more stopped at
+        // startup on a fixed default of 432. Left unset, the bond CLTV must
+        // fit the escrow CLTV the node runs with, up to the last one (719)
+        // that leaves room for a bond at all.
+        for hold_cltv_delta in [288, 298, 432, 576, 719] {
+            let mut settings = base_settings();
+            settings.lightning = lightning(hold_cltv_delta, 24);
+            settings.anti_abuse_bond = Some(AntiAbuseBondSettings {
+                enabled: true,
+                ..Default::default()
+            });
+            if let Err(e) = validate_mostro_settings(&settings) {
+                panic!("hold_invoice_cltv_delta {hold_cltv_delta} without bond_cltv_delta: {e}");
+            }
+        }
+    }
+
+    #[test]
     fn bond_cltv_delta_without_book_time_is_rejected() {
         // With the shipped CLTV delta of 144, a bond must have more than
         // 144 + 144 blocks: at 288 its order would get no time in the book.
@@ -1390,5 +1410,25 @@ mod init_configuration_file_tests {
         std::fs::write(dir.join("settings.toml"), tampered).expect("write settings.toml");
         let result = init_configuration_file(Some(dir.to_string_lossy().into_owned()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_refused_setting_reads_as_its_reason() {
+        // #1098: the operator reads why the settings were refused, not
+        // `Error caused by IO error: …`, a file-system failure that never
+        // happened.
+        let dir = temp_config_dir("refusal-reason");
+        let template = std::str::from_utf8(include_bytes!("../../settings.tpl.toml"))
+            .expect("template is UTF-8");
+        let tampered =
+            template.replace("dev_fee_percentage = ", "dev_fee_percentage = 99.0 # was: ");
+        std::fs::write(dir.join("settings.toml"), tampered).expect("write settings.toml");
+        let err = init_configuration_file(Some(dir.to_string_lossy().into_owned()))
+            .expect_err("an out-of-range dev fee must stop the load")
+            .to_string();
+        assert!(
+            err.starts_with("dev_fee_percentage (99) exceeds maximum"),
+            "unexpected message: {err}"
+        );
     }
 }

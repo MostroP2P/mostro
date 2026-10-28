@@ -25,12 +25,14 @@
 //! `XPT` — the non-fiat tail — and nothing else, so Phase 2 does not
 //! silently remove a currency a node was publishing yesterday.
 //!
-//! A second, smaller table, [`KNOWN_STABLECOINS`], maps each stablecoin
-//! code to the fiat it is pegged 1:1 to (spec §11.8). Its codes pass the
-//! manager boundary **only** when the `stablecoins` provider quotes them:
-//! a source that also lists crypto (`currency-api`'s `usdt`) and a trusted
-//! node's relayed rate (`nostr`) are still dropped for them, so nothing but
-//! the peg ever prices a stablecoin.
+//! A second, smaller table, [`KNOWN_PEGGED`], maps each pegged code to
+//! what it is pegged 1:1 to: a fiat for a stablecoin (`USDT` → `USD`,
+//! spec §11.8), or bitcoin for bitcoin on another network (`RBTC`,
+//! §11.9). Its codes pass the manager boundary **only** when the `pegged`
+//! provider quotes them: a source that also lists crypto (`currency-api`'s
+//! `usdt`, Yadio's `BTC`) and a trusted node's relayed rate (`nostr`) are
+//! still dropped for them, so nothing but the peg ever prices a pegged
+//! code.
 
 /// Sorted (binary-searchable) allowlist. Keep alphabetical — there is a
 /// test asserting the order so `binary_search` stays correct.
@@ -57,29 +59,47 @@ pub fn is_known_fiat(code: &str) -> bool {
     KNOWN_FIAT.binary_search(&upper.as_str()).is_ok()
 }
 
-/// Stablecoin code → the fiat it is pegged 1:1 to (spec §11.8). Sorted by
-/// code — there is a test asserting the order so `binary_search` stays
-/// correct. Adding a coin is one row here and one in the protocol book's
-/// list; its peg must itself be in [`KNOWN_FIAT`] (tested).
-const KNOWN_STABLECOINS: &[(&str, &str)] = &[("DOC", "USD"), ("USDC", "USD"), ("USDT", "USD")];
+/// What a pegged code is pegged 1:1 to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peg {
+    /// A fiat in [`KNOWN_FIAT`]: a stablecoin, `fa` in whole coins
+    /// (spec §11.8).
+    Fiat(&'static str),
+    /// Bitcoin itself: bitcoin on another network, `fa` in sats of the
+    /// asset (spec §11.9).
+    Btc,
+}
 
-/// The fiat `code` (any casing) is pegged to, when it is a known stablecoin.
-pub fn stablecoin_peg(code: &str) -> Option<&'static str> {
+/// Pegged code → its peg (spec §11.8, §11.9). Sorted by code — there is a
+/// test asserting the order so `binary_search` stays correct. Adding a
+/// code is one row here and one in the protocol book's list; a fiat peg
+/// must itself be in [`KNOWN_FIAT`] (tested).
+const KNOWN_PEGGED: &[(&str, Peg)] = &[
+    ("BTC", Peg::Btc),
+    ("DOC", Peg::Fiat("USD")),
+    ("LBTC", Peg::Btc),
+    ("RBTC", Peg::Btc),
+    ("USDC", Peg::Fiat("USD")),
+    ("USDT", Peg::Fiat("USD")),
+];
+
+/// What `code` (any casing) is pegged to, when it is a known pegged code.
+pub fn peg_of(code: &str) -> Option<Peg> {
     let upper = code.to_uppercase();
-    KNOWN_STABLECOINS
+    KNOWN_PEGGED
         .binary_search_by(|(c, _)| c.cmp(&upper.as_str()))
         .ok()
-        .map(|i| KNOWN_STABLECOINS[i].1)
+        .map(|i| KNOWN_PEGGED[i].1)
 }
 
-/// Whether `code` (any casing) is a known stablecoin.
-pub fn is_known_stablecoin(code: &str) -> bool {
-    stablecoin_peg(code).is_some()
+/// Whether `code` (any casing) is a known pegged code.
+pub fn is_known_pegged(code: &str) -> bool {
+    peg_of(code).is_some()
 }
 
-/// Every known stablecoin with its peg, in table order.
-pub fn known_stablecoins() -> &'static [(&'static str, &'static str)] {
-    KNOWN_STABLECOINS
+/// Every known pegged code with its peg, in table order.
+pub fn known_pegged() -> &'static [(&'static str, Peg)] {
+    KNOWN_PEGGED
 }
 
 #[cfg(test)]
@@ -148,8 +168,8 @@ mod tests {
     }
 
     #[test]
-    fn stablecoin_table_is_sorted_and_deduped() {
-        let codes: Vec<&str> = KNOWN_STABLECOINS.iter().map(|(c, _)| *c).collect();
+    fn pegged_table_is_sorted_and_deduped() {
+        let codes: Vec<&str> = KNOWN_PEGGED.iter().map(|(c, _)| *c).collect();
         let mut sorted = codes.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -157,29 +177,44 @@ mod tests {
     }
 
     #[test]
-    fn every_stablecoin_peg_is_a_known_fiat() {
-        for (code, peg) in KNOWN_STABLECOINS {
-            assert!(is_known_fiat(peg), "{code} is pegged to unknown fiat {peg}");
+    fn every_fiat_peg_is_a_known_fiat() {
+        for (code, peg) in KNOWN_PEGGED {
+            if let Peg::Fiat(fiat) = peg {
+                assert!(
+                    is_known_fiat(fiat),
+                    "{code} is pegged to unknown fiat {fiat}"
+                );
+            }
         }
     }
 
     #[test]
-    fn no_code_is_both_fiat_and_stablecoin() {
-        for (code, _) in KNOWN_STABLECOINS {
+    fn no_code_is_both_fiat_and_pegged() {
+        for (code, _) in KNOWN_PEGGED {
             assert!(!is_known_fiat(code), "{code} must not be in both tables");
         }
     }
 
     #[test]
-    fn stablecoin_lookup_is_case_insensitive_and_rejects_others() {
-        assert_eq!(stablecoin_peg("USDT"), Some("USD"));
-        assert_eq!(stablecoin_peg("usdc"), Some("USD"));
-        assert_eq!(stablecoin_peg("Doc"), Some("USD"));
-        assert!(is_known_stablecoin("USDT"));
-        for code in ["USD", "BTC", "ETH", "EURC", "USTD", ""] {
-            assert!(!is_known_stablecoin(code), "{code} must be unknown");
-            assert_eq!(stablecoin_peg(code), None);
+    fn pegged_lookup_is_case_insensitive_and_rejects_others() {
+        assert_eq!(peg_of("USDT"), Some(Peg::Fiat("USD")));
+        assert_eq!(peg_of("usdc"), Some(Peg::Fiat("USD")));
+        assert_eq!(peg_of("Doc"), Some(Peg::Fiat("USD")));
+        assert!(is_known_pegged("USDT"));
+        for code in ["USD", "ETH", "EURC", "USTD", "WBTC", "L-BTC", ""] {
+            assert!(!is_known_pegged(code), "{code} must be unknown");
+            assert_eq!(peg_of(code), None);
         }
-        assert_eq!(known_stablecoins().len(), 3);
+        assert_eq!(known_pegged().len(), 6);
+    }
+
+    #[test]
+    fn bitcoin_on_other_networks_is_pegged_to_btc() {
+        // Spec §11.9: on-chain BTC, L-BTC and RBTC, with `fa` in sats.
+        for code in ["BTC", "LBTC", "RBTC", "btc", "lbtc", "Rbtc"] {
+            assert_eq!(peg_of(code), Some(Peg::Btc), "{code}");
+        }
+        // Still not fiat, so Yadio's `BTC` self-quote stays dropped (§6.6).
+        assert!(!is_known_fiat("BTC"));
     }
 }

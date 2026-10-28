@@ -144,7 +144,9 @@ publish_mostro_info_interval = 300
 #      present and only falls back to this key otherwise.
 #  (c) Fully removed in Phase 5.
 bitcoin_price_api_url = "https://api.yadio.io"
-# Fiat currencies accepted for orders - leave empty [] to accept all fiat currencies
+# Currencies accepted for orders: ISO 4217 fiat codes, plus the pegged codes
+# of [price.providers.pegged] (stablecoins such as USDT; BTC, LBTC and RBTC,
+# whose amounts are in sats). Leave empty [] to accept every code.
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']
 # Maximum orders per response in orders action
 max_orders_per_response = 10
@@ -285,19 +287,35 @@ lnd_resynced_clear_after = 300
 #     # hex pubkeys of Mostro nodes you trust to publish accurate rates
 # ]
 #
-# # Stablecoins as order currencies (docs/PRICE_PROVIDERS.md §11.8). No
-# # network call: quotes each coin at 1:1 with the fiat it is pegged to
-# # (USDT, USDC, DOC → USD), resolved against the node's aggregated USD
-# # rate, so a USDT market order is priced exactly like a USD one. Opt-in:
-# # off, the node behaves as today (fixed-price orders in these codes pass
-# # where `fiat_currencies_accepted` allows them; market-priced ones are
-# # refused for lack of a rate). A non-empty `fiat_currencies_accepted`
-# # must also list the coins you quote, or every order in them is refused.
-# # The network of a transfer goes in the order's payment method
-# # ("USDT (Tron)"); the node does not check it.
-# [price.providers.stablecoins]
+# # Pegged currencies as order currencies (docs/PRICE_PROVIDERS.md §11.8,
+# # §11.9). No network call: each code is quoted at 1:1 with what it is
+# # pegged to. Opt-in: off, the node behaves as today (fixed-price orders in
+# # these codes pass where `fiat_currencies_accepted` allows them;
+# # market-priced ones are refused for lack of a rate).
+# #
+# # Stablecoins, pegged to a fiat. `fa` is in whole coins, priced from the
+# # node's rate for that fiat, so a USDT market order is priced like a USD
+# # one. The network goes in the order's payment method ("USDT (Tron)",
+# # "DOC (Rootstock)"); the node does not check it.
+# #   USDT, USDC, DOC -> USD
+# #
+# # Bitcoin on other networks, pegged to bitcoin. `fa` is in SATS of the
+# # asset (fa = 100000 is 0.001 RBTC). At market price the order is `fa`
+# # sats less the premium. The code names the network.
+# #   BTC (on-chain), LBTC (Liquid), RBTC (Rootstock)
+# #
+# # A non-empty `fiat_currencies_accepted` must also list every code you
+# # quote, or every order in it is refused; the node warns at startup.
+# # To accept a code at fixed price only, list it there and leave it out
+# # of `only`.
+# #
+# # `only` picks the codes; without it, every code above is quoted:
+# #   only = ["USDT", "USDC"]          # dollar stablecoins
+# #   only = ["LBTC", "RBTC"]          # Lightning <-> Liquid / Rootstock swaps
+# #   only = ["USDT", "BTC", "RBTC"]   # both kinds
+# [price.providers.pegged]
 # enabled = false
-# # only = ["USDT", "USDC"]   # optional; default: every coin in the table
+# # only = ["USDT", "USDC"]
 
 # Anti-abuse bond (issue #711). Opt-in, disabled by default. Uncomment to
 # require a Lightning hold-invoice bond from takers and/or makers. See

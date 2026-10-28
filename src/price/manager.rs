@@ -244,7 +244,13 @@ impl PriceManager {
                 Ok(Ok(quotes)) => {
                     info!("price: {} ok ({} currencies)", id, quotes.len());
                     quotes_by_provider.push((id, quotes));
-                    report.successes.push(id);
+                    // The pegged provider makes no network call, so it
+                    // answers every tick (§11.8): counted here, it would
+                    // hide an outage of every price source from the
+                    // scheduler's all-failed error.
+                    if id != ProviderId::Pegged {
+                        report.successes.push(id);
+                    }
                     true
                 }
                 Ok(Err(e)) => {
@@ -998,7 +1004,10 @@ impl std::error::Error for InstallError {}
 /// Per-tick outcome used by the scheduler (for outage logging) and tests.
 #[derive(Debug, Default)]
 pub struct TickReport {
-    /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick.
+    /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick,
+    /// except [`ProviderId::Pegged`]: it makes no network call and cannot
+    /// fail, so it says nothing about the price sources. It still appears
+    /// in [`Self::contributors`] when one of its quotes priced a currency.
     pub successes: Vec<ProviderId>,
     /// Providers that failed or timed out, with the stringified error.
     pub failures: Vec<(ProviderId, String)>,

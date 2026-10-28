@@ -40,7 +40,8 @@ pub enum ProviderId {
     Blockchain,
     ElToque,
     Nostr,
-    /// Fixed 1:1 peg quoter for pegged codes, no network call (spec §11.8).
+    /// Fixed 1:1 peg quoter for pegged codes (stablecoins, bitcoin on other
+    /// networks), no network call (spec §11.8, §11.9).
     Pegged,
 }
 

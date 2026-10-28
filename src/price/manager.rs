@@ -282,9 +282,11 @@ impl PriceManager {
         //     currency-api's `eth`, Yadio's `XAU`) before they can form
         //     single-source aggregates or bloat the Nostr event. A known
         //     pegged code passes only from the `pegged` provider
-        //     (§11.8): `currency-api`'s `usdt` would price it off a thin
-        //     market, and a trusted node's relayed `USDT` would turn market
-        //     orders on for a node that never opted in;
+        //     (§11.8, §11.9): `currency-api`'s `usdt` would price it off a
+        //     thin market, Yadio's `BTC` self-quote (bitcoin in bitcoin)
+        //     would price a sat-denominated `BTC` order 10⁸ off, and a
+        //     trusted node's relayed `USDT` would turn market orders on for
+        //     a node that never opted in;
         //  2. per-provider `only`/`except` scoping — a mis-marketed source
         //     (currency-api's official-rate CUP) never enters the median.
         let filtered_with_ids: Vec<(ProviderId, ProviderQuotes)> = quotes_by_provider
@@ -904,7 +906,7 @@ fn sources_to_tag(ids: &[ProviderId]) -> String {
 
 /// The §6.6 boundary rule: a code passes when it is a known fiat, or when
 /// it is a known pegged code **and** the `pegged` provider quoted it
-/// (§11.8). Pure, so the two drops the spec names are unit-testable.
+/// (§11.8, §11.9). Pure, so the two drops the spec names are unit-testable.
 fn passes_allowlist(id: ProviderId, code: &str) -> bool {
     is_known_fiat(code) || (id == ProviderId::Pegged && is_known_pegged(code))
 }
@@ -1840,6 +1842,13 @@ mod tests {
         assert!(passes_allowlist(ProviderId::Pegged, "USD"));
         // Junk is still junk.
         assert!(!passes_allowlist(ProviderId::Pegged, "ETH"));
+        // §11.9: the BTC-pegged codes follow the same rule, so Yadio's
+        // `BTC` self-quote and a relayed `RBTC` never price them.
+        assert!(passes_allowlist(ProviderId::Pegged, "RBTC"));
+        assert!(passes_allowlist(ProviderId::Pegged, "btc"));
+        assert!(!passes_allowlist(ProviderId::Yadio, "BTC"));
+        assert!(!passes_allowlist(ProviderId::Nostr, "RBTC"));
+        assert!(!passes_allowlist(ProviderId::CurrencyApi, "lbtc"));
     }
 
     #[tokio::test]
@@ -2017,18 +2026,111 @@ mod tests {
             quoted_but_unaccepted_pegged(&settings, &accepted(&["USD", "VES", "USDT"])),
             vec!["USDC".to_string()]
         );
-        // Default scope: every coin in the table.
+        // Default scope: every code in the table, of both kinds.
         let settings = pegged_settings(true, None);
         assert_eq!(
             quoted_but_unaccepted_pegged(&settings, &accepted(&["USD"])),
-            vec!["DOC".to_string(), "USDC".into(), "USDT".into()]
+            vec![
+                "BTC".to_string(),
+                "DOC".into(),
+                "LBTC".into(),
+                "RBTC".into(),
+                "USDC".into(),
+                "USDT".into()
+            ]
         );
         // The list is matched exactly, as `check_fiat_currency` matches it:
         // a lowercase `usdt` does not admit a `USDT` order, so it warns.
         assert_eq!(
-            quoted_but_unaccepted_pegged(&settings, &accepted(&["usdt", "USDC", "doc"])),
+            quoted_but_unaccepted_pegged(
+                &settings,
+                &accepted(&["usdt", "USDC", "doc", "BTC", "LBTC", "RBTC"])
+            ),
             vec!["DOC".to_string(), "USDT".into()]
         );
+        // §11.9, example 5: RBTC is quoted but not accepted.
+        let settings = pegged_settings(true, Some(vec!["LBTC", "RBTC"]));
+        assert_eq!(
+            quoted_but_unaccepted_pegged(&settings, &accepted(&["USD", "LBTC"])),
+            vec!["RBTC".to_string()]
+        );
+    }
+
+    /// What the real provider emits. Constructing a `reqwest::Client`
+    /// performs no I/O, and `fetch` never uses it.
+    async fn pegged_provider_quotes() -> ProviderQuotes {
+        PeggedProvider::new(&pegged_settings(true, None).providers["pegged"])
+            .fetch(&reqwest::Client::new())
+            .await
+            .unwrap()
+    }
+
+    /// §11.9 acceptance: with the provider on and no other provider, so no
+    /// USD anchor, a BTC-pegged code is priced at 10⁸ units per BTC, which
+    /// makes `fa` units exactly `fa` sats. The stablecoins, which need the
+    /// anchor, are not servable.
+    #[tokio::test]
+    async fn btc_pegged_codes_need_no_anchor() {
+        let manager = manager_with_many(vec![ScriptedProvider::new(
+            ProviderId::Pegged,
+            vec![Ok(pegged_provider_quotes().await)],
+        )]);
+        let report = manager.update_all().await;
+        assert_eq!(report.servable_currencies, 3);
+        for code in ["BTC", "LBTC", "RBTC", "rbtc"] {
+            assert_eq!(manager.get_price(code).unwrap(), 100_000_000.0, "{code}");
+        }
+        assert!(manager.get_price("USDT").is_err());
+    }
+
+    /// §11.9 acceptance: Yadio's `BTC` self-quote and a relayed `RBTC` are
+    /// dropped at the boundary, with or without the provider; with it, its
+    /// own quote is the one stored.
+    #[tokio::test]
+    async fn only_the_pegged_provider_prices_btc_pegged_codes() {
+        let mut yadio = usd_anchor(50_000.0);
+        yadio.insert("BTC".into(), Quote::PerBtc(1.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("RBTC".into(), Quote::PerBtc(99_000_000.0));
+
+        let without = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio.clone())]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr.clone())]),
+        ]);
+        without.update_all().await;
+        assert!(without.get_price("USD").is_ok());
+        assert!(without.get_price("BTC").is_err());
+        assert!(without.get_price("RBTC").is_err());
+
+        let with = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(yadio)]),
+            ScriptedProvider::new(ProviderId::Nostr, vec![Ok(nostr)]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+        with.update_all().await;
+        assert_eq!(with.get_price("BTC").unwrap(), 100_000_000.0);
+        assert_eq!(with.get_price("RBTC").unwrap(), 100_000_000.0);
+        assert_eq!(with.get_price("USDT").unwrap(), 50_000.0);
+    }
+
+    /// §11.9 acceptance: `only = ["RBTC"]` quotes RBTC and no stablecoin.
+    #[tokio::test]
+    async fn pegged_only_scopes_btc_pegged_codes_too() {
+        let mut manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(usd_anchor(50_000.0))]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+        manager
+            .settings
+            .providers
+            .get_mut(&ProviderId::Pegged.to_string())
+            .unwrap()
+            .only = Some(vec!["RBTC".into()]);
+        manager.update_all().await;
+        assert_eq!(manager.get_price("RBTC").unwrap(), 100_000_000.0);
+        for code in ["BTC", "LBTC", "USDT", "USDC", "DOC"] {
+            assert!(manager.get_price(code).is_err(), "{code} is out of scope");
+        }
     }
 
     /// … and not for a listed coin that is not quoted (fixed-price only),

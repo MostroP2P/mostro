@@ -93,7 +93,7 @@ impl ProviderConfig {
         // copy-pasted `trusted_nodes` mask a missing `url` past startup and
         // into a confusing per-tick HTTP failure instead.
         //
-        // The `pegged` provider makes no network call at all (§11.8),
+        // The `pegged` provider makes no network call at all (§11.8, §11.9),
         // so it needs no `url` either; what it does need is that every
         // `only` / `except` entry be a code from its table — a typo would
         // otherwise quote nothing without a word.
@@ -108,7 +108,7 @@ impl ProviderConfig {
             if let Some(code) = unknown.first() {
                 return Err(format!(
                     "price provider '{id}': `{code}` is not a known pegged code \
-                     (see docs/PRICE_PROVIDERS.md §11.8)"
+                     (see docs/PRICE_PROVIDERS.md §11.8, §11.9)"
                 ));
             }
             return Ok(());
@@ -498,5 +498,84 @@ only = ["USDT", "USDC"]
         assert!(sc.url.is_empty());
         assert!(sc.allows_currency("usdt"));
         assert!(!sc.allows_currency("DOC"));
+    }
+
+    #[test]
+    fn pegged_scoping_accepts_bitcoin_on_other_networks() {
+        // Spec §11.9: BTC, LBTC and RBTC are codes of the same table.
+        pegged_cfg(Some(vec!["BTC", "lbtc", "RBTC"]), None)
+            .validate("pegged")
+            .unwrap();
+        pegged_cfg(None, Some(vec!["BTC"]))
+            .validate("pegged")
+            .unwrap();
+        for typo in ["RBT", "L-BTC", "WBTC"] {
+            assert!(
+                pegged_cfg(Some(vec![typo]), None)
+                    .validate("pegged")
+                    .is_err(),
+                "{typo} must be rejected"
+            );
+        }
+    }
+
+    /// Spec §11.9 (B1): the template's `pegged` block, uncommented, loads,
+    /// and each `only` example in its comment passes validation, so the
+    /// examples an operator copies cannot go stale.
+    #[test]
+    fn template_pegged_block_and_its_only_examples_validate() {
+        #[derive(Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        #[derive(Deserialize)]
+        struct Only {
+            only: Vec<String>,
+        }
+        let template = include_str!("../../settings.tpl.toml");
+        let start = template
+            .find("# # Pegged currencies as order currencies")
+            .expect("the template documents the pegged provider");
+        let section: Vec<&str> = template[start..]
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .collect();
+
+        // The block itself: the commented-out keys, not the prose.
+        let block: String = section
+            .iter()
+            .filter(|l| !l.starts_with("# #"))
+            .map(|l| l.trim_start_matches("# ").to_string() + "\n")
+            .collect();
+        assert!(block.starts_with("[price.providers.pegged]"), "{block}");
+        let parsed: Stub = toml::from_str(&format!("[price]\n{block}")).unwrap();
+        parsed.price.validate().unwrap();
+        assert!(!parsed.price.providers["pegged"].enabled, "ships disabled");
+
+        // Every `only = [...]` example in the prose.
+        let examples: Vec<Vec<String>> = section
+            .iter()
+            .filter_map(|l| {
+                let at = l.find("only = [")?;
+                let end = l[at..].find(']')? + at + 1;
+                Some(toml::from_str::<Only>(&l[at..end]).unwrap().only)
+            })
+            .collect();
+        assert!(examples.len() >= 3, "{examples:?}");
+        for only in examples {
+            let mut cfg = pegged_cfg(None, None);
+            cfg.only = Some(only.clone());
+            assert!(cfg.validate("pegged").is_ok(), "{only:?}");
+        }
+
+        // The prose names every code in the table, so a new row cannot
+        // ship without the template telling operators about it.
+        let words: std::collections::HashSet<&str> = section
+            .iter()
+            .flat_map(|l| l.split(|c: char| !c.is_ascii_alphanumeric()))
+            .collect();
+        for (code, _) in crate::price::fiat::known_pegged() {
+            assert!(words.contains(code), "the template does not name {code}");
+        }
     }
 }

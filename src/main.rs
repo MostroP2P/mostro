@@ -560,7 +560,7 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
         ),
     };
 
-    // §11.8: a pegged code the provider quotes but a non-empty
+    // §11.8, §11.9: a pegged code the provider quotes but a non-empty
     // `fiat_currencies_accepted` does not name would get a rate published
     // and every order in it refused. Say so once, here, where both
     // settings are in hand.
@@ -570,7 +570,7 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
         tracing::warn!(
             "price: the pegged provider quotes {} but `fiat_currencies_accepted` does not \
              list them — their rates will be published and every order in them refused \
-             (see docs/PRICE_PROVIDERS.md §11.8)",
+             (see docs/PRICE_PROVIDERS.md §11.8, §11.9)",
             unaccepted.join(", ")
         );
     }

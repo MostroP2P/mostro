@@ -1317,8 +1317,10 @@ async fn book_blocks_at_maker_lock(bond: &Bond, hash: &str, bond_cltv_delta: u32
     })
 }
 
-/// Message the taker of a losing concurrent bond that their take was
-/// cancelled because another taker locked their bond first.
+/// Message the taker of `bond` that their take was cancelled and the bond
+/// released: another taker locked their bond first, the order closed
+/// (canceled or expired) while they paid, or its take window closed before
+/// their bond locked (#1084).
 async fn notify_loser(bond: &Bond) {
     if let Ok(taker_pk) = PublicKey::from_str(&bond.pubkey) {
         enqueue_order_msg(

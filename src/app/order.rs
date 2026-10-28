@@ -12,10 +12,12 @@ async fn calculate_and_check_quote(
 ) -> Result<(), MostroError> {
     // Get mostro settings
     let mostro_settings = &ctx.settings().mostro;
-    // Calculate quote
+    // Calculate quote. A market order is checked at the sats the take will
+    // compute, so with its premium: without it, an order near a limit
+    // passed creation and was taken outside it (#1092).
     let quote = match order.amount {
         0 => match get_bitcoin_price(&order.fiat_code) {
-            Ok(price) => fiat_to_sats(*fiat_amount, price, 0),
+            Ok(price) => fiat_to_sats(*fiat_amount, price, order.premium),
             // No fresh rate within the staleness window — refuse the
             // market-priced order cleanly instead of pricing on stale data.
             Err(MostroInternalErr(ServiceError::PriceTooStale)) => {

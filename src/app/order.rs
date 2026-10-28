@@ -573,6 +573,22 @@ mod tests {
                 MostroCantDo(CantDoReason::OutOfRangeSatsAmount)
             ));
         }
+
+        #[tokio::test]
+        async fn market_priced_order_at_the_minimum_is_accepted() {
+            // Spec §11.9 (R1): at 10⁸ units per BTC, 105 units are exactly
+            // 105 sats. Truncation made them 104, under a 105-sat minimum.
+            let mut settings = test_settings();
+            settings.mostro.min_payment_amount = 105;
+            let pool = Arc::new(SqlitePool::connect(":memory:").await.unwrap());
+            let ctx = TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(settings)
+                .build();
+            BitcoinPriceManager::set_price_for_test("QUOTEPEG", 100_000_000.0);
+            let order = order_with(0, "QUOTEPEG");
+            assert!(calculate_and_check_quote(&ctx, &order, &105).await.is_ok());
+        }
     }
 
     mod order_action_flow_tests {

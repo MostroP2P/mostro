@@ -3084,6 +3084,29 @@ mod tests {
     }
 
     #[test]
+    fn maker_bond_notional_rounds_to_the_nearest_sat() {
+        // Spec §11.9 (R1): at 10⁸ units per BTC, 29 fiat units are 29 sats
+        // in both the market and the range branch; truncation gave 28.
+        BitcoinPriceManager::set_price_for_test("T6PEG", 100_000_000.0);
+        let market = Order {
+            amount: 0,
+            fiat_code: "T6PEG".to_string(),
+            fiat_amount: 29,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&market).unwrap(), 29);
+        let range = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(29),
+            fiat_code: "T6PEG".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&range).unwrap(), 29);
+    }
+
+    #[test]
     fn maker_bond_notional_range_rejects_non_positive_max() {
         // `is_range_order()` only checks `Some`-ness, so a `max_amount` of 0
         // still enters the range branch and must be rejected before bond
@@ -3222,6 +3245,23 @@ mod tests {
         assert_eq!(get_market_quote(&100, "UTILQ1", 0).unwrap(), 200_000);
         // …and 10% premium knocks 10% off the sats value.
         assert_eq!(get_market_quote(&100, "UTILQ1", 10).unwrap(), 180_000);
+    }
+
+    #[test]
+    fn market_quote_at_one_to_one_returns_every_amount() {
+        // Spec §11.9 (R1): at 10⁸ units per BTC, a BTC-pegged code's `fa`
+        // is its sats. Truncating `(fa / 1e8) × 1e8` lost a sat whenever
+        // the float landed just under the whole number (`fa = 29` gave 28).
+        BitcoinPriceManager::set_price_for_test("UTILQPEG", 100_000_000.0);
+        for fa in 1..=200_000 {
+            assert_eq!(
+                get_market_quote(&fa, "UTILQPEG", 0).unwrap(),
+                fa,
+                "fa = {fa}"
+            );
+        }
+        // The premium still comes off the sats: 1% of 100_000.
+        assert_eq!(get_market_quote(&100_000, "UTILQPEG", 1).unwrap(), 99_000);
     }
 
     #[test]

@@ -562,7 +562,11 @@ impl PriceManager {
             // one-shot swallow this path exists to prevent.
             let servable =
                 now.saturating_sub(entry.as_of) <= self.settings.max_price_staleness_seconds;
-            if servable && entry.source_count <= 1 {
+            // A pegged code's one source is its peg by construction: the
+            // §6.6 boundary admits it from the pegged provider alone. How
+            // many sources back a stablecoin is its anchor's count, warned
+            // on the anchor itself (§11.8, §11.9).
+            if servable && entry.source_count <= 1 && !is_known_pegged(currency) {
                 if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }

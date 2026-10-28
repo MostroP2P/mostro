@@ -1,7 +1,7 @@
 use crate::app::context::AppContext;
 use crate::cashu::mint_policy::resolve_order_mint;
 use crate::db::update_user_trade_index;
-use crate::util::{get_bitcoin_price, publish_order, validate_invoice};
+use crate::util::{fiat_to_sats, get_bitcoin_price, publish_order, validate_invoice};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::Keys;
 
@@ -15,10 +15,7 @@ async fn calculate_and_check_quote(
     // Calculate quote
     let quote = match order.amount {
         0 => match get_bitcoin_price(&order.fiat_code) {
-            Ok(price) => {
-                let quote = *fiat_amount as f64 / price;
-                (quote * 1E8) as i64
-            }
+            Ok(price) => fiat_to_sats(*fiat_amount, price, 0),
             // No fresh rate within the staleness window — refuse the
             // market-priced order cleanly instead of pricing on stale data.
             Err(MostroInternalErr(ServiceError::PriceTooStale)) => {
@@ -873,14 +870,14 @@ mod tests {
             let price = 50000.0; // $50,000 per BTC
 
             // Expected: (100 / 50000) * 1E8 = 200,000 sats
-            let expected_quote = (fiat_amount as f64 / price * 1E8) as i64;
-            assert_eq!(expected_quote, 200_000);
+            let quote = crate::util::fiat_to_sats(fiat_amount, price, 0);
+            assert_eq!(quote, 200_000);
 
             // Test with different values
             let fiat_amount2 = 1000i64;
             let price2 = 25000.0; // $25,000 per BTC
-            let expected_quote2 = (fiat_amount2 as f64 / price2 * 1E8) as i64;
-            assert_eq!(expected_quote2, 4_000_000); // 0.04 BTC = 4M sats
+            let quote2 = crate::util::fiat_to_sats(fiat_amount2, price2, 0);
+            assert_eq!(quote2, 4_000_000); // 0.04 BTC = 4M sats
         }
 
         #[test]

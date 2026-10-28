@@ -1,12 +1,20 @@
 use mostro_core::error::MostroError;
 
+use crate::price::fiat::{peg_of, Peg};
+
 pub fn hold_invoice_description(
     order_id: &str,
     fiat_code: &str,
     fiat_amount: &str,
 ) -> Result<String, MostroError> {
+    // A BTC-pegged code counts `fa` in sats of the asset (spec §11.9), so
+    // name the unit: "RBTC 100000" would read as 100,000 whole RBTC.
+    let price = match peg_of(fiat_code) {
+        Some(Peg::Btc) => format!("{fiat_amount} sats of {fiat_code}"),
+        _ => format!("{fiat_code} {fiat_amount}"),
+    };
     Ok(format!(
-        "Escrow amount Order #{order_id}: SELL BTC for {fiat_code} {fiat_amount} - It WILL FREEZE IN WALLET. It will release once you release. It will return if buyer does not confirm the payment"
+        "Escrow amount Order #{order_id}: SELL BTC for {price} - It WILL FREEZE IN WALLET. It will release once you release. It will return if buyer does not confirm the payment"
     ))
 }
 
@@ -29,6 +37,29 @@ mod tests {
         assert!(description.contains(&format!("Order #{order_id}")));
         assert!(description.contains("SELL BTC for USD 100"));
         assert!(description.starts_with("Escrow amount"));
+    }
+
+    #[test]
+    fn hold_invoice_description_names_sats_for_btc_pegged_codes() {
+        // #1094: a BTC-pegged code counts `fa` in sats of the asset (spec
+        // §11.9), so "RBTC 100000" would read as 100,000 whole RBTC.
+        for code in ["RBTC", "LBTC", "BTC", "rbtc"] {
+            let description = hold_invoice_description("id", code, "100000")
+                .expect("description building is infallible");
+            assert!(
+                description.contains(&format!("SELL BTC for 100000 sats of {code} - ")),
+                "{description}"
+            );
+        }
+        // Fiat and stablecoins are counted in whole units: unchanged.
+        for code in ["USD", "USDT"] {
+            let description = hold_invoice_description("id", code, "100")
+                .expect("description building is infallible");
+            assert!(
+                description.contains(&format!("SELL BTC for {code} 100 - ")),
+                "{description}"
+            );
+        }
     }
 
     #[test]

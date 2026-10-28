@@ -2083,6 +2083,39 @@ mod tests {
         assert!(manager.get_price("USDT").is_err());
     }
 
+    /// §11.9 acceptance, on the order path: the rate the pipeline stores for
+    /// a BTC-pegged code makes `get_market_quote` turn `fa` into exactly `fa`
+    /// sats, premium applied. This holds only with the rounding of R1:
+    /// truncation gave 100_001 for 100_002.
+    #[tokio::test]
+    async fn btc_pegged_order_amounts_convert_one_to_one() {
+        let manager = manager_with_many(vec![ScriptedProvider::new(
+            ProviderId::Pegged,
+            vec![Ok(pegged_provider_quotes().await)],
+        )]);
+        manager.update_all().await;
+        // Order code paths read the global price; a unique code keeps this
+        // test's override from clobbering any other test's.
+        let rate = manager.get_price("RBTC").unwrap();
+        crate::bitcoin_price::BitcoinPriceManager::set_price_for_test("RBTCPIPE", rate);
+
+        for fa in 1..=200_000 {
+            assert_eq!(
+                crate::util::get_market_quote(&fa, "RBTCPIPE", 0).unwrap(),
+                fa,
+                "fa = {fa}"
+            );
+        }
+        assert_eq!(
+            crate::util::get_market_quote(&100_002, "RBTCPIPE", 0).unwrap(),
+            100_002
+        );
+        assert_eq!(
+            crate::util::get_market_quote(&100_000, "RBTCPIPE", 1).unwrap(),
+            99_000
+        );
+    }
+
     /// §11.9 acceptance: Yadio's `BTC` self-quote and a relayed `RBTC` are
     /// dropped at the boundary, with or without the provider; with it, its
     /// own quote is the one stored.

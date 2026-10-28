@@ -205,8 +205,10 @@ fn validate_escrow_deadline_margin(
 /// with margin once published. Above the ceiling a payer whose routing caps
 /// the total timelock at 1008 blocks (LDK's default) finds no route to pay
 /// the bond. Neither fails until a maker or taker is stuck, so both stop
-/// the daemon at load. Skipped while bonds are off, and in Cashu mode,
-/// which has no hold invoice.
+/// the daemon at load. A `hold_invoice_cltv_delta` that puts the floor at
+/// the ceiling leaves no valid value, and the error then names it instead.
+/// Skipped while bonds are off, and in Cashu mode, which has no hold
+/// invoice.
 fn validate_bond_cltv_delta(
     bond: Option<&crate::config::types::AntiAbuseBondSettings>,
     lightning: &crate::config::types::LightningSettings,
@@ -222,6 +224,16 @@ fn validate_bond_cltv_delta(
     let bond_cltv_delta = bond.bond_cltv_delta;
     let hold_cltv_delta = lightning.hold_invoice_cltv_delta;
     let floor = hold_cltv_delta.saturating_add(BOND_TRADE_MARGIN_BLOCKS);
+
+    if floor >= MAX_BOND_CLTV_DELTA {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "lightning.hold_invoice_cltv_delta ({hold_cltv_delta}) leaves no valid \
+             anti_abuse_bond.bond_cltv_delta: it would have to be above {floor} \
+             (hold_invoice_cltv_delta + {BOND_TRADE_MARGIN_BLOCKS}) and at most \
+             {MAX_BOND_CLTV_DELTA}. Lower lightning.hold_invoice_cltv_delta below {}",
+            MAX_BOND_CLTV_DELTA - BOND_TRADE_MARGIN_BLOCKS
+        ))));
+    }
 
     if bond_cltv_delta <= floor {
         return Err(MostroInternalErr(ServiceError::IOError(format!(
@@ -1238,6 +1250,30 @@ mod startup_validation_tests {
 
         settings.anti_abuse_bond = Some(enabled_bond(MAX_BOND_CLTV_DELTA));
         validate_mostro_settings(&settings).expect("the ceiling itself is accepted");
+    }
+
+    #[test]
+    fn a_hold_invoice_cltv_delta_with_no_room_for_a_bond_is_named() {
+        // At 720 the floor (720 + 144) is already the ceiling: no
+        // `bond_cltv_delta` is valid, so the error must point at
+        // `hold_invoice_cltv_delta` instead of sending the operator up and
+        // down the bond setting.
+        for bond_cltv_delta in [432, MAX_BOND_CLTV_DELTA, MAX_BOND_CLTV_DELTA + 1] {
+            let mut settings = base_settings();
+            settings.lightning = lightning(720, 24);
+            settings.anti_abuse_bond = Some(enabled_bond(bond_cltv_delta));
+            let err = validate_mostro_settings(&settings)
+                .expect_err("no bond_cltv_delta fits over a 720-block escrow");
+            assert!(
+                err.to_string().contains("Lower lightning.hold_invoice_cltv_delta"),
+                "bond_cltv_delta {bond_cltv_delta}: the error must name hold_invoice_cltv_delta: {err}"
+            );
+        }
+        // One block less and the ceiling itself is valid.
+        let mut settings = base_settings();
+        settings.lightning = lightning(719, 24);
+        settings.anti_abuse_bond = Some(enabled_bond(MAX_BOND_CLTV_DELTA));
+        validate_mostro_settings(&settings).expect("719 + 144 = 863 leaves 864");
     }
 
     #[test]

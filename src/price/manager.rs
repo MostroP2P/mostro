@@ -2283,6 +2283,55 @@ mod tests {
         cfg.validate().expect("synthesised config must validate");
     }
 
+    fn price_section(toml_src: &str) -> PriceSettings {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        let parsed: Stub = toml::from_str(toml_src).expect("the [price] section parses");
+        parsed.price
+    }
+
+    #[test]
+    fn a_lone_pegged_provider_keeps_the_legacy_market_source() {
+        // #1099: `[price.providers.pegged]` on its own switched the node to
+        // multi-source pricing with no provider fetching a market price, so
+        // it lost every fiat rate and refused every market-priced order.
+        let price = price_section("[price.providers.pegged]\nenabled = true");
+        let kept = with_legacy_market_source(&price, "https://api.yadio.io")
+            .expect("pegged alone needs the legacy source");
+        let yadio = kept
+            .providers
+            .get("yadio")
+            .expect("the legacy source joins it");
+        assert!(yadio.enabled);
+        assert_eq!(yadio.url, "https://api.yadio.io");
+        assert!(
+            kept.providers["pegged"].enabled,
+            "the pegged provider stays"
+        );
+        assert_eq!(kept.update_interval_seconds, price.update_interval_seconds);
+        kept.validate().expect("the result validates");
+    }
+
+    #[test]
+    fn a_market_provider_or_a_written_yadio_table_is_left_as_configured() {
+        for toml_src in [
+            // A market provider next to pegged: the operator's own choice.
+            "[price.providers.pegged]\nenabled = true\n\
+             [price.providers.coingecko]\nenabled = true\nurl = \"https://api.coingecko.com/api/v3\"",
+            // A yadio table the operator wrote, even disabled, is kept as written.
+            "[price.providers.pegged]\nenabled = true\n\
+             [price.providers.yadio]\nenabled = false\nurl = \"https://api.yadio.io\"",
+        ] {
+            let price = price_section(toml_src);
+            assert!(
+                with_legacy_market_source(&price, "https://api.yadio.io").is_none(),
+                "{toml_src}"
+            );
+        }
+    }
+
     fn eltoque_cfg(token: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             enabled: true,

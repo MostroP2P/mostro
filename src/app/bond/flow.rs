@@ -64,6 +64,7 @@ use crate::util::{
 };
 
 use super::db::{create_bond, find_active_bonds, find_active_bonds_for_order, find_bond_by_hash};
+use super::horizon;
 use super::math::compute_bond_amount;
 use super::model::Bond;
 use super::types::{BondRole, BondState};
@@ -184,7 +185,7 @@ pub async fn request_taker_bond(
     let expiry = taker_bond_invoice_expiry(Settings::get_ln());
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, expiry)
+        .create_hold_invoice_with_expiry(&memo, amount, expiry, cfg.bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -349,11 +350,13 @@ pub async fn request_maker_bond(
 
     // The invoice stops being payable when the maker's window closes, so LND
     // enforces the deadline even while the daemon is down (#942);
-    // `expire_unpaid_maker_bonds` enforces it on the order side.
+    // `expire_unpaid_maker_bonds` enforces it on the order side. The CLTV is
+    // the bond's own (#1084): the bond has to last while the order rests in
+    // the book and then through the trade, which the escrow's CLTV cannot.
     let expiry = i64::try_from(cfg.maker_bond_payment_timeout_seconds).unwrap_or(i64::MAX);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry))
+        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry), cfg.bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -1115,11 +1118,34 @@ async fn on_bond_invoice_accepted(
         return Ok(());
     }
 
+    // The take window can close while the taker pays: the order reached
+    // its `expires_at`, or the maker-bond guardian pulled it forward because
+    // the maker bond can no longer cover a trade (#1084). The expiry job
+    // ends the order on its next tick; a lock landing first must not start
+    // the trade, so release the bond and tell the taker, as on a closed
+    // order. The promotion CAS re-checks the window atomically; on that
+    // narrow miss the expiry job releases the bond.
+    let now = Utc::now().timestamp();
+    if crate::util::is_order_take_window_closed(&order, now) {
+        info!(
+            "Bond {} locked after the take window of order {} closed — releasing and notifying taker",
+            current.id, order.id
+        );
+        if let Err(e) = release_bond(pool, &current).await {
+            warn!(
+                bond_id = %current.id,
+                "release_bond after the take window closed failed ({}); the expiry job retries", e
+            );
+        }
+        notify_loser(&current).await;
+        return Ok(());
+    }
+
     // Promote the winning bond's `taker_*` context onto the order row.
     // Under concurrent bonds the take handler deliberately did not
     // touch these fields (so racing takers couldn't clobber each
     // other); now that we know the winner, copy their snapshot.
-    let order = promote_taker_context_to_order(pool, order, &current).await?;
+    let order = promote_taker_context_to_order(pool, order, &current, now).await?;
 
     let my_keys = get_keys()?;
     resume_take_after_bond(pool, order, my_keys, request_id).await
@@ -1256,12 +1282,45 @@ async fn on_maker_bond_accepted(
         return Ok(());
     }
 
+    // Only a bonded maker gets here, so the block is present; without it
+    // there is no bond CLTV to clamp to.
+    let book_blocks = match Settings::get_bond() {
+        Some(cfg) => Some(book_blocks_at_maker_lock(&current, hash, cfg.bond_cltv_delta).await),
+        None => None,
+    };
     let my_keys = get_keys()?;
-    crate::util::resume_publish_after_maker_bond(pool, my_keys, order, request_id).await
+    crate::util::resume_publish_after_maker_bond(pool, my_keys, order, request_id, book_blocks)
+        .await
 }
 
-/// Message the taker of a losing concurrent bond that their take was
-/// cancelled because another taker locked their bond first.
+/// Blocks the order of `bond`, a maker bond that has just locked, may rest
+/// in the book (#1084, [`horizon`]). Counted from the bond's accepted HTLC,
+/// so a lock processed late (the daemon was down when the maker paid) does
+/// not restart the window. Without a chain view the configured window
+/// counts from now, and the guardian (`job_enforce_maker_bond_deadline`)
+/// still checks the HTLC.
+async fn book_blocks_at_maker_lock(bond: &Bond, hash: &str, bond_cltv_delta: u32) -> u32 {
+    let hold_cltv = Settings::get_ln().hold_invoice_cltv_delta;
+    let configured = horizon::maker_bond_book_blocks(bond_cltv_delta, hold_cltv);
+    let probed = match LndConnector::new().await {
+        Ok(mut ln) => {
+            horizon::maker_bond_book_blocks_at_lock(&mut ln, hash, configured, hold_cltv).await
+        }
+        Err(e) => Err(e),
+    };
+    probed.unwrap_or_else(|e| {
+        warn!(
+            bond_id = %bond.id,
+            "no chain view when the maker bond locked ({e}); its book window counts from now"
+        );
+        configured
+    })
+}
+
+/// Message the taker of `bond` that their take was cancelled and the bond
+/// released: another taker locked their bond first, the order closed
+/// (canceled or expired) while they paid, or its take window closed before
+/// their bond locked (#1084).
 async fn notify_loser(bond: &Bond) {
     if let Ok(taker_pk) = PublicKey::from_str(&bond.pubkey) {
         enqueue_order_msg(
@@ -1339,11 +1398,13 @@ pub async fn release_bond_if_order_closed(pool: &Pool<Sqlite>, bond: &Bond) -> b
 /// "owner" is undefined until the lock), so we populate them here
 /// from the bond's `taker_*` columns and persist before
 /// `resume_take_after_bond` reads them back via
-/// `order.get_buyer_pubkey()` / `order.get_seller_pubkey()`.
+/// `order.get_buyer_pubkey()` / `order.get_seller_pubkey()`. `now` is the
+/// time the order's take window is checked against.
 async fn promote_taker_context_to_order(
     pool: &Pool<Sqlite>,
     mut order: Order,
     bond: &Bond,
+    now: i64,
 ) -> Result<Order, MostroError> {
     let kind = order.get_order_kind().map_err(MostroInternalErr)?;
     match kind {
@@ -1377,8 +1438,10 @@ async fn promote_taker_context_to_order(
     // Compare-and-swap: write only the promoted columns, and only while the
     // order is still pre-trade. A maker cancel that committed in the
     // meantime wins — aborting here leaves the row canceled and drops the
-    // take; the cancel path already released this taker's bond.
-    let won = crate::db::cas_promote_taker_context(pool, &order).await?;
+    // take; the cancel path already released this taker's bond. So does a
+    // take window that closed by `now` (#1084): the order stays in the book
+    // until the expiry job ends it and releases the bond.
+    let won = crate::db::cas_promote_taker_context(pool, &order, now).await?;
     if !won {
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
@@ -4296,7 +4359,7 @@ mod tests {
         bond.taker_fee = Some(9);
         bond.taker_dev_fee = Some(2);
 
-        let updated = promote_taker_context_to_order(&pool, order, &bond)
+        let updated = promote_taker_context_to_order(&pool, order, &bond, Utc::now().timestamp())
             .await
             .unwrap();
         assert_eq!(updated.seller_pubkey.as_deref(), Some(&*"s".repeat(64)));
@@ -4331,7 +4394,7 @@ mod tests {
         bond.taker_trade_index = Some(4);
         bond.taker_invoice = Some("lnbc1pTEST".to_string());
 
-        let updated = promote_taker_context_to_order(&pool, order, &bond)
+        let updated = promote_taker_context_to_order(&pool, order, &bond, Utc::now().timestamp())
             .await
             .unwrap();
         assert_eq!(updated.buyer_pubkey.as_deref(), Some(&*"b".repeat(64)));
@@ -4362,7 +4425,8 @@ mod tests {
         let mut bond = make_bond(order_id, BondState::Locked);
         bond.pubkey = "s".repeat(64);
 
-        let result = promote_taker_context_to_order(&pool, order, &bond).await;
+        let result =
+            promote_taker_context_to_order(&pool, order, &bond, Utc::now().timestamp()).await;
         assert!(
             result.is_err(),
             "a committed cancel must win over the bond promotion"
@@ -4408,6 +4472,44 @@ mod tests {
         assert!(
             order.buyer_pubkey.is_none() && order.seller_pubkey.is_none(),
             "no resume may happen on a canceled order"
+        );
+    }
+
+    /// #1084: the maker-bond guardian (or the order's own expiration)
+    /// closed the take window while the taker was paying their bond. The
+    /// expiry job ends the order on its next tick; a lock landing first
+    /// must not start the trade, and the taker must be told.
+    #[tokio::test]
+    async fn accepted_taker_bond_after_the_take_window_closed_starts_no_trade() {
+        // Arrange
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await; // kind 'buy': the taker sells
+        sqlx::query("UPDATE orders SET status = ?, expires_at = ? WHERE id = ?")
+            .bind(Status::WaitingTakerBond.to_string())
+            .bind(Utc::now().timestamp() - 60)
+            .bind(order_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bond = make_bond(order_id, BondState::Locked);
+        create_bond(&pool, bond).await.unwrap();
+
+        // Act
+        on_bond_invoice_accepted(&"c".repeat(64), &pool, None)
+            .await
+            .expect("a closed take window is not an error");
+
+        // Assert
+        assert!(
+            count_msgs(order_id, Action::Canceled).await > 0,
+            "the taker must be told the take is dead"
+        );
+        let order = load_order(&pool, order_id).await;
+        assert_eq!(order.status, Status::WaitingTakerBond.to_string());
+        assert!(
+            order.seller_pubkey.is_none(),
+            "no taker context may be promoted past the take window"
         );
     }
 

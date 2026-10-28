@@ -24,6 +24,20 @@ pub const MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS: u32 = 6;
 pub const MIN_ESCROW_DEADLINE_MARGIN_BLOCKS: u32 =
     LND_DEFAULT_HOLD_EXPIRY_DELTA + MIN_ESCROW_DEADLINE_HEADROOM_BLOCKS;
 
+/// Blocks a maker bond must still have, on top of `hold_invoice_cltv_delta`,
+/// when its order leaves the book (#1084). A take starts a trade whose
+/// escrow can stay held for `hold_invoice_cltv_delta` blocks, and the bond
+/// has to outlive that trade with room to spare: a maker slash (lost
+/// dispute or waiting timeout) settles the bond, which LND refuses once it
+/// has auto-canceled the HTLC near its expiry. 144 blocks is ~24 h.
+pub const BOND_TRADE_MARGIN_BLOCKS: u32 = 144;
+
+/// Ceiling on `[anti_abuse_bond] bond_cltv_delta`. The payer's route adds
+/// its own hops' deltas on top of the bond's final CLTV delta, and wallets
+/// cap the total timelock they accept: LDK's default is 1008 blocks. 864
+/// leaves 144 blocks for the route, so such a payer still finds one.
+pub const MAX_BOND_CLTV_DELTA: u32 = 864;
+
 /// Ceiling on `[reputation_import] max_lifetime_seconds` (30 days). The cap
 /// keeps a faulty or compromised issuer from minting attestations that live
 /// for years, so a value above this (e.g. a digit too many on the 7-day

@@ -843,12 +843,16 @@ pub async fn cas_pretrade_order_status(
 /// Compare-and-swap the winning taker's bond context onto the order row
 /// (see `promote_taker_context_to_order`). Writes only the promoted
 /// columns — never `status` — and only while the order is still
-/// pre-trade, so a maker cancel that already committed is not undone.
-/// `order` must be the merged in-memory row (taker fields applied).
-/// Returns `false` when the CAS missed.
+/// pre-trade, so a maker cancel that already committed is not undone, and
+/// while its take window is still open at `now`
+/// (`util::is_order_take_window_closed`): the order's expiration, or the
+/// maker-bond guardian pulling it forward (#1084), may land while the taker
+/// pays their bond. `order` must be the merged in-memory row (taker fields
+/// applied). Returns `false` when the CAS missed.
 pub async fn cas_promote_taker_context(
     pool: &SqlitePool,
     order: &Order,
+    now: i64,
 ) -> Result<bool, MostroError> {
     let kind = order.get_order_kind().map_err(MostroInternalErr)?;
     let taker_columns = match kind {
@@ -861,7 +865,8 @@ pub async fn cas_promote_taker_context(
     let query = format!(
         "UPDATE orders SET {taker_columns}, fiat_amount = ?6, amount = ?7, fee = ?8, \
          dev_fee = ?9, created_at = ?10, taken_at = ?11 \
-         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES})"
+         WHERE id = ?1 AND status IN ({PRETRADE_STATUSES}) \
+           AND (expires_at <= 0 OR expires_at > ?12)"
     );
     // The unused ?5 slot for buy orders binds a throwaway `None`.
     let buyer_invoice: Option<&str> = match kind {
@@ -892,6 +897,7 @@ pub async fn cas_promote_taker_context(
         .bind(order.dev_fee)
         .bind(order.created_at)
         .bind(order.taken_at)
+        .bind(now)
         .execute(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
@@ -4280,7 +4286,7 @@ mod tests {
         order.dev_fee = 9;
         order.taken_at = 1_700_000_500;
 
-        let won = super::cas_promote_taker_context(&pool, &order)
+        let won = super::cas_promote_taker_context(&pool, &order, 1_700_000_500)
             .await
             .unwrap();
         assert!(won, "pending orders accept the promotion");
@@ -4298,6 +4304,35 @@ mod tests {
         assert_eq!(after.taken_at, 1_700_000_500);
         // The promotion never writes status — the resume owns that flip.
         assert_eq!(after.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn cas_promote_taker_context_misses_once_the_take_window_closed() {
+        // Arrange: the taker bond's lock read the order while its take
+        // window was open; the maker-bond guardian (or the order's own
+        // expiration) closed it before the promotion (#1084).
+        let pool = migrated_pool().await;
+        let now = 1_700_000_500;
+        let mut order = insert_pretrade_order(&pool, "waiting-taker-bond").await;
+        sqlx::query("UPDATE orders SET expires_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        order.buyer_pubkey = Some("bb".repeat(32));
+
+        // Act
+        let won = super::cas_promote_taker_context(&pool, &order, now)
+            .await
+            .unwrap();
+
+        // Assert: no taker context is written, so no trade starts.
+        assert!(!won, "a closed take window must refuse the promotion");
+        use mostro_core::db::Crud;
+        let after = super::Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_ne!(after.buyer_pubkey, Some("bb".repeat(32)));
+        assert_eq!(after.status, "waiting-taker-bond");
     }
 
     #[tokio::test]

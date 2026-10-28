@@ -42,6 +42,11 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_lnd_sync_monitor(ctx.clone()).await;
         job_cancel_orders(ctx.clone()).await;
         job_enforce_escrow_deadline(ctx.clone()).await;
+        // Maker bonds only exist with bonds on for the maker side, which
+        // Cashu mode excludes (CF-1).
+        if bond::maker_bond_required() {
+            job_enforce_maker_bond_deadline(ctx.clone()).await;
+        }
         job_retry_failed_payments(ctx.clone()).await;
         job_reconcile_inflight_payouts(ctx.clone()).await;
         job_process_dev_fee_payment(ctx.clone()).await;
@@ -1260,6 +1265,135 @@ async fn enforce_escrow_deadline_pass(
     Ok(())
 }
 
+/// Guardian for a maker bond's CLTV horizon (#1084).
+///
+/// A maker bond locks before its order is published and has to last while
+/// the order rests in the book and then through a full trade.
+/// `resume_publish_after_maker_bond` clamps the order's `expires_at` to the
+/// book window the bond leaves
+/// ([`maker_bond_book_blocks`](bond::horizon::maker_bond_book_blocks)), but
+/// counts it in 10-minute blocks: a stretch of fast blocks brings the
+/// bond's HTLC closer to its expiry than the clock says, and near it LND
+/// cancels the bond while the order still advertises a bonded maker.
+///
+/// Each tick, for every `Locked` maker bond whose range tree still has
+/// orders in the book (`pending` / `waiting-taker-bond`), the bond HTLC's
+/// expiry height is read from LND. When it is within
+/// `hold_invoice_cltv_delta + BOND_TRADE_MARGIN_BLOCKS` blocks of the chain
+/// tip, or no accepted HTLC backs the bond anymore, their take window closes
+/// now ([`close_book_window`](bond::db::close_book_window)) and the regular
+/// expiry job ends them, releasing the bond. Orders already in a trade are
+/// left alone: their escrow has its own guardian
+/// ([`job_enforce_escrow_deadline`]).
+async fn job_enforce_maker_bond_deadline(ctx: AppContext) {
+    let mut ln_client = if let Ok(client) = LndConnector::new().await {
+        client
+    } else {
+        return error!("Failed to create LND client");
+    };
+
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = enforce_maker_bond_deadline_pass(&ctx, &mut ln_client).await {
+                error!("maker bond deadline pass failed: {e}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
+/// One guardian tick, split out for testing. See
+/// [`job_enforce_maker_bond_deadline`] for the semantics.
+async fn enforce_maker_bond_deadline_pass(
+    ctx: &AppContext,
+    escrow: &mut dyn EscrowBackend,
+) -> Result<(), MostroError> {
+    if ctx.settings().anti_abuse_bond.is_none() {
+        return Ok(());
+    }
+    let pool = ctx.pool();
+    let hold_cltv = ctx.settings().lightning.hold_invoice_cltv_delta;
+    // Every locked maker bond, whatever its age: how close an HTLC is to
+    // its expiry depends on the CLTV it was created with (144 for a bond
+    // locked before #1084, or a `bond_cltv_delta` the operator has since
+    // raised) and on how fast blocks came, not on the bond's age. A bond
+    // with nothing in the book costs one query and no LND call.
+    let candidates = bond::db::find_locked_maker_parent_bonds(pool).await?;
+
+    // Probed on the first bond that still has orders in the book, then
+    // reused: one probe per tick, and none when there is nothing to check.
+    let mut chain_tip = None;
+    for maker_bond in candidates {
+        let lookup = bond::db::find_book_orders_in_range_tree(pool, maker_bond.order_id).await;
+        let book_orders = match lookup {
+            // Nothing in the book: the order is in a trade (the escrow
+            // guardian's), or the range is closing.
+            Ok(orders) if orders.is_empty() => continue,
+            Ok(orders) => orders,
+            Err(e) => {
+                warn!(
+                    "maker_bond_deadline: book lookup failed for maker bond {} ({e}); skipping it this tick",
+                    maker_bond.id
+                );
+                continue;
+            }
+        };
+        let tip = match chain_tip {
+            Some(tip) => tip,
+            None => match escrow.chain_height().await {
+                Ok(tip) => *chain_tip.insert(tip),
+                Err(e) => {
+                    // The clamped `expires_at` still ends these orders on
+                    // the nominal clock, through the regular expiry job.
+                    warn!("maker_bond_deadline: chain height unavailable ({e}); leaving the book to the regular expiry job");
+                    return Ok(());
+                }
+            },
+        };
+        let Some(hash) = maker_bond.hash.as_deref() else {
+            continue; // a locked bond always has one; defensive
+        };
+        let expiry = match escrow.hold_invoice_expiry_height(hash).await {
+            Ok(expiry) => expiry,
+            Err(e) => {
+                warn!(
+                    "maker_bond_deadline: HTLC expiry lookup failed for maker bond {} ({e}); skipping it this tick",
+                    maker_bond.id
+                );
+                continue;
+            }
+        };
+        if !bond::horizon::maker_bond_horizon_due(tip, expiry, hold_cltv) {
+            continue;
+        }
+        let horizon = match expiry {
+            Some(height) => format!("HTLC expiry height {height}"),
+            None => "no accepted HTLC".to_string(),
+        };
+        // Close the take window instead of expiring here: a take can land
+        // between reading `book_orders` and now, and the CAS skips an order
+        // that left the book. Takes refuse an order past `expires_at`, and
+        // the regular expiry job ends it on its next tick, releasing the
+        // bonds the same way it does at the order's own expiration.
+        let now = Utc::now().timestamp();
+        for order in &book_orders {
+            match bond::db::close_book_window(pool, order.id, now).await {
+                Ok(true) => info!(
+                    "maker_bond_deadline: order {} leaves the book — maker bond {} can no longer cover a trade (chain tip {tip}, {horizon})",
+                    order.id, maker_bond.id
+                ),
+                Ok(false) => {} // taken or ended meanwhile
+                Err(e) => warn!(
+                    "maker_bond_deadline: could not close the take window of order {} ({e}); retrying next tick",
+                    order.id
+                ),
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// How often the orderbook reconciler drains the failed-publish queue.
 const ORDERBOOK_RECONCILE_INTERVAL_SECS: u64 = 60;
 
@@ -2163,6 +2297,9 @@ mod tests {
         /// `(chain tip, HTLC expiry lookup result)`. `None` = no chain
         /// view (both probes error), driving the nominal-time fallback.
         heights: Option<(u32, Option<u32>)>,
+        /// Calls to `chain_height` and `hold_invoice_expiry_height`, so a
+        /// test can tell LND was not consulted at all.
+        probes: usize,
     }
 
     impl StubEscrow {
@@ -2171,6 +2308,7 @@ mod tests {
                 cancel_error: None,
                 canceled: std::sync::Mutex::new(Vec::new()),
                 heights: None,
+                probes: 0,
             }
         }
 
@@ -2179,6 +2317,7 @@ mod tests {
                 cancel_error: Some(msg),
                 canceled: std::sync::Mutex::new(Vec::new()),
                 heights: None,
+                probes: 0,
             }
         }
 
@@ -2217,6 +2356,7 @@ mod tests {
         }
 
         async fn chain_height(&mut self) -> Result<u32, MostroError> {
+            self.probes += 1;
             self.heights.map(|(chain, _)| chain).ok_or_else(|| {
                 MostroInternalErr(ServiceError::LnNodeError("no chain view".to_string()))
             })
@@ -2226,6 +2366,7 @@ mod tests {
             &mut self,
             _hash: &str,
         ) -> Result<Option<u32>, MostroError> {
+            self.probes += 1;
             self.heights.map(|(_, expiry)| expiry).ok_or_else(|| {
                 MostroInternalErr(ServiceError::LnNodeError("no chain view".to_string()))
             })
@@ -2566,6 +2707,308 @@ mod tests {
         assert!(escrow.canceled().is_empty());
     }
 
+    // ── enforce_maker_bond_deadline_pass ─────────────────────────────────
+
+    /// Chain tip the maker-bond guardian tests run at.
+    const TIP: u32 = 900_000;
+
+    /// Bonds on for the maker with the shipped CLTVs: hold 144, bond 432,
+    /// so 144 blocks (86 400 s) of book time. The horizon is due once the
+    /// bond HTLC is 288 blocks or less from expiry.
+    async fn maker_bond_guardian_ctx() -> AppContext {
+        init_test_settings();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let mut settings = test_settings();
+        settings.lightning.hold_invoice_cltv_delta = 144;
+        settings.anti_abuse_bond = Some(AntiAbuseBondSettings {
+            enabled: true,
+            apply_to: BondApplyTo::Both,
+            bond_cltv_delta: 432,
+            ..Default::default()
+        });
+        TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(settings)
+            .build()
+    }
+
+    /// A sell order of a bonded maker, persisted with `status`. `parent`
+    /// makes it a range remainder of that order.
+    async fn maker_order(pool: &sqlx::SqlitePool, status: Status, parent: Option<Uuid>) -> Order {
+        let maker = hex_key();
+        Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: status.to_string(),
+            seller_pubkey: Some(maker.clone()),
+            master_seller_pubkey: Some(maker.clone()),
+            creator_pubkey: maker,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 10,
+            payment_method: "bank".to_string(),
+            range_parent_id: parent,
+            expires_at: Utc::now().timestamp() + 86_400,
+            ..Default::default()
+        }
+        .create(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The `Locked` maker bond of `order_id`, created and locked
+    /// `locked_secs_ago` seconds ago.
+    async fn locked_maker_bond(pool: &sqlx::SqlitePool, order_id: Uuid, locked_secs_ago: i64) {
+        maker_bond_locked_after(pool, order_id, locked_secs_ago, locked_secs_ago).await;
+    }
+
+    /// The `Locked` maker bond of `order_id`, created `created_secs_ago`
+    /// and locked `locked_secs_ago` seconds ago.
+    async fn maker_bond_locked_after(
+        pool: &sqlx::SqlitePool,
+        order_id: Uuid,
+        created_secs_ago: i64,
+        locked_secs_ago: i64,
+    ) {
+        let now = Utc::now().timestamp();
+        let mut maker_bond =
+            bond::Bond::new_requested(order_id, hex_key(), bond::BondRole::Maker, 1_000);
+        maker_bond.state = bond::BondState::Locked.to_string();
+        maker_bond.hash = Some(hex_key());
+        maker_bond.preimage = Some(hex_key());
+        maker_bond.created_at = now - created_secs_ago;
+        maker_bond.locked_at = Some(now - locked_secs_ago);
+        bond::db::create_bond(pool, maker_bond).await.unwrap();
+    }
+
+    async fn status_of(pool: &sqlx::SqlitePool, order_id: Uuid) -> String {
+        Order::by_id(pool, order_id).await.unwrap().unwrap().status
+    }
+
+    /// Whether takes now refuse `order_id`: the guardian closed its take
+    /// window, and the regular expiry job ends it on its next tick.
+    async fn take_window_closed(pool: &sqlx::SqlitePool, order_id: Uuid) -> bool {
+        let order = Order::by_id(pool, order_id).await.unwrap().unwrap();
+        crate::util::is_order_take_window_closed(&order, Utc::now().timestamp())
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_closes_the_take_window_once_the_bond_cannot_cover_a_trade() {
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 50_000).await;
+        // 288 blocks left: exactly a trade plus the margin, no book time.
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 288));
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert!(take_window_closed(ctx.pool(), order.id).await);
+        // Still in the book: the regular expiry job ends it and releases
+        // the bonds, as at the order's own expiration.
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_leaves_an_order_whose_bond_still_covers_a_trade() {
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 50_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 289));
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+        assert!(!take_window_closed(ctx.pool(), order.id).await);
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_closes_the_take_window_when_no_accepted_htlc_backs_the_bond() {
+        // LND already canceled (or settled) the bond: the order must not
+        // keep advertising a bonded maker.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 50_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, None);
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert!(take_window_closed(ctx.pool(), order.id).await);
+        // Still in the book: the regular expiry job ends it and releases
+        // the bonds, as at the order's own expiration.
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_without_a_chain_view_leaves_the_book_alone() {
+        // No chain tip: the clamped `expires_at` and the regular expiry job
+        // are the fallback, so the guardian does nothing.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 200_000).await;
+        let mut escrow = StubEscrow::ok();
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+        assert!(!take_window_closed(ctx.pool(), order.id).await);
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_leaves_a_recent_bond_that_still_covers_a_trade() {
+        // Created 1 000 s ago and still 289 blocks from expiry: LND is
+        // asked (tip and HTLC expiry), and the order stays in the book.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 1_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 289));
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+        assert!(!take_window_closed(ctx.pool(), order.id).await);
+        assert_eq!(escrow.probes, 2);
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_ignores_the_age_of_a_bond_that_cannot_cover_a_trade() {
+        // An HTLC 100 blocks from expiry, as a bond locked with the
+        // pre-upgrade 144-block CLTV has, cannot cover a trade at any age
+        // (43 200 s is half the 86 400 s book window): its order leaves
+        // the book on the first pass.
+        for locked_secs_ago in [1, 1_000, 43_199, 50_000] {
+            let ctx = maker_bond_guardian_ctx().await;
+            let order = maker_order(ctx.pool(), Status::Pending, None).await;
+            locked_maker_bond(ctx.pool(), order.id, locked_secs_ago).await;
+            let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 100));
+
+            enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+                .await
+                .unwrap();
+
+            assert!(
+                take_window_closed(ctx.pool(), order.id).await,
+                "a bond locked {locked_secs_ago} s ago must be checked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_checks_a_bond_whose_lock_was_processed_late() {
+        // Arrange: the maker paid 50 000 s ago while the daemon was down;
+        // the restart resubscriber locked the bond just now (#1084). Its
+        // HTLC is as old as the payment, so the guardian must look at it.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Pending, None).await;
+        maker_bond_locked_after(ctx.pool(), order.id, 50_000, 0).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 288));
+
+        // Act
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        // Assert
+        assert!(take_window_closed(ctx.pool(), order.id).await);
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_closes_the_take_window_of_an_order_waiting_for_a_taker_bond() {
+        // `waiting-taker-bond` publishes as `pending`: still in the book.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::WaitingTakerBond, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 50_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 100));
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert!(take_window_closed(ctx.pool(), order.id).await);
+        // Still in the book: the regular expiry job ends it and releases
+        // the bonds, as at the order's own expiration.
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::WaitingTakerBond.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_closes_only_the_book_remainder_of_a_range() {
+        // The bond lives on the range root, which is in a trade; its
+        // remainder rests in the book. Only the remainder leaves.
+        let ctx = maker_bond_guardian_ctx().await;
+        let root = maker_order(ctx.pool(), Status::Active, None).await;
+        let remainder = maker_order(ctx.pool(), Status::Pending, Some(root.id)).await;
+        locked_maker_bond(ctx.pool(), root.id, 50_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 100));
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), root.id).await,
+            Status::Active.to_string()
+        );
+        assert!(!take_window_closed(ctx.pool(), root.id).await);
+        assert!(take_window_closed(ctx.pool(), remainder.id).await);
+        // Still in the book: the regular expiry job ends it and releases
+        // the bonds, as at the order's own expiration.
+        assert_eq!(
+            status_of(ctx.pool(), remainder.id).await,
+            Status::Pending.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_never_touches_an_order_in_a_trade() {
+        // A due bond whose only order is in a trade: nothing in the book,
+        // so LND is not asked and the trade is left to the escrow guardian.
+        let ctx = maker_bond_guardian_ctx().await;
+        let order = maker_order(ctx.pool(), Status::Active, None).await;
+        locked_maker_bond(ctx.pool(), order.id, 50_000).await;
+        let mut escrow = StubEscrow::ok().with_heights(TIP, None);
+
+        enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Active.to_string()
+        );
+        assert_eq!(escrow.probes, 0);
+    }
+
     // ── job smoke tests ──────────────────────────────────────────────────
     //
     // The jobs are infinite `tokio::spawn` loops; under a paused clock
@@ -2750,9 +3193,10 @@ mod tests {
     #[tokio::test]
     async fn ln_backed_jobs_fail_fast_without_lnd() {
         let ctx = migrated_ctx().await;
-        // Both return early (error log) because LndConnector::new() cannot
+        // All return early (error log) because LndConnector::new() cannot
         // read the default cert/macaroon paths.
         job_cancel_orders(ctx.clone()).await;
+        job_enforce_maker_bond_deadline(ctx.clone()).await;
         job_process_dev_fee_payment(ctx).await;
     }
 }

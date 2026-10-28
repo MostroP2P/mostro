@@ -1435,11 +1435,18 @@ network, so unlike `USDT (Tron)` the payment method needs no network.
 book, the clients and the solver guide.
 
 - **Confirmations.** The seller releases only after the transfer confirms,
-  never on zero confirmations. The window is the hold invoice's life
-  (`hold_invoice_cltv_delta`, 144 blocks or about a day by default).
-  Liquid and Rootstock confirm in minutes. An on-chain BTC transfer with a
-  low fee can stay unconfirmed past the window, so a client tells the
-  sender to pay a fee that confirms within hours.
+  never on zero confirmations. The deadline is not the hold invoice's full
+  life. Once the chain tip is within `escrow_deadline_margin_blocks` of
+  the accepted HTLC's expiry, `enforce_escrow_deadline_pass`
+  (`src/scheduler.rs`) cancels an `active` trade or opens a dispute on a
+  `fiat-sent` one, while the escrow still exists. With the template
+  defaults that is `hold_invoice_cltv_delta − escrow_deadline_margin_blocks`
+  = 144 − 24 = 120 blocks (about 20 hours) after the seller's payment is
+  accepted, and the transfer has to confirm and the seller release inside
+  it. Liquid and Rootstock confirm in minutes. An on-chain BTC transfer
+  with a low fee can stay unconfirmed for longer, so a client tells the
+  sender to pay a fee that confirms within a few hours, which leaves the
+  rest of the window for the release or a dispute.
 - **Fees.** As for stablecoins, the sender pays the network fee and the
   receiver gets the full amount. On-chain, the fee can be a large share of
   a small order.

@@ -2116,6 +2116,55 @@ mod tests {
         );
     }
 
+    /// With every network source down, the pegged provider still answers:
+    /// it makes no network call, so it cannot fail. The scheduler logs its
+    /// all-failed error only when `successes` is empty, so counting the peg
+    /// there hides an outage of every real source behind a partial-outage
+    /// warning.
+    #[tokio::test]
+    async fn the_pegged_provider_does_not_hide_an_outage_of_every_network_source() {
+        let down = || Err(ProviderError::Http("down".into()));
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![down()]),
+            ScriptedProvider::new(ProviderId::CoinGecko, vec![down()]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+
+        let report = manager.update_all().await;
+
+        assert_eq!(report.failures.len(), 2);
+        assert!(
+            report.successes.is_empty(),
+            "the peg answered, but no price source did: {:?}",
+            report.successes
+        );
+        // The peg is still polled: the BTC-pegged codes need no anchor.
+        assert_eq!(manager.get_price("RBTC").unwrap(), 100_000_000.0);
+    }
+
+    /// A pegged code's only source is its peg by construction: the §6.6
+    /// boundary admits it from no other provider. Whether USDT has enough
+    /// sources is USD's question, warned on USD itself, so the pegged codes
+    /// must not each warn "now has a single source".
+    #[tokio::test]
+    async fn pegged_codes_do_not_warn_of_a_single_source() {
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(usd_anchor(50_000.0))]),
+            ScriptedProvider::new(ProviderId::CoinGecko, vec![Ok(usd_anchor(50_100.0))]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+
+        manager.update_all().await;
+
+        assert!(manager.get_price("USDT").is_ok());
+        assert!(manager.get_price("RBTC").is_ok());
+        let warned = manager.warned_single_source.read().unwrap();
+        assert!(
+            warned.is_empty(),
+            "USD has two sources and a peg is not a source: {warned:?}"
+        );
+    }
+
     /// §11.9 acceptance: Yadio's `BTC` self-quote and a relayed `RBTC` are
     /// dropped at the boundary, with or without the provider; with it, its
     /// own quote is the one stored.

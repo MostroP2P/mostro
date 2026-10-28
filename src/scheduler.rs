@@ -1308,12 +1308,17 @@ async fn enforce_maker_bond_deadline_pass(
     ctx: &AppContext,
     escrow: &mut dyn EscrowBackend,
 ) -> Result<(), MostroError> {
-    let Some(bond_settings) = ctx.settings().anti_abuse_bond.as_ref() else {
+    if ctx.settings().anti_abuse_bond.is_none() {
         return Ok(());
-    };
+    }
     let pool = ctx.pool();
     let hold_cltv = ctx.settings().lightning.hold_invoice_cltv_delta;
-    let candidates = maker_bond_deadline_candidates(pool, bond_settings, hold_cltv).await?;
+    // Every locked maker bond, whatever its age: how close an HTLC is to
+    // its expiry depends on the CLTV it was created with (144 for a bond
+    // locked before #1084, or a `bond_cltv_delta` the operator has since
+    // raised) and on how fast blocks came, not on the bond's age. A bond
+    // with nothing in the book costs one query and no LND call.
+    let candidates = bond::db::find_locked_maker_parent_bonds(pool).await?;
 
     // Probed on the first bond that still has orders in the book, then
     // reused: one probe per tick, and none when there is nothing to check.
@@ -1387,32 +1392,6 @@ async fn enforce_maker_bond_deadline_pass(
     }
 
     Ok(())
-}
-
-/// `Locked` parent maker bonds old enough for the guardian to look at.
-///
-/// Candidate prefilter only — real due-ness is decided from chain height
-/// in [`enforce_maker_bond_deadline_pass`]. A bond's book window is measured
-/// in blocks, so a stretch of fast blocks shortens it in wall-clock time;
-/// half the nominal window keeps bonds in view even at twice the 10-minute
-/// average block rate, as in the escrow guardian. The age counts from the
-/// bond row's `created_at`: the HTLC cannot predate the invoice the row was
-/// created with, while `locked_at` is when the daemon processed the
-/// payment, which can be long after it (the daemon was down when the maker
-/// paid).
-async fn maker_bond_deadline_candidates(
-    pool: &sqlx::SqlitePool,
-    bond_settings: &AntiAbuseBondSettings,
-    hold_cltv: u32,
-) -> Result<Vec<bond::Bond>, MostroError> {
-    let book_blocks =
-        bond::horizon::maker_bond_book_blocks(bond_settings.bond_cltv_delta, hold_cltv);
-    let created_before = Utc::now().timestamp() - bond::horizon::book_window_secs(book_blocks) / 2;
-    let bonds = bond::db::find_locked_maker_parent_bonds(pool).await?;
-    Ok(bonds
-        .into_iter()
-        .filter(|maker_bond| maker_bond.created_at <= created_before)
-        .collect())
 }
 
 /// How often the orderbook reconciler drains the failed-publish queue.
@@ -2734,9 +2713,8 @@ mod tests {
     const TIP: u32 = 900_000;
 
     /// Bonds on for the maker with the shipped CLTVs: hold 144, bond 432,
-    /// so 144 blocks (86 400 s) of book time, and the guardian looks at
-    /// bonds created at least 43 200 s ago. The horizon is due once the bond
-    /// HTLC is 288 blocks or less from expiry.
+    /// so 144 blocks (86 400 s) of book time. The horizon is due once the
+    /// bond HTLC is 288 blocks or less from expiry.
     async fn maker_bond_guardian_ctx() -> AppContext {
         init_test_settings();
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -2896,13 +2874,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maker_bond_deadline_skips_a_recently_locked_bond() {
-        // Created 1 000 s ago, far inside half the 86 400 s book window: not
-        // a candidate, so LND is not even asked (it would say due).
+    async fn maker_bond_deadline_leaves_a_recent_bond_that_still_covers_a_trade() {
+        // Created 1 000 s ago and still 289 blocks from expiry: LND is
+        // asked (tip and HTLC expiry), and the order stays in the book.
         let ctx = maker_bond_guardian_ctx().await;
         let order = maker_order(ctx.pool(), Status::Pending, None).await;
         locked_maker_bond(ctx.pool(), order.id, 1_000).await;
-        let mut escrow = StubEscrow::ok().with_heights(TIP, None);
+        let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 289));
 
         enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
             .await
@@ -2913,7 +2891,30 @@ mod tests {
             Status::Pending.to_string()
         );
         assert!(!take_window_closed(ctx.pool(), order.id).await);
-        assert_eq!(escrow.probes, 0);
+        assert_eq!(escrow.probes, 2);
+    }
+
+    #[tokio::test]
+    async fn maker_bond_deadline_ignores_the_age_of_a_bond_that_cannot_cover_a_trade() {
+        // An HTLC 100 blocks from expiry, as a bond locked with the
+        // pre-upgrade 144-block CLTV has, cannot cover a trade at any age
+        // (43 200 s is half the 86 400 s book window): its order leaves
+        // the book on the first pass.
+        for locked_secs_ago in [1, 1_000, 43_199, 50_000] {
+            let ctx = maker_bond_guardian_ctx().await;
+            let order = maker_order(ctx.pool(), Status::Pending, None).await;
+            locked_maker_bond(ctx.pool(), order.id, locked_secs_ago).await;
+            let mut escrow = StubEscrow::ok().with_heights(TIP, Some(TIP + 100));
+
+            enforce_maker_bond_deadline_pass(&ctx, &mut escrow)
+                .await
+                .unwrap();
+
+            assert!(
+                take_window_closed(ctx.pool(), order.id).await,
+                "a bond locked {locked_secs_ago} s ago must be checked"
+            );
+        }
     }
 
     #[tokio::test]

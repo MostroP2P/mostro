@@ -2435,11 +2435,13 @@ releasing the bond exactly as at the order's own expiration. A taker
 bond that locks in between starts no trade either:
 `on_bond_invoice_accepted` releases it and tells the taker, and the
 promotion CAS (`cas_promote_taker_context` in `src/db.rs`) re-checks the
-take window. The guardian only looks at bonds created at least half a
-nominal book window ago (an HTLC cannot predate its bond row), it never
-touches an order in a trade (the escrow-deadline guardian covers those),
-and without a chain view it does nothing that tick, leaving the clamped
-`expires_at` as the deadline.
+take window. The guardian looks at every locked maker bond whatever its
+age, since how close its HTLC is to expiry depends on the CLTV it was
+created with and on how fast blocks came: a bond locked before this change
+(CLTV 144) is due on the first pass after the upgrade. It never touches an
+order in a trade (the escrow-deadline guardian covers those), and without
+a chain view it does nothing that tick, leaving the clamped `expires_at`
+as the deadline.
 
 In normal operation a bond HTLC keeps well over 100 blocks when its trade
 ends. Only a dispute left open for days can bring a maker bond close to

@@ -69,15 +69,25 @@ pub fn get_market_quote(
         return Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse));
     }
 
+    Ok(fiat_to_sats(*fiat_amount, price, premium))
+}
+
+/// Sats for `fiat_amount` at `price` fiat units per BTC, less `premium`
+/// percent, rounded to the nearest sat.
+///
+/// Rounding, not truncating: at 10⁸ units per BTC (a BTC-pegged code such
+/// as `RBTC`, spec §11.9) the float lands just under the whole number for
+/// many amounts, and truncation lost a sat (`fa = 29` gave 28).
+pub fn fiat_to_sats(fiat_amount: i64, price: f64, premium: i64) -> i64 {
     // sats = (fiat_amount / fiat_per_btc) × 1e8.
-    let mut sats = (*fiat_amount as f64 / price) * 100_000_000_f64;
+    let mut sats = (fiat_amount as f64 / price) * 100_000_000_f64;
 
     // Apply the order premium to the sats value.
     if premium != 0 {
         sats -= (premium as f64) / 100_f64 * sats;
     }
 
-    Ok(sats as i64)
+    sats.round() as i64
 }
 
 pub fn get_fee(amount: i64) -> i64 {
@@ -429,8 +439,7 @@ fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
         if price <= 0.0 {
             return Err(MostroInternalErr(ServiceError::NoAPIResponse));
         }
-        let sats = (max_fiat as f64 / price) * 1E8;
-        return Ok(sats as i64);
+        return Ok(fiat_to_sats(max_fiat, price, 0));
     }
     if order.amount > 0 {
         return Ok(order.amount);
@@ -439,8 +448,7 @@ fn maker_bond_notional_sats(order: &Order) -> Result<i64, MostroError> {
     if price <= 0.0 {
         return Err(MostroInternalErr(ServiceError::NoAPIResponse));
     }
-    let sats = (order.fiat_amount as f64 / price) * 1E8;
-    Ok(sats as i64)
+    Ok(fiat_to_sats(order.fiat_amount, price, 0))
 }
 
 /// Publish the NIP-33 event for a freshly-persisted order, persist its
@@ -3068,8 +3076,9 @@ mod tests {
     #[test]
     fn maker_bond_notional_range_sizes_against_max_at_price() {
         // Phase 6: a range order sizes the notional against `max_amount`
-        // converted at the cached price: 100 fiat / 60_000 * 1e8 ≈ 166_666
-        // sats. Unique fiat_code avoids clobbering the shared price cache.
+        // converted at the cached price: 100 fiat / 60_000 * 1e8 = 166_666.67,
+        // rounded to 166_667 sats. Unique fiat_code avoids clobbering the
+        // shared price cache.
         BitcoinPriceManager::set_price_for_test("T6RANGE", 60_000.0);
         let order = Order {
             amount: 0,
@@ -3080,7 +3089,30 @@ mod tests {
             ..Default::default()
         };
         assert!(order.is_range_order());
-        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 166_666);
+        assert_eq!(maker_bond_notional_sats(&order).unwrap(), 166_667);
+    }
+
+    #[test]
+    fn maker_bond_notional_rounds_to_the_nearest_sat() {
+        // Spec §11.9 (R1): at 10⁸ units per BTC, 29 fiat units are 29 sats
+        // in both the market and the range branch; truncation gave 28.
+        BitcoinPriceManager::set_price_for_test("T6PEG", 100_000_000.0);
+        let market = Order {
+            amount: 0,
+            fiat_code: "T6PEG".to_string(),
+            fiat_amount: 29,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&market).unwrap(), 29);
+        let range = Order {
+            amount: 0,
+            min_amount: Some(10),
+            max_amount: Some(29),
+            fiat_code: "T6PEG".to_string(),
+            fiat_amount: 0,
+            ..Default::default()
+        };
+        assert_eq!(maker_bond_notional_sats(&range).unwrap(), 29);
     }
 
     #[test]
@@ -3222,6 +3254,23 @@ mod tests {
         assert_eq!(get_market_quote(&100, "UTILQ1", 0).unwrap(), 200_000);
         // …and 10% premium knocks 10% off the sats value.
         assert_eq!(get_market_quote(&100, "UTILQ1", 10).unwrap(), 180_000);
+    }
+
+    #[test]
+    fn market_quote_at_one_to_one_returns_every_amount() {
+        // Spec §11.9 (R1): at 10⁸ units per BTC, a BTC-pegged code's `fa`
+        // is its sats. Truncating `(fa / 1e8) × 1e8` lost a sat whenever
+        // the float landed just under the whole number (`fa = 29` gave 28).
+        BitcoinPriceManager::set_price_for_test("UTILQPEG", 100_000_000.0);
+        for fa in 1..=200_000 {
+            assert_eq!(
+                get_market_quote(&fa, "UTILQPEG", 0).unwrap(),
+                fa,
+                "fa = {fa}"
+            );
+        }
+        // The premium still comes off the sats: 1% of 100_000.
+        assert_eq!(get_market_quote(&100_000, "UTILQPEG", 1).unwrap(), 99_000);
     }
 
     #[test]

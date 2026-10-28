@@ -785,7 +785,13 @@ they can land in one PR or be split per provider.
 
 - `tracing` per tick: per-provider outcome (ok/{n currencies} | skipped:
   cooldown | error), and per-currency `source_count`. A currency dropping
-  to a single source, or to last-known-good, logs at `warn`.
+  to a single source, or to last-known-good, logs at `warn`. A tick where
+  every provider polled failed logs at `error`.
+- The `pegged` provider (§11.8, §11.9) makes no network call and cannot
+  fail, so it is left out of both: a tick where every other provider
+  failed is still an all-failed tick, and a pegged code does not warn of
+  a single source, since its peg is its only source by construction. A
+  stablecoin's sources are its anchor's, warned on the anchor.
 - No Prometheus wiring until real traffic justifies it.
 
 ### 10.5 Testing discipline

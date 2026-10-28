@@ -244,7 +244,13 @@ impl PriceManager {
                 Ok(Ok(quotes)) => {
                     info!("price: {} ok ({} currencies)", id, quotes.len());
                     quotes_by_provider.push((id, quotes));
-                    report.successes.push(id);
+                    // The pegged provider makes no network call, so it
+                    // answers every tick (§11.8): counted here, it would
+                    // hide an outage of every price source from the
+                    // scheduler's all-failed error.
+                    if id != ProviderId::Pegged {
+                        report.successes.push(id);
+                    }
                     true
                 }
                 Ok(Err(e)) => {
@@ -556,7 +562,11 @@ impl PriceManager {
             // one-shot swallow this path exists to prevent.
             let servable =
                 now.saturating_sub(entry.as_of) <= self.settings.max_price_staleness_seconds;
-            if servable && entry.source_count <= 1 {
+            // A pegged code's one source is its peg by construction: the
+            // §6.6 boundary admits it from the pegged provider alone. How
+            // many sources back a stablecoin is its anchor's count, warned
+            // on the anchor itself (§11.8, §11.9).
+            if servable && entry.source_count <= 1 && !is_known_pegged(currency) {
                 if self.mark_warned(&self.warned_single_source, &key) {
                     warn!("price: {} now has a single source", currency);
                 }
@@ -998,7 +1008,10 @@ impl std::error::Error for InstallError {}
 /// Per-tick outcome used by the scheduler (for outage logging) and tests.
 #[derive(Debug, Default)]
 pub struct TickReport {
-    /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick.
+    /// Providers whose [`PriceProvider::fetch`] returned `Ok` this tick,
+    /// except [`ProviderId::Pegged`]: it makes no network call and cannot
+    /// fail, so it says nothing about the price sources. It still appears
+    /// in [`Self::contributors`] when one of its quotes priced a currency.
     pub successes: Vec<ProviderId>,
     /// Providers that failed or timed out, with the stringified error.
     pub failures: Vec<(ProviderId, String)>,
@@ -2113,6 +2126,55 @@ mod tests {
         assert_eq!(
             crate::util::get_market_quote(&100_000, "RBTCPIPE", 1).unwrap(),
             99_000
+        );
+    }
+
+    /// With every network source down, the pegged provider still answers:
+    /// it makes no network call, so it cannot fail. The scheduler logs its
+    /// all-failed error only when `successes` is empty, so counting the peg
+    /// there hides an outage of every real source behind a partial-outage
+    /// warning.
+    #[tokio::test]
+    async fn the_pegged_provider_does_not_hide_an_outage_of_every_network_source() {
+        let down = || Err(ProviderError::Http("down".into()));
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![down()]),
+            ScriptedProvider::new(ProviderId::CoinGecko, vec![down()]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+
+        let report = manager.update_all().await;
+
+        assert_eq!(report.failures.len(), 2);
+        assert!(
+            report.successes.is_empty(),
+            "the peg answered, but no price source did: {:?}",
+            report.successes
+        );
+        // The peg is still polled: the BTC-pegged codes need no anchor.
+        assert_eq!(manager.get_price("RBTC").unwrap(), 100_000_000.0);
+    }
+
+    /// A pegged code's only source is its peg by construction: the §6.6
+    /// boundary admits it from no other provider. Whether USDT has enough
+    /// sources is USD's question, warned on USD itself, so the pegged codes
+    /// must not each warn "now has a single source".
+    #[tokio::test]
+    async fn pegged_codes_do_not_warn_of_a_single_source() {
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(ProviderId::Yadio, vec![Ok(usd_anchor(50_000.0))]),
+            ScriptedProvider::new(ProviderId::CoinGecko, vec![Ok(usd_anchor(50_100.0))]),
+            ScriptedProvider::new(ProviderId::Pegged, vec![Ok(pegged_provider_quotes().await)]),
+        ]);
+
+        manager.update_all().await;
+
+        assert!(manager.get_price("USDT").is_ok());
+        assert!(manager.get_price("RBTC").is_ok());
+        let warned = manager.warned_single_source.read().unwrap();
+        assert!(
+            warned.is_empty(),
+            "USD has two sources and a peg is not a source: {warned:?}"
         );
     }
 

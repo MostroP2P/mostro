@@ -418,7 +418,19 @@ fn validate_cashu_settings(
 /// Initialize the default settings directory and create a settings file from the template if it doesn't exist.
 /// Checks if the directory already exists, and if not, creates it and writes the template file.
 /// If a custom config path is provided, it uses that instead of the default `~/.mostro` directory.
-pub fn init_configuration_file(config_path: Option<String>) -> Result<(), MostroError> {
+///
+/// A refusal comes back as its reason alone (#1098). The loaders report a
+/// refused setting as `ServiceError::IOError`, mostro-core having no
+/// settings variant, and `MostroError`'s `Display` would print it as
+/// `Error caused by IO error: …`, a file-system failure that never happened.
+pub fn init_configuration_file(config_path: Option<String>) -> Result<(), String> {
+    load_configuration_file(config_path).map_err(|e| match e {
+        MostroInternalErr(ServiceError::IOError(reason)) => reason,
+        other => other.to_string(),
+    })
+}
+
+fn load_configuration_file(config_path: Option<String>) -> Result<(), MostroError> {
     let settings_dir = if let Some(user_path) = config_path {
         PathBuf::from(user_path)
     } else {

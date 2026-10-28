@@ -1,12 +1,20 @@
 use mostro_core::error::MostroError;
 
+use crate::price::fiat::{peg_of, Peg};
+
 pub fn hold_invoice_description(
     order_id: &str,
     fiat_code: &str,
     fiat_amount: &str,
 ) -> Result<String, MostroError> {
+    // A BTC-pegged code counts `fa` in sats of the asset (spec §11.9), so
+    // name the unit: "RBTC 100000" would read as 100,000 whole RBTC.
+    let price = match peg_of(fiat_code) {
+        Some(Peg::Btc) => format!("{fiat_amount} sats of {fiat_code}"),
+        _ => format!("{fiat_code} {fiat_amount}"),
+    };
     Ok(format!(
-        "Escrow amount Order #{order_id}: SELL BTC for {fiat_code} {fiat_amount} - It WILL FREEZE IN WALLET. It will release once you release. It will return if buyer does not confirm the payment"
+        "Escrow amount Order #{order_id}: SELL BTC for {price} - It WILL FREEZE IN WALLET. It will release once you release. It will return if buyer does not confirm the payment"
     ))
 }
 

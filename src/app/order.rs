@@ -586,6 +586,53 @@ mod tests {
             let order = order_with(0, "QUOTEPEG");
             assert!(calculate_and_check_quote(&ctx, &order, &105).await.is_ok());
         }
+
+        fn market_order_with_premium(fiat_code: &str, premium: i64) -> SmallOrder {
+            SmallOrder {
+                premium,
+                ..order_with(0, fiat_code)
+            }
+        }
+
+        #[tokio::test]
+        async fn premium_that_takes_the_order_under_the_minimum_is_refused() {
+            // #1092: the take applies the premium, so the check must too. At
+            // 10⁸ units per BTC, 100 units at a 10% premium are 90 sats,
+            // under the 100-sat minimum; without the premium they passed.
+            let ctx = create_ctx().await;
+            BitcoinPriceManager::set_price_for_test("PREMMIN", 100_000_000.0);
+            let order = market_order_with_premium("PREMMIN", 10);
+            let err = calculate_and_check_quote(&ctx, &order, &100)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MostroCantDo(CantDoReason::OutOfRangeSatsAmount)
+            ));
+            // 112 units at 10% are 100.8 sats, rounded to 101: accepted.
+            assert!(calculate_and_check_quote(&ctx, &order, &112).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn negative_premium_that_takes_the_order_over_the_maximum_is_refused() {
+            // #1092: 1_000_000 units at −5% are 1_050_000 sats, over the
+            // 1_000_000-sat maximum.
+            let ctx = create_ctx().await;
+            BitcoinPriceManager::set_price_for_test("PREMMAX", 100_000_000.0);
+            let order = market_order_with_premium("PREMMAX", -5);
+            let err = calculate_and_check_quote(&ctx, &order, &1_000_000)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MostroCantDo(CantDoReason::OutOfRangeSatsAmount)
+            ));
+            // Without the premium the same amount is exactly the maximum.
+            let at_par = market_order_with_premium("PREMMAX", 0);
+            assert!(calculate_and_check_quote(&ctx, &at_par, &1_000_000)
+                .await
+                .is_ok());
+        }
     }
 
     mod order_action_flow_tests {

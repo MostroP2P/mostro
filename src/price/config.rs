@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::fiat::is_known_stablecoin;
+use super::fiat::is_known_pegged;
 
 /// Top-level `[price]` configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,21 +93,21 @@ impl ProviderConfig {
         // copy-pasted `trusted_nodes` mask a missing `url` past startup and
         // into a confusing per-tick HTTP failure instead.
         //
-        // The `stablecoins` provider makes no network call at all (§11.8),
+        // The `pegged` provider makes no network call at all (§11.8),
         // so it needs no `url` either; what it does need is that every
-        // `only` / `except` entry be a coin from its table — a typo would
+        // `only` / `except` entry be a code from its table — a typo would
         // otherwise quote nothing without a word.
-        if id == "stablecoins" {
+        if id == "pegged" {
             let unknown: Vec<&String> = self
                 .only
                 .iter()
                 .chain(self.except.iter())
                 .flatten()
-                .filter(|code| !is_known_stablecoin(code))
+                .filter(|code| !is_known_pegged(code))
                 .collect();
             if let Some(code) = unknown.first() {
                 return Err(format!(
-                    "price provider '{id}': `{code}` is not a known stablecoin \
+                    "price provider '{id}': `{code}` is not a known pegged code \
                      (see docs/PRICE_PROVIDERS.md §11.8)"
                 ));
             }
@@ -427,7 +427,7 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
         assert!(cfg.allows_currency("CUP"));
     }
 
-    fn stablecoins_cfg(only: Option<Vec<&str>>, except: Option<Vec<&str>>) -> ProviderConfig {
+    fn pegged_cfg(only: Option<Vec<&str>>, except: Option<Vec<&str>>) -> ProviderConfig {
         let to_vec = |v: Option<Vec<&str>>| v.map(|v| v.into_iter().map(String::from).collect());
         ProviderConfig {
             enabled: true,
@@ -442,41 +442,41 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
     }
 
     #[test]
-    fn enabled_stablecoins_provider_needs_no_url() {
-        stablecoins_cfg(None, None).validate("stablecoins").unwrap();
-        stablecoins_cfg(Some(vec!["USDT", "usdc"]), None)
-            .validate("stablecoins")
+    fn enabled_pegged_provider_needs_no_url() {
+        pegged_cfg(None, None).validate("pegged").unwrap();
+        pegged_cfg(Some(vec!["USDT", "usdc"]), None)
+            .validate("pegged")
             .unwrap();
-        stablecoins_cfg(None, Some(vec!["DOC"]))
-            .validate("stablecoins")
+        pegged_cfg(None, Some(vec!["DOC"]))
+            .validate("pegged")
             .unwrap();
     }
 
     #[test]
-    fn stablecoins_scoping_entry_outside_the_table_is_rejected() {
+    fn pegged_scoping_entry_outside_the_table_is_rejected() {
         // A typo would otherwise quote nothing without a word (§11.8).
-        let err = stablecoins_cfg(Some(vec!["USTD"]), None)
-            .validate("stablecoins")
+        let err = pegged_cfg(Some(vec!["USTD"]), None)
+            .validate("pegged")
             .unwrap_err();
         assert!(err.contains("USTD"), "{err}");
-        assert!(stablecoins_cfg(None, Some(vec!["USD"]))
-            .validate("stablecoins")
+        assert!(pegged_cfg(None, Some(vec!["USD"]))
+            .validate("pegged")
             .is_err());
         // Even when disabled: the config is wrong either way.
-        let mut disabled = stablecoins_cfg(Some(vec!["EURC"]), None);
+        let mut disabled = pegged_cfg(Some(vec!["EURC"]), None);
         disabled.enabled = false;
-        assert!(disabled.validate("stablecoins").is_err());
+        assert!(disabled.validate("pegged").is_err());
     }
 
     #[test]
-    fn stablecoins_only_and_except_together_is_still_rejected() {
-        assert!(stablecoins_cfg(Some(vec!["USDT"]), Some(vec!["DOC"]))
-            .validate("stablecoins")
+    fn pegged_only_and_except_together_is_still_rejected() {
+        assert!(pegged_cfg(Some(vec!["USDT"]), Some(vec!["DOC"]))
+            .validate("pegged")
             .is_err());
     }
 
     #[test]
-    fn stablecoins_block_parses_from_toml() {
+    fn pegged_block_parses_from_toml() {
         #[derive(Deserialize)]
         struct Stub {
             price: PriceSettings,
@@ -485,7 +485,7 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
             r#"
 [price]
 
-[price.providers.stablecoins]
+[price.providers.pegged]
 enabled = true
 only = ["USDT", "USDC"]
 "#,
@@ -493,7 +493,7 @@ only = ["USDT", "USDC"]
         .unwrap();
         let p = parsed.price;
         p.validate().unwrap();
-        let sc = &p.providers["stablecoins"];
+        let sc = &p.providers["pegged"];
         assert!(sc.enabled);
         assert!(sc.url.is_empty());
         assert!(sc.allows_currency("usdt"));

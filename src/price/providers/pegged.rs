@@ -4,7 +4,7 @@
 //! order's currency (`f = USDT`). Each coin is treated as a currency pegged
 //! 1:1 to a fiat, so this adapter makes **no network call**: every tick it
 //! emits [`Quote::PerBase`] `{ base: <peg>, value: 1.0 }` for every row of
-//! [`known_stablecoins`], and the §6.3 resolution turns that into the peg's
+//! [`known_pegged`], and the §6.3 resolution turns that into the peg's
 //! aggregated per-BTC price. A USDT market order is therefore priced
 //! exactly like a USD one, premium included; with no USD anchor this tick
 //! the coin keeps its last-known-good value and is refused past the TTL,
@@ -19,14 +19,14 @@
 use async_trait::async_trait;
 
 use crate::price::config::ProviderConfig;
-use crate::price::fiat::known_stablecoins;
+use crate::price::fiat::known_pegged;
 use crate::price::provider::{PriceProvider, ProviderError, ProviderId, ProviderQuotes, Quote};
 
 /// Fixed 1:1 peg quoter. Holds no state: the table is the data.
-pub struct StablecoinsProvider;
+pub struct PeggedProvider;
 
-impl StablecoinsProvider {
-    /// Build the provider from its `[price.providers.stablecoins]`
+impl PeggedProvider {
+    /// Build the provider from its `[price.providers.pegged]`
     /// sub-table. Nothing is read from it: `only` / `except` are enforced
     /// by `ProviderConfig::validate` and the manager's scoping.
     pub fn new(_cfg: &ProviderConfig) -> Self {
@@ -35,13 +35,13 @@ impl StablecoinsProvider {
 }
 
 #[async_trait]
-impl PriceProvider for StablecoinsProvider {
+impl PriceProvider for PeggedProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::Stablecoins
+        ProviderId::Pegged
     }
 
     async fn fetch(&self, _http: &reqwest::Client) -> Result<ProviderQuotes, ProviderError> {
-        Ok(known_stablecoins()
+        Ok(known_pegged()
             .iter()
             .map(|(code, peg)| {
                 (
@@ -75,13 +75,13 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_quotes_every_coin_at_one_to_one_with_its_peg() {
-        let provider = StablecoinsProvider::new(&cfg());
-        assert_eq!(provider.id(), ProviderId::Stablecoins);
+        let provider = PeggedProvider::new(&cfg());
+        assert_eq!(provider.id(), ProviderId::Pegged);
         // Constructing a `reqwest::Client` performs no I/O, and `fetch`
         // never uses it.
         let quotes = provider.fetch(&reqwest::Client::new()).await.unwrap();
-        assert_eq!(quotes.len(), known_stablecoins().len());
-        for (code, peg) in known_stablecoins() {
+        assert_eq!(quotes.len(), known_pegged().len());
+        for (code, peg) in known_pegged() {
             assert_eq!(
                 quotes.get(*code),
                 Some(&Quote::PerBase {
@@ -102,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_never_emits_a_direct_quote() {
-        let quotes = StablecoinsProvider::new(&cfg())
+        let quotes = PeggedProvider::new(&cfg())
             .fetch(&reqwest::Client::new())
             .await
             .unwrap();

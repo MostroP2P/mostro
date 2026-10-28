@@ -522,7 +522,7 @@ async fn install_spam_gate() {
 /// working byte-for-byte (spec §10.1).
 fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
     use crate::price::{
-        quoted_but_unaccepted_stablecoins, synthesise_legacy_price_settings, PriceManager,
+        quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, PriceManager,
     };
 
     let mostro_settings = Settings::get_mostro();
@@ -560,17 +560,15 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
         ),
     };
 
-    // §11.8: a stablecoin the provider quotes but a non-empty
+    // §11.8: a pegged code the provider quotes but a non-empty
     // `fiat_currencies_accepted` does not name would get a rate published
     // and every order in it refused. Say so once, here, where both
     // settings are in hand.
-    let unaccepted = quoted_but_unaccepted_stablecoins(
-        &price_settings,
-        &mostro_settings.fiat_currencies_accepted,
-    );
+    let unaccepted =
+        quoted_but_unaccepted_pegged(&price_settings, &mostro_settings.fiat_currencies_accepted);
     if !unaccepted.is_empty() {
         tracing::warn!(
-            "price: the stablecoins provider quotes {} but `fiat_currencies_accepted` does not \
+            "price: the pegged provider quotes {} but `fiat_currencies_accepted` does not \
              list them — their rates will be published and every order in them refused \
              (see docs/PRICE_PROVIDERS.md §11.8)",
             unaccepted.join(", ")

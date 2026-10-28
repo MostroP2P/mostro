@@ -317,10 +317,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(3599)).await;
         assert!(queued_restore_msgs_for(&trade_pubkey).await.is_empty());
 
+        // Checked before awaiting the task: awaiting it first would let the
+        // paused clock jump to whenever the timeout fires, however late.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        task.await.unwrap();
         let queued = queued_restore_msgs_for(&trade_pubkey).await;
         assert_eq!(queued.len(), 1);
         assert!(queued[0].get_inner_message_kind().payload.is_none());
+        task.await.unwrap();
     }
 }

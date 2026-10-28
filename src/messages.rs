@@ -32,6 +32,29 @@ mod tests {
     }
 
     #[test]
+    fn hold_invoice_description_names_sats_for_btc_pegged_codes() {
+        // #1094: a BTC-pegged code counts `fa` in sats of the asset (spec
+        // §11.9), so "RBTC 100000" would read as 100,000 whole RBTC.
+        for code in ["RBTC", "LBTC", "BTC", "rbtc"] {
+            let description = hold_invoice_description("id", code, "100000")
+                .expect("description building is infallible");
+            assert!(
+                description.contains(&format!("SELL BTC for 100000 sats of {code} - ")),
+                "{description}"
+            );
+        }
+        // Fiat and stablecoins are counted in whole units: unchanged.
+        for code in ["USD", "USDT"] {
+            let description = hold_invoice_description("id", code, "100")
+                .expect("description building is infallible");
+            assert!(
+                description.contains(&format!("SELL BTC for {code} 100 - ")),
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
     fn hold_invoice_description_handles_empty_inputs() {
         // Arrange / Act
         let description =

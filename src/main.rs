@@ -567,13 +567,15 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
                 enabled,
             );
             // A `yadio` table the operator disabled keeps the legacy source
-            // out, and with no other market provider every market-priced
-            // order is refused for lack of a rate.
+            // out, and with no other market provider a market-priced order
+            // in a fiat or a stablecoin is refused for lack of a rate. The
+            // codes pegged to bitcoin still price at 1:1.
             if !fetches_market_prices(p) {
                 tracing::warn!(
                     "price: no enabled `[price.providers.*]` provider fetches a market \
-                     price, so every market-priced order is refused; enable one, or \
-                     remove the `yadio` table to keep the legacy source"
+                     price, so market-priced orders in a fiat currency or a stablecoin \
+                     are refused; enable one, or remove the `yadio` table to keep the \
+                     legacy source"
                 );
             }
             p.clone()

@@ -183,9 +183,10 @@ pub async fn request_taker_bond(
     let memo = format!("mostro bond order_id={}", order.id);
 
     let expiry = taker_bond_invoice_expiry(Settings::get_ln());
+    let bond_cltv_delta = cfg.cltv_delta(Settings::get_ln().hold_invoice_cltv_delta);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, expiry, cfg.bond_cltv_delta)
+        .create_hold_invoice_with_expiry(&memo, amount, expiry, bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -354,9 +355,10 @@ pub async fn request_maker_bond(
     // the bond's own (#1084): the bond has to last while the order rests in
     // the book and then through the trade, which the escrow's CLTV cannot.
     let expiry = i64::try_from(cfg.maker_bond_payment_timeout_seconds).unwrap_or(i64::MAX);
+    let bond_cltv_delta = cfg.cltv_delta(Settings::get_ln().hold_invoice_cltv_delta);
     let mut ln_client = LndConnector::new().await?;
     let (invoice_resp, preimage, hash) = ln_client
-        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry), cfg.bond_cltv_delta)
+        .create_hold_invoice_with_expiry(&memo, amount, Some(expiry), bond_cltv_delta)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?;
 
@@ -1285,7 +1287,10 @@ async fn on_maker_bond_accepted(
     // Only a bonded maker gets here, so the block is present; without it
     // there is no bond CLTV to clamp to.
     let book_blocks = match Settings::get_bond() {
-        Some(cfg) => Some(book_blocks_at_maker_lock(&current, hash, cfg.bond_cltv_delta).await),
+        Some(cfg) => {
+            let bond_cltv_delta = cfg.cltv_delta(Settings::get_ln().hold_invoice_cltv_delta);
+            Some(book_blocks_at_maker_lock(&current, hash, bond_cltv_delta).await)
+        }
         None => None,
     };
     let my_keys = get_keys()?;

@@ -122,17 +122,37 @@ pub struct AntiAbuseBondSettings {
     /// `hold_invoice_cltv_delta + BOND_TRADE_MARGIN_BLOCKS` and at most
     /// [`MAX_BOND_CLTV_DELTA`](crate::config::constants::MAX_BOND_CLTV_DELTA)
     /// (Lightning mode only). A change applies to bonds created after it;
-    /// a locked bond keeps the CLTV it was created with.
-    #[serde(default = "default_bond_cltv_delta")]
-    pub bond_cltv_delta: u32,
+    /// a locked bond keeps the CLTV it was created with. Unset, it follows
+    /// `hold_invoice_cltv_delta` ([`AntiAbuseBondSettings::cltv_delta`]).
+    #[serde(default)]
+    pub bond_cltv_delta: Option<u32>,
 }
 
-/// 432 blocks ≈ 3 days. With the shipped `hold_invoice_cltv_delta = 144`
-/// an order rests in the book for up to 144 blocks (~24 h, the default
-/// `expiration_hours`), and when it is taken its bond still covers a full
-/// trade plus [`BOND_TRADE_MARGIN_BLOCKS`](crate::config::constants::BOND_TRADE_MARGIN_BLOCKS).
-fn default_bond_cltv_delta() -> u32 {
-    432
+impl AntiAbuseBondSettings {
+    /// The CLTV delta bond hold invoices are created with: `bond_cltv_delta`
+    /// when the operator sets it, otherwise `hold_invoice_cltv_delta` plus
+    /// [`BOND_TRADE_MARGIN_BLOCKS`] and [`DEFAULT_BOND_BOOK_BLOCKS`], at most
+    /// [`MAX_BOND_CLTV_DELTA`] (#1098). With the shipped
+    /// `hold_invoice_cltv_delta = 144` that is 432 blocks ≈ 3 days: an order
+    /// rests in the book for up to 144 blocks, and when it is taken its bond
+    /// still covers a full trade with margin. A fixed default stopped every
+    /// node whose escrow CLTV left it no room. Past 576 the ceiling holds and
+    /// the book time shrinks; from 720 no value is valid, which startup
+    /// validation reports.
+    ///
+    /// [`BOND_TRADE_MARGIN_BLOCKS`]: crate::config::constants::BOND_TRADE_MARGIN_BLOCKS
+    /// [`DEFAULT_BOND_BOOK_BLOCKS`]: crate::config::constants::DEFAULT_BOND_BOOK_BLOCKS
+    /// [`MAX_BOND_CLTV_DELTA`]: crate::config::constants::MAX_BOND_CLTV_DELTA
+    pub fn cltv_delta(&self, hold_invoice_cltv_delta: u32) -> u32 {
+        use crate::config::constants::{
+            BOND_TRADE_MARGIN_BLOCKS, DEFAULT_BOND_BOOK_BLOCKS, MAX_BOND_CLTV_DELTA,
+        };
+        self.bond_cltv_delta.unwrap_or_else(|| {
+            hold_invoice_cltv_delta
+                .saturating_add(BOND_TRADE_MARGIN_BLOCKS + DEFAULT_BOND_BOOK_BLOCKS)
+                .min(MAX_BOND_CLTV_DELTA)
+        })
+    }
 }
 
 fn default_bond_amount_pct() -> f64 {
@@ -213,7 +233,7 @@ impl Default for AntiAbuseBondSettings {
             payout_max_retries: default_payout_max_retries(),
             payout_claim_window_days: default_payout_claim_window_days(),
             maker_bond_payment_timeout_seconds: default_maker_bond_payment_timeout_seconds(),
-            bond_cltv_delta: default_bond_cltv_delta(),
+            bond_cltv_delta: None,
         }
     }
 }
@@ -1162,7 +1182,28 @@ mod anti_abuse_bond_tests {
         assert_eq!(cfg.payout_max_retries, 5);
         assert_eq!(cfg.slash_node_share_pct, 0.5);
         assert_eq!(cfg.payout_claim_window_days, 15);
-        assert_eq!(cfg.bond_cltv_delta, 432);
+        assert_eq!(cfg.bond_cltv_delta, None);
+        assert_eq!(cfg.cltv_delta(144), 432);
+    }
+
+    #[test]
+    fn an_unset_bond_cltv_delta_follows_the_escrow_cltv() {
+        use crate::config::constants::MAX_BOND_CLTV_DELTA;
+        let unset = AntiAbuseBondSettings::default();
+        assert_eq!(
+            unset.cltv_delta(144),
+            432,
+            "the shipped escrow CLTV keeps 432"
+        );
+        assert_eq!(unset.cltv_delta(298), 586);
+        assert_eq!(unset.cltv_delta(576), MAX_BOND_CLTV_DELTA);
+        // Past 576 the ceiling holds and the book time shrinks.
+        assert_eq!(unset.cltv_delta(700), MAX_BOND_CLTV_DELTA);
+        let set = AntiAbuseBondSettings {
+            bond_cltv_delta: Some(600),
+            ..Default::default()
+        };
+        assert_eq!(set.cltv_delta(298), 600, "an explicit value wins");
     }
 
     #[test]
@@ -1171,13 +1212,13 @@ mod anti_abuse_bond_tests {
         struct Stub {
             anti_abuse_bond: AntiAbuseBondSettings,
         }
-        // An operator upgrading with an existing block gets the default.
+        // An operator upgrading with an existing block leaves it unset.
         let parsed: Stub =
             toml::from_str("[anti_abuse_bond]\nenabled = true").expect("minimal block parses");
-        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, 432);
+        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, None);
         let parsed: Stub = toml::from_str("[anti_abuse_bond]\nbond_cltv_delta = 600")
             .expect("an explicit value parses");
-        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, 600);
+        assert_eq!(parsed.anti_abuse_bond.bond_cltv_delta, Some(600));
     }
 
     #[test]

@@ -2724,7 +2724,7 @@ mod tests {
         settings.anti_abuse_bond = Some(AntiAbuseBondSettings {
             enabled: true,
             apply_to: BondApplyTo::Both,
-            bond_cltv_delta: 432,
+            bond_cltv_delta: Some(432),
             ..Default::default()
         });
         TestContextBuilder::new()

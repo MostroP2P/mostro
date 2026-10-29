@@ -1075,6 +1075,43 @@ pub fn synthesise_legacy_price_settings(
     }
 }
 
+/// `price` with the legacy single source added (#1099), when it enables no
+/// provider that fetches a market price: none, or only `pegged`. Any
+/// `[price.*]` table switches the node to multi-source pricing, so a
+/// `[price.providers.pegged]` block on its own left it with no fiat rate,
+/// every market-priced order refused and no USD to price the stablecoins,
+/// while the template presents the block as an opt-in that adds the pegged
+/// codes. The legacy source is the Yadio provider at
+/// `bitcoin_price_api_url`, as [`synthesise_legacy_price_settings`] builds
+/// it. `None` when a market provider is enabled ([`fetches_market_prices`]),
+/// or when the operator wrote a `yadio` table, which stays as written.
+pub fn with_legacy_market_source(
+    price: &PriceSettings,
+    bitcoin_price_api_url: &str,
+) -> Option<PriceSettings> {
+    let yadio = ProviderId::Yadio.to_string();
+    if fetches_market_prices(price) || price.providers.contains_key(&yadio) {
+        return None;
+    }
+    let legacy = synthesise_legacy_price_settings(bitcoin_price_api_url, 0, false);
+    let mut kept = price.clone();
+    kept.providers.extend(legacy.providers);
+    Some(kept)
+}
+
+/// True when `price` enables a provider that fetches a market price: one
+/// [`PriceManager::from_settings`] builds, other than `pegged`. An id it
+/// cannot parse (a typo, or a provider newer than the binary) is ignored
+/// there, so it fetches nothing here either.
+pub fn fetches_market_prices(price: &PriceSettings) -> bool {
+    price.providers.iter().any(|(id, cfg)| {
+        cfg.enabled
+            && id
+                .parse::<ProviderId>()
+                .is_ok_and(|id| id != ProviderId::Pegged)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2281,6 +2318,88 @@ mod tests {
         assert!(yadio.enabled);
         assert_eq!(yadio.url, "https://api.yadio.io");
         cfg.validate().expect("synthesised config must validate");
+    }
+
+    fn price_section(toml_src: &str) -> PriceSettings {
+        #[derive(serde::Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        let parsed: Stub = toml::from_str(toml_src).expect("the [price] section parses");
+        parsed.price
+    }
+
+    #[test]
+    fn a_lone_pegged_provider_keeps_the_legacy_market_source() {
+        // #1099: `[price.providers.pegged]` on its own switched the node to
+        // multi-source pricing with no provider fetching a market price, so
+        // it lost every fiat rate and refused every market-priced order.
+        let price = price_section("[price.providers.pegged]\nenabled = true");
+        let kept = with_legacy_market_source(&price, "https://api.yadio.io")
+            .expect("pegged alone needs the legacy source");
+        let yadio = kept
+            .providers
+            .get("yadio")
+            .expect("the legacy source joins it");
+        assert!(yadio.enabled);
+        assert_eq!(yadio.url, "https://api.yadio.io");
+        assert!(
+            kept.providers["pegged"].enabled,
+            "the pegged provider stays"
+        );
+        assert_eq!(kept.update_interval_seconds, price.update_interval_seconds);
+        kept.validate().expect("the result validates");
+    }
+
+    #[test]
+    fn a_market_provider_or_a_written_yadio_table_is_left_as_configured() {
+        for toml_src in [
+            // A market provider next to pegged: the operator's own choice.
+            "[price.providers.pegged]\nenabled = true\n\
+             [price.providers.coingecko]\nenabled = true\nurl = \"https://api.coingecko.com/api/v3\"",
+            // A yadio table the operator wrote, even disabled, is kept as written.
+            "[price.providers.pegged]\nenabled = true\n\
+             [price.providers.yadio]\nenabled = false\nurl = \"https://api.yadio.io\"",
+        ] {
+            let price = price_section(toml_src);
+            assert!(
+                with_legacy_market_source(&price, "https://api.yadio.io").is_none(),
+                "{toml_src}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_provider_id_is_no_market_source() {
+        // `PriceManager::from_settings` ignores an id it cannot parse, so a
+        // typo next to pegged leaves the node with no fiat rate (#1099).
+        let price = price_section(
+            "[price.providers.pegged]\nenabled = true\n\
+             [price.providers.coingeko]\nenabled = true\nurl = \"https://api.coingecko.com/api/v3\"",
+        );
+        assert!(!fetches_market_prices(&price));
+        let kept = with_legacy_market_source(&price, "https://api.yadio.io")
+            .expect("the typo is no market source, so the legacy one joins");
+        assert!(kept.providers["yadio"].enabled);
+    }
+
+    #[test]
+    fn only_an_enabled_known_provider_other_than_pegged_fetches_market_prices() {
+        for (toml_src, fetches) in [
+            ("[price.providers.pegged]\nenabled = true", false),
+            (
+                "[price.providers.pegged]\nenabled = true\n\
+                 [price.providers.yadio]\nenabled = false\nurl = \"https://api.yadio.io\"",
+                false,
+            ),
+            (
+                "[price.providers.yadio]\nenabled = true\nurl = \"https://api.yadio.io\"",
+                true,
+            ),
+        ] {
+            let price = price_section(toml_src);
+            assert_eq!(fetches_market_prices(&price), fetches, "{toml_src}");
+        }
     }
 
     fn eltoque_cfg(token: Option<&str>) -> ProviderConfig {

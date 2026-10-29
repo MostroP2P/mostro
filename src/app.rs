@@ -436,10 +436,13 @@ async fn accept_event(
     // signature — unwrap_message already verified it, so if identity
     // and sender differ here without a signature we bail out.
     if unwrapped.identity != unwrapped.sender && unwrapped.signature.is_none() {
+        // Identity beside trade key is the linkage the two-key design keeps to
+        // Mostro alone; `sender` alone is unpaired, and is what tells one
+        // misbehaving client from many. It is also the event's author, so the
+        // event id would add nothing.
         tracing::warn!(
-            "Missing inner signature: identity {} differs from trade key {}",
-            unwrapped.identity,
-            unwrapped.sender
+            trade_key = %unwrapped.sender,
+            "missing inner signature: identity differs from trade key"
         );
         // `user_info.md`, Errors: an identity proof that does not verify is
         // answered `invalid_signature`; other actions stay silent.
@@ -1740,6 +1743,38 @@ mod tests {
             assert_eq!(
                 cant_do_reasons_for(&trade.public_key()).await,
                 vec![CantDoReason::InvalidSignature]
+            );
+        }
+
+        /// #836: the rejection may name the trade key, never beside the
+        /// identity it claimed.
+        #[tokio::test]
+        async fn missing_trade_signature_logs_no_identity_key() {
+            let (mostro, identity, trade) =
+                (create_test_keys(), create_test_keys(), create_test_keys());
+            let message = Message::Restore(kind(None, None));
+            let proof = identity_sig(&message, &trade, &identity);
+            let event = raw_event(
+                &message,
+                &trade,
+                &mostro.public_key(),
+                None,
+                Some((identity.public_key().to_hex(), proof)),
+            );
+
+            let (accepted, logs) =
+                crate::app::context::test_utils::logged_on_this_thread(accept_raw(&event, &mostro))
+                    .await;
+            assert!(!accepted);
+            let trade_hex = trade.public_key().to_hex();
+            assert!(
+                logs.lines()
+                    .any(|l| l.contains("inner signature") && l.contains(&trade_hex)),
+                "rejection not logged with the trade key"
+            );
+            assert!(
+                !logs.contains(&identity.public_key().to_hex()),
+                "identity key logged"
             );
         }
 

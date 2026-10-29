@@ -350,7 +350,7 @@ lnd_resynced_clear_after = 300
 # # when the bond locks. Must be above hold_invoice_cltv_delta + 144 and at
 # # most 864. Unset, it is hold_invoice_cltv_delta + 288, at most 864 (432
 # # with the shipped 144).
-# bond_cltv_delta = 432
+# # bond_cltv_delta = 432
 
 # Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
 # Opt-in, disabled by default. Mostro never sees the buyer's payer details:

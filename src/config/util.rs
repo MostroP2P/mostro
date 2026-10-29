@@ -241,7 +241,8 @@ fn validate_bond_cltv_delta(
              hold_invoice_cltv_delta ({hold_cltv_delta}) + {BOND_TRADE_MARGIN_BLOCKS} \
              ({floor}): a maker bond must still cover a full trade with \
              {BOND_TRADE_MARGIN_BLOCKS} blocks of margin when its order leaves the \
-             book, so at or below it an order gets no time in the book"
+             book, so at or below it an order gets no time in the book. Remove it to \
+             follow hold_invoice_cltv_delta"
         ))));
     }
 
@@ -1263,6 +1264,11 @@ mod startup_validation_tests {
             assert!(
                 err.to_string().contains("must be above"),
                 "bond_cltv_delta {bond_cltv_delta}: unexpected error {err}"
+            );
+            // Unset, the bond CLTV fits (#1098), so the error says so.
+            assert!(
+                err.to_string().contains("Remove it to follow"),
+                "bond_cltv_delta {bond_cltv_delta}: no hint to remove it: {err}"
             );
         }
         let mut settings = base_settings();

@@ -2404,7 +2404,11 @@ fails unless `bond_cltv_delta` is above
 otherwise) and at most `MAX_BOND_CLTV_DELTA` = 864 (a payer whose routing
 caps the total timelock at 1008 blocks, LDK's default, must still find a
 route), in Lightning mode with bonds enabled
-(`validate_bond_cltv_delta` in `src/config/util.rs`).
+(`validate_bond_cltv_delta` in `src/config/util.rs`). A window that passes
+but is shorter than `expiration_hours` only logs a warning at startup, with
+makers bonded (`bond_book_window_warning`): unset, the bond CLTV stays at
+864 once `hold_invoice_cltv_delta` passes 576, and the window shrinks with
+it (20 blocks, ~3.3 h, at 700).
 
 **Clamp at lock time.** When the maker bond locks,
 `resume_publish_after_maker_bond` (`src/util.rs`) cuts the order's

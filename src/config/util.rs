@@ -44,9 +44,11 @@ fn load_env_file(settings_dir: &std::path::Path) {
     }
 }
 
-/// Log the node's pubkey, then that the settings loaded. Nothing is logged
-/// before the settings on a normal start, so the node's identity is the first
-/// line: an operator can match the logs to the pubkey clients connect to.
+/// Log the node's pubkey, then that the settings loaded, then a book window
+/// shorter than the default expiration ([`bond_book_window_warning`]).
+/// Nothing is logged before the settings on a normal start, so the node's
+/// identity is the first line: an operator can match the logs to the pubkey
+/// clients connect to. Called once the global settings are initialised.
 fn log_settings_loaded() {
     if let Some(keys) = get_mostro_keys() {
         let pubkey = keys.public_key();
@@ -56,6 +58,14 @@ fn log_settings_loaded() {
         }
     }
     tracing::info!("Settings correctly loaded!");
+    if let Some(warning) = bond_book_window_warning(
+        Settings::get_bond(),
+        Settings::get_ln(),
+        Settings::get_mostro().expiration_hours,
+        Settings::is_cashu_enabled(),
+    ) {
+        tracing::warn!("{warning}");
+    }
 }
 
 /// If the `MOSTRO_NSEC_PRIVKEY` environment variable is set to a non-empty
@@ -255,6 +265,53 @@ fn validate_bond_cltv_delta(
     }
 
     Ok(())
+}
+
+/// The warning logged at startup when an order cannot rest in the book on
+/// its maker bond for the default `expiration_hours` (#1098): when the bond
+/// locks, the expiration is cut to the blocks the bond leaves after a full
+/// trade and [`BOND_TRADE_MARGIN_BLOCKS`]. [`validate_bond_cltv_delta`]
+/// keeps that window above 0 blocks, not above the default expiration, and
+/// with `bond_cltv_delta` unset it shrinks once `hold_invoice_cltv_delta`
+/// passes 576 and the bond CLTV stays at [`MAX_BOND_CLTV_DELTA`]. `None`
+/// while makers post no bond, and in Cashu mode, which has no hold invoice.
+fn bond_book_window_warning(
+    bond: Option<&crate::config::types::AntiAbuseBondSettings>,
+    lightning: &crate::config::types::LightningSettings,
+    expiration_hours: u32,
+    cashu_enabled: bool,
+) -> Option<String> {
+    use crate::app::bond::horizon::{book_window_secs, maker_bond_book_blocks};
+
+    let bond = bond.filter(|bond| bond.enabled && bond.apply_to.applies_to_maker())?;
+    if cashu_enabled {
+        return None;
+    }
+
+    let hold_cltv_delta = lightning.hold_invoice_cltv_delta;
+    let bond_cltv_delta = bond.cltv_delta(hold_cltv_delta);
+    let book_blocks = maker_bond_book_blocks(bond_cltv_delta, hold_cltv_delta);
+    let book_secs = book_window_secs(book_blocks);
+    if book_secs >= chrono::Duration::hours(i64::from(expiration_hours)).num_seconds() {
+        return None;
+    }
+
+    let remedy = if bond_cltv_delta < MAX_BOND_CLTV_DELTA {
+        format!(
+            "raise anti_abuse_bond.bond_cltv_delta (at most {MAX_BOND_CLTV_DELTA}) or lower \
+             lightning.hold_invoice_cltv_delta"
+        )
+    } else {
+        "lower lightning.hold_invoice_cltv_delta".to_string()
+    };
+    Some(format!(
+        "anti_abuse_bond: an order rests in the book for at most {book_blocks} blocks \
+         (~{:.1} h) on its maker bond, less than expiration_hours ({expiration_hours}): \
+         bond_cltv_delta ({bond_cltv_delta}) - hold_invoice_cltv_delta ({hold_cltv_delta}) \
+         - {BOND_TRADE_MARGIN_BLOCKS}. Its expiration is cut to that when the bond locks; \
+         to give orders more time, {remedy}",
+        book_secs as f64 / 3600.0
+    ))
 }
 
 /// `[reputation_export]`: a lifetime core can sign, between 1 and
@@ -996,8 +1053,8 @@ mod startup_validation_tests {
         MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE, MIN_ESCROW_DEADLINE_MARGIN_BLOCKS,
     };
     use crate::config::types::{
-        AntiAbuseBondSettings, CashuSettings, DatabaseSettings, LightningSettings, MostroSettings,
-        NostrSettings, RpcSettings,
+        AntiAbuseBondSettings, BondApplyTo, CashuSettings, DatabaseSettings, LightningSettings,
+        MostroSettings, NostrSettings, RpcSettings,
     };
 
     fn base_settings() -> Settings {
@@ -1326,6 +1383,94 @@ mod startup_validation_tests {
         assert!(validate_bond_cltv_delta(None, &lightning, false).is_ok());
         // Cashu mode has no hold invoice (and refuses bonds on its own).
         assert!(validate_bond_cltv_delta(Some(&enabled_bond(0)), &lightning, true).is_ok());
+    }
+
+    fn maker_bond(bond_cltv_delta: Option<u32>) -> AntiAbuseBondSettings {
+        AntiAbuseBondSettings {
+            enabled: true,
+            apply_to: BondApplyTo::Make,
+            bond_cltv_delta,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_book_window_shorter_than_the_default_expiration_is_warned() {
+        // #1098: unset, the bond CLTV stays at 864 once
+        // hold_invoice_cltv_delta passes 576, and the book window shrinks
+        // with no error: at 700 an order gets 20 blocks of its 24 hours.
+        let warning =
+            bond_book_window_warning(Some(&maker_bond(None)), &lightning(700, 24), 24, false)
+                .expect("20 blocks are less than 24 hours");
+        assert!(warning.contains("at most 20 blocks"), "{warning}");
+        assert!(
+            !warning.contains("raise"),
+            "the bond CLTV is already at the ceiling: {warning}"
+        );
+        assert!(
+            warning.contains("lower lightning.hold_invoice_cltv_delta"),
+            "{warning}"
+        );
+
+        // An explicit bond CLTV below the ceiling can still be raised.
+        let warning =
+            bond_book_window_warning(Some(&maker_bond(Some(300))), &lightning(144, 24), 24, false)
+                .expect("12 blocks are less than 24 hours");
+        assert!(warning.contains("at most 12 blocks"), "{warning}");
+        assert!(
+            warning.contains("raise anti_abuse_bond.bond_cltv_delta"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn a_book_window_that_holds_the_default_expiration_is_not_warned() {
+        // The shipped CLTVs give 144 blocks, the default 24 hours, and so
+        // does an unset bond CLTV over a 298-block escrow (#1098).
+        for hold_cltv_delta in [144, 298] {
+            assert_eq!(
+                bond_book_window_warning(
+                    Some(&maker_bond(None)),
+                    &lightning(hold_cltv_delta, 24),
+                    24,
+                    false
+                ),
+                None,
+                "hold_invoice_cltv_delta {hold_cltv_delta}"
+            );
+        }
+        // A 48-hour default does not fit those 144 blocks.
+        assert!(
+            bond_book_window_warning(Some(&maker_bond(None)), &lightning(144, 24), 48, false)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_book_window_is_not_warned_without_a_maker_bond() {
+        let lightning = lightning(700, 24);
+        let taker_only = AntiAbuseBondSettings {
+            apply_to: BondApplyTo::Take,
+            ..maker_bond(None)
+        };
+        let disabled = AntiAbuseBondSettings {
+            enabled: false,
+            ..maker_bond(None)
+        };
+        assert_eq!(
+            bond_book_window_warning(Some(&taker_only), &lightning, 24, false),
+            None
+        );
+        assert_eq!(
+            bond_book_window_warning(Some(&disabled), &lightning, 24, false),
+            None
+        );
+        assert_eq!(bond_book_window_warning(None, &lightning, 24, false), None);
+        // Cashu mode has no hold invoice.
+        assert_eq!(
+            bond_book_window_warning(Some(&maker_bond(None)), &lightning, 24, true),
+            None
+        );
     }
 
     #[test]

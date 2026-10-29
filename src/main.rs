@@ -522,8 +522,8 @@ async fn install_spam_gate() {
 /// working byte-for-byte (spec §10.1).
 fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>> {
     use crate::price::{
-        quoted_but_unaccepted_pegged, synthesise_legacy_price_settings, with_legacy_market_source,
-        PriceManager,
+        fetches_market_prices, quoted_but_unaccepted_pegged, synthesise_legacy_price_settings,
+        with_legacy_market_source, PriceManager,
     };
 
     let mostro_settings = Settings::get_mostro();
@@ -532,9 +532,10 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
     let kept = configured.and_then(|p| with_legacy_market_source(p, legacy_url));
     let price_settings = match (configured, kept) {
         // No provider fetches a market price (#1099): keep the legacy source
-        // next to the pegged one, or the node has no fiat rate at all.
+        // next to the pegged one, or the node has no fiat rate at all. The
+        // template documents this, so it is not a warning.
         (Some(_), Some(kept)) => {
-            tracing::warn!(
+            tracing::info!(
                 "price: `[price]` enables no market price provider, so the legacy \
                  `bitcoin_price_api_url` = \"{legacy_url}\" stays in use next to it; \
                  add a `[price.providers.*]` market provider to choose your own"
@@ -565,6 +566,16 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
                 mostro_settings.bitcoin_price_api_url,
                 enabled,
             );
+            // A `yadio` table the operator disabled keeps the legacy source
+            // out, and with no other market provider every market-priced
+            // order is refused for lack of a rate.
+            if !fetches_market_prices(p) {
+                tracing::warn!(
+                    "price: no enabled `[price.providers.*]` provider fetches a market \
+                     price, so every market-priced order is refused; enable one, or \
+                     remove the `yadio` table to keep the legacy source"
+                );
+            }
             p.clone()
         }
         (None, _) => synthesise_legacy_price_settings(

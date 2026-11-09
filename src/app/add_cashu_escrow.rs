@@ -13,13 +13,17 @@
 //! persistence failure leaves the order exactly as it was and the seller can
 //! retry.
 //!
-//! Fee collection (Option 2, §4A) is **not** handled here — it lands in TA-1f.
+//! The seller-funded fee token (Option 2, §4A) is validated and persisted here
+//! (TA-1f); collecting it at the mint is a follow-up.
 
 use crate::app::context::AppContext;
 use crate::cashu::mint_policy::normalize_mint_url;
-use crate::cashu::{cashu_pubkey_from_xonly_hex, Error as CashuError};
+use crate::cashu::{cashu_pubkey_from_xonly_hex, proof_ys_hex, Error as CashuError};
 use crate::config::settings::Settings;
-use crate::db::{cashu_escrow_token_in_use, update_order_cashu_escrow};
+use crate::db::{
+    cashu_escrow_token_in_use, update_order_cashu_escrow, update_order_cashu_escrow_with_fee,
+    CashuLockOutcome,
+};
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use chrono::Utc;
 use mostro_core::db::Crud;
@@ -280,21 +284,72 @@ pub async fn add_cashu_escrow_action(
         .await
         .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
 
-    // 8. Atomically persist the escrow and advance the status in one write. A
-    //    `false` return is classified by `classify_zero_row_cas`: a benign
+    // 7A. Fee token (Option 2, §4A). An order that carries a fee needs the
+    //     seller to fund the WHOLE Mostro fee (`2 * order.fee`) as a separate
+    //     P2PK-1-of-1 token locked to `P_M`, on the order's mint, submitted in
+    //     the same message. Validated alongside the escrow token: both must be
+    //     valid before any state changes.
+    let fee_ctx = match fee_token_amount(&order) {
+        Some(expected_fee) => {
+            let fee_token = proof
+                .fee_token
+                .clone()
+                .ok_or(MostroCantDo(CantDoReason::CashuSignatureMissing))?;
+            let parsed = cashu_client
+                .verify_fee_token(&fee_token, p_m, expected_fee)
+                .await
+                .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+            let fee_ys = proof_ys_hex(&parsed).map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+            Some((fee_token, fee_ys))
+        }
+        None => None,
+    };
+
+    // 8. Atomically persist the escrow (+ fee token and anti-reuse guard when
+    //    the order carries a fee) and advance the status in one write. A
+    //    zero-row result is classified by `classify_zero_row_cas`: a benign
     //    no-op returns `Ok(())` without notifying (idempotent; same shape as
     //    the `rows_affected() == 0` guard in `release_action`), while a race
     //    that left this submission's token unaccepted is rejected.
-    let locked = update_order_cashu_escrow(
-        pool,
-        order.id,
-        &order_mint,
-        &proof.token,
-        now,
-        Status::WaitingPayment,
-        Status::Active,
-    )
-    .await?;
+    let locked = match &fee_ctx {
+        Some((fee_token, fee_ys)) => {
+            match update_order_cashu_escrow_with_fee(
+                pool,
+                order.id,
+                &order_mint,
+                &proof.token,
+                fee_token,
+                fee_ys,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?
+            {
+                CashuLockOutcome::Locked => true,
+                CashuLockOutcome::StatusMismatch => false,
+                CashuLockOutcome::FeeReuse => {
+                    tracing::warn!(
+                        "cashu lock: fee token reused across orders for {} — rejected",
+                        order.id
+                    );
+                    return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+                }
+            }
+        }
+        None => {
+            update_order_cashu_escrow(
+                pool,
+                order.id,
+                &order_mint,
+                &proof.token,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?
+        }
+    };
     if !locked {
         classify_zero_row_cas(pool, order.id, &proof.token).await?;
         tracing::info!(
@@ -335,6 +390,16 @@ pub async fn add_cashu_escrow_action(
     Ok(())
 }
 
+/// Sats the seller must fund as the fee token, `None` when the order carries
+/// no fee. Read from the stored `order.fee`, the value the parties agreed to:
+/// the live `[mostro].fee` can have changed since, and a small order can round
+/// down to no fee at all.
+fn fee_token_amount(order: &Order) -> Option<u64> {
+    u64::try_from(order.fee.saturating_mul(2))
+        .ok()
+        .filter(|fee| *fee > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +419,17 @@ mod tests {
             .with_pool(Arc::new(pool.clone()))
             .with_settings(test_settings())
             .build()
+    }
+
+    #[test]
+    fn fee_token_amount_follows_the_stored_order_fee() {
+        let with_fee = |fee| Order {
+            fee,
+            ..Default::default()
+        };
+
+        assert_eq!(fee_token_amount(&with_fee(0)), None);
+        assert_eq!(fee_token_amount(&with_fee(21)), Some(42));
     }
 
     /// A `WaitingPayment` sell order — the state a taken Cashu order sits in

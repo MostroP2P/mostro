@@ -464,6 +464,20 @@ refinement no longer costs a migration — only a slightly richer
 self-service refunds and "fee only on success" semantics. It is a clean
 follow-up, not a TA-1 blocker; TA-1f ships the simpler 1-of-1 form.
 
+`verify_fee_token` therefore rejects a fee token carrying `locktime` or `refund`
+tags until that refinement lands: while the redeem is deferred, a second spend
+path would let the token leave Mostro's control.
+
+Open while the live redeem is deferred:
+
+- A fee token persisted today is only worth something while the mint keeps
+  honouring its keyset (NUT-02), which is mint policy. The redeem follow-up must
+  add an alert or a deadline on the oldest pending redeem.
+- A fee token sent with a lock that is refused cannot be recovered by the seller
+  alone, because it is P2PK to `P_M` with no refund path. The refinement above,
+  with the refund key bound to this order's `P_S` and a locktime beyond the
+  escrow's, is the proposed way out.
+
 ### What Option 2 does *not* solve
 
 A seller and buyer who collude out-of-band could agree the seller funds a

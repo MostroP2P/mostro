@@ -1,0 +1,11 @@
+# Money paths: code that moves or locks sats (docs/ORTSOM_PR_E2E_SPEC.md
+# § 15). A pull request that touches one needs an approving review from one
+# of these maintainers other than its author, and `ortsom:pass`. The list is
+# `[money_path] paths` in .github/ortsom/map.toml; .github/ortsom/tests/
+# test_map.py fails when the two disagree.
+/src/lightning/ @grunch @Catrya @arkanoider
+/src/app/bond/ @grunch @Catrya @arkanoider
+/src/app/release.rs @grunch @Catrya @arkanoider
+/src/app/add_invoice.rs @grunch @Catrya @arkanoider
+/src/app/dev_fee.rs @grunch @Catrya @arkanoider
+/src/scheduler.rs @grunch @Catrya @arkanoider

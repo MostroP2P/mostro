@@ -1,0 +1,4 @@
+# No [price] table at all: the legacy bitcoin_price_api_url alone, which is
+# every settings.toml written before multi-source pricing existed.
+[ortsom]
+remove = ["price"]

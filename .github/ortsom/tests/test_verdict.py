@@ -555,8 +555,8 @@ class ApplyTest(unittest.TestCase):
         vd.remove_label(gh.send, REPO, 7, "ortsom:missing")
 
 
-class RunTest(unittest.TestCase):
-    """The whole job against a fake GitHub and a result directory."""
+class ResultDirCase(unittest.TestCase):
+    """A result directory and the whole job against a fake GitHub."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -582,6 +582,8 @@ class RunTest(unittest.TestCase):
         args.update(over)
         return vd.run(args, REPO, gh.get, gh.send, lambda _m: list(history), SETTINGS)
 
+
+class RunTest(ResultDirCase):
     def test_a_passing_run_labels_pass_and_writes_the_comment(self):
         res = self.write_result(meta(), selection(*FOUR), passing(*FOUR))
         gh = FakeGitHub()
@@ -672,6 +674,161 @@ class RunTest(unittest.TestCase):
         res = self.write_result(meta(head_sha="d" * 40), selection(*FOUR), passing(*FOUR))
         with self.assertRaises(vd.VerdictError):
             self.run_job(FakeGitHub(), res=res)
+
+
+
+PEGGED_V = {"name": "pegged", "overlay": "variants/pegged.toml", "sha256": "p1", "scenarios": ["market"]}
+CLTV_V = {"name": "cltv", "overlay": "variants/cltv.toml", "sha256": "c1", "scenarios": ["bond", "happy"]}
+
+
+def variant_doc(runs=None, summaries=None):
+    return {"runs": runs or {}, "summaries": summaries or {}}
+
+
+def run_rec(stack="ok", sha="p1"):
+    return {"stack": stack, "overlay_sha256": sha, "suite_exit": 0 if stack == "ok" else None}
+
+
+class VariantResultsTest(unittest.TestCase):
+    WANTED = {"pegged": PEGGED_V, "cltv": CLTV_V}
+
+    def test_a_variants_results_are_named_scenario_at_variant(self):
+        doc = variant_doc({"pegged": run_rec()}, {"pegged": passing("market")})
+
+        merged, skipped = vd.with_variants(passing("s1"), doc, {"pegged": PEGGED_V})
+
+        self.assertEqual([r["name"] for r in merged["results"]], ["s1", "market@pegged"])
+        self.assertEqual(skipped, {})
+
+    def test_a_daemon_that_refused_the_settings_fails_every_scenario_of_the_variant(self):
+        doc = variant_doc({"cltv": run_rec("daemon_failed", sha="c1")})
+
+        merged, skipped = vd.with_variants(passing("s1"), doc, {"cltv": CLTV_V})
+
+        failed = {r["name"]: r for r in merged["results"] if "@" in r["name"]}
+        self.assertEqual(sorted(failed), ["bond@cltv", "happy@cltv"])
+        self.assertTrue(all(r["outcome"] == "failed" for r in failed.values()))
+        self.assertIn("did not start", failed["bond@cltv"]["detail"])
+        self.assertEqual(skipped, {})
+
+    def test_a_variant_that_could_not_be_judged_is_skipped_with_its_reason(self):
+        doc = variant_doc({
+            "pegged": run_rec("infra_failed"),
+            "cltv": run_rec(sha="c1"),  # ok, but its suite left no summary
+        })
+
+        merged, skipped = vd.with_variants(passing("s1"), doc, self.WANTED)
+
+        self.assertEqual([r["name"] for r in merged["results"]], ["s1"])
+        self.assertEqual(skipped, {"pegged": "infra_failed", "cltv": "incomplete"})
+
+    def test_a_variant_run_with_another_overlay_is_not_used(self):
+        doc = variant_doc({"pegged": run_rec(sha="old")}, {"pegged": passing("market")})
+
+        merged, skipped = vd.with_variants(passing("s1"), doc, {"pegged": PEGGED_V})
+
+        self.assertEqual([r["name"] for r in merged["results"]], ["s1"])
+        self.assertEqual(skipped, {"pegged": "not-run"})
+
+    def test_no_variant_document_skips_every_wanted_variant(self):
+        merged, skipped = vd.with_variants(passing("s1"), None, self.WANTED)
+
+        self.assertEqual(merged, passing("s1"))
+        self.assertEqual(skipped, {"pegged": "not-run", "cltv": "not-run"})
+
+    def test_an_interrupted_variant_suite_is_incomplete(self):
+        interrupted = summary(result("market", "interrupted"))
+        doc = variant_doc({"pegged": run_rec()}, {"pegged": interrupted})
+
+        self.assertEqual(vd.with_variants(passing("s1"), doc, {"pegged": PEGGED_V})[1], {"pegged": "incomplete"})
+
+    def test_the_baseline_zip_carries_its_variants(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("meta.json", json.dumps({"sha": BASE}))
+            z.writestr("summary.json", json.dumps(passing("s1")))
+            z.writestr("variants/variants.json", json.dumps({"pegged": run_rec()}))
+            z.writestr("variants/pegged/summary.json", json.dumps(passing("market")))
+
+        meta_doc, summ = vd.read_baseline_zip(buf.getvalue())
+
+        self.assertEqual(meta_doc["variants"], variant_doc({"pegged": run_rec()}, {"pegged": passing("market")}))
+        self.assertEqual(summ, passing("s1"))
+
+
+class VariantRunTest(ResultDirCase):
+    def write_variants(self, res, runs, summaries):
+        (res / "variants").mkdir()
+        (res / "variants" / "variants.json").write_text(json.dumps(runs))
+        for name, summ in summaries.items():
+            (res / "variants" / name).mkdir()
+            (res / "variants" / name / "summary.json").write_text(json.dumps(summ))
+
+    def judged(self, pr_runs, pr_summaries, base_variants):
+        sel = selection(*FOUR, variants=[PEGGED_V, CLTV_V])
+        res = self.write_result(meta(), sel, passing(*FOUR), changes="M\tsettings.tpl.toml\n")
+        self.write_variants(res, pr_runs, pr_summaries)
+        base = baseline(BASE, passing(*FOUR))
+        base["meta"]["variants"] = base_variants
+        return self.run_job(FakeGitHub(), history=[base], res=res)
+
+    MAIN_VARIANTS = variant_doc(
+        {"pegged": run_rec(), "cltv": run_rec(sha="c1")},
+        {"pegged": passing("market"), "cltv": passing("bond", "happy")},
+    )
+
+    def test_a_daemon_that_refuses_a_variants_settings_is_a_regression(self):
+        # #1098: main starts under the overlay, the pull request does not.
+        out = self.judged({"pegged": run_rec(), "cltv": run_rec("daemon_failed", sha="c1")},
+                          {"pegged": passing("market")}, self.MAIN_VARIANTS)
+
+        self.assertEqual(out["verdict"], "regression")
+        regressed = sorted(r["name"] for r in out["rows"] if r["class"] == "regression")
+        self.assertEqual(regressed, ["bond@cltv", "happy@cltv"])
+        comment = (self.dir / "out" / "comment.md").read_text()
+        self.assertIn("`bond@cltv`", comment)
+        self.assertIn("did not start", comment)
+
+    def test_a_variant_scenario_failing_where_main_passes_is_a_regression(self):
+        # #1099: the market order fails only under the pegged-only overlay.
+        out = self.judged({"pegged": run_rec(), "cltv": run_rec(sha="c1")},
+                          {"pegged": summary(result("market", "failed")), "cltv": passing("bond", "happy")},
+                          self.MAIN_VARIANTS)
+
+        self.assertEqual(out["verdict"], "regression")
+        self.assertEqual([r["name"] for r in out["rows"] if r["class"] == "regression"], ["market@pegged"])
+
+    def test_variants_passing_on_both_sides_count_as_compared_passes(self):
+        out = self.judged({"pegged": run_rec(), "cltv": run_rec(sha="c1")},
+                          {"pegged": passing("market"), "cltv": passing("bond", "happy")}, self.MAIN_VARIANTS)
+
+        self.assertEqual((out["verdict"], out["counts"]["pass"]), ("pass", 7))
+
+    def test_a_baseline_without_variants_leaves_them_uncompared(self):
+        out = self.judged({"pegged": run_rec(), "cltv": run_rec(sha="c1")},
+                          {"pegged": passing("market"), "cltv": passing("bond", "happy")}, None)
+
+        self.assertEqual(out["verdict"], "pass")
+        no_base = sorted(r["name"] for r in out["rows"] if r["class"] == "no-baseline")
+        self.assertEqual(no_base, ["bond@cltv", "happy@cltv", "market@pegged"])
+
+    def test_a_variant_whose_stack_failed_makes_a_pass_inconclusive(self):
+        out = self.judged({"pegged": run_rec("infra_failed"), "cltv": run_rec(sha="c1")},
+                          {"cltv": passing("bond", "happy")}, self.MAIN_VARIANTS)
+
+        self.assertEqual((out["verdict"], out["reason"]), ("inconclusive", "variant-not-compared"))
+        self.assertNotIn("market@pegged", [r["name"] for r in out["rows"]])
+        self.assertEqual(out["variants_skipped"], {"pegged": "infra_failed"})
+        comment = (self.dir / "out" / "comment.md").read_text()
+        self.assertIn("`pegged`", comment)
+        self.assertIn("not compared", comment)
+
+    def test_variants_that_never_ran_do_not_hide_a_regression(self):
+        out = self.judged({"pegged": run_rec()}, {"pegged": summary(result("market", "failed"))},
+                          self.MAIN_VARIANTS)
+
+        self.assertEqual(out["verdict"], "regression")
+        self.assertEqual(out["variants_skipped"], {"cltv": "not-run"})
 
 
 if __name__ == "__main__":

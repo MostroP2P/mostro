@@ -1,0 +1,9 @@
+# A node whose only [price] provider is pegged, as an operator gets by
+# uncommenting the pegged block of settings.tpl.toml and nothing else.
+# MostroP2P/mostro#1099: 0.20.2 then had no fiat price at all and refused
+# every market-priced order.
+[ortsom]
+remove = ["price.providers.yadio"]
+
+[price.providers.pegged]
+enabled = true

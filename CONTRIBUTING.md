@@ -139,6 +139,13 @@ Reviewers should also verify **external contract impact** for any PR that modifi
 
 Please note that Pull Requests marked `NACK` and/or GitHub's `Change requested` are closed after 30 days if not addressed.
 
+### Money paths
+
+A pull request that changes code that moves or locks sats — `src/lightning/`, `src/app/bond/`, `src/app/release.rs`, `src/app/add_invoice.rs`, `src/app/dev_fee.rs` or `src/scheduler.rs` — needs two more things to merge:
+
+- an approving review from a maintainer other than its author. They are the code owners of those paths in [`.github/CODEOWNERS`](.github/CODEOWNERS), and GitHub requests their review for you;
+- the `ortsom/money-path` check, which passes only once the maintainers' end-to-end suite has passed on the pull request's last commit. You do not run that suite. If it fails for a reason outside your change, a maintainer runs it again.
+
 ## Code formatting
 
 Run `cargo fmt` and `cargo clippy` before committing to ensure that code is consistently formatted.

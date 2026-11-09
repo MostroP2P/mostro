@@ -118,9 +118,11 @@ def fill_gap(get, send, repo, sha, globs, target_url):
     existing = get(f"/repos/{repo}/commits/{sha}/status").get("statuses") or []
     if any(s.get("context") == CONTEXT for s in existing):
         return
-    for pull in get(f"/repos/{repo}/commits/{sha}/pulls"):
-        if pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != sha:
+    for listed in get(f"/repos/{repo}/commits/{sha}/pulls"):
+        if listed.get("state") != "open" or (listed.get("head") or {}).get("sha") != sha:
             continue
+        # The commit's list omits changed_files, which state_for checks.
+        pull = {**get(f"/repos/{repo}/pulls/{listed['number']}"), "number": listed["number"]}
         state, text = state_for(get, repo, pull, "incomplete", globs)
         send_status(send, repo, sha, state, text, target_url)
 

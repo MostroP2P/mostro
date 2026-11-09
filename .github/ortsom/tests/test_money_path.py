@@ -68,10 +68,10 @@ class FakeGitHub:
             return self.files if "page=1" in params else []
         if path.endswith("/status"):
             return {"statuses": [{"context": c} for c in self.statuses]}
-        pull = {"number": 7, "state": self.state, "head": {"sha": self.head}, "changed_files": self.changed}
+        pull = {"number": 7, "state": self.state, "head": {"sha": self.head}}
         if path.endswith("/pulls"):
-            return [pull]
-        return pull
+            return [pull]  # the commit's list: no changed_files
+        return {**pull, "changed_files": self.changed}
 
     def send(self, method, path, body=None):
         self.calls.append((method, path, body))

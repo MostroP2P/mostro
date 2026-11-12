@@ -1624,8 +1624,12 @@ async fn on_bond_invoice_canceled(hash: &str, pool: &Pool<Sqlite>) -> Result<(),
         None => return Ok(()),
     };
 
+    // A terminal bond has nothing left to release. A `PendingSettle` one
+    // belongs to the settle retry (`slash::retry_pending_settles`): it
+    // sees the canceled invoice on its next tick, releases the row with
+    // the slash metadata cleared and reports the slash as lost.
     if BondState::from_str(&bond.state)
-        .map(|s| s.is_terminal())
+        .map(|s| s.is_terminal() || s == BondState::PendingSettle)
         .unwrap_or(false)
     {
         return Ok(());

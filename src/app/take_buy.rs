@@ -421,6 +421,38 @@ mod tests {
         ));
     }
 
+    /// The maker's identity cannot take its own order from another trade
+    /// key: every order uses a fresh trade key, so the sender differs from
+    /// `creator_pubkey` while the identity is the order's master buyer.
+    #[tokio::test]
+    async fn take_buy_action_rejects_maker_identity_with_another_trade_key() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let identity = Keys::generate().public_key();
+        let maker_trade_key = Keys::generate().public_key();
+        let taker_trade_key = Keys::generate().public_key();
+
+        let mut order = pending_buy_order(maker_trade_key);
+        order.master_buyer_pubkey = Some(identity.to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let mut event = taker_event(taker_trade_key);
+        event.identity = identity;
+
+        let result = take_buy_action(
+            &ctx,
+            take_buy_msg(order.id, Some(2)),
+            &event,
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
     /// A range order for which the taker requested no amount is rejected
     /// with `OutOfRangeSatsAmount`.
     #[tokio::test]

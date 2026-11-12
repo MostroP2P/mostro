@@ -125,13 +125,46 @@ async fn classify_zero_row_cas(
     }
 }
 
+/// [`classify_zero_row_cas`] for a lock that carries a fee token.
+///
+/// The fee token is a 1-of-1 to `P_M` with no refund path, so once the seller
+/// built it only Mostro can spend it. A zero-row result is therefore a no-op
+/// only when this very submission is what the order holds (a duplicate
+/// delivery of the lock that won). Anything else is reported to the seller:
+/// - the escrow token is stored with a different fee token ⇒ the one sent
+///   here was not accepted;
+/// - the order moved on unlocked (expired, canceled) or is gone ⇒ the lock
+///   failed, rather than the silent success the plain lock answers.
 async fn classify_zero_row_fee_cas(
     pool: &SqlitePool,
     order_id: uuid::Uuid,
     token: &str,
-    _fee_token: &str,
+    fee_token: &str,
 ) -> Result<(), MostroError> {
-    classify_zero_row_cas(pool, order_id, token).await
+    classify_zero_row_cas(pool, order_id, token).await?;
+
+    let stored: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT cashu_escrow_token, cashu_fee_token FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    match stored {
+        Some((Some(escrow), Some(fee))) if escrow == token && fee == fee_token => Ok(()),
+        Some((Some(escrow), _)) if escrow == token => {
+            tracing::warn!(
+                "cashu lock: order {order_id} holds this escrow with another fee token — rejected"
+            );
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        }
+        _ => {
+            tracing::warn!(
+                "cashu lock: fee-bearing lock for order {order_id} was not persisted — rejected"
+            );
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        }
+    }
 }
 
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
@@ -319,7 +352,10 @@ pub async fn add_cashu_escrow_action(
     //    zero-row result is classified by `classify_zero_row_cas`: a benign
     //    no-op returns `Ok(())` without notifying (idempotent; same shape as
     //    the `rows_affected() == 0` guard in `release_action`), while a race
-    //    that left this submission's token unaccepted is rejected.
+    //    that left this submission's token unaccepted is rejected. With a fee
+    //    token, `classify_zero_row_fee_cas` is stricter: only a duplicate of
+    //    the stored submission is a no-op, so the seller always learns that a
+    //    fee token it can no longer spend was not accepted.
     let locked = match &fee_ctx {
         Some((fee_token, fee_ys)) => {
             match update_order_cashu_escrow_with_fee(
@@ -360,7 +396,12 @@ pub async fn add_cashu_escrow_action(
         }
     };
     if !locked {
-        classify_zero_row_cas(pool, order.id, &proof.token).await?;
+        match &fee_ctx {
+            Some((fee_token, _)) => {
+                classify_zero_row_fee_cas(pool, order.id, &proof.token, fee_token).await?
+            }
+            None => classify_zero_row_cas(pool, order.id, &proof.token).await?,
+        }
         tracing::info!(
             "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
             order.id

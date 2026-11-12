@@ -202,7 +202,12 @@ to `release_action` (compute/verify first, persist second, notify last).
    **different** token. Both ⇒ `CantDo(InvalidCashuToken)`, because answering
    `Ok(())` would leave the seller believing an untouched, still-unspent token
    is escrowed. A duplicate delivery of the token that actually won, and a
-   status that simply moved on, stay no-ops.
+   status that simply moved on, stay no-ops. A lock that carries a fee token
+   (§4A) is stricter: only a duplicate of the stored escrow **and** fee token
+   is a no-op. The same escrow token stored with another fee token ⇒
+   `CantDo(InvalidCashuToken)`; a status that moved on, or a vanished order ⇒
+   `CantDo(NotAllowedByStatus)`. The seller can no longer spend that fee token,
+   so it must learn that the lock failed.
 9. **Publish the updated order event** (kind 38383) via `update_order_event`, as
    the LN funding path does, so the order's public state stays consistent.
 10. **Notify the buyer.** Enqueue `Action::CashuEscrowLocked` to the buyer plus
@@ -476,7 +481,8 @@ Open while the live redeem is deferred:
 - A fee token sent with a lock that is refused cannot be recovered by the seller
   alone, because it is P2PK to `P_M` with no refund path. The refinement above,
   with the refund key bound to this order's `P_S` and a locktime beyond the
-  escrow's, is the proposed way out.
+  escrow's, is the proposed way out. Until then, a refused fee-bearing lock is
+  always reported to the seller, never answered as a silent no-op (§4 step 8).
 
 ### What Option 2 does *not* solve
 

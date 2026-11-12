@@ -256,8 +256,10 @@ Purely additive. Touches no trade flow.
   percentage dominates, huge amount saturation.
 - Enums (new file `src/app/bond/types.rs`):
   - `BondRole { Maker, Taker }` — *posting-timing* role; see §3.1.
-  - `BondState { Requested, Locked, Released, PendingPayout, Slashed, Forfeited, Failed }`
-    — `Forfeited` is the long-stop terminal state for a slash whose
+  - `BondState { Requested, Locked, Released, PendingSettle, PendingPayout, Slashed, Forfeited, Failed }`
+    — `PendingSettle` is a slash that is recorded on the row but whose
+    hold invoice is not settled yet (§7.3 step 4); it is neither active
+    nor terminal. `Forfeited` is the long-stop terminal state for a slash whose
     counterparty never claimed their share within
     `payout_claim_window_days` (§8.1). Distinct from `Failed`, which
     is reserved for technical errors (e.g. `send_payment` never routes).
@@ -956,22 +958,42 @@ or a legacy admin client):
    `apply_to`.
 4. On a valid payload: perform the trade resolution (settle or cancel)
    first, then for each bond marked for slash:
-   1. **Settle the bond hold invoice immediately** via
+   1. **Record the slash on the row**: CAS `Locked → PendingSettle`
+      with `slashed_reason = LostDispute`, the payout recipient, and the
+      split per §8.1 (compute `node_share_sats` from the current
+      `slash_node_share_pct` and write it in the same DB update). This
+      comes first because the handler closes the dispute right after
+      this step and its status guard rejects a second resolution: a
+      slash that only lived in the solver's message would be lost with
+      a failed settle. A row that already left `Locked` is not touched
+      and nothing is settled for it.
+   2. **Settle the bond hold invoice** via
       `settle_hold_invoice(preimage)`. This claims the bonded sats into
-      Mostro's wallet at slash time — the HTLC is no longer encumbered
-      by the time the slash step returns. The settle is the
-      load-bearing side effect of the slash decision; the row
-      transition that follows is bookkeeping.
-   2. CAS the row `state = PendingPayout, slashed_reason =
-      LostDispute, slashed_at = now`, and persist the split per §8.1
-      (compute `node_share_sats` from the current
-      `slash_node_share_pct` and write it in the same DB update).
-   3. **Settle MUST succeed before the CAS runs.** If
-      `settle_hold_invoice` fails with a transient transport error,
-      the row stays `Locked` so a future admin retry can re-attempt
-      the slash. LND's idempotent "already settled" response (admin
-      retry after a partial failure where settle succeeded but the
-      CAS lost a race) is treated as success and the CAS proceeds.
+      Mostro's wallet at slash time. LND's idempotent "already settled"
+      response is treated as success.
+   3. CAS the row `PendingSettle → PendingPayout, slashed_at = now`.
+      The row reaches `PendingPayout` **only after the settle
+      succeeds**, so Phase 3 never sees a row whose HTLC is still
+      encumbered.
+
+   **A failed settle does not lose the slash.** The row stays
+   `PendingSettle` and the trade resolution goes on. `PendingSettle` is
+   not an active state, so no release path cancels the HTLC. The
+   scheduler job `job_retry_pending_bond_settles` picks the row up
+   every minute and lets LND's view of the hold invoice decide:
+
+   | Invoice state at LND | Action |
+   |---|---|
+   | `Accepted` | settle, then `PendingSettle → PendingPayout`; a failed settle waits for the next tick |
+   | `Settled` | only the row is finished (`PendingSettle → PendingPayout`) |
+   | `Canceled`, `Open` or unknown to LND | `PendingSettle → Released`, slash metadata cleared, logged as an error |
+   | lookup failed | wait for the next tick |
+
+   LND cancels an accepted hold invoice by itself shortly before its
+   CLTV expiry, and it cannot be settled after that, so the retries are
+   bounded by the bond's CLTV without a counter. A bond released this
+   way went back to the bonded party: the slash is lost and nothing is
+   owed to the counterparty.
 
    Bonds not marked for slash are cancelled (`cancel_hold_invoice`)
    and marked `Released` immediately.
@@ -984,12 +1006,13 @@ or a legacy admin client):
    This mirrors the timeout-slash path (§9): a settle/cancel resolution
    otherwise produces the **same** order message whether or not a bond was
    slashed, leaving the loser with no protocol signal that they forfeited a
-   bond. `apply_bond_resolution` returns the bond rows whose slash is
-   **confirmed** (via the durable `slashed_reason = LostDispute` witness, or
-   a freshly-inserted range slice child row); the handler sends one notice
-   per returned row. A transient settle failure (bond left `Locked`) and an
-   idempotent admin retry both yield no row, so the notice is never
-   untruthful and a winner is never re-notified. The amount is the full bond
+   bond. `apply_bond_resolution` returns the bond rows whose slash **this
+   call finished** (the row reached `PendingPayout`, or a range slice child
+   row was freshly inserted); the handler sends one notice per returned row.
+   A failed settle (bond left `PendingSettle`) and an idempotent admin retry
+   both yield no row, so the notice is never untruthful and a winner is
+   never re-notified. For a bond left `PendingSettle` the retry job sends
+   the notice once it settles the HTLC. The amount is the full bond
    for a taker / non-range maker bond, or the slice's proportional amount for
    a range maker bond. Like the timeout notice it is fire-and-forget — a
    dropped message never rolls back the slash.
@@ -1025,9 +1048,14 @@ sats are already in Mostro's wallet.
 - Confirmed slash → `apply_bond_resolution` returns the slashed row(s) and
   the handler sends `Action::BondSlashed` to each slashed party (#768);
   `null` payload / no slash → no row, no notice.
-- Transient settle failure (bond left `Locked`) → no row returned, no
-  notice (never untruthful); idempotent admin retry → no row, no
-  re-notification of the winner.
+- Failed settle → bond left `PendingSettle` with the slash reason and the
+  payout recipient, no row returned, no notice (never untruthful); the
+  settle retry then moves it to `PendingPayout` and reports it once.
+  Idempotent admin retry → no row, no re-notification of the winner.
+- Settle retry: `Accepted` → settled and `PendingPayout`; `Settled` → row
+  finished without a second settle; `Canceled` / `Open` / unknown →
+  `Released` with the slash metadata cleared; lookup failure → unchanged;
+  other bonds of the same order are left alone.
 - Range maker dispute slash → the returned row is the slice child carrying
   the proportional amount, not the full parent bond.
 
@@ -1292,10 +1320,12 @@ must land hand-in-hand with the client adoption. See §14.3.
 ### 8.2 Failure modes & invariants
 
 - **Slashed HTLC is settled at slash time, not by the scheduler.**
-  Phase 2 §7.3 step 4.1 runs `settle_hold_invoice(preimage)` before
-  the row is flipped to `PendingPayout`. By the time Phase 3 sees the
-  row the sats are already in Mostro's wallet. The scheduler never
-  calls `settle_hold_invoice`; failure modes that previously hinged
+  Phase 2 §7.3 step 4.2 runs `settle_hold_invoice(preimage)` before
+  the row is flipped to `PendingPayout`; a slash whose settle failed
+  waits in `PendingSettle`, out of Phase 3's reach, until the settle
+  retry lands it. By the time Phase 3 sees the row the sats are already
+  in Mostro's wallet. The payout scheduler never calls
+  `settle_hold_invoice`; failure modes that previously hinged
   on "settle before send_payment" ordering are now impossible by
   construction.
 - **Node share is retained unconditionally.** The slash-time settle
@@ -1591,8 +1621,9 @@ waiting state alone:
 
 The scheduler then asks: *does that party have an active bond row?* This
 is where `apply_to` and the order kind cross-check (§3.1 table). Only
-when a bond exists is it transitioned to
-`PendingPayout, slashed_reason = Timeout`. Otherwise the existing
+when a bond exists is it slashed with `slashed_reason = Timeout`
+(`PendingSettle`, then `PendingPayout` once its HTLC is settled).
+Otherwise the existing
 cancel-and-republish behaviour runs unchanged.
 
 Worked rows for `apply_to = "take"`:
@@ -1623,11 +1654,16 @@ slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
 - Modify `scheduler::job_cancel_orders`: when the waiting-state timeout
   elapses on an order in `WaitingBuyerInvoice` / `WaitingPayment`, run
   the §9.2 lookup. If a bond exists for the responsible party, reuse
-  the Phase 2 slash primitive: **settle the bond hold invoice
-  immediately** (`settle_hold_invoice(preimage)`) and CAS the row to
-  `state = PendingPayout, slashed_reason = Timeout` (Phase 3 then
-  picks it up for the asynchronous counterparty payout). Continue
-  the existing cancel-escrow + republish work. The payout recipient
+  the Phase 2 slash primitive (§7.3 step 4): record the slash on the
+  row (`PendingSettle, slashed_reason = Timeout`), **settle the bond
+  hold invoice** (`settle_hold_invoice(preimage)`) and CAS the row to
+  `PendingPayout` (Phase 3 then picks it up for the asynchronous
+  counterparty payout). Continue the existing cancel-escrow +
+  republish work whether or not the settle succeeded: the order never
+  waits for the bond's HTLC. A failed settle leaves the row
+  `PendingSettle` for the settle retry, and because that is not an
+  active state the republished order is not blocked by the bond of the
+  taker who left. The payout recipient
   is fixed at slash time in `bonds.payout_recipient`, because the same
   tick then clears the responsible taker's pubkeys from the order
   (MOSTRO-006); it follows the "Recipient resolution" rule in §8.1: `slashed_reason = Timeout` plus the §9.2 responsibility entry
@@ -1640,13 +1676,10 @@ slash notice uses `Action::BondSlashed` (mostro-core **0.11.5**).
   the user's locale. The notice is **best-effort and complements** the
   `Action::Canceled` the slashed user already receives for the order; a
   dropped notice never rolls back the slash. It is sent **only after the
-  slash is confirmed to have landed** — confirmed via the bond row's
-  durable `slashed_reason = Timeout` metadata (which the concurrent
-  Phase 3 payout scheduler never clears as it moves the row
-  `PendingPayout → Slashed | Forfeited | Failed`), not a transient
-  `state = PendingPayout` check that the scheduler could invalidate
-  within the race window. A transient `settle_hold_invoice` failure
-  leaves the bond `Locked` with no slash metadata, so it can never
+  slash has landed**: by the scheduler when the slash primitive reports
+  that this call moved the row to `PendingPayout`, or by the settle
+  retry when it does so later. A failed `settle_hold_invoice` leaves
+  the bond `PendingSettle`, which reports nothing, so it can never
   produce a false "your bond was slashed" message.
 - Tests:
   - "Cancel at minute 5 of a 15-minute timeout" → bond released, no

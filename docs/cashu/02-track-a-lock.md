@@ -141,7 +141,10 @@ to `release_action` (compute/verify first, persist second, notify last).
    retry. If the submitted token equals the stored one, **re-send the step-10
    notifications and return `Ok(())`** — no mint round-trip, no second write. A
    *different* token on an already-locked order ⇒ `CantDo(InvalidCashuToken)`
-   (a second funding the escrow can never honour). The exception is deliberately
+   (a second funding the escrow can never honour). The fee token must equal the
+   stored `cashu_fee_token` too (none on a fee-free order); a different one ⇒
+   `CantDo(InvalidCashuToken)`, because it is spendable by `P_M` alone and would
+   never be stored. The exception is deliberately
    scoped to `Active`: a locked order that has moved on (`FiatSent`, `Success`,
    …) falls through to the step-3 rejection, so a stale "escrow locked, send
    fiat" is never replayed onto an advanced trade. Only the seller trade key
@@ -202,7 +205,12 @@ to `release_action` (compute/verify first, persist second, notify last).
    **different** token. Both ⇒ `CantDo(InvalidCashuToken)`, because answering
    `Ok(())` would leave the seller believing an untouched, still-unspent token
    is escrowed. A duplicate delivery of the token that actually won, and a
-   status that simply moved on, stay no-ops.
+   status that simply moved on, stay no-ops. A lock that carries a fee token
+   (§4A) is stricter: only a duplicate of the stored escrow **and** fee token
+   is a no-op. The same escrow token stored with another fee token ⇒
+   `CantDo(InvalidCashuToken)`; a status that moved on, or a vanished order ⇒
+   `CantDo(NotAllowedByStatus)`. The seller can no longer spend that fee token,
+   so it must learn that the lock failed.
 9. **Publish the updated order event** (kind 38383) via `update_order_event`, as
    the LN funding path does, so the order's public state stays consistent.
 10. **Notify the buyer.** Enqueue `Action::CashuEscrowLocked` to the buyer plus
@@ -336,7 +344,9 @@ whether this node charges a fee. Presence/amount of `fee_token` is therefore a
 **daemon-side, config-dependent** check (in `add_cashu_escrow_action`, §4A), not
 a protocol invariant. When `mostro.fee > 0` the handler rejects a `None` or
 mis-valued `fee_token` with `CantDo(CashuSignatureMissing)` /
-`InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid.
+`InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid and a `Some` ⇒
+`CantDo(InvalidCashuToken)`, checked before any mint round-trip: the fee-free
+path stores no fee token, so accepting one would strand it.
 
 **4 · Tests** (the Cashu test module in `src/message.rs`). Extend
 `sample_lock_proof()`/round-trip coverage with two cases: (a) a proof built via
@@ -463,6 +473,21 @@ refinement no longer costs a migration — only a slightly richer
 `verify_fee_token` (accept locktime + `P_S` refund) in exchange for
 self-service refunds and "fee only on success" semantics. It is a clean
 follow-up, not a TA-1 blocker; TA-1f ships the simpler 1-of-1 form.
+
+`verify_fee_token` therefore rejects a fee token carrying `locktime` or `refund`
+tags until that refinement lands: while the redeem is deferred, a second spend
+path would let the token leave Mostro's control.
+
+Open while the live redeem is deferred:
+
+- A fee token persisted today is only worth something while the mint keeps
+  honouring its keyset (NUT-02), which is mint policy. The redeem follow-up must
+  add an alert or a deadline on the oldest pending redeem.
+- A fee token sent with a lock that is refused cannot be recovered by the seller
+  alone, because it is P2PK to `P_M` with no refund path. The refinement above,
+  with the refund key bound to this order's `P_S` and a locktime beyond the
+  escrow's, is the proposed way out. Until then, a refused fee-bearing lock is
+  always reported to the seller, never answered as a silent no-op (§4 step 8).
 
 ### What Option 2 does *not* solve
 

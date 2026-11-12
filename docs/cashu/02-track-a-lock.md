@@ -141,7 +141,10 @@ to `release_action` (compute/verify first, persist second, notify last).
    retry. If the submitted token equals the stored one, **re-send the step-10
    notifications and return `Ok(())`** — no mint round-trip, no second write. A
    *different* token on an already-locked order ⇒ `CantDo(InvalidCashuToken)`
-   (a second funding the escrow can never honour). The exception is deliberately
+   (a second funding the escrow can never honour). The fee token must equal the
+   stored `cashu_fee_token` too (none on a fee-free order); a different one ⇒
+   `CantDo(InvalidCashuToken)`, because it is spendable by `P_M` alone and would
+   never be stored. The exception is deliberately
    scoped to `Active`: a locked order that has moved on (`FiatSent`, `Success`,
    …) falls through to the step-3 rejection, so a stale "escrow locked, send
    fiat" is never replayed onto an advanced trade. Only the seller trade key

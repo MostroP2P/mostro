@@ -341,7 +341,9 @@ whether this node charges a fee. Presence/amount of `fee_token` is therefore a
 **daemon-side, config-dependent** check (in `add_cashu_escrow_action`, §4A), not
 a protocol invariant. When `mostro.fee > 0` the handler rejects a `None` or
 mis-valued `fee_token` with `CantDo(CashuSignatureMissing)` /
-`InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid.
+`InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid and a `Some` ⇒
+`CantDo(InvalidCashuToken)`, checked before any mint round-trip: the fee-free
+path stores no fee token, so accepting one would strand it.
 
 **4 · Tests** (the Cashu test module in `src/message.rs`). Extend
 `sample_lock_proof()`/round-trip coverage with two cases: (a) a proof built via

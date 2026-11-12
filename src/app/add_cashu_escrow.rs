@@ -229,10 +229,15 @@ pub async fn add_cashu_escrow_action(
     //     notifications and stop — no mint round-trip, no second write, and the
     //     buyer finally gets its cue to send fiat. A *different* token on an
     //     already-locked order is a second funding attempt, which the escrow
-    //     can never honour, so it is rejected outright. Only the seller trade
-    //     key (checked in step 2) can reach this path.
+    //     can never honour, so it is rejected outright. The fee token must
+    //     match the stored one too (none on a fee-free order): a different one
+    //     is spendable by `P_M` alone and would never be stored, so the seller
+    //     must learn it was refused. Only the seller trade key (checked in
+    //     step 2) can reach this path.
     if replayable {
-        if order.cashu_escrow_token.as_deref() != Some(proof.token.as_str()) {
+        if order.cashu_escrow_token.as_deref() != Some(proof.token.as_str())
+            || stored_fee_token(pool, order.id).await? != proof.fee_token
+        {
             return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
         }
         tracing::info!(
@@ -241,6 +246,14 @@ pub async fn add_cashu_escrow_action(
         );
         notify_escrow_locked(order.id, buyer_pubkey, seller_pubkey, request_id).await;
         return Ok(());
+    }
+
+    // 4b. An order with no fee takes no fee token. The fee-free path stores
+    //     none, so a supplied token, spendable by `P_M` alone, would be dropped
+    //     while the seller hears the lock succeeded. Rejected before any mint
+    //     round-trip.
+    if fee_token_amount(&order).is_none() && proof.fee_token.is_some() {
+        return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
     }
 
     // 5. Bind the mint: the escrow goes on the mint the maker chose and the
@@ -448,6 +461,21 @@ fn fee_token_amount(order: &Order) -> Option<u64> {
     u64::try_from(order.fee.saturating_mul(2))
         .ok()
         .filter(|fee| *fee > 0)
+}
+
+/// The fee token stored with the order's lock. `Order` (mostro-core) does not
+/// carry the column, so the replay path reads it here.
+async fn stored_fee_token(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+) -> Result<Option<String>, MostroError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT cashu_fee_token FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(row.and_then(|(fee,)| fee))
 }
 
 #[cfg(test)]

@@ -757,27 +757,23 @@ async fn job_cancel_orders(ctx: AppContext) {
                         // `status ∈ {WaitingBuyerInvoice, WaitingPayment}`
                         // eligibility window — both `update_order_to_initial_state`
                         // (republish path) and `order_updated.update`
-                        // (cancel path) below are such mutations. A
-                        // transient `settle_hold_invoice` failure inside
-                        // `slash_one` leaves the bond `Locked`; with the
-                        // slash gated on persist success (the original
-                        // Phase 4 layout) that means the slash is dropped
-                        // entirely, because the order has already moved
-                        // out of the eligible set and the next tick never
-                        // re-picks it up. Running it here means a
-                        // transient LND hiccup just defers the cancel to
-                        // the next tick, at which point the slash is
-                        // idempotent (HTLC's "already settled" path
-                        // proceeds to a CAS no-op and returns `Ok(None)`,
-                        // so neither the bond nor the user are touched
-                        // twice). The notification fires immediately on
-                        // first success so a later persist failure
-                        // doesn't lose it — by next tick `slash_or_release_on_timeout`
-                        // sees no `Locked` bond and returns `Ok(None)`,
-                        // so the notice never duplicates either.
-                        // `order` is the pre-mutation snapshot — its
+                        // (cancel path) below are such mutations, and
+                        // `order` is the pre-mutation snapshot: its
                         // waiting status and trade pubkeys are intact,
                         // which the §3.1 buyer/seller → bond mapping needs.
+                        // The order does not wait for the bond's HTLC,
+                        // though. `slash_one` records the slash on the
+                        // bond row (`pending-settle`) before it asks LND
+                        // to settle, so a `settle_hold_invoice` failure
+                        // returns `Ok(None)` here and the cancel/republish
+                        // goes ahead: `job_retry_pending_bond_settles`
+                        // owns the settle from then on and notifies the
+                        // slashed user when it lands. The notification
+                        // fires immediately when the settle succeeds
+                        // inline, so a later persist failure doesn't lose
+                        // it — by next tick `slash_or_release_on_timeout`
+                        // sees no `Locked` bond and returns `Ok(None)`,
+                        // so the notice never duplicates either.
                         match bond::slash_or_release_on_timeout(
                             pool,
                             &mut ln_client,
@@ -791,11 +787,11 @@ async fn job_cancel_orders(ctx: AppContext) {
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                // `Err` from `slash_or_release_on_timeout` is a DB-read
-                                // failure (e.g. `find_active_bonds_for_order` /
-                                // `timeout_slash_confirmed` couldn't read the bond
-                                // rows), so we don't yet know whether the slash
-                                // applies. Falling through to cancel/republish
+                                // `Err` from `slash_or_release_on_timeout` is a DB
+                                // failure (e.g. `find_active_bonds_for_order`
+                                // couldn't read the bond rows, or the slash
+                                // couldn't be recorded on its row), so we don't
+                                // yet know whether the slash applies. Falling through to cancel/republish
                                 // would persist the order out of
                                 // `find_order_by_seconds`'s waiting-state
                                 // eligibility window, and the next tick would

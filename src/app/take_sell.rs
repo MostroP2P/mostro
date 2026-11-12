@@ -96,6 +96,12 @@ pub async fn take_sell_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
+    // The trade key differs on every order, so the check above misses the
+    // maker taking from another one: compare the identities too.
+    if order.master_seller_pubkey.as_deref() == Some(event.identity.to_string().as_str()) {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
     // Anti-abuse bond (Phase 1, concurrent-bonds model). The take
     // handler doesn't release prior bonds at retake-time anymore —
     // multiple `Requested` taker bonds coexist on the order and the

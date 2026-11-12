@@ -2942,6 +2942,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_slash_settle_failure_records_the_slash_for_retry() {
+        // The scheduler moves the order on after this call, so nothing
+        // reads its waiting status again: the slash a failed settle left
+        // undone must be recorded on the bond itself, or it is lost.
+        let pool = setup_pool().await;
+        let order = waiting_order(
+            Kind::Sell,
+            maker_pk(),
+            taker_pk(),
+            Status::WaitingBuyerInvoice,
+        );
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+
+        let cfg = timeout_cfg(true, true, BondApplyTo::Take);
+        let result = slash_or_release_on_timeout(&pool, &mut ln, &order, Some(&cfg))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "an unconfirmed slash must not be reported to the caller"
+        );
+        let row: (String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, slashed_reason, payout_recipient, slashed_at FROM bonds WHERE id = ?",
+        )
+        .bind(bond.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending-settle", "the slash must stay owed");
+        assert_eq!(row.1, Some(BondSlashReason::Timeout.to_string()));
+        assert_eq!(row.2.as_deref(), Some(maker_pk()));
+        assert_eq!(row.3, None, "the bond is not slashed until it settles");
+    }
+
+    #[tokio::test]
     async fn timeout_slash_confirmed_survives_concurrent_payout_progression() {
         // Regression: the payout scheduler runs concurrently (every 60s)
         // and can move a just-slashed `PendingPayout` row onward — e.g. a
@@ -4062,6 +4101,41 @@ mod tests {
             BondState::Locked.to_string(),
             "bond stays Locked for an admin retry"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_settle_failure_records_the_slash_for_retry() {
+        // The order leaves `Dispute` right after this call and the solver's
+        // directive is stored nowhere else: the slash a failed settle left
+        // undone must be recorded on the bond itself, or it is lost.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+        let res = BondResolution {
+            slash_seller: false,
+            slash_buyer: true,
+        };
+
+        let slashed =
+            apply_bond_resolution(&pool, &mut ln, &order, &res, BondSlashReason::LostDispute)
+                .await
+                .unwrap();
+
+        assert!(slashed.is_empty(), "unconfirmed slash yields no notice");
+        let row: (String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, slashed_reason, payout_recipient, slashed_at FROM bonds WHERE id = ?",
+        )
+        .bind(bond.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending-settle", "the slash must stay owed");
+        assert_eq!(row.1, Some(BondSlashReason::LostDispute.to_string()));
+        assert_eq!(row.2.as_deref(), Some(maker_pk()));
+        assert_eq!(row.3, None, "the bond is not slashed until it settles");
     }
 
     #[tokio::test]

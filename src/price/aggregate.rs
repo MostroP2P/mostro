@@ -38,7 +38,12 @@ pub struct AggregateResult {
 ///
 /// - `n == 0` → `None` (no usable value),
 /// - `n == 1` → that value,
-/// - `n == 2` → their mean,
+/// - `n == 2` → their mean, **only if** the two agree within `outlier_pct`
+///   percent of that mean; otherwise `None`. With two sources there is no
+///   median to tell which one is wrong, so a divergent pair is refused and
+///   the currency falls back to last-known-good (and, past the staleness
+///   window, refuses market pricing) rather than serving a value one
+///   corrupt source could move arbitrarily,
 /// - `n >= 3` → the median, then the mean of the values within
 ///   `outlier_pct` percent of that median; if nothing falls within the band
 ///   (a widely-spread even-length input, where the median is a synthetic
@@ -60,7 +65,13 @@ pub fn combine(xs: &[f64], outlier_pct: f64) -> Option<f64> {
 
     match clean.len() {
         1 => Some(clean[0]),
-        2 => Some(mean(&clean)),
+        2 => {
+            if pair_diverges(clean[0], clean[1], outlier_pct) {
+                None
+            } else {
+                Some(mean(&clean))
+            }
+        }
         _ => {
             let m = median_sorted(&clean);
             let tol = m * (outlier_pct / 100.0);
@@ -231,7 +242,9 @@ pub fn aggregate_tick(
 /// "contributing-source list"). The predicate mirrors [`combine`]:
 ///
 /// - clean: drop non-finite and non-positive,
-/// - `n <= 2`: every clean provider contributes,
+/// - `n == 1`: that provider contributes,
+/// - `n == 2`: both contribute if they agree within `outlier_pct` of their
+///   mean, none if they diverge (`combine` returns `None` then),
 /// - `n >= 3`: only providers whose value lies within
 ///   `outlier_pct` percent of the median contribute,
 /// - `n >= 3` with no value inside the outlier band (the
@@ -248,6 +261,9 @@ fn kept_contributors(pairs: &[(ProviderId, f64)], outlier_pct: f64) -> Vec<Provi
         .filter(|(_, x)| x.is_finite() && *x > 0.0)
         .collect();
     if clean.is_empty() {
+        return Vec::new();
+    }
+    if clean.len() == 2 && pair_diverges(clean[0].1, clean[1].1, outlier_pct) {
         return Vec::new();
     }
     if clean.len() <= 2 {
@@ -276,6 +292,14 @@ fn dedup_sort(mut ids: Vec<ProviderId>) -> Vec<ProviderId> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Whether two clean (finite, positive) candidates disagree by more than
+/// `outlier_pct` percent of their mean. Symmetric in its arguments, and
+/// inclusive at the boundary like the `n >= 3` band.
+pub(crate) fn pair_diverges(a: f64, b: f64, outlier_pct: f64) -> bool {
+    let m = (a + b) / 2.0;
+    (a - b).abs() > m * (outlier_pct / 100.0)
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -311,6 +335,28 @@ mod tests {
     fn combine_one_two_sources() {
         approx(combine(&[100.0], PCT).unwrap(), 100.0);
         approx(combine(&[100.0, 102.0], PCT).unwrap(), 101.0); // mean of 2
+    }
+
+    #[test]
+    fn combine_two_sources_diverged_is_none() {
+        // One source 10× off: no median to arbitrate → refuse, never 5×.
+        assert!(combine(&[100.0, 1000.0], PCT).is_none());
+        assert!(combine(&[1000.0, 100.0], PCT).is_none());
+        // A near-zero (but positive) glitch must not halve the price either.
+        assert!(combine(&[100.0, 1e-6], PCT).is_none());
+    }
+
+    #[test]
+    fn combine_two_sources_boundary_inclusive() {
+        // mean 100, tol 5 → a gap of exactly 5 is kept, just over is refused.
+        approx(combine(&[97.5, 102.5], PCT).unwrap(), 100.0);
+        assert!(combine(&[97.4, 102.6], PCT).is_none());
+    }
+
+    #[test]
+    fn combine_two_sources_ignores_unclean_third() {
+        // A NaN/zero third source does not unlock the n >= 3 path.
+        assert!(combine(&[100.0, 1000.0, f64::NAN, 0.0], PCT).is_none());
     }
 
     #[test]
@@ -523,6 +569,64 @@ mod tests {
             vec![ProviderId::Yadio, ProviderId::CurrencyApi],
             "n=2: both contributors keep their seat"
         );
+    }
+
+    #[test]
+    fn aggregate_tick_two_diverged_sources_drop_the_currency() {
+        // Audit #9: with exactly two live quotes for a currency, one source
+        // 10× off used to move the served price 5×. Now the currency is
+        // left out of the tick, so the store keeps last-known-good.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        yadio.insert("EUR".into(), Quote::PerBtc(46_000.0));
+        let mut coingecko = ProviderQuotes::new();
+        coingecko.insert("USD".into(), Quote::PerBtc(500_000.0));
+        coingecko.insert("EUR".into(), Quote::PerBtc(46_100.0));
+        let out = aggregate_tick(
+            &[
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+            ],
+            PCT,
+        );
+        assert!(
+            !out.contains_key("USD"),
+            "divergent pair must not be served"
+        );
+        approx(out["EUR"].value, 46_050.0);
+    }
+
+    #[test]
+    fn aggregate_tick_diverged_two_source_anchor_does_not_resolve_cross() {
+        // The USD anchor itself is a divergent pair → no anchor → the
+        // El Toque CUP cross cannot resolve on a corrupt anchor.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut coingecko = ProviderQuotes::new();
+        coingecko.insert("USD".into(), Quote::PerBtc(5_000.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let out = aggregate_tick(
+            &[
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+                (ProviderId::ElToque, eltoque),
+            ],
+            PCT,
+        );
+        assert!(out.is_empty(), "no trustworthy USD → neither USD nor CUP");
+    }
+
+    #[test]
+    fn kept_contributors_two_diverged_is_empty() {
+        let pairs = [(ProviderId::Yadio, 100.0), (ProviderId::CoinGecko, 1000.0)];
+        assert!(kept_contributors(&pairs, PCT).is_empty());
     }
 
     #[test]

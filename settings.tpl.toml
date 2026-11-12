@@ -228,7 +228,9 @@ lnd_resynced_clear_after = 300
 # update_interval_seconds = 300
 # max_price_staleness_seconds = 1800
 # # Discard a source whose value deviates more than this % from the median
-# # (only applies with >= 3 sources for a currency).
+# # (with >= 3 sources for a currency). With exactly 2 sources there is no
+# # median: if they differ by more than this % of their mean, the currency is
+# # refused and serves last-known-good until it goes stale.
 # outlier_threshold_pct = 5.0
 # # Per-provider request timeout and circuit-breaker (cooldown caps at 30 min).
 # provider_timeout_seconds = 10

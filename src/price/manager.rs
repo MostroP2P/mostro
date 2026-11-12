@@ -34,7 +34,7 @@ use mostro_core::error::{MostroError, ServiceError};
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use super::aggregate::{aggregate_tick, combine, AggregateResult};
+use super::aggregate::{aggregate_tick, combine, pair_diverges, AggregateResult};
 use super::config::{PriceSettings, ProviderConfig};
 use super::fiat::{is_known_fiat, is_known_pegged, known_pegged};
 use super::provider::{
@@ -324,6 +324,23 @@ impl PriceManager {
             restrict_nostr_to_fallback(filtered_with_ids, self.settings.outlier_threshold_pct);
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
+        // Audit #9: a currency with exactly two live quotes that disagree is
+        // refused by `combine` (no median to arbitrate). Say so — otherwise
+        // the operator only sees it later as a stale/refused currency.
+        for (currency, pair) in
+            diverged_two_source_currencies(&filtered_with_ids, self.settings.outlier_threshold_pct)
+        {
+            warn!(
+                "price: {} refused this tick — its two sources disagree by more than {}% \
+                 ({} = {}, {} = {}); serving last-known-good until the staleness window",
+                currency,
+                self.settings.outlier_threshold_pct,
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
         if aggregates.is_empty() {
             warn!("price: tick produced no fresh aggregates — keeping last-known-good");
             // Last-known-good is exactly what this path preserves, so report
@@ -814,6 +831,46 @@ fn restrict_nostr_to_fallback(
         .collect()
 }
 
+/// Currencies whose direct (`PerBtc`) candidates this tick are exactly two
+/// clean values that diverge beyond `outlier_pct` — the pairs
+/// [`combine`] refuses (audit #9). Used only to warn the operator; the
+/// refusal itself happens in `aggregate_tick`. Fiat-cross candidates are
+/// not counted here, so a currency that also has a resolved cross is
+/// reported only when that cross would not lift it to `n >= 3`; the
+/// warning may therefore miss a cross-only divergence, never invent one.
+fn diverged_two_source_currencies(
+    results: &[(ProviderId, ProviderQuotes)],
+    outlier_pct: f64,
+) -> Vec<(String, [(ProviderId, f64); 2])> {
+    let mut direct: HashMap<String, Vec<(ProviderId, f64)>> = HashMap::new();
+    let mut has_cross: HashSet<String> = HashSet::new();
+    for (id, quotes) in results {
+        for (currency, quote) in quotes {
+            let code = currency.to_uppercase();
+            match quote {
+                Quote::PerBtc(v) if v.is_finite() && *v > 0.0 => {
+                    direct.entry(code).or_default().push((*id, *v));
+                }
+                Quote::PerBase { .. } => {
+                    has_cross.insert(code);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<(String, [(ProviderId, f64); 2])> = direct
+        .into_iter()
+        .filter(|(code, pairs)| {
+            !has_cross.contains(code)
+                && pairs.len() == 2
+                && pair_diverges(pairs[0].1, pairs[1].1, outlier_pct)
+        })
+        .map(|(code, pairs)| (code, [pairs[0], pairs[1]]))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Currencies a non-Nostr provider can actually yield this tick: either a
 /// usable direct `PerBtc`, or a `PerBase` that resolves against the
 /// tick's anchors (anchors include Nostr `PerBtc` so local crosses can
@@ -832,6 +889,9 @@ fn currencies_covered_by_non_nostr(
             }
         }
     }
+    // A two-source anchor whose sources diverge yields no anchor here
+    // (`combine` returns `None`, audit #9), so a cross on it counts as
+    // uncovered and Nostr may fill the gap — its documented fallback role.
     let mut anchors: HashMap<String, f64> = HashMap::new();
     for (currency, values) in &direct {
         if let Some(v) = combine(values, outlier_pct) {
@@ -1776,6 +1836,46 @@ mod tests {
         assert_eq!(r.failures.len(), 1);
         // Store still serves the prior tick's value — no panic, no wipe.
         assert!((manager.get_price("USD").unwrap() - 50_000.0).abs() < 1e-6);
+    }
+
+    /// Audit #9: two sources, the second turns 10× wrong on tick two. The
+    /// currency must keep its first-tick value, not jump to the 5.5× mean.
+    #[tokio::test]
+    async fn two_diverged_sources_keep_last_known_good() {
+        let manager = manager_with_many(vec![
+            ScriptedProvider::new(
+                ProviderId::Yadio,
+                vec![Ok(usd_anchor(50_000.0)), Ok(usd_anchor(50_000.0))],
+            ),
+            ScriptedProvider::new(
+                ProviderId::CoinGecko,
+                vec![Ok(usd_anchor(50_200.0)), Ok(usd_anchor(500_000.0))],
+            ),
+        ]);
+        manager.update_all().await;
+        assert!((manager.get_price("USD").unwrap() - 50_100.0).abs() < 1e-6);
+        manager.update_all().await;
+        assert!(
+            (manager.get_price("USD").unwrap() - 50_100.0).abs() < 1e-6,
+            "a divergent pair must not overwrite last-known-good"
+        );
+    }
+
+    #[test]
+    fn diverged_two_source_currencies_lists_only_refused_pairs() {
+        let mut yadio = usd_anchor(50_000.0);
+        yadio.insert("EUR".into(), Quote::PerBtc(46_000.0));
+        let mut coingecko = usd_anchor(500_000.0);
+        coingecko.insert("EUR".into(), Quote::PerBtc(46_100.0));
+        let out = diverged_two_source_currencies(
+            &[
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+            ],
+            5.0,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "USD");
     }
 
     #[tokio::test]

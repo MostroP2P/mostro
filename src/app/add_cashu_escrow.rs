@@ -125,6 +125,15 @@ async fn classify_zero_row_cas(
     }
 }
 
+async fn classify_zero_row_fee_cas(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    token: &str,
+    _fee_token: &str,
+) -> Result<(), MostroError> {
+    classify_zero_row_cas(pool, order_id, token).await
+}
+
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
 ///
 /// On success the order advances `WaitingPayment → Active` in one atomic write
@@ -874,6 +883,64 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A fee-bearing lock that matched zero rows must not answer success
+    /// unless this very submission (escrow AND fee token) is what is stored:
+    /// the fee token is spendable only by `P_M`, so the seller has to learn
+    /// that it was not accepted.
+    #[tokio::test]
+    async fn fee_zero_row_cas_rejects_unless_this_submission_is_stored() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        // Duplicate delivery of the submission that won: a no-op.
+        let duplicate = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, duplicate.id, "cashuAdup", Status::Active).await;
+        sqlx::query("UPDATE orders SET cashu_fee_token = ?1 WHERE id = ?2")
+            .bind("cashuAfeedup")
+            .bind(duplicate.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            classify_zero_row_fee_cas(&pool, duplicate.id, "cashuAdup", "cashuAfeedup")
+                .await
+                .is_ok()
+        );
+
+        // Same escrow token stored with another fee token: ours was not kept.
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, duplicate.id, "cashuAdup", "cashuAfeeother").await,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+
+        // The order moved on unlocked (expired, canceled): the lock failed.
+        let moved = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+            .bind(Status::Expired.to_string())
+            .bind(moved.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, moved.id, "cashuAmoved", "cashuAfeemoved").await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+
+        // A vanished order is never reported as a success either.
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, uuid::Uuid::new_v4(), "cashuAgone", "cashuAfeegone")
+                .await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
     }
 
     /// The replay path is scoped to `Active`: a locked order whose trade has

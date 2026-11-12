@@ -834,27 +834,47 @@ fn restrict_nostr_to_fallback(
 /// Currencies whose direct (`PerBtc`) candidates this tick are exactly two
 /// clean values that diverge beyond `outlier_pct` — the pairs
 /// [`combine`] refuses (audit #9). Used only to warn the operator; the
-/// refusal itself happens in `aggregate_tick`. Fiat-cross candidates are
-/// not counted here, so a currency that also has a resolved cross is
-/// reported only when that cross would not lift it to `n >= 3`; the
-/// warning may therefore miss a cross-only divergence, never invent one.
+/// refusal itself happens in `aggregate_tick`. A currency that also has a
+/// fiat-cross which **resolves** this tick is skipped: the extra candidate
+/// changes `n`, and a refusal there involves a derived value, not two named
+/// sources. An unresolvable cross adds no candidate, so it does not hide
+/// the warning. The warning may therefore miss a cross-involved
+/// divergence, never invent one.
 fn diverged_two_source_currencies(
     results: &[(ProviderId, ProviderQuotes)],
     outlier_pct: f64,
 ) -> Vec<(String, [(ProviderId, f64); 2])> {
     let mut direct: HashMap<String, Vec<(ProviderId, f64)>> = HashMap::new();
-    let mut has_cross: HashSet<String> = HashSet::new();
     for (id, quotes) in results {
         for (currency, quote) in quotes {
-            let code = currency.to_uppercase();
-            match quote {
-                Quote::PerBtc(v) if v.is_finite() && *v > 0.0 => {
-                    direct.entry(code).or_default().push((*id, *v));
+            if let Quote::PerBtc(v) = quote {
+                if v.is_finite() && *v > 0.0 {
+                    direct
+                        .entry(currency.to_uppercase())
+                        .or_default()
+                        .push((*id, *v));
                 }
-                Quote::PerBase { .. } => {
-                    has_cross.insert(code);
+            }
+        }
+    }
+    // Same anchors `aggregate_tick` resolves crosses against.
+    let anchors: HashMap<&String, f64> = direct
+        .iter()
+        .filter_map(|(code, pairs)| {
+            let values: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
+            combine(&values, outlier_pct).map(|v| (code, v))
+        })
+        .collect();
+    let mut has_cross: HashSet<String> = HashSet::new();
+    for (_id, quotes) in results {
+        for (currency, quote) in quotes {
+            if let Quote::PerBase { base, value } = quote {
+                if let Some(anchor) = anchors.get(&base.to_uppercase()) {
+                    let candidate = value * anchor;
+                    if candidate.is_finite() && candidate > 0.0 {
+                        has_cross.insert(currency.to_uppercase());
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -873,27 +893,47 @@ fn diverged_two_source_currencies(
 
 /// Currencies a non-Nostr provider can actually yield this tick: either a
 /// usable direct `PerBtc`, or a `PerBase` that resolves against the
-/// tick's anchors (anchors include Nostr `PerBtc` so local crosses can
-/// still cover a currency when only the relayed USD is available).
+/// tick's anchors.
+///
+/// The anchors are the ones `aggregate_tick` will see **after** this
+/// filter: a currency with any non-Nostr direct quote is anchored on those
+/// alone (Nostr's direct quote for it is about to be dropped), and only a
+/// currency no local provider quotes directly falls back to Nostr's
+/// `PerBtc` — so a local cross can still cover a currency when only the
+/// relayed USD is available. Mixing Nostr into an anchor that it will not
+/// be part of used to be harmless, but since `combine` refuses a divergent
+/// pair (audit #9) a Yadio + Nostr USD that disagree would yield *no*
+/// anchor here, keep Nostr's CUP, and let it meet the local cross as a
+/// divergent pair — refusing a CUP the local sources could price
+/// (CodeRabbit on #1109). A divergent *local* pair still yields no anchor:
+/// that currency is refused in `aggregate_tick` too, so a cross on it
+/// counts as uncovered and Nostr may fill the gap.
 fn currencies_covered_by_non_nostr(
     results: &[(ProviderId, ProviderQuotes)],
     outlier_pct: f64,
 ) -> HashSet<String> {
-    let mut direct: HashMap<String, Vec<f64>> = HashMap::new();
-    for (_id, quotes) in results {
+    let mut local: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut relayed: HashMap<String, Vec<f64>> = HashMap::new();
+    for (id, quotes) in results {
         for (currency, quote) in quotes {
             if let Quote::PerBtc(v) = quote {
                 if v.is_finite() && *v > 0.0 {
-                    direct.entry(currency.to_uppercase()).or_default().push(*v);
+                    let bucket = if *id == ProviderId::Nostr {
+                        &mut relayed
+                    } else {
+                        &mut local
+                    };
+                    bucket.entry(currency.to_uppercase()).or_default().push(*v);
                 }
             }
         }
     }
-    // A two-source anchor whose sources diverge yields no anchor here
-    // (`combine` returns `None`, audit #9), so a cross on it counts as
-    // uncovered and Nostr may fill the gap — its documented fallback role.
     let mut anchors: HashMap<String, f64> = HashMap::new();
-    for (currency, values) in &direct {
+    for (currency, values) in local.iter().chain(
+        relayed
+            .iter()
+            .filter(|(currency, _)| !local.contains_key(*currency)),
+    ) {
         if let Some(v) = combine(values, outlier_pct) {
             anchors.insert(currency.clone(), v);
         }
@@ -2777,6 +2817,71 @@ mod tests {
             Some(&Quote::PerBtc(30_000_000.0)),
             "unresolvable El Toque PerBase must not suppress Nostr's PerBtc CUP"
         );
+    }
+
+    #[test]
+    fn a_divergent_nostr_usd_does_not_let_nostr_cup_compete_with_the_local_cross() {
+        // CodeRabbit on #1109. Yadio USD 50k and Nostr USD 60k diverge, but
+        // Nostr's USD is dropped anyway (Yadio covers USD), so aggregate_tick
+        // anchors El Toque on Yadio alone. Coverage must see that same
+        // anchor — otherwise Nostr's CUP survives the filter, meets the
+        // local cross as a divergent pair, and CUP is refused.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("USD".into(), Quote::PerBtc(50_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("USD".into(), Quote::PerBtc(60_000.0));
+        nostr.insert("CUP".into(), Quote::PerBtc(24_000_000.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let filtered = restrict_nostr_to_fallback(
+            vec![
+                (ProviderId::Yadio, yadio),
+                (ProviderId::Nostr, nostr),
+                (ProviderId::ElToque, eltoque),
+            ],
+            5.0,
+        );
+        let out = aggregate_tick(&filtered, 5.0);
+        assert!((out["USD"].value - 50_000.0).abs() < 1e-6);
+        assert!(
+            (out["CUP"].value - 20_000_000.0).abs() < 1e-6,
+            "CUP must come from the local cross on Yadio's USD"
+        );
+        assert_eq!(out["CUP"].contributors, vec![ProviderId::ElToque]);
+    }
+
+    #[test]
+    fn diverged_two_source_warning_ignores_an_unresolvable_cross() {
+        // CodeRabbit on #1109: a CUP/USD cross with no USD anchor adds no
+        // candidate, so it must not hide the warning for a refused CUP pair.
+        let mut yadio = ProviderQuotes::new();
+        yadio.insert("CUP".into(), Quote::PerBtc(20_000_000.0));
+        let mut nostr = ProviderQuotes::new();
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let out = diverged_two_source_currencies(
+            &[
+                (ProviderId::Yadio, yadio),
+                (ProviderId::Nostr, nostr),
+                (ProviderId::ElToque, eltoque),
+            ],
+            5.0,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "CUP");
     }
 
     #[test]

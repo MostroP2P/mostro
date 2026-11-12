@@ -32,7 +32,7 @@ pub use payout::{add_bond_invoice_action, run_bond_payout_cycle};
 pub use slash::{
     apply_bond_resolution, extract_bond_resolution, notify_bond_slashed,
     reconcile_stranded_range_maker_bonds, resolve_range_maker_bond_at_close,
-    resolve_range_maker_bond_at_close_or_warn, slash_or_release_on_timeout,
+    resolve_range_maker_bond_at_close_or_warn, retry_pending_settles, slash_or_release_on_timeout,
     validate_bond_resolution,
 };
 pub use types::{BondRole, BondSlashReason, BondState};

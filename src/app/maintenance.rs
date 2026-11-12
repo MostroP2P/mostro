@@ -417,13 +417,14 @@ pub async fn drain_counters(pool: &SqlitePool) -> Result<DrainCounters, MostroEr
             &[],
         )
         .await?,
-        // D is exactly `BondState::is_active()`; keep the two in sync.
+        // D is exactly `BondState::holds_htlc()`; keep the two in sync.
         open_bonds: count(
             pool,
-            "SELECT COUNT(*) FROM bonds WHERE hash IS NOT NULL AND state IN (?1, ?2)",
+            "SELECT COUNT(*) FROM bonds WHERE hash IS NOT NULL AND state IN (?1, ?2, ?3)",
             &[
                 BondState::Requested.to_string(),
                 BondState::Locked.to_string(),
+                BondState::PendingSettle.to_string(),
             ],
         )
         .await?,
@@ -856,20 +857,25 @@ mod tests {
         }
     }
 
-    /// Predicate D must stay the SQL twin of `BondState::is_active()`.
+    /// Predicate D must stay the SQL twin of `BondState::holds_htlc()`.
     #[test]
-    fn open_bond_predicate_matches_bond_state_is_active() {
-        let counted = [BondState::Requested, BondState::Locked];
+    fn open_bond_predicate_matches_bond_state_holds_htlc() {
+        let counted = [
+            BondState::Requested,
+            BondState::Locked,
+            BondState::PendingSettle,
+        ];
         for state in [
             BondState::Requested,
             BondState::Locked,
             BondState::Released,
+            BondState::PendingSettle,
             BondState::PendingPayout,
             BondState::Slashed,
             BondState::Forfeited,
             BondState::Failed,
         ] {
-            assert_eq!(counted.contains(&state), state.is_active(), "{state}");
+            assert_eq!(counted.contains(&state), state.holds_htlc(), "{state}");
         }
     }
 

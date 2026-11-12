@@ -70,6 +70,12 @@ pub enum BondState {
     Locked,
     /// Hold invoice was cancelled (not slashed). Terminal happy exit.
     Released,
+    /// A slash condition was hit and recorded, but the bond hold invoice is
+    /// **not settled yet**: the settle failed, or the daemon stopped before
+    /// it finished. The row carries the slash reason and the payout
+    /// recipient; the retry job settles the HTLC and moves the row to
+    /// `PendingPayout`, or to `Released` once LND no longer holds the HTLC.
+    PendingSettle,
     /// A slash condition was hit. The bond hold invoice has already been
     /// **settled** (claimed into Mostro's wallet at slash time by Phase 2);
     /// Phase 3 is asynchronously driving the recipient payout
@@ -115,9 +121,17 @@ impl BondState {
     /// True for states that still have an outstanding LND HTLC and are
     /// candidates for release / slash. Inverse of [`BondState::is_terminal`]
     /// minus `PendingPayout`, which is owned by the Phase 3 payout job
-    /// rather than the release flow.
+    /// rather than the release flow, and `PendingSettle`, which is owned by
+    /// the settle retry job: its HTLC is outstanding but already claimed by
+    /// a slash, so no release path may cancel it.
     pub fn is_active(self) -> bool {
         matches!(self, BondState::Requested | BondState::Locked)
+    }
+
+    /// True while LND may still hold an HTLC for the bond: the active
+    /// states plus `PendingSettle`.
+    pub fn holds_htlc(self) -> bool {
+        self.is_active() || self == BondState::PendingSettle
     }
 }
 
@@ -127,6 +141,7 @@ impl fmt::Display for BondState {
             BondState::Requested => "requested",
             BondState::Locked => "locked",
             BondState::Released => "released",
+            BondState::PendingSettle => "pending-settle",
             BondState::PendingPayout => "pending-payout",
             BondState::Slashed => "slashed",
             BondState::Forfeited => "forfeited",
@@ -144,6 +159,7 @@ impl FromStr for BondState {
             "requested" => Ok(BondState::Requested),
             "locked" => Ok(BondState::Locked),
             "released" => Ok(BondState::Released),
+            "pending-settle" => Ok(BondState::PendingSettle),
             "pending-payout" => Ok(BondState::PendingPayout),
             "slashed" => Ok(BondState::Slashed),
             "forfeited" => Ok(BondState::Forfeited),
@@ -222,6 +238,7 @@ mod tests {
             BondState::Requested,
             BondState::Locked,
             BondState::Released,
+            BondState::PendingSettle,
             BondState::PendingPayout,
             BondState::Slashed,
             BondState::Forfeited,
@@ -229,6 +246,18 @@ mod tests {
         ] {
             assert_eq!(BondState::from_str(&s.to_string()).unwrap(), s);
         }
+    }
+
+    /// A bond whose slash is recorded but not settled is out of reach of
+    /// the release paths (not active) and of the payout job (not terminal,
+    /// not `PendingPayout`), while its HTLC still counts as outstanding.
+    #[test]
+    fn pending_settle_is_neither_active_nor_terminal() {
+        let state = BondState::PendingSettle;
+        assert!(!state.is_active());
+        assert!(!state.is_terminal());
+        assert!(state.holds_htlc());
+        assert_eq!(state.to_string(), "pending-settle");
     }
 
     #[test]

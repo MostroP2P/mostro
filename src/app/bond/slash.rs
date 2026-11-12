@@ -42,6 +42,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 
 use chrono::Utc;
+use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use mostro_core::db::Crud;
 use mostro_core::error::{
     CantDoReason,
@@ -52,7 +53,7 @@ use mostro_core::message::{Action, BondResolution, Message, Payload};
 use mostro_core::order::{Kind, Order, SmallOrder, Status};
 use nostr_sdk::prelude::PublicKey;
 use sqlx::{Pool, Sqlite};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::db::{
@@ -1460,6 +1461,218 @@ pub async fn reconcile_stranded_range_maker_bonds(pool: &Pool<Sqlite>) {
     }
 }
 
+/// LND lookup the settle retry needs: where the bond hold invoice stands.
+/// A trait so tests can pass a stub instead of a live [`LndConnector`].
+pub trait BondInvoiceLookup {
+    /// See [`LndConnector::lookup_invoice_state`]: `None` when LND has no
+    /// record of the invoice.
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>>;
+}
+
+impl BondInvoiceLookup for LndConnector {
+    fn lookup_invoice_state<'a>(
+        &'a mut self,
+        hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>> {
+        Box::pin(async move { LndConnector::lookup_invoice_state(self, hash).await })
+    }
+}
+
+/// Finish a recorded slash whose HTLC is settled: CAS the row
+/// `PendingSettle → PendingPayout` and stamp `slashed_at`, the anchor of
+/// the payout claim window. Returns whether this call moved the row, so of
+/// two concurrent finishers exactly one sends the forfeiture notice.
+async fn complete_pending_settle(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    let result =
+        sqlx::query("UPDATE bonds SET state = ?, slashed_at = ? WHERE id = ? AND state = ?")
+            .bind(BondState::PendingPayout.to_string())
+            .bind(Utc::now().timestamp())
+            .bind(bond_id)
+            .bind(BondState::PendingSettle.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Give up a recorded slash whose HTLC LND no longer holds: CAS the row
+/// `PendingSettle → Released`. The bonded party already has the sats back,
+/// so the slash metadata is cleared and nothing is owed to the
+/// counterparty. Returns whether this call moved the row.
+async fn abandon_pending_settle(pool: &Pool<Sqlite>, bond_id: Uuid) -> Result<bool, MostroError> {
+    let result = sqlx::query(
+        "UPDATE bonds \
+           SET state = ?, released_at = ?, slashed_reason = NULL, node_share_sats = NULL, \
+               payout_recipient = NULL \
+         WHERE id = ? AND state = ?",
+    )
+    .bind(BondState::Released.to_string())
+    .bind(Utc::now().timestamp())
+    .bind(bond_id)
+    .bind(BondState::PendingSettle.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// What one retry of a `PendingSettle` bond came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingSettleOutcome {
+    /// The HTLC is settled and this call moved the row to `PendingPayout`.
+    Slashed,
+    /// LND no longer holds the HTLC; the row is `Released`.
+    Abandoned,
+    /// Nothing final yet (LND unreachable, settle failed again) or another
+    /// writer moved the row first: the next tick looks again.
+    Deferred,
+}
+
+/// Retry the settle of one `PendingSettle` bond.
+///
+/// LND's own view of the hold invoice decides, not the wording of a settle
+/// error: `Accepted` is still claimable and is settled, `Settled` only needs
+/// the row finished, and anything else means the HTLC is gone — LND cancels
+/// an accepted hold invoice by itself shortly before its CLTV expiry, and a
+/// settle can never succeed after that. That bounds the retries without a
+/// counter.
+async fn retry_pending_settle<L: SettleLightning + BondInvoiceLookup + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+    bond: &Bond,
+) -> Result<PendingSettleOutcome, MostroError> {
+    let Some(preimage) = bond.preimage.as_deref() else {
+        warn!(
+            bond_id = %bond.id,
+            order_id = %bond.order_id,
+            "settle retry: bond has no preimage; leaving PendingSettle for operator review"
+        );
+        return Ok(PendingSettleOutcome::Deferred);
+    };
+
+    // A bond without a hash has no invoice to look up (not a row the bond
+    // flow creates); the settle itself is then the only probe there is.
+    let state = match bond.hash.as_deref() {
+        Some(hash) => ln_client.lookup_invoice_state(hash).await?,
+        None => Some(InvoiceState::Accepted),
+    };
+    match state {
+        Some(InvoiceState::Settled) => {}
+        Some(InvoiceState::Accepted) => {
+            if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
+                if !is_already_settled_error(&e) {
+                    warn!(
+                        bond_id = %bond.id,
+                        order_id = %bond.order_id,
+                        "settle retry: settle_hold_invoice failed: {e}; next tick retries"
+                    );
+                    return Ok(PendingSettleOutcome::Deferred);
+                }
+            }
+        }
+        Some(InvoiceState::Open) | Some(InvoiceState::Canceled) | None => {
+            if !abandon_pending_settle(pool, bond.id).await? {
+                return Ok(PendingSettleOutcome::Deferred);
+            }
+            error!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                invoice_state = ?state,
+                "settle retry: LND no longer holds the bond HTLC; the slash is lost and the bond is released"
+            );
+            return Ok(PendingSettleOutcome::Abandoned);
+        }
+    }
+
+    if !complete_pending_settle(pool, bond.id).await? {
+        return Ok(PendingSettleOutcome::Deferred);
+    }
+    info!(
+        bond_id = %bond.id,
+        order_id = %bond.order_id,
+        "settle retry: bond HTLC settled and row transitioned to PendingPayout"
+    );
+    Ok(PendingSettleOutcome::Slashed)
+}
+
+/// Bonds whose slash is recorded but not settled, oldest first.
+async fn find_pending_settle_bonds(pool: &Pool<Sqlite>) -> Result<Vec<Bond>, MostroError> {
+    sqlx::query_as::<_, Bond>("SELECT * FROM bonds WHERE state = ? ORDER BY created_at ASC")
+        .bind(BondState::PendingSettle.to_string())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Settle retry (testable core): retry every `PendingSettle` bond once and
+/// return the ones this call slashed, each worth a `BondSlashed` notice. A
+/// per-bond failure is logged and the sweep moves on.
+pub(crate) async fn retry_pending_settles_with<L: SettleLightning + BondInvoiceLookup + Send>(
+    pool: &Pool<Sqlite>,
+    ln_client: &mut L,
+) -> Vec<Bond> {
+    let bonds = match find_pending_settle_bonds(pool).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("settle retry: scan for pending-settle bonds failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut slashed = Vec::new();
+    for bond in bonds {
+        match retry_pending_settle(pool, ln_client, &bond).await {
+            Ok(PendingSettleOutcome::Slashed) => slashed.push(bond),
+            Ok(PendingSettleOutcome::Abandoned | PendingSettleOutcome::Deferred) => {}
+            Err(e) => warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "settle retry: {e}; next tick retries"
+            ),
+        }
+    }
+    slashed
+}
+
+/// Settle retry (scheduler entry point): finish the slashes that were
+/// recorded but whose hold invoice is not settled yet, and tell each
+/// slashed party. Opens LND only when there is such a bond — the common
+/// case costs one indexed query.
+pub async fn retry_pending_settles(pool: &Pool<Sqlite>) {
+    match find_pending_settle_bonds(pool).await {
+        Ok(bonds) if bonds.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("settle retry: scan for pending-settle bonds failed: {e}");
+            return;
+        }
+    }
+    let mut ln = match LndConnector::new().await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("settle retry: cannot connect to LND to settle pending bonds: {e}");
+            return;
+        }
+    };
+    for bond in retry_pending_settles_with(pool, &mut ln).await {
+        match Order::by_id(pool, bond.order_id).await {
+            Ok(Some(order)) => notify_bond_slashed(&order, &bond).await,
+            Ok(None) => warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "settle retry: order not found; skipping BondSlashed notice"
+            ),
+            Err(e) => warn!(
+                bond_id = %bond.id,
+                order_id = %bond.order_id,
+                "settle retry: order lookup failed ({e}); skipping BondSlashed notice"
+            ),
+        }
+    }
+}
+
 /// Resolve a buyer/seller slash flag to the matching `Locked` bond row,
 /// if any. The mapping uses the §3.1 buyer-side → trade-pubkey lookup
 /// on the order, then filters bonds by `pubkey` and `state = Locked`.
@@ -1505,6 +1718,9 @@ mod tests {
         calls: Mutex<Vec<String>>,
         // When set, force every settle to return this canned error.
         fail_with: Mutex<Option<String>>,
+        // What `lookup_invoice_state` answers; `Accepted` when unset.
+        invoice_state: Mutex<Option<Result<Option<InvoiceState>, String>>>,
+        lookups: Mutex<Vec<String>>,
     }
 
     impl StubSettle {
@@ -1516,6 +1732,31 @@ mod tests {
         }
         fn fail_next_with(&self, msg: &str) {
             *self.fail_with.lock().unwrap() = Some(msg.to_string());
+        }
+        fn invoice_state_is(&self, state: Result<Option<InvoiceState>, &str>) {
+            *self.invoice_state.lock().unwrap() = Some(state.map_err(str::to_string));
+        }
+        fn lookups(&self) -> Vec<String> {
+            self.lookups.lock().unwrap().clone()
+        }
+    }
+
+    impl BondInvoiceLookup for Arc<StubSettle> {
+        fn lookup_invoice_state<'a>(
+            &'a mut self,
+            hash: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<InvoiceState>, MostroError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.lookups.lock().unwrap().push(hash.to_string());
+                match self.invoice_state.lock().unwrap().clone() {
+                    None => Ok(Some(InvoiceState::Accepted)),
+                    Some(Ok(state)) => Ok(state),
+                    Some(Err(msg)) => Err(MostroError::MostroInternalErr(
+                        ServiceError::LnNodeError(msg),
+                    )),
+                }
+            })
         }
     }
 
@@ -5180,5 +5421,218 @@ mod tests {
             .unwrap();
 
         reconcile_stranded_range_maker_bonds(&pool).await;
+    }
+
+    // ── Settle retry of recorded slashes ────────────────────────────────────
+
+    fn bond_hash() -> String {
+        "ab".repeat(32)
+    }
+
+    /// A bond whose slash was recorded but not settled: `PendingSettle`
+    /// with the slash reason, the payout recipient and the node share, and
+    /// a hold invoice hash for LND to be asked about.
+    async fn insert_pending_settle_bond(pool: &Pool<Sqlite>, order_id: Uuid) -> Bond {
+        let bond = insert_bond(pool, order_id, taker_pk(), BondState::Locked).await;
+        sqlx::query(
+            "UPDATE bonds SET state = ?, hash = ?, slashed_reason = ?, payout_recipient = ?, \
+             node_share_sats = 0 WHERE id = ?",
+        )
+        .bind(BondState::PendingSettle.to_string())
+        .bind(bond_hash())
+        .bind(BondSlashReason::LostDispute.to_string())
+        .bind(maker_pk())
+        .bind(bond.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        bond
+    }
+
+    /// `(state, slashed_reason, payout_recipient, slashed_at, released_at)`.
+    type SlashColumns = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    async fn read_slash_columns(pool: &Pool<Sqlite>, id: Uuid) -> SlashColumns {
+        sqlx::query_as(
+            "SELECT state, slashed_reason, payout_recipient, slashed_at, released_at \
+             FROM bonds WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settle_retry_settles_an_accepted_htlc() {
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_pending_settle_bond(&pool, order.id).await;
+        let mut ln = StubSettle::new();
+
+        let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+
+        assert_eq!(slashed.len(), 1, "the slashed bond is reported once");
+        assert_eq!(slashed[0].id, bond.id);
+        assert_eq!(ln.lookups(), vec![bond_hash()]);
+        assert_eq!(ln.calls(), vec![stub_preimage()]);
+        let row = read_slash_columns(&pool, bond.id).await;
+        assert_eq!(row.0, BondState::PendingPayout.to_string());
+        assert_eq!(row.1, Some(BondSlashReason::LostDispute.to_string()));
+        assert_eq!(row.2.as_deref(), Some(maker_pk()));
+        assert!(row.3.is_some(), "slashed_at anchors the claim window");
+
+        // A second tick finds nothing left to do.
+        assert!(retry_pending_settles_with(&pool, &mut ln).await.is_empty());
+        assert_eq!(ln.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settle_retry_finishes_an_already_settled_htlc_without_settling_again() {
+        // The settle landed but the row was never moved on (a crash, or a
+        // DB error right after it): only the row is left to finish.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_pending_settle_bond(&pool, order.id).await;
+        let mut ln = StubSettle::new();
+        ln.invoice_state_is(Ok(Some(InvoiceState::Settled)));
+
+        let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+
+        assert_eq!(slashed.len(), 1);
+        assert!(ln.calls().is_empty(), "a settled HTLC is not settled again");
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::PendingPayout.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_retry_releases_the_bond_when_lnd_canceled_the_invoice() {
+        // LND cancels an accepted hold invoice by itself before its CLTV
+        // expiry. The sats are back with the bonded party: nothing is owed
+        // to the counterparty and the retries end.
+        for gone in [Some(InvoiceState::Canceled), Some(InvoiceState::Open), None] {
+            let pool = setup_pool().await;
+            let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+            insert_order_row(&pool, &order).await;
+            let bond = insert_pending_settle_bond(&pool, order.id).await;
+            let mut ln = StubSettle::new();
+            ln.invoice_state_is(Ok(gone));
+
+            let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+
+            assert!(slashed.is_empty(), "{gone:?}: no slash, no notice");
+            assert!(ln.calls().is_empty(), "{gone:?}: nothing to settle");
+            let row = read_slash_columns(&pool, bond.id).await;
+            assert_eq!(row.0, BondState::Released.to_string(), "{gone:?}");
+            assert_eq!(row.1, None, "{gone:?}: slash reason cleared");
+            assert_eq!(row.2, None, "{gone:?}: payout recipient cleared");
+            assert_eq!(row.3, None, "{gone:?}: never slashed");
+            assert!(row.4.is_some(), "{gone:?}: released_at stamped");
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_retry_waits_when_lnd_cannot_be_asked() {
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_pending_settle_bond(&pool, order.id).await;
+        let mut ln = StubSettle::new();
+        ln.invoice_state_is(Err("code=Unavailable: connection refused"));
+
+        let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+
+        assert!(slashed.is_empty());
+        assert!(ln.calls().is_empty(), "no settle without knowing the state");
+        let row = read_slash_columns(&pool, bond.id).await;
+        assert_eq!(row.0, BondState::PendingSettle.to_string());
+        assert_eq!(row.1, Some(BondSlashReason::LostDispute.to_string()));
+    }
+
+    #[tokio::test]
+    async fn settle_retry_keeps_trying_after_a_failed_settle() {
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_pending_settle_bond(&pool, order.id).await;
+        let mut ln = StubSettle::new();
+        ln.fail_next_with("code=Unavailable: connection refused");
+
+        assert!(retry_pending_settles_with(&pool, &mut ln).await.is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::PendingSettle.to_string(),
+            "a failed settle leaves the slash owed"
+        );
+
+        // The next tick settles it.
+        let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+        assert_eq!(slashed.len(), 1);
+        assert_eq!(ln.calls().len(), 2);
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::PendingPayout.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_retry_leaves_the_other_bonds_of_the_order_alone() {
+        // A republished order: the taker who walked away has a slash still
+        // to settle, and the next taker's bond is locked on the same order.
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let owed = insert_pending_settle_bond(&pool, order.id).await;
+        let next_taker = "3333333333333333333333333333333333333333333333333333333333333333";
+        let locked = insert_bond(&pool, order.id, next_taker, BondState::Locked).await;
+        let released = insert_bond(&pool, order.id, taker_pk(), BondState::Released).await;
+        let mut ln = StubSettle::new();
+
+        let slashed = retry_pending_settles_with(&pool, &mut ln).await;
+
+        assert_eq!(slashed.len(), 1);
+        assert_eq!(slashed[0].id, owed.id);
+        assert_eq!(ln.calls().len(), 1, "only the owed slash is settled");
+        assert_eq!(
+            read_bond_state(&pool, locked.id).await,
+            BondState::Locked.to_string()
+        );
+        assert_eq!(
+            read_bond_state(&pool, released.id).await,
+            BondState::Released.to_string()
+        );
+        // The owed slash is no longer an active bond of the order, so it
+        // does not stand in the way of the next taker.
+        let active = find_active_bonds_for_order(&pool, order.id).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, locked.id);
+    }
+
+    #[tokio::test]
+    async fn settle_retry_without_owed_slashes_never_asks_lnd() {
+        let pool = setup_pool().await;
+        let order = fixture_order(Kind::Sell, maker_pk(), taker_pk());
+        insert_order_row(&pool, &order).await;
+        let bond = insert_bond(&pool, order.id, taker_pk(), BondState::Locked).await;
+        let mut ln = StubSettle::new();
+
+        assert!(retry_pending_settles_with(&pool, &mut ln).await.is_empty());
+
+        assert!(ln.lookups().is_empty());
+        assert!(ln.calls().is_empty());
+        assert_eq!(
+            read_bond_state(&pool, bond.id).await,
+            BondState::Locked.to_string()
+        );
     }
 }

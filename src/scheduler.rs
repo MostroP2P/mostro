@@ -53,6 +53,7 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
         job_reconcile_stranded_taker_bonds(ctx.clone()).await;
+        job_retry_pending_bond_settles(ctx.clone()).await;
         job_expire_unpaid_maker_bonds(ctx.clone()).await;
     }
 
@@ -1645,6 +1646,25 @@ async fn job_reconcile_stranded_maker_bonds(ctx: AppContext) {
         let pool = ctx.pool();
         loop {
             bond::reconcile_stranded_range_maker_bonds(pool).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Finish the bond slashes that were recorded but not settled: a slash
+/// moves its bond to `pending-settle` before asking LND to settle the hold
+/// invoice, and the order goes on whether or not that settle succeeds. This
+/// job retries the settle until it lands or LND no longer holds the HTLC,
+/// which LND itself bounds by canceling the invoice shortly before its CLTV
+/// expiry. Not gated on the bond feature being enabled: a bond left over
+/// from an enabled period must still be resolved. Runs every minute.
+async fn job_retry_pending_bond_settles(ctx: AppContext) {
+    let interval = 60u64;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            bond::retry_pending_settles(pool).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
     });

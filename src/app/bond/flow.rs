@@ -4027,6 +4027,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_callback_leaves_a_pending_settle_bond_to_the_retry_job() {
+        // LND canceled the hold invoice of a bond whose slash was recorded
+        // but never settled. The settle retry owns that row: it is the one
+        // that clears the slash metadata and reports the lost slash, so the
+        // callback must not release the bond under it.
+        let pool = setup_pool().await;
+        let order_id = Uuid::new_v4();
+        insert_order(&pool, order_id).await;
+        let mut b = make_bond(order_id, BondState::PendingSettle);
+        b.hash = Some("a".repeat(64));
+        b.slashed_reason = Some("timeout".to_string());
+        create_bond(&pool, b).await.unwrap();
+
+        on_bond_invoice_canceled(&"a".repeat(64), &pool)
+            .await
+            .expect("a pending-settle bond is a no-op");
+
+        let after = find_bond_by_hash(&pool, &"a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, BondState::PendingSettle.to_string());
+        assert_eq!(after.released_at, None);
+    }
+
+    #[tokio::test]
     async fn canceled_callback_expires_unpublished_maker_order() {
         // #942: LND cancels the unpaid maker bond invoice. The order was
         // never published, so it must end with the bond instead of sitting

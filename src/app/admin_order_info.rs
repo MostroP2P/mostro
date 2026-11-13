@@ -29,6 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::warn;
 use uuid::Uuid;
@@ -80,6 +81,17 @@ impl OrderInfoLightning for LndConnector {
 ///
 /// `ln_client` is `None` in Cashu mode, where there is no Lightning node.
 ///
+/// # What runs where
+///
+/// The permission check and the database reads run here, in the event loop:
+/// they are quick, and they decide every `cant-do`. The Lightning lookups do
+/// not. The loop has a single consumer and drops a message that waited more
+/// than 10 seconds for its turn, and a Lightning node that is slow to answer
+/// is exactly when a solver asks about stuck orders. So when the order has a
+/// hash to ask about, the lookups and the reply go to a task of their own,
+/// with a clone of the connector, and this function returns at once. An
+/// order with nothing to ask is answered inline.
+///
 /// # Errors
 ///
 /// - `CantDo(InvalidPubkey)`: the caller is neither the admin nor a solver.
@@ -97,13 +109,17 @@ pub async fn admin_order_info_action<L>(
     ln_client: Option<&mut L>,
 ) -> Result<(), MostroError>
 where
-    L: OrderInfoLightning + Send,
+    L: OrderInfoLightning + Clone + Send + 'static,
 {
-    answer_order_info(ctx, msg, event, my_keys, ln_client, LND_LOOKUP_TIMEOUT).await
+    answer_order_info(ctx, msg, event, my_keys, ln_client, LND_LOOKUP_TIMEOUT)
+        .await
+        .map(|_| ())
 }
 
 /// [`admin_order_info_action`] with the bound on each Lightning lookup as a
-/// parameter, so a test does not wait the real one.
+/// parameter, so a test does not wait the real one. Returns the task that
+/// asks the Lightning node and sends the reply, when there is one; `None`
+/// when the reply was queued before returning.
 async fn answer_order_info<L>(
     ctx: &AppContext,
     msg: Message,
@@ -111,9 +127,9 @@ async fn answer_order_info<L>(
     my_keys: &Keys,
     ln_client: Option<&mut L>,
     lookup_timeout: Duration,
-) -> Result<(), MostroError>
+) -> Result<Option<JoinHandle<()>>, MostroError>
 where
-    L: OrderInfoLightning + Send,
+    L: OrderInfoLightning + Clone + Send + 'static,
 {
     let pool = ctx.pool();
     let kind = msg.get_inner_message_kind();
@@ -122,21 +138,36 @@ where
         return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
     let order_id = kind.id.ok_or(MostroCantDo(CantDoReason::NotFound))?;
-
-    let info = build_order_info(pool, order_id, ln_client, lookup_timeout).await?;
+    let stored = StoredOrder::read(pool, order_id).await?;
 
     // To the trade key that sent the request, where its `cant-do` would go.
-    enqueue_order_msg(
-        kind.request_id,
-        Some(order_id),
-        Action::AdminOrderInfo,
-        Some(Payload::OrderInfo(info)),
-        event.sender,
-        None,
-    )
-    .await;
+    let (request_id, sender) = (kind.request_id, event.sender);
+    let reply = move |info: OrderInfo| {
+        enqueue_order_msg(
+            request_id,
+            Some(order_id),
+            Action::AdminOrderInfo,
+            Some(Payload::OrderInfo(info)),
+            sender,
+            None,
+        )
+    };
 
-    Ok(())
+    // A clone of the connector, as the buyer payout takes: the event loop
+    // keeps its own, and the task may outlive this dispatch.
+    match ln_client.filter(|_| stored.has_lightning_part()) {
+        Some(ln_client) => {
+            let mut ln_client = ln_client.clone();
+            Ok(Some(tokio::spawn(async move {
+                let info = stored.complete(Some(&mut ln_client), lookup_timeout).await;
+                reply(info).await;
+            })))
+        }
+        None => {
+            reply(stored.complete(None::<&mut L>, lookup_timeout).await).await;
+            Ok(None)
+        }
+    }
 }
 
 /// The Mostro admin key, or a registered solver with any permission level.
@@ -153,8 +184,9 @@ async fn may_ask(
 
 /// Builds the snapshot of one order, without sending anything.
 ///
-/// The database is read first and in full; the Lightning node is asked
-/// after, and only about what the row holds a hash for:
+/// The database is read first and in full ([`StoredOrder::read`]); the
+/// Lightning node is asked after ([`StoredOrder::complete`]), and only about
+/// what the row holds a hash for:
 ///
 /// - the hold invoice, if the order has a `hash`;
 /// - the payment to the buyer, if it has a `payout_payment_hash`.
@@ -169,79 +201,125 @@ async fn may_ask(
 pub async fn build_order_info<L>(
     pool: &Pool<Sqlite>,
     order_id: Uuid,
-    mut ln_client: Option<&mut L>,
+    ln_client: Option<&mut L>,
     lookup_timeout: Duration,
 ) -> Result<OrderInfo, MostroError>
 where
     L: OrderInfoLightning + Send,
 {
-    let order = Order::by_id(pool, order_id)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        .ok_or(MostroCantDo(CantDoReason::NotFound))?;
-    let (payout_payment_hash, hold_settled_at) =
-        find_order_payout_marker_and_settle_time(pool, order_id)
+    let stored = StoredOrder::read(pool, order_id).await?;
+    Ok(stored.complete(ln_client, lookup_timeout).await)
+}
+
+/// Everything the database holds for a snapshot: the half that is always
+/// answered, read in one go before the Lightning node is asked anything.
+struct StoredOrder {
+    order: Order,
+    payout_payment_hash: Option<String>,
+    hold_settled_at: Option<i64>,
+    bonds: Vec<BondInfo>,
+}
+
+impl StoredOrder {
+    /// Reads the order, the two columns core's `Order` does not carry and
+    /// the bond rows. `CantDo(NotFound)` when no order has that id.
+    async fn read(pool: &Pool<Sqlite>, order_id: Uuid) -> Result<Self, MostroError> {
+        let order = Order::by_id(pool, order_id)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+            .ok_or(MostroCantDo(CantDoReason::NotFound))?;
+        let (payout_payment_hash, hold_settled_at) =
+            find_order_payout_marker_and_settle_time(pool, order_id)
+                .await?
+                .unwrap_or_default();
+        let bonds = find_bonds_for_order_info(pool, &order)
             .await?
-            .unwrap_or_default();
-    let bonds = find_bonds_for_order_info(pool, &order)
-        .await?
-        .iter()
-        .map(|bond| bond_info(bond, order_id))
-        .collect();
+            .iter()
+            .map(|bond| bond_info(bond, order_id))
+            .collect();
+        Ok(Self {
+            order,
+            payout_payment_hash,
+            hold_settled_at,
+            bonds,
+        })
+    }
 
-    let hold_invoice = match stored(order.hash.as_deref()) {
-        Some(hash) => Some(HoldInvoiceInfo {
-            state: hold_invoice_state(ln_client.as_deref_mut(), hash, lookup_timeout).await,
-            held_at: set_timestamp(order.invoice_held_at),
-        }),
-        None => None,
-    };
-    // At most one escrow part: a Cashu order has no hold invoice hash.
-    let cashu_escrow = match (&hold_invoice, stored(order.cashu_mint_url.as_deref())) {
-        (None, Some(mint_url)) => Some(CashuEscrowInfo {
-            mint_url: mint_url.to_string(),
-            locked_at: order.cashu_escrow_locked_at,
-        }),
-        _ => None,
-    };
-    let payout = match stored(payout_payment_hash.as_deref()) {
-        Some(hash) => Some(payout_info(ln_client, hash, lookup_timeout).await),
-        None => None,
-    };
+    fn hold_invoice_hash(&self) -> Option<&str> {
+        stored(self.order.hash.as_deref())
+    }
 
-    // Every field is named, with no `..Default::default()`: a field added to
-    // `OrderInfo` must be decided here, not silently left empty.
-    Ok(OrderInfo {
-        id: order.id,
-        kind: order.kind,
-        status: order.status,
-        amount: order.amount,
-        fee: order.fee,
-        routing_fee: order.routing_fee,
-        fiat_code: order.fiat_code,
-        fiat_amount: order.fiat_amount,
-        min_amount: order.min_amount,
-        max_amount: order.max_amount,
-        payment_method: order.payment_method,
-        premium: order.premium,
-        range_parent_id: order.range_parent_id,
-        created_at: order.created_at,
-        taken_at: set_timestamp(order.taken_at),
-        expires_at: order.expires_at,
-        buyer_trade_pubkey: order.buyer_pubkey,
-        seller_trade_pubkey: order.seller_pubkey,
-        buyer_dispute: order.buyer_dispute,
-        seller_dispute: order.seller_dispute,
-        buyer_cooperativecancel: order.buyer_cooperativecancel,
-        seller_cooperativecancel: order.seller_cooperativecancel,
-        failed_payment: order.failed_payment,
-        payment_attempts: order.payment_attempts,
-        hold_settled_at: hold_settled_at.and_then(set_timestamp),
-        hold_invoice,
-        cashu_escrow,
-        payout,
-        bonds,
-    })
+    fn payout_hash(&self) -> Option<&str> {
+        stored(self.payout_payment_hash.as_deref())
+    }
+
+    /// Does the row hold a hash the Lightning node can be asked about?
+    fn has_lightning_part(&self) -> bool {
+        self.hold_invoice_hash().is_some() || self.payout_hash().is_some()
+    }
+
+    /// The snapshot, asking `ln_client` about each stored hash. Never
+    /// fails: a lookup that cannot be made is a state of its part. Without a
+    /// client a stored hash is `unavailable`.
+    async fn complete<L>(self, mut ln_client: Option<&mut L>, lookup_timeout: Duration) -> OrderInfo
+    where
+        L: OrderInfoLightning + Send,
+    {
+        let hold_invoice = match self.hold_invoice_hash() {
+            Some(hash) => Some(HoldInvoiceInfo {
+                state: hold_invoice_state(ln_client.as_deref_mut(), hash, lookup_timeout).await,
+                held_at: set_timestamp(self.order.invoice_held_at),
+            }),
+            None => None,
+        };
+        // At most one escrow part: a Cashu order has no hold invoice hash.
+        let cashu_escrow = match (&hold_invoice, stored(self.order.cashu_mint_url.as_deref())) {
+            (None, Some(mint_url)) => Some(CashuEscrowInfo {
+                mint_url: mint_url.to_string(),
+                locked_at: self.order.cashu_escrow_locked_at,
+            }),
+            _ => None,
+        };
+        let payout = match self.payout_hash() {
+            Some(hash) => Some(payout_info(ln_client, hash, lookup_timeout).await),
+            None => None,
+        };
+
+        let order = self.order;
+        // Every field is named, with no `..Default::default()`: a field added
+        // to `OrderInfo` must be decided here, not silently left empty.
+        OrderInfo {
+            id: order.id,
+            kind: order.kind,
+            status: order.status,
+            amount: order.amount,
+            fee: order.fee,
+            routing_fee: order.routing_fee,
+            fiat_code: order.fiat_code,
+            fiat_amount: order.fiat_amount,
+            min_amount: order.min_amount,
+            max_amount: order.max_amount,
+            payment_method: order.payment_method,
+            premium: order.premium,
+            range_parent_id: order.range_parent_id,
+            created_at: order.created_at,
+            taken_at: set_timestamp(order.taken_at),
+            expires_at: order.expires_at,
+            buyer_trade_pubkey: order.buyer_pubkey,
+            seller_trade_pubkey: order.seller_pubkey,
+            buyer_dispute: order.buyer_dispute,
+            seller_dispute: order.seller_dispute,
+            buyer_cooperativecancel: order.buyer_cooperativecancel,
+            seller_cooperativecancel: order.seller_cooperativecancel,
+            failed_payment: order.failed_payment,
+            payment_attempts: order.payment_attempts,
+            hold_settled_at: self.hold_settled_at.and_then(set_timestamp),
+            hold_invoice,
+            cashu_escrow,
+            payout,
+            bonds: self.bonds,
+        }
+    }
 }
 
 /// A stored text column that actually holds something.
@@ -450,6 +528,9 @@ mod tests {
     }
 
     /// A Lightning node that answers as told and records what it was asked.
+    /// A clone keeps the script and its own record, like the connector the
+    /// handler clones for its task.
+    #[derive(Clone)]
     struct StubLn {
         invoice: Answer<InvoiceState>,
         payment: Answer<PaymentLookup>,
@@ -611,6 +692,33 @@ mod tests {
         )
         .await;
         (result, replies_for(&sender).await)
+    }
+
+    /// Runs the handler with `ln`, waits for its Lightning task if it
+    /// started one, and returns the replies queued for the caller.
+    async fn answered(
+        ctx: &AppContext,
+        mostro: &Keys,
+        order_id: Uuid,
+        ln: &mut StubLn,
+        lookup_timeout: Duration,
+    ) -> Vec<Message> {
+        let sender = Keys::generate().public_key();
+        let event = event_from(sender, mostro.public_key());
+        let task = answer_order_info(
+            ctx,
+            request(Some(order_id)),
+            &event,
+            mostro,
+            Some(ln),
+            lookup_timeout,
+        )
+        .await
+        .unwrap();
+        if let Some(task) = task {
+            task.await.unwrap();
+        }
+        replies_for(&sender).await
     }
 
     async fn register_solver(pool: &SqlitePool, category: i64) -> PublicKey {
@@ -907,22 +1015,21 @@ mod tests {
         let ctx = setup_ctx().await;
         let mostro = Keys::generate();
         let order = order_with_hold_invoice(&ctx).await;
-        let sender = Keys::generate().public_key();
-        let event = event_from(sender, mostro.public_key());
         let mut ln = StubLn::new(Answer::Hangs, Answer::Hangs);
 
-        let result = answer_order_info(
-            &ctx,
-            request(Some(order.id)),
-            &event,
-            &mostro,
-            Some(&mut ln),
-            TEST_TIMEOUT,
-        )
-        .await;
+        let replies = answered(&ctx, &mostro, order.id, &mut ln, TEST_TIMEOUT).await;
 
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(replies_for(&sender).await.len(), 1);
+        assert_eq!(replies.len(), 1);
+        match &replies[0].get_inner_message_kind().payload {
+            Some(Payload::OrderInfo(info)) => {
+                assert_eq!(
+                    info.hold_invoice.as_ref().map(|hold| hold.state),
+                    Some(HoldInvoiceState::Unavailable)
+                );
+                assert_eq!(info.status, "active");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     /// The event loop has one consumer and drops a message that waited more
@@ -953,10 +1060,113 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(returned, Ok(Ok(_))),
-            "the handler waited for the Lightning node"
+        let Ok(Ok(task)) = returned else {
+            panic!("the handler waited for the Lightning node");
+        };
+        // The lookups are still waiting, in a task of their own: no reply
+        // yet, and the caller's turn in the loop is over.
+        let task = task.expect("an order with hashes is answered from a task");
+        assert!(!task.is_finished());
+        assert!(replies_for(&sender).await.is_empty());
+        task.abort();
+    }
+
+    /// The permission check and the order lookup stay in the event loop, so
+    /// a refusal is still the handler's own error, answered as a `cant-do`
+    /// by the dispatch, and no task is started for it.
+    #[tokio::test]
+    async fn a_refusal_is_decided_before_any_task_is_started() {
+        let ctx = setup_ctx().await;
+        let mostro = Keys::generate();
+        let order = order_with_hold_invoice(&ctx).await;
+        let mut ln = StubLn::new(Answer::Hangs, Answer::Hangs);
+
+        let stranger = event_from(Keys::generate().public_key(), Keys::generate().public_key());
+        let refused = answer_order_info(
+            &ctx,
+            request(Some(order.id)),
+            &stranger,
+            &mostro,
+            Some(&mut ln),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+
+        let admin = event_from(Keys::generate().public_key(), mostro.public_key());
+        let missing = answer_order_info(
+            &ctx,
+            request(Some(Uuid::new_v4())),
+            &admin,
+            &mostro,
+            Some(&mut ln),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(matches!(missing, Err(MostroCantDo(CantDoReason::NotFound))));
+    }
+
+    /// An order with no hash has nothing to ask the node: its reply is
+    /// queued before the handler returns, with no task.
+    #[tokio::test]
+    async fn an_order_with_nothing_to_ask_is_answered_inline() {
+        let ctx = setup_ctx().await;
+        let mostro = Keys::generate();
+        let order = insert(ctx.pool(), base_order()).await;
+        let sender = Keys::generate().public_key();
+        let event = event_from(sender, mostro.public_key());
+
+        let task = answer_order_info(
+            &ctx,
+            request(Some(order.id)),
+            &event,
+            &mostro,
+            Some(&mut StubLn::new(Answer::Hangs, Answer::Hangs)),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert!(task.is_none());
+        assert_eq!(replies_for(&sender).await.len(), 1);
+    }
+
+    /// The task asks the node what the inline path would have asked, and
+    /// its reply is the same snapshot `build_order_info` gives.
+    #[tokio::test]
+    async fn the_task_sends_the_same_snapshot() {
+        let ctx = setup_ctx().await;
+        let mostro = Keys::generate();
+        let order = order_with_hold_invoice(&ctx).await;
+        set_payout_columns(ctx.pool(), order.id, Some(&"b2".repeat(32)), None).await;
+        let found = lookup(
+            PaymentStatus::InFlight,
+            PaymentFailureReason::FailureReasonNone,
         );
+        let mut ln = StubLn::new(Answer::Found(InvoiceState::Accepted), Answer::Found(found));
+
+        let replies = answered(&ctx, &mostro, order.id, &mut ln, TEST_TIMEOUT).await;
+
+        let expected = snapshot(&ctx, order.id, &mut ln.clone()).await;
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].verify());
+        match &replies[0].get_inner_message_kind().payload {
+            Some(Payload::OrderInfo(info)) => {
+                assert_eq!(info, &expected);
+                assert_eq!(
+                    info.hold_invoice.as_ref().map(|hold| hold.state),
+                    Some(HoldInvoiceState::Accepted)
+                );
+                assert_eq!(
+                    info.payout.as_ref().map(|payout| payout.state),
+                    Some(PayoutState::InFlight)
+                );
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     // --- The payout ------------------------------------------------------
@@ -1226,15 +1436,17 @@ mod tests {
                 PaymentFailureReason::FailureReasonNoRoute,
             )),
         );
-        admin_order_info_action(
+        let task = answer_order_info(
             &ctx,
             request(Some(order.id)),
             &event,
             &mostro,
             Some(&mut ln),
+            TEST_TIMEOUT,
         )
         .await
         .unwrap();
+        task.expect("the order has hashes").await.unwrap();
 
         let replies = replies_for(&sender).await;
         assert_eq!(replies.len(), 1);

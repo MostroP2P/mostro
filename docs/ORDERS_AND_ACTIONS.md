@@ -73,7 +73,7 @@ Database and Lightning values are reported side by side and never merged, so a s
 | The node has no record of the hash | `not-found` |
 | The node could not be asked (error, or no answer in 2 s) | `unavailable` |
 
-The database part is always answered: a node that is down or slow costs only its own part of the reply. `unknown`, in any enum of the payload, is a different thing: a value the client's build of `mostro-core` does not know.
+The database part is always answered: a node that is down or slow costs only its own part of the reply. The lookups do not run in the event loop: the permission check and the database reads do, and decide every `cant-do`; when the order has a hash to ask about, the lookups and the reply go to a task of their own, so a Lightning node that is slow to answer never makes other users' messages wait (a message that waits more than 10 seconds for its turn is dropped as stale). `unknown`, in any enum of the payload, is a different thing: a value the client's build of `mostro-core` does not know.
 
 `payout_payment_hash` marks a payout in flight and is cleared when the payout succeeds or fails. After a failure the payout part is therefore `null`, and `failed_payment` and `payment_attempts` tell what happened.
 

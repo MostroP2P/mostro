@@ -2354,7 +2354,9 @@ mod tests {
         }
 
         /// With the node down, the admin still gets the answer: the hold
-        /// invoice is `unavailable` and the database part is there.
+        /// invoice is `unavailable` and the database part is there. The
+        /// lookup and the reply run in a task of their own, off the event
+        /// loop, so the dispatch returns first and the reply follows.
         #[tokio::test]
         async fn the_admin_is_answered_with_the_lightning_node_down() {
             let ctx = create_migrated_ctx().await;
@@ -2374,7 +2376,14 @@ mod tests {
             .await;
 
             assert!(result.is_ok(), "{result:?}");
-            let snapshots = snapshots_for(&event.sender).await;
+            let mut snapshots = Vec::new();
+            for _ in 0..100 {
+                snapshots = snapshots_for(&event.sender).await;
+                if !snapshots.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             assert_eq!(snapshots.len(), 1);
             assert_eq!(snapshots[0].id, order.id);
             assert_eq!(snapshots[0].status, "active");

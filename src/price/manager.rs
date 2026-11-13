@@ -320,8 +320,17 @@ impl PriceManager {
         // direct sources would double-count correlated information and skew
         // the result. Keep it strictly fallback — only for currencies no
         // other provider covered this tick.
-        let filtered_with_ids =
-            restrict_nostr_to_fallback(filtered_with_ids, self.settings.outlier_threshold_pct);
+        let (filtered_with_ids, nostr_over_refused_local) = restrict_nostr_to_fallback_reporting(
+            filtered_with_ids,
+            self.settings.outlier_threshold_pct,
+        );
+        for currency in &nostr_over_refused_local {
+            warn!(
+                "price: {} — local sources could not agree this tick; serving the \
+                 trusted-node (Nostr) rate alone as fallback",
+                currency
+            );
+        }
 
         let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
         // Audit #9: a currency with exactly two live quotes that disagree is
@@ -407,7 +416,7 @@ impl PriceManager {
     ///
     /// Two groups get the earlier stamp:
     /// - currencies Nostr contributed to at all. Today
-    ///   `restrict_nostr_to_fallback` drops Nostr's quote for any currency
+    ///   `restrict_nostr_to_fallback_reporting` drops Nostr's quote for any currency
     ///   another provider covers, so in practice this means "sole
     ///   contributor" — but the test is `contains`, not equality, so if that
     ///   invariant ever relaxes a partly-relayed value is stamped early
@@ -421,7 +430,7 @@ impl PriceManager {
     /// Both halves rest on the same guarantee, which is why reading the
     /// stamp from provider state *after* the tick is sound for both. The
     /// flag is set from `anchor_uses_nostr`, i.e. `kept_contributors` over
-    /// **this tick's** direct quotes after `restrict_nostr_to_fallback`
+    /// **this tick's** direct quotes after `restrict_nostr_to_fallback_reporting`
     /// (`aggregate.rs`), so it cannot be true unless Nostr's quote survived
     /// this tick — exactly the condition `contributors.contains(&Nostr)`
     /// states outright.
@@ -788,7 +797,8 @@ impl PriceManager {
 
 /// Drop the `Nostr` provider's quotes for any currency another provider
 /// can actually produce a value for this tick, leaving every other
-/// provider untouched.
+/// provider untouched — except where the local sources **fail** to
+/// produce one and Nostr can (see below).
 ///
 /// A trusted-node `nostr` quote is a relayed *aggregate*, not an
 /// independent local observation — the remote node already ran its own
@@ -804,31 +814,66 @@ impl PriceManager {
 /// keys. El Toque reports CUP/MLC only as `PerBase { base: USD }`; a key
 /// presence check would treat that as covering CUP even when the USD
 /// anchor is missing, drop Nostr's usable `PerBtc` CUP, then lose CUP
-/// entirely when the cross fails to resolve (ermeme, PR #841). Anchors
-/// are built from *all* direct `PerBtc` quotes (including Nostr) so a
-/// local El Toque cross that needs Nostr's USD still counts as covering
-/// CUP — Nostr's direct CUP is then correctly suppressed as redundant.
+/// entirely when the cross fails to resolve (ermeme, PR #841). A local
+/// El Toque cross that needs Nostr's USD still counts as covering CUP —
+/// Nostr's direct CUP is then correctly suppressed as redundant.
+///
+/// Coverage also means the local candidates **aggregate**, not merely that
+/// one of them is valid: since `combine` refuses a divergent two-source
+/// set (audit #9), a currency whose local quotes disagree is uncovered,
+/// and a usable Nostr quote for it becomes its fallback (ermeme on
+/// #1109). Nostr then stands **alone**: that currency's local quotes are
+/// set aside for this tick rather than left in to be arbitrated by the
+/// relayed value. Blending would let Nostr pick between local sources
+/// (and, if the remote node priced from the same corrupt upstream, pick
+/// the corrupt one), and a mixed `[local, Nostr]` aggregate would be
+/// republished as a fresh local observation. Served alone, the value goes
+/// through the existing Nostr-only handling: not republished, stamped with
+/// the remote's observation time, and crosses on it are marked
+/// `nostr_anchor_dependent`.
 ///
 /// Currency codes are folded to uppercase because `aggregate_tick` does
 /// the same before grouping; Yadio forwards API codes verbatim.
-fn restrict_nostr_to_fallback(
+///
+/// Also returns (sorted) the currencies whose local candidates were refused
+/// and set aside in favour of Nostr, so the tick can warn about them.
+fn restrict_nostr_to_fallback_reporting(
     results: Vec<(ProviderId, ProviderQuotes)>,
     outlier_pct: f64,
-) -> Vec<(ProviderId, ProviderQuotes)> {
-    let covered_elsewhere = currencies_covered_by_non_nostr(&results, outlier_pct);
-    results
+) -> (Vec<(ProviderId, ProviderQuotes)>, Vec<String>) {
+    let coverage = local_coverage(&results, outlier_pct);
+    let filtered = results
         .into_iter()
         .map(|(id, quotes)| {
-            if id != ProviderId::Nostr {
-                return (id, quotes);
-            }
-            let fallback_only: ProviderQuotes = quotes
+            let kept: ProviderQuotes = quotes
                 .into_iter()
-                .filter(|(currency, _)| !covered_elsewhere.contains(&currency.to_uppercase()))
+                .filter(|(currency, _)| {
+                    let code = currency.to_uppercase();
+                    if id == ProviderId::Nostr {
+                        !coverage.covered.contains(&code)
+                    } else {
+                        !coverage.nostr_fallback.contains(&code)
+                    }
+                })
                 .collect();
-            (id, fallback_only)
+            (id, kept)
         })
-        .collect()
+        .collect();
+    let mut refused: Vec<String> = coverage.refused_local.into_iter().collect();
+    refused.sort();
+    (filtered, refused)
+}
+
+/// What [`local_coverage`] decides for one tick.
+struct LocalCoverage {
+    /// Currencies the non-Nostr providers can aggregate on their own.
+    covered: HashSet<String>,
+    /// Uncovered currencies Nostr has a usable quote for: Nostr is served
+    /// alone, so every local quote for them is set aside.
+    nostr_fallback: HashSet<String>,
+    /// The subset of `nostr_fallback` where local candidates existed but
+    /// `combine` refused them (worth a warning).
+    refused_local: HashSet<String>,
 }
 
 /// Currencies whose direct (`PerBtc`) candidates this tick are exactly two
@@ -891,27 +936,22 @@ fn diverged_two_source_currencies(
     out
 }
 
-/// Currencies a non-Nostr provider can actually yield this tick: either a
-/// usable direct `PerBtc`, or a `PerBase` that resolves against the
-/// tick's anchors.
+/// Decide which currencies the non-Nostr providers can price this tick,
+/// mirroring what `aggregate_tick` will see **after** the filter.
 ///
-/// The anchors are the ones `aggregate_tick` will see **after** this
-/// filter: a currency with any non-Nostr direct quote is anchored on those
-/// alone (Nostr's direct quote for it is about to be dropped), and only a
-/// currency no local provider quotes directly falls back to Nostr's
-/// `PerBtc` — so a local cross can still cover a currency when only the
-/// relayed USD is available. Mixing Nostr into an anchor that it will not
-/// be part of used to be harmless, but since `combine` refuses a divergent
-/// pair (audit #9) a Yadio + Nostr USD that disagree would yield *no*
-/// anchor here, keep Nostr's CUP, and let it meet the local cross as a
-/// divergent pair — refusing a CUP the local sources could price
-/// (CodeRabbit on #1109). A divergent *local* pair still yields no anchor:
-/// that currency is refused in `aggregate_tick` too, so a cross on it
-/// counts as uncovered and Nostr may fill the gap.
-fn currencies_covered_by_non_nostr(
-    results: &[(ProviderId, ProviderQuotes)],
-    outlier_pct: f64,
-) -> HashSet<String> {
+/// - **Anchors.** A currency's anchor is the `combine` of its local direct
+///   quotes; only when those yield nothing (none, or a refused divergent
+///   set) does it fall back to Nostr's direct quote — exactly the value
+///   `aggregate_tick` will anchor on once the filter has kept Nostr alone
+///   there or dropped it. Mixing Nostr into an anchor it will not be part
+///   of could, now that `combine` refuses divergent pairs, yield no anchor
+///   and let Nostr's CUP compete with a valid local cross (CodeRabbit on
+///   #1109).
+/// - **Covered.** A currency's local candidates — local direct quotes plus
+///   local fiat-crosses resolved against those anchors — must `combine` to
+///   a value. One individually valid quote is not enough: a refused local
+///   pair is uncovered (ermeme on #1109).
+fn local_coverage(results: &[(ProviderId, ProviderQuotes)], outlier_pct: f64) -> LocalCoverage {
     let mut local: HashMap<String, Vec<f64>> = HashMap::new();
     let mut relayed: HashMap<String, Vec<f64>> = HashMap::new();
     for (id, quotes) in results {
@@ -928,41 +968,66 @@ fn currencies_covered_by_non_nostr(
             }
         }
     }
+
     let mut anchors: HashMap<String, f64> = HashMap::new();
-    for (currency, values) in local.iter().chain(
-        relayed
-            .iter()
-            .filter(|(currency, _)| !local.contains_key(*currency)),
-    ) {
-        if let Some(v) = combine(values, outlier_pct) {
+    for currency in local.keys().chain(relayed.keys()) {
+        if anchors.contains_key(currency) {
+            continue;
+        }
+        let value = local
+            .get(currency)
+            .and_then(|xs| combine(xs, outlier_pct))
+            .or_else(|| {
+                relayed
+                    .get(currency)
+                    .and_then(|xs| combine(xs, outlier_pct))
+            });
+        if let Some(v) = value {
             anchors.insert(currency.clone(), v);
         }
     }
 
-    let mut covered: HashSet<String> = HashSet::new();
+    // Local candidates per currency: direct quotes plus resolved crosses.
+    let mut candidates: HashMap<String, Vec<f64>> = local.clone();
     for (id, quotes) in results {
         if *id == ProviderId::Nostr {
             continue;
         }
         for (currency, quote) in quotes {
-            let code = currency.to_uppercase();
-            match quote {
-                Quote::PerBtc(v) if v.is_finite() && *v > 0.0 => {
-                    covered.insert(code);
-                }
-                Quote::PerBase { base, value } => {
-                    if let Some(anchor) = anchors.get(&base.to_uppercase()) {
-                        let candidate = value * anchor;
-                        if candidate.is_finite() && candidate > 0.0 {
-                            covered.insert(code);
-                        }
+            if let Quote::PerBase { base, value } = quote {
+                if let Some(anchor) = anchors.get(&base.to_uppercase()) {
+                    let candidate = value * anchor;
+                    if candidate.is_finite() && candidate > 0.0 {
+                        candidates
+                            .entry(currency.to_uppercase())
+                            .or_default()
+                            .push(candidate);
                     }
                 }
-                _ => {}
             }
         }
     }
-    covered
+
+    let mut covered: HashSet<String> = HashSet::new();
+    let mut refused: HashSet<String> = HashSet::new();
+    for (currency, xs) in &candidates {
+        if combine(xs, outlier_pct).is_some() {
+            covered.insert(currency.clone());
+        } else {
+            refused.insert(currency.clone());
+        }
+    }
+    let nostr_fallback: HashSet<String> = relayed
+        .iter()
+        .filter(|(currency, xs)| !covered.contains(*currency) && combine(xs, outlier_pct).is_some())
+        .map(|(currency, _)| currency.clone())
+        .collect();
+    let refused_local = refused.intersection(&nostr_fallback).cloned().collect();
+    LocalCoverage {
+        covered,
+        nostr_fallback,
+        refused_local,
+    }
 }
 
 /// Currencies fit to republish to Nostr this tick: everything **except**
@@ -1940,6 +2005,14 @@ mod tests {
         assert!(manager.get_price("USD").is_err());
     }
 
+    /// The filtered quotes alone, for tests that do not need the report.
+    fn restrict_nostr_to_fallback(
+        results: Vec<(ProviderId, ProviderQuotes)>,
+        outlier_pct: f64,
+    ) -> Vec<(ProviderId, ProviderQuotes)> {
+        restrict_nostr_to_fallback_reporting(results, outlier_pct).0
+    }
+
     fn usd_anchor(value: f64) -> ProviderQuotes {
         let mut q = ProviderQuotes::new();
         q.insert("USD".into(), Quote::PerBtc(value));
@@ -2854,6 +2927,104 @@ mod tests {
             "CUP must come from the local cross on Yadio's USD"
         );
         assert_eq!(out["CUP"].contributors, vec![ProviderId::ElToque]);
+    }
+
+    /// ermeme on #1109: Yadio USD 50k and CoinGecko USD 500k diverge, so the
+    /// local pair cannot aggregate. Nostr's USD must survive as the
+    /// fallback, served **alone** (not blended with the refused locals),
+    /// and must not be republished as a fresh local observation.
+    #[test]
+    fn a_refused_local_pair_falls_back_to_nostr_alone() {
+        let yadio = usd_anchor(50_000.0);
+        let coingecko = usd_anchor(500_000.0);
+        let nostr = usd_anchor(50_100.0);
+        let (filtered, refused) = restrict_nostr_to_fallback_reporting(
+            vec![
+                (ProviderId::Yadio, yadio),
+                (ProviderId::CoinGecko, coingecko),
+                (ProviderId::Nostr, nostr),
+            ],
+            5.0,
+        );
+        assert_eq!(refused, vec!["USD".to_string()]);
+        for (id, q) in &filtered {
+            let expect_usd = *id == ProviderId::Nostr;
+            assert_eq!(q.contains_key("USD"), expect_usd, "{id}: USD kept?");
+        }
+        let out = aggregate_tick(&filtered, 5.0);
+        assert!((out["USD"].value - 50_100.0).abs() < 1e-6);
+        assert_eq!(out["USD"].contributors, vec![ProviderId::Nostr]);
+        assert!(
+            !republishable_rates(&out).contains_key("USD"),
+            "a Nostr-only fallback must not be republished"
+        );
+    }
+
+    /// The Nostr fallback anchor also prices local crosses, and they carry
+    /// the Nostr taint; Nostr's own CUP stays suppressed as redundant.
+    #[test]
+    fn a_cross_on_the_nostr_fallback_anchor_is_marked_dependent() {
+        let mut nostr = usd_anchor(50_000.0);
+        nostr.insert("CUP".into(), Quote::PerBtc(30_000_000.0));
+        let mut eltoque = ProviderQuotes::new();
+        eltoque.insert(
+            "CUP".into(),
+            Quote::PerBase {
+                base: "USD".into(),
+                value: 400.0,
+            },
+        );
+        let filtered = restrict_nostr_to_fallback(
+            vec![
+                (ProviderId::Yadio, usd_anchor(50_000.0)),
+                (ProviderId::CoinGecko, usd_anchor(500_000.0)),
+                (ProviderId::Nostr, nostr),
+                (ProviderId::ElToque, eltoque),
+            ],
+            5.0,
+        );
+        let out = aggregate_tick(&filtered, 5.0);
+        assert!((out["CUP"].value - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(out["CUP"].contributors, vec![ProviderId::ElToque]);
+        assert!(out["CUP"].nostr_anchor_dependent);
+        assert!(!republishable_rates(&out).contains_key("CUP"));
+    }
+
+    /// Without a Nostr quote there is nothing to fall back to: the local
+    /// quotes are left as they are and `aggregate_tick` refuses them.
+    #[test]
+    fn a_refused_local_pair_without_nostr_is_left_alone() {
+        let (filtered, refused) = restrict_nostr_to_fallback_reporting(
+            vec![
+                (ProviderId::Yadio, usd_anchor(50_000.0)),
+                (ProviderId::CoinGecko, usd_anchor(500_000.0)),
+            ],
+            5.0,
+        );
+        assert!(refused.is_empty());
+        assert!(filtered.iter().all(|(_, q)| q.contains_key("USD")));
+        assert!(aggregate_tick(&filtered, 5.0).is_empty());
+    }
+
+    /// An agreeing local pair still covers the currency: Nostr is dropped
+    /// and the locals are untouched.
+    #[test]
+    fn an_agreeing_local_pair_still_suppresses_nostr() {
+        let (filtered, refused) = restrict_nostr_to_fallback_reporting(
+            vec![
+                (ProviderId::Yadio, usd_anchor(50_000.0)),
+                (ProviderId::CoinGecko, usd_anchor(50_200.0)),
+                (ProviderId::Nostr, usd_anchor(60_000.0)),
+            ],
+            5.0,
+        );
+        assert!(refused.is_empty());
+        let out = aggregate_tick(&filtered, 5.0);
+        assert!((out["USD"].value - 50_100.0).abs() < 1e-6);
+        assert_eq!(
+            out["USD"].contributors,
+            vec![ProviderId::Yadio, ProviderId::CoinGecko]
+        );
     }
 
     #[test]

@@ -980,6 +980,18 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
   with no in-provider outlier guard; operators mitigate by choosing
   `trusted_nodes` they actually trust, same as any other single-sourced
   provider.
+- **Fallback only, and always alone.** A relayed rate is an aggregate, not
+  an independent sample, so it never joins this node's own sources in the
+  §6.2 combine. It is dropped for every currency the local providers can
+  price this tick (after fiat-cross resolution), and kept for the rest.
+  "Can price" means the local candidates actually aggregate: when they
+  are refused (two sources that disagree, §6.2), the currency counts as
+  uncovered, the relayed rate is served **alone**, and that currency's
+  local quotes are set aside for the tick, with a `warn!`. Letting the
+  relayed rate arbitrate between disagreeing local sources would let it
+  pick a side (the corrupt one, if the remote priced from the same
+  upstream) and would republish a mixed value as a fresh local
+  observation.
 - **Publish cadence bounds the serving window.** A relayed rate is stamped
   with the source event's `created_at`, not with when it arrived (§6.4), so
   its serving window on this node is `max_price_staleness_seconds` **minus

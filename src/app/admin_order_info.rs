@@ -925,6 +925,40 @@ mod tests {
         assert_eq!(replies_for(&sender).await.len(), 1);
     }
 
+    /// The event loop has one consumer and drops a message that waited more
+    /// than 10 seconds for its turn. A node that hangs must cost this query
+    /// its Lightning part, never the other users their place in the queue:
+    /// the handler returns while the lookups are still waiting.
+    #[tokio::test]
+    async fn a_hung_node_does_not_hold_the_event_loop() {
+        let ctx = setup_ctx().await;
+        let mostro = Keys::generate();
+        let order = order_with_hold_invoice(&ctx).await;
+        set_payout_columns(ctx.pool(), order.id, Some(&"b2".repeat(32)), None).await;
+        let sender = Keys::generate().public_key();
+        let event = event_from(sender, mostro.public_key());
+        let mut ln = StubLn::new(Answer::Hangs, Answer::Hangs);
+
+        // A bound far longer than the test: both lookups hang for all of it.
+        let returned = timeout(
+            Duration::from_secs(1),
+            answer_order_info(
+                &ctx,
+                request(Some(order.id)),
+                &event,
+                &mostro,
+                Some(&mut ln),
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(returned, Ok(Ok(_))),
+            "the handler waited for the Lightning node"
+        );
+    }
+
     // --- The payout ------------------------------------------------------
 
     fn lookup(status: PaymentStatus, failure_reason: PaymentFailureReason) -> PaymentLookup {

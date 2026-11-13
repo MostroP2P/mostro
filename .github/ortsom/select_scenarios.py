@@ -15,6 +15,7 @@ would shadow the standard library's select module, which subprocess imports.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -27,6 +28,11 @@ GATE_DIR = Path(__file__).resolve().parent
 # image may not have been built the way the baseline's was (§ 9.2).
 GATE_PATHS = (re.compile(r"^\.github/ortsom/"), re.compile(r"^\.github/workflows/ortsom-[^/]*\.yml$"))
 RULE_KEYS = {"name", "paths", "ignore", "full", "uncovered", "tags", "scenarios"}
+# A settings variant (§ 4.5): scenarios run again with mostrod restarted
+# under an overlay of the Ortsom template.
+VARIANT_KEYS = {"name", "overlay", "why", "paths", "scenarios"}
+VARIANT_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+VARIANT_OVERLAY = re.compile(r"^variants/[a-z0-9][a-z0-9-]*\.toml$")
 
 
 class SelectionError(Exception):
@@ -131,6 +137,30 @@ def validate_map(gate_map):
             )
 
 
+def validate_variants(variants):
+    if not isinstance(variants, list) or not all(isinstance(v, dict) for v in variants):
+        raise SelectionError("variant must be an array of [[variant]] tables")
+    seen = set()
+    for v in variants:
+        name = v.get("name")
+        if not isinstance(name, str) or not VARIANT_NAME.match(name):
+            raise SelectionError(f"variant name must be lowercase letters, digits and dashes: {name!r}")
+        if name in seen:
+            raise SelectionError(f"duplicate variant name: {name!r}")
+        seen.add(name)
+        unknown = set(v) - VARIANT_KEYS
+        if unknown:
+            raise SelectionError(f"variant {name!r}: unknown keys {sorted(unknown)}")
+        if not isinstance(v.get("overlay"), str) or not VARIANT_OVERLAY.match(v["overlay"]):
+            raise SelectionError(f"variant {name!r}: overlay must be variants/<name>.toml")
+        if not isinstance(v.get("why"), str) or not v["why"].strip():
+            raise SelectionError(f"variant {name!r}: why must say which configuration it stands for")
+        for key in ("paths", "scenarios"):
+            value = v.get(key)
+            if not isinstance(value, list) or not value or not all(isinstance(x, str) for x in value):
+                raise SelectionError(f"variant {name!r}: {key} must be a non-empty list")
+
+
 def check_references(gate_map, registry):
     """Every tag and scenario name the map uses exists in the pinned Ortsom."""
     names = {s["name"] for s in registry}
@@ -144,6 +174,8 @@ def check_references(gate_map, registry):
         problems += [
             f"rule {rule['name']!r}: unknown scenario {n!r}" for n in rule.get("scenarios", []) if n not in names
         ]
+    for v in gate_map.get("variant", []):
+        problems += [f"variant {v['name']!r}: unknown scenario {n!r}" for n in v["scenarios"] if n not in names]
     if problems:
         raise SelectionError(
             "map.toml does not match scenarios.json (stale map or snapshot): " + "; ".join(problems)
@@ -160,14 +192,27 @@ def unmapped(files, gate_map):
     return sorted(f for f in files if not matching_rules(f, rules))
 
 
+def overlay_digest(rel, gate_dir=GATE_DIR):
+    """The sha256 of a variant's overlay file. Part of a variant result's
+    identity: a baseline measured with another overlay is not compared."""
+    return hashlib.sha256((gate_dir / rel).read_bytes()).hexdigest()
+
+
+def variant_covers(path, variants):
+    return any(glob_match(p, path) for v in variants for p in v["paths"])
+
+
 def gate_files(files):
     """The changed files that belong to the gate itself (§ 9.2)."""
     return sorted(f for f in set(files) if any(p.match(f) for p in GATE_PATHS))
 
 
-def select(files, gate_map, registry):
-    """The selection.json document of § 4.3 for these changed files."""
+def select(files, gate_map, registry, digest=overlay_digest):
+    """The selection.json document of § 4.3 for these changed files.
+    `digest(overlay)` hashes a selected variant's overlay file."""
     validate_map(gate_map)
+    variants = gate_map.get("variant", [])
+    validate_variants(variants)
     check_references(gate_map, registry)
     rules = gate_map.get("rule", [])
 
@@ -184,6 +229,7 @@ def select(files, gate_map, registry):
         "unmapped_files": [],
         "ignored_files": ignored,
         "gate_files": gate_files(files),
+        "variants": [],
     }
     if not remaining:
         return result
@@ -191,15 +237,23 @@ def select(files, gate_map, registry):
     matched = []
     for f in remaining:
         hits = matching_rules(f, rules)
+        covered = variant_covers(f, variants)
         if not hits:
-            result["unmapped_files"].append(f)
+            if not covered:
+                result["unmapped_files"].append(f)
             continue
         matched += [r for r in hits if r not in matched]
-        if all("uncovered" in r for r in hits):
+        if all("uncovered" in r for r in hits) and not covered:
             result["uncovered_files"][f] = "; ".join(r["uncovered"] for r in hits)
     result["matched_rules"] = [r["name"] for r in rules if r in matched]
 
-    if any(r.get("full") is True for r in matched):
+    full = any(r.get("full") is True for r in matched)
+    result["variants"] = [
+        {"name": v["name"], "overlay": v["overlay"], "sha256": digest(v["overlay"]), "scenarios": v["scenarios"]}
+        for v in variants
+        if full or any(variant_covers(f, [v]) for f in remaining)
+    ]
+    if full:
         result["mode"] = "full"
         result["scenarios"] = sorted(s["name"] for s in registry)
         return result

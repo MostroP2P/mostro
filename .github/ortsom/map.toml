@@ -132,11 +132,6 @@ paths = ["src/app/payer/**", "src/app/release_payer_tests.rs"]
 uncovered = "opt-in [payer_history] is off in the ortsom stack and no ortsom scenario declares a payer; covered by unit tests in src/app/payer and the fiat_sent / release tests"
 
 [[rule]]
-name = "settings template"
-paths = ["settings.tpl.toml"]
-uncovered = "the ortsom stack runs its own template (ci/regtest/mostro-settings.tpl.toml in Ortsom); mostrod embeds this one only to write a first-run settings.toml and for the wizard, covered by unit tests in src/config"
-
-[[rule]]
 name = "session restore and key bookkeeping"
 paths = [
   "src/app/restore_session.rs", "src/app/last_trade_index.rs", "src/app/trade_pubkey.rs",
@@ -148,3 +143,63 @@ uncovered = "no ortsom scenario yet"
 name = "misc daemon entry points"
 paths = ["src/cli.rs", "src/lnurl.rs"]
 uncovered = "no ortsom scenario yet (the stack pays bolt11 invoices, never LNURL)"
+
+# --- Money paths (§ 15) -------------------------------------------------------
+#
+# Code that moves or locks sats. A pull request that touches one may merge
+# only with `ortsom:pass` (the `ortsom/money-path` status, required by branch
+# protection) and an approving review from a code owner other than its
+# author (.github/CODEOWNERS lists the same paths; tests/test_map.py checks
+# they agree).
+
+[money_path]
+paths = [
+  "src/lightning/**", "src/app/bond/**", "src/app/release.rs", "src/app/add_invoice.rs",
+  "src/app/dev_fee.rs", "src/scheduler.rs",
+]
+
+# --- Settings variants (§ 4.5) -----------------------------------------------
+#
+# The stack runs Ortsom's own settings template, so a bug that only shows
+# under another daemon configuration never ran: #1098 and #1099 both shipped
+# with `ortsom:pass`. A variant restarts mostrod on the same stack with an
+# overlay of that template (`ortsom stack restart-daemon --settings-overlay`,
+# overlay format in Ortsom's docs/ci-regtest.md) and runs `scenarios` again,
+# reported as `<scenario>@<variant>`. A variant runs when a changed file
+# matches its `paths`, and every variant runs when the selection is full.
+# A file only variants match (settings.tpl.toml) counts as covered.
+
+[[variant]]
+name = "price-pegged-only"
+why = "a lone [price.providers.pegged], as the template's opt-in block reads (#1099)"
+overlay = "variants/price-pegged-only.toml"
+paths = ["src/price/**", "src/bitcoin_price.rs", "src/config/**", "settings.tpl.toml"]
+scenarios = ["market_price_order"]
+
+[[variant]]
+name = "price-pegged-and-market"
+why = "the pegged provider next to a market provider"
+overlay = "variants/price-pegged-and-market.toml"
+paths = ["src/price/**", "src/bitcoin_price.rs", "src/config/**", "settings.tpl.toml"]
+scenarios = ["market_price_order"]
+
+[[variant]]
+name = "price-legacy"
+why = "no [price] table: the legacy bitcoin_price_api_url of every pre-[price] settings.toml"
+overlay = "variants/price-legacy.toml"
+paths = ["src/price/**", "src/bitcoin_price.rs", "src/config/**", "settings.tpl.toml"]
+scenarios = ["market_price_order"]
+
+[[variant]]
+name = "bond-hold-cltv-298"
+why = "bonds on, hold_invoice_cltv_delta = 298 and no bond_cltv_delta (#1098)"
+overlay = "variants/bond-hold-cltv-298.toml"
+paths = ["src/app/bond/**", "src/lightning/**", "src/config/**", "settings.tpl.toml"]
+scenarios = ["bond_released_on_success", "happy_sell"]
+
+[[variant]]
+name = "bond-cltv-at-limit"
+why = "bond_cltv_delta at its floor, hold_invoice_cltv_delta + 145"
+overlay = "variants/bond-cltv-at-limit.toml"
+paths = ["src/app/bond/**", "src/lightning/**", "src/config/**", "settings.tpl.toml"]
+scenarios = ["bond_released_on_success"]

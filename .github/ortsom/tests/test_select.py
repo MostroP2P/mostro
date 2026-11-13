@@ -175,6 +175,101 @@ class SelectTest(unittest.TestCase):
             self.run_select(["src/x.rs"], TRADE, always_tags=("gone",))
 
 
+PEGGED = {
+    "name": "price-pegged-only", "overlay": "variants/price-pegged-only.toml",
+    "why": "a lone pegged provider (#1099)",
+    "paths": ["src/price/**", "settings.tpl.toml"], "scenarios": ["range_order"],
+}
+BOND_CLTV = {
+    "name": "bond-hold-cltv-298", "overlay": "variants/bond-hold-cltv-298.toml",
+    "why": "bonds on with a high hold CLTV (#1098)",
+    "paths": ["src/app/bond/**", "settings.tpl.toml"], "scenarios": ["happy_sell", "happy_buy"],
+}
+
+
+def digest(rel):
+    return f"sha-of-{rel}"
+
+
+class VariantTest(unittest.TestCase):
+    def run_select(self, files, *rules, variants=(PEGGED, BOND_CLTV)):
+        gate_map = make_map(*rules)
+        gate_map["variant"] = [dict(v) for v in variants]
+        return sel.select(files, gate_map, REGISTRY, digest=digest)
+
+    def test_a_variant_runs_when_one_of_its_paths_changes(self):
+        result = self.run_select(["src/price/mod.rs"], PRICING)
+
+        self.assertEqual(result["variants"], [{
+            "name": "price-pegged-only", "overlay": "variants/price-pegged-only.toml",
+            "sha256": "sha-of-variants/price-pegged-only.toml", "scenarios": ["range_order"],
+        }])
+
+    def test_no_variant_runs_when_none_of_their_paths_change(self):
+        self.assertEqual(self.run_select(["src/app/release.rs"], TRADE)["variants"], [])
+
+    def test_a_full_selection_runs_every_variant(self):
+        result = self.run_select(["src/db.rs"], CORE)
+
+        self.assertEqual([v["name"] for v in result["variants"]], ["price-pegged-only", "bond-hold-cltv-298"])
+
+    def test_a_file_only_variants_cover_is_neither_unmapped_nor_uncovered(self):
+        result = self.run_select(["settings.tpl.toml"], TRADE)
+
+        self.assertEqual(result["mode"], "subset")
+        self.assertEqual(result["scenarios"], SMOKE)
+        self.assertEqual(result["unmapped_files"], [])
+        self.assertEqual(result["uncovered_files"], {})
+        self.assertEqual([v["name"] for v in result["variants"]], ["price-pegged-only", "bond-hold-cltv-298"])
+
+    def test_a_variant_covers_a_file_an_uncovered_rule_also_names(self):
+        tpl = {"name": "template", "paths": ["settings.tpl.toml"], "uncovered": "own template"}
+        result = self.run_select(["settings.tpl.toml"], tpl)
+
+        self.assertEqual(result["uncovered_files"], {})
+
+    def test_an_ignored_file_runs_no_variant(self):
+        result = self.run_select(["src/price/README.md"], DOCS, PRICING)
+
+        self.assertEqual((result["mode"], result["variants"]), ("none", []))
+
+    def test_a_selection_without_variants_has_an_empty_list(self):
+        result = sel.select(["src/app/release.rs"], make_map(TRADE), REGISTRY)
+
+        self.assertEqual(result["variants"], [])
+
+    def test_variant_scenarios_must_exist(self):
+        bad = dict(PEGGED, scenarios=["no_such_scenario"])
+        with self.assertRaisesRegex(sel.SelectionError, "no_such_scenario"):
+            self.run_select(["src/price/mod.rs"], PRICING, variants=[bad])
+
+    def test_variant_shape_is_checked(self):
+        cases = [
+            (dict(PEGGED, name="Bad Name"), "name"),
+            (dict(PEGGED, overlay="../../secrets.toml"), "overlay"),
+            (dict(PEGGED, overlay="variants/x.json"), "overlay"),
+            (dict(PEGGED, paths=[]), "paths"),
+            (dict(PEGGED, scenarios=[]), "scenarios"),
+            ({k: v for k, v in PEGGED.items() if k != "why"}, "why"),
+            (dict(PEGGED, extra=1), "unknown keys"),
+        ]
+        for variant, needle in cases:
+            with self.subTest(needle=needle), self.assertRaisesRegex(sel.SelectionError, needle):
+                self.run_select(["src/price/mod.rs"], PRICING, variants=[variant])
+
+    def test_variant_names_are_unique(self):
+        with self.assertRaisesRegex(sel.SelectionError, "duplicate variant"):
+            self.run_select(["src/price/mod.rs"], PRICING, variants=[PEGGED, PEGGED])
+
+    def test_the_default_digest_is_the_overlay_files_sha256(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "variants").mkdir()
+            (Path(d) / "variants" / "x.toml").write_bytes(b"[mostro]\nfee = 0\n")
+            got = sel.overlay_digest("variants/x.toml", gate_dir=Path(d))
+        import hashlib
+        self.assertEqual(got, hashlib.sha256(b"[mostro]\nfee = 0\n").hexdigest())
+
+
 class ValidateMapTest(unittest.TestCase):
     def test_accepts_every_rule_kind(self):
         sel.validate_map(make_map(DOCS, TRADE, PRICING, CORE, RPC))

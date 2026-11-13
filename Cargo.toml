@@ -71,7 +71,10 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.17.3", features = ["sqlx"] }
+# Pinned to MostroP2P/mostro-core#190 (admin-order-info) until it is released.
+mostro-core = { git = "https://github.com/MostroP2P/mostro-core", rev = "dabb6f64883f913966f0da79c6c32f9e538aedd9", features = [
+  "sqlx",
+] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

@@ -261,8 +261,11 @@ pub async fn find_maker_bond_for_order(
 /// who are long gone. The reply is about the trade as it stands, so of the
 /// rows whose `order_id` is this order it keeps:
 ///
-/// - every `maker` row: the maker bond, and on a range order the child rows
-///   written against it (a slice slash, the maker refund);
+/// - every `maker` row: the maker bond and, on a range order, the child rows
+///   stored on this same order. A slice slash is stored on its slice and the
+///   maker refund on the root, so a slice shows its own slash and the root
+///   shows the refund; the root does not list the slashes of its slices,
+///   which the reply has no field to tell apart (#1107);
 /// - the `taker` row of a current party of the order (its `pubkey` is the
 ///   order's buyer or seller trade key);
 /// - any row still owed a payout (`pending-payout` or `failed`), whoever

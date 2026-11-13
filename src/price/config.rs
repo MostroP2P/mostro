@@ -23,7 +23,9 @@ pub struct PriceSettings {
     #[serde(default = "default_max_price_staleness_seconds")]
     pub max_price_staleness_seconds: i64,
     /// Discard a source whose value deviates more than this percent from the
-    /// median (only applies with ≥ 3 sources for a currency).
+    /// median (with ≥ 3 sources for a currency). With exactly 2 there is no
+    /// median: a pair differing by more than this percent of its mean is
+    /// refused, and the currency serves last-known-good until it goes stale.
     #[serde(default = "default_outlier_threshold_pct")]
     pub outlier_threshold_pct: f64,
     /// Per-provider request timeout.

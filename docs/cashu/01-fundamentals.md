@@ -536,11 +536,15 @@ an order"*:
   **`Orders`**, **`LastTradeIndex`**, **`UserInfo`**, **`RestoreSession`**, **`TradePubkey`**.
   A Cashu-foundation node can therefore still serve the order book, restore
   sessions, and sync trade indexes — all zero-risk for funds.
+  **`AdminOrderInfo`** (#1107) joined the allow-list later on the same
+  grounds: it is read-only. It has its own arm, which calls
+  `admin_order_info_action` without a Lightning client, and reports the Cashu
+  escrow of the order (mint URL and lock time, never the token).
 - **Blocked** → `Err(MostroCantDo(CantDoReason::InvalidAction))` — everything that
   creates, advances, or settles an order, because there is no escrow behind it
   yet: `NewOrder`, `TakeBuy`, `TakeSell`, `AddInvoice`, `FiatSent`, `Release`,
   `Cancel`, `Dispute`, `RateUser`, `AddCashuEscrow`, `AdminCancel`,
-  `AdminSettle`, `AddBondInvoice`, and any admin/dispute action. The feature
+  `AdminSettle`, `AddBondInvoice`, and any other admin/dispute action. The feature
   tracks replace these arms one at a time, in their own files.
 
 Rationale: allowing, say, `NewOrder` would populate the order book with orders
@@ -568,6 +572,7 @@ never trade at all; the first Cashu attempt hit exactly this bug in code).
 | `Cancel` | **Track C** | cashu cancel handler |
 | `Dispute`, `AdminCancel`, `AdminSettle`, `AdminTakeDispute` | **Track D** | cashu dispute handlers |
 | `AdminAddSolver` | **Track D** (dispute setup needs solvers) | `handle_message_action_no_ln` — solver management touches no escrow/LND |
+| `AdminOrderInfo` | **already allowed** (#1107) — read-only | `admin_order_info_action` with no Lightning client |
 | `AddInvoice` | **never** — the buyer-invoice step does not exist in cashu mode (02 §2) | permanently `InvalidAction` (documented decision) |
 | `AddBondInvoice` | **never** — bonds ⊕ cashu are mutually exclusive (§4.5) | permanently `InvalidAction` |
 

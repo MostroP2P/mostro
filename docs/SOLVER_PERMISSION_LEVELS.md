@@ -6,7 +6,7 @@ This document specifies solver permission levels for dispute resolution.
 
 Mostro supports two solver permission levels:
 
-- `read`: solver can take a dispute, receive dispute context, and communicate with users
+- `read`: solver can take a dispute, receive dispute context, communicate with users, and ask for the state of any order with `admin-order-info`
 - `read-write`: solver can do everything above and can also execute `admin-settle` and `admin-cancel`
 
 This split is intended to support automated dispute assistants, including AI-based agents, without giving them authority to move funds.
@@ -51,6 +51,16 @@ Allowed only when:
 
 If the caller is assigned but only has `read` permission, Mostro returns:
 - `CantDoReason::NotAuthorized`
+
+### `admin-order-info`
+Allowed for:
+- Mostro daemon admin key
+- solvers with `is_solver = true`, with either permission level
+
+It is read-only, so `read` is enough. Unlike the actions above it is not tied to a dispute: a solver may ask about any order of the node, disputed or not, and the answer includes the trade pubkeys of both parties and the amounts of the trade. It never includes a preimage, an invoice, a Cashu token or a master (identity) pubkey. See [ORDERS_AND_ACTIONS.md](ORDERS_AND_ACTIONS.md#admin-order-info).
+
+Any other caller gets:
+- `CantDoReason::InvalidPubkey`
 
 ## AdminAddSolver payload
 

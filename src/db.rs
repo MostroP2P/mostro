@@ -2217,6 +2217,40 @@ pub async fn ensure_dispute_finalize_permission(
     }
 }
 
+/// Is `pubkey` a registered solver of this node, with any permission level
+/// (`read` or `read-write`)?
+///
+/// Unlike [`find_solver_pubkey`], which reports a missing row and a database
+/// failure with the same error, this tells them apart: `Ok(false)` means the
+/// key is not a solver.
+pub async fn is_solver(pool: &SqlitePool, pubkey: &str) -> Result<bool, MostroError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE pubkey = ?1 AND is_solver = true)",
+    )
+    .bind(pubkey)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// The two `orders` columns `admin-order-info` reports that core's `Order`
+/// does not carry: the in-flight payout marker (`payout_payment_hash`) and
+/// when the seller's hold invoice was settled (`hold_settled_at`).
+///
+/// `None` when the order does not exist.
+pub async fn find_order_payout_marker_and_settle_time(
+    pool: &SqlitePool,
+    order_id: Uuid,
+) -> Result<Option<(Option<String>, Option<i64>)>, MostroError> {
+    sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+        "SELECT payout_payment_hash, hold_settled_at FROM orders WHERE id = ?1",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Returns true when `pubkey` corresponds to a solver user with read-write
 /// permission (`users.is_solver = true` and `users.category = 2`), independent
 /// of any dispute assignment. Use this when the caller is a prospective taker

@@ -12,6 +12,7 @@ pub mod add_cashu_escrow; // Cashu escrow lock handler (Track A / CF-5 stub)
 pub mod add_invoice; // Handles invoice creation
 pub mod admin_add_solver; // Admin functionality to add dispute solvers
 pub mod admin_cancel; // Admin order cancellation
+pub mod admin_order_info; // Real state of an order, for the admin and the solvers
 pub mod admin_settle; // Admin dispute settlement
 pub mod admin_take_dispute; // Admin dispute handling
 pub mod bond; // Anti-abuse bond data + helpers (issue #711)
@@ -38,6 +39,7 @@ use crate::app::add_cashu_escrow::add_cashu_escrow_action;
 use crate::app::add_invoice::add_invoice_action;
 use crate::app::admin_add_solver::admin_add_solver_action;
 use crate::app::admin_cancel::admin_cancel_action;
+use crate::app::admin_order_info::admin_order_info_action;
 use crate::app::admin_settle::admin_settle_action;
 use crate::app::admin_take_dispute::admin_take_dispute_action;
 use crate::app::bond::add_bond_invoice_action;
@@ -316,6 +318,13 @@ async fn handle_message_action(
         Action::AdminSettle => admin_settle_action(ctx, msg, event, my_keys, ln_client)
             .await
             .map_err(|e| e.into()),
+        // Read-only, but it asks the node about the hold invoice and the
+        // payout, so it is routed here and not through the no-LN handlers.
+        Action::AdminOrderInfo => {
+            admin_order_info_action(ctx, msg, event, my_keys, Some(ln_client))
+                .await
+                .map_err(|e| e.into())
+        }
         _ => handle_message_action_no_ln(action, msg, event, my_keys, ctx).await,
     }
 }
@@ -513,8 +522,13 @@ async fn accept_event(
         }
         return None;
     }
-    // Core's verify also admits the `user-info` reply shape; intake takes only the request.
-    if inner_message.action == Action::UserInfo && inner_message.payload.is_some() {
+    // Core's verify also admits the reply shape of `user-info` and of
+    // `admin-order-info`; intake takes only the request.
+    if matches!(
+        inner_message.action,
+        Action::UserInfo | Action::AdminOrderInfo
+    ) && inner_message.payload.is_some()
+    {
         return None;
     }
     let action = message.inner_action()?;
@@ -715,6 +729,8 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 /// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
 ///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
 ///   `UserInfo`, `RestoreSession`, `TradePubkey`.
+/// - **`AdminOrderInfo`** → `admin_order_info_action` without a Lightning
+///   client: read-only too, and the one admin action open in Cashu mode.
 /// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
 ///   fills in). Frozen here so Track A edits only its own file (G-1).
 /// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
@@ -740,6 +756,13 @@ async fn dispatch_cashu(
         // Reputation import and export touch no escrow either.
         Action::ImportReputation | Action::ExportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Read-only snapshot of an order for the admin and the solvers. There
+        // is no Lightning node to ask here: it reports the Cashu escrow.
+        Action::AdminOrderInfo => {
+            admin_order_info_action::<LndConnector>(ctx, msg, event, my_keys, None)
+                .await
+                .map_err(|e| e.into())
         }
         // Order creation + the take flow (Track A TA-2). Creating a pending
         // order touches no escrow; the take handlers branch on cashu mode and
@@ -2170,6 +2193,236 @@ mod tests {
                     if e.downcast_ref::<MostroError>()
                         == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
             ));
+        }
+    }
+
+    /// `admin-order-info` (#1107): intake takes only the request, and both
+    /// routers reach the handler.
+    mod admin_order_info_tests {
+        use super::*;
+        use mostro_core::db::Crud;
+        use mostro_core::order::{Order, Status};
+        use mostro_core::order_info::{HoldInvoiceState, OrderInfo};
+        use mostro_core::prelude::{MessageKind, Payload};
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        fn kind(id: Option<uuid::Uuid>, payload: Option<Payload>) -> MessageKind {
+            MessageKind::new(id, Some(1), None, Action::AdminOrderInfo, payload)
+        }
+
+        async fn accepted(message: Message) -> bool {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let trade = create_test_keys();
+            let event = wrap_message_nip44(
+                &message,
+                &trade,
+                &trade,
+                mostro.public_key(),
+                WrapOptions::default(),
+            )
+            .expect("wrap kind-14 event");
+            accept_event(
+                &ctx,
+                &event,
+                &mostro,
+                0,
+                0,
+                NostrKind::from(crate::config::constants::DM_EVENT_KIND),
+                None,
+            )
+            .await
+            .is_some()
+        }
+
+        #[tokio::test]
+        async fn the_request_is_accepted() {
+            let id = uuid::Uuid::new_v4();
+            assert!(accepted(Message::Order(kind(Some(id), None))).await);
+        }
+
+        /// Core's `verify` admits the reply too, so that clients can check
+        /// what they receive. Sent to Mostro it is not a request.
+        #[tokio::test]
+        async fn a_reply_shaped_message_is_dropped() {
+            let id = uuid::Uuid::new_v4();
+            let reply = Message::Order(kind(
+                Some(id),
+                Some(Payload::OrderInfo(OrderInfo {
+                    id,
+                    ..Default::default()
+                })),
+            ));
+            assert!(reply.verify(), "core admits the reply shape");
+            assert!(!accepted(reply).await);
+        }
+
+        #[tokio::test]
+        async fn a_request_without_an_order_id_is_dropped() {
+            assert!(!accepted(Message::Order(kind(None, None))).await);
+        }
+
+        /// Offline `LndConnector`: connecting is lazy, so nothing touches the
+        /// network until a lookup, which then fails at once.
+        async fn offline_ln_client() -> LndConnector {
+            let dir = std::env::temp_dir().join(format!("mostro-orderinfo-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let cert = dir.join("tls.cert");
+            let macaroon = dir.join("admin.macaroon");
+            std::fs::write(&cert, b"").expect("write cert");
+            std::fs::write(&macaroon, b"").expect("write macaroon");
+            let client =
+                fedimint_tonic_lnd::connect("https://127.0.0.1:1".to_string(), cert, macaroon)
+                    .await
+                    .expect("lazy connect must not touch the network");
+            LndConnector { client }
+        }
+
+        fn request_from(identity: PublicKey, order_id: uuid::Uuid) -> (Message, UnwrappedMessage) {
+            let message = Message::Order(kind(Some(order_id), None));
+            let event = UnwrappedMessage {
+                message: message.clone(),
+                signature: None,
+                sender: create_test_keys().public_key(),
+                identity,
+                created_at: Timestamp::now(),
+            };
+            (message, event)
+        }
+
+        /// The snapshots queued for `to` (the queue is process-global, so
+        /// filter by destination).
+        async fn snapshots_for(to: &PublicKey) -> Vec<OrderInfo> {
+            crate::config::MESSAGE_QUEUES
+                .queue_order_msg
+                .read()
+                .await
+                .iter()
+                .filter(|(_, dest)| dest == to)
+                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                    Some(Payload::OrderInfo(info)) => Some(info.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn is_cant_do(result: &Result<()>, reason: CantDoReason) -> bool {
+            matches!(
+                result,
+                Err(e) if e.downcast_ref::<MostroError>()
+                    == Some(&MostroError::MostroCantDo(reason))
+            )
+        }
+
+        async fn order_with_hold_invoice(ctx: &AppContext) -> Order {
+            Order {
+                id: uuid::Uuid::new_v4(),
+                kind: "sell".to_string(),
+                status: Status::Active.to_string(),
+                hash: Some("a1".repeat(32)),
+                ..Default::default()
+            }
+            .create(ctx.pool())
+            .await
+            .unwrap()
+        }
+
+        /// The Lightning router reaches the handler: a key that may not ask
+        /// is refused by it, where the no-LN fallback would answer `Ok`.
+        #[tokio::test]
+        async fn the_lightning_router_reaches_the_handler() {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let mut ln_client = offline_ln_client().await;
+            let stranger = create_test_keys().public_key();
+            let (message, event) = request_from(stranger, uuid::Uuid::new_v4());
+
+            let result = handle_message_action(
+                &Action::AdminOrderInfo,
+                message,
+                &event,
+                &mostro,
+                &mut ln_client,
+                &ctx,
+            )
+            .await;
+
+            assert!(
+                is_cant_do(&result, CantDoReason::InvalidPubkey),
+                "{result:?}"
+            );
+        }
+
+        /// With the node down, the admin still gets the answer: the hold
+        /// invoice is `unavailable` and the database part is there.
+        #[tokio::test]
+        async fn the_admin_is_answered_with_the_lightning_node_down() {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+            let mut ln_client = offline_ln_client().await;
+            let order = order_with_hold_invoice(&ctx).await;
+            let (message, event) = request_from(mostro.public_key(), order.id);
+
+            let result = handle_message_action(
+                &Action::AdminOrderInfo,
+                message,
+                &event,
+                &mostro,
+                &mut ln_client,
+                &ctx,
+            )
+            .await;
+
+            assert!(result.is_ok(), "{result:?}");
+            let snapshots = snapshots_for(&event.sender).await;
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0].id, order.id);
+            assert_eq!(snapshots[0].status, "active");
+            assert_eq!(
+                snapshots[0].hold_invoice.as_ref().map(|hold| hold.state),
+                Some(HoldInvoiceState::Unavailable)
+            );
+        }
+
+        /// The one admin action open in Cashu mode: it is read-only.
+        #[tokio::test]
+        async fn the_cashu_router_reaches_the_handler() {
+            let ctx = create_migrated_ctx().await;
+            let mostro = create_test_keys();
+
+            let stranger = create_test_keys().public_key();
+            let (message, event) = request_from(stranger, uuid::Uuid::new_v4());
+            let result =
+                dispatch_cashu(&Action::AdminOrderInfo, message, &event, &mostro, &ctx).await;
+            assert!(
+                is_cant_do(&result, CantDoReason::InvalidPubkey),
+                "{result:?}"
+            );
+
+            let order = Order {
+                id: uuid::Uuid::new_v4(),
+                kind: "sell".to_string(),
+                status: Status::Active.to_string(),
+                cashu_mint_url: Some("https://mint.example".to_string()),
+                ..Default::default()
+            }
+            .create(ctx.pool())
+            .await
+            .unwrap();
+            let (message, event) = request_from(mostro.public_key(), order.id);
+            let result =
+                dispatch_cashu(&Action::AdminOrderInfo, message, &event, &mostro, &ctx).await;
+            assert!(result.is_ok(), "{result:?}");
+            let snapshots = snapshots_for(&event.sender).await;
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(
+                snapshots[0]
+                    .cashu_escrow
+                    .as_ref()
+                    .map(|escrow| escrow.mint_url.as_str()),
+                Some("https://mint.example")
+            );
+            assert_eq!(snapshots[0].hold_invoice, None);
         }
     }
 

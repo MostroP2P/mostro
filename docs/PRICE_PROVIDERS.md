@@ -323,7 +323,9 @@ source move the price by half its error (security audit item #9). Note
 that `n` counts the candidates that survive cleaning and scoping on a
 given tick, not the providers configured: a currency only two providers
 cover, or a three-source currency with one provider down, lands here.
-The mostrod logs a `warn!` per tick naming the two values.
+Each tick logs a `warn!` per refused currency naming every candidate
+(provider and value, and the base for a fiat-cross) and whether the
+Nostr fallback (§11.7) or last-known-good is served instead.
 
 ### 6.3 PerBase resolution (fiat-cross sources)
 

@@ -909,4 +909,143 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    /// Largest LNURL body the tests below expect to be read.
+    const BODY_CAP: usize = 1024 * 1024;
+
+    /// The two ways a server can send a body of `body.len()` bytes: announced
+    /// by `content-length`, or streamed until the connection closes.
+    fn http_200_responses(body: &str) -> [String; 2] {
+        [
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}"),
+        ]
+    }
+
+    /// A JSON object made of `fields` plus a `pad` string, exactly `len` bytes.
+    fn json_padded_to(fields: &str, len: usize) -> String {
+        let head = format!("{{{fields},\"pad\":\"");
+        let tail = "\"}";
+        assert!(len >= head.len() + tail.len(), "padding target too small");
+        format!("{head}{}{tail}", "a".repeat(len - head.len() - tail.len()))
+    }
+
+    /// A loopback server that answers its n-th connection with the n-th
+    /// response built by `responses` (which gets the server's own address,
+    /// for callback URLs). The client may hang up early on an oversized body.
+    async fn serve_in_order(responses: impl FnOnce(SocketAddr) -> Vec<String>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = responses(addr);
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    fn lnurl_for(addr: SocketAddr, path: &str) -> String {
+        LnUrl {
+            url: format!("http://{addr}{path}"),
+        }
+        .encode()
+    }
+
+    #[tokio::test]
+    async fn ln_exists_refuses_a_body_over_the_cap() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        let body = json_padded_to(r#""tag":"payRequest""#, BODY_CAP + 1);
+        for response in http_200_responses(&body) {
+            let head = response[..response.find("\r\n\r\n").unwrap()].to_string();
+            let addr = serve_in_order(|_| vec![response]).await;
+            let result = ln_exists(&lnurl_for(addr, "/.well-known/lnurlp/alice")).await;
+            assert!(
+                result.is_err(),
+                "{head:?}: a body over the cap must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ln_exists_accepts_a_body_exactly_at_the_cap() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        let body = json_padded_to(r#""tag":"payRequest""#, BODY_CAP);
+        for response in http_200_responses(&body) {
+            let head = response[..response.find("\r\n\r\n").unwrap()].to_string();
+            let addr = serve_in_order(|_| vec![response]).await;
+            let result = ln_exists(&lnurl_for(addr, "/.well-known/lnurlp/alice")).await;
+            assert!(
+                result.is_ok(),
+                "{head:?}: a body at the cap must be read: {result:?}"
+            );
+        }
+    }
+
+    /// The LNURL-pay document (first fetch of `resolv_ln_address`) over the cap.
+    #[tokio::test]
+    async fn resolv_ln_address_refuses_a_pay_document_over_the_cap() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        for variant in 0..2 {
+            let addr = serve_in_order(|addr| {
+                let document = json_padded_to(
+                    &format!(
+                        r#""tag":"payRequest","callback":"http://{addr}/cb","minSendable":1000,"maxSendable":1000000000"#
+                    ),
+                    BODY_CAP + 1,
+                );
+                let callback = r#"{"pr":"lnbc1fake","routes":[]}"#;
+                vec![
+                    http_200_responses(&document)[variant].clone(),
+                    http_200_responses(callback)[0].clone(),
+                ]
+            })
+            .await;
+            let result =
+                resolv_ln_address(&lnurl_for(addr, "/.well-known/lnurlp/alice"), 100, None).await;
+            assert!(
+                result.is_err(),
+                "variant {variant}: a pay document over the cap must be refused: {result:?}"
+            );
+        }
+    }
+
+    /// The callback reply (second fetch of `resolv_ln_address`) over the cap.
+    #[tokio::test]
+    async fn resolv_ln_address_refuses_a_callback_reply_over_the_cap() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        for variant in 0..2 {
+            let addr = serve_in_order(|addr| {
+                let document = format!(
+                    r#"{{"tag":"payRequest","callback":"http://{addr}/cb","minSendable":1000,"maxSendable":1000000000}}"#
+                );
+                let callback = json_padded_to(r#""pr":"lnbc1fake""#, BODY_CAP + 1);
+                vec![
+                    http_200_responses(&document)[0].clone(),
+                    http_200_responses(&callback)[variant].clone(),
+                ]
+            })
+            .await;
+            let result =
+                resolv_ln_address(&lnurl_for(addr, "/.well-known/lnurlp/alice"), 100, None).await;
+            assert!(
+                result.is_err(),
+                "variant {variant}: a callback reply over the cap must be refused: {result:?}"
+            );
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use crate::app::bond::BondState;
+use crate::app::health::cashu_mint::ESCROW_HOLDING_STATUSES;
 use crate::config::settings::Settings;
 use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
@@ -1165,24 +1166,30 @@ pub async fn cashu_escrow_token_in_use(
     Ok(found.is_some())
 }
 
-/// Every order with a locked Cashu escrow, for restore/monitoring after a
-/// restart (CF-4). Deliberately **no** `status` predicate:
-/// [`update_order_cashu_escrow`] advances the status in the same write as
-/// the lock, so filtering on a status would skip legitimately locked rows
-/// that have already moved on. Only re-add a status predicate if a separate
-/// invariant guarantees locked rows never leave that status.
+/// The orders whose locked Cashu escrow is still in flight, for restore and
+/// monitoring after a restart (TA-3).
+///
+/// Filtered on every status that can hold an escrow, never a single one:
+/// [`update_order_cashu_escrow`] advances the status in the same write as the
+/// lock and the trade moves on from there. Terminal orders are left out
+/// because nothing clears `cashu_escrow_locked_at`: a released escrow is
+/// legitimately spent, and would otherwise warn on every later boot.
 pub async fn find_locked_cashu_orders(pool: &SqlitePool) -> Result<Vec<Order>, MostroError> {
-    sqlx::query_as::<_, Order>(
-        r#"
-          SELECT *
-          FROM orders
-          WHERE cashu_escrow_locked_at IS NOT NULL
-          ORDER BY cashu_escrow_locked_at ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+    sqlx::query_as::<_, Order>(locked_cashu_orders_query())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// The query behind [`find_locked_cashu_orders`]. The status list is a
+/// compile-time constant, never user input.
+pub(crate) fn locked_cashu_orders_query() -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!(
+        "SELECT * FROM orders \
+         WHERE cashu_escrow_locked_at IS NOT NULL \
+           AND status IN ({ESCROW_HOLDING_STATUSES}) \
+         ORDER BY cashu_escrow_locked_at ASC"
+    ))
 }
 
 /// Orders whose hold invoice still needs an LND subscription attached.
@@ -6300,13 +6307,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_locked_cashu_orders_includes_terminal_status_orders() {
-        // Pins the deliberate CF-4 design (M-1): the finder has no status
-        // predicate and nothing ever clears `cashu_escrow_locked_at`, so a
-        // locked order that reached a terminal status is STILL returned.
-        // This is a conscious, tested contract — if CF-5 needs terminal
-        // orders excluded, it must clear the lock or filter, not rely on
-        // this finder to drop them.
+    async fn find_locked_cashu_orders_excludes_terminal_status_orders() {
+        // Nothing clears `cashu_escrow_locked_at`, so without the status
+        // filter the restore pass would re-check every escrow the node ever
+        // locked, and warn about each legitimately spent token, on every boot.
         let pool = setup_orders_db().await.unwrap();
         let id = uuid::Uuid::new_v4();
         insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
@@ -6323,21 +6327,26 @@ mod tests {
         .await
         .unwrap());
 
-        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
-            .bind(Status::Canceled.to_string())
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        for status in [
+            Status::Canceled,
+            Status::CanceledByAdmin,
+            Status::SettledByAdmin,
+            Status::CompletedByAdmin,
+            Status::Expired,
+            Status::Success,
+            Status::CooperativelyCanceled,
+        ] {
+            sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+                .bind(status.to_string())
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
 
-        let locked = super::find_locked_cashu_orders(&pool).await.unwrap();
-        assert_eq!(
-            locked.len(),
-            1,
-            "a canceled-but-locked order is still found"
-        );
-        assert_eq!(locked[0].id, id);
-        assert_eq!(locked[0].status, Status::Canceled.to_string());
+            let locked = super::find_locked_cashu_orders(&pool).await.unwrap();
+
+            assert!(locked.is_empty(), "{status} is not in flight");
+        }
     }
 }
 

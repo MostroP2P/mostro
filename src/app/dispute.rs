@@ -3,7 +3,7 @@
 //! and publish dispute events to the network.
 
 use crate::app::context::AppContext;
-use crate::db::find_dispute_by_order_id;
+use crate::db::{find_dispute_by_order_id, find_optional_dispute_by_order_id};
 use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order};
 use mostro_core::prelude::*;
@@ -280,22 +280,25 @@ pub async fn dispute_action(
     Ok(())
 }
 
-/// Closes a dispute after users resolve it themselves (cooperative cancel or release).
+/// Closes a dispute once the order it belongs to has been resolved.
 ///
 /// This is a best-effort operation: if the dispute update or event publishing fails,
 /// errors are logged but not propagated, since the primary order operation has already
-/// succeeded. The solver is notified via DM when one is assigned and the dispute
-/// reaches a terminal status. Non-terminal statuses do not trigger a notification.
+/// succeeded. That is also why the callers past an irreversible Lightning effect can
+/// use it — an early return there would strand the order's bonds and its payout.
+/// The solver is notified via DM after a user resolution. Admin settlement
+/// notifications are sent by the admin handler, not duplicated here.
 ///
 /// # Arguments
 /// * `ctx` - Application context containing the database pool and Nostr client
 /// * `order` - The order associated with the dispute
-/// * `new_status` - The new dispute status: `Released` after a release,
-///   `CooperativelyCanceled` after a cooperative cancel. Never `Settled`, which marks
-///   a solver's `admin-settle`.
+/// * `new_status` - The outcome being recorded: `Released` when the seller
+///   releases, `CooperativelyCanceled` after a cooperative cancel, `Settled` when a
+///   solver admin-settles. The status is what distinguishes a resolution the
+///   users reached themselves from one a solver decided.
 /// * `my_keys` - Mostro's keys for signing the dispute event
-/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel", "release")
-pub async fn close_dispute_after_user_resolution(
+/// * `context` - Description of the resolution context for logging (e.g., "cooperative cancel")
+pub async fn close_dispute_after_resolution(
     ctx: &AppContext,
     order: &Order,
     new_status: DisputeStatus,
@@ -303,7 +306,19 @@ pub async fn close_dispute_after_user_resolution(
     context: &str,
 ) {
     let pool = ctx.pool();
-    if let Ok(mut dispute) = find_dispute_by_order_id(pool, order.id).await {
+    let dispute = match find_optional_dispute_by_order_id(pool, order.id).await {
+        Ok(dispute) => dispute,
+        Err(e) => {
+            tracing::error!(
+                "Failed to load the dispute row for order {} after {}: {}",
+                order.id,
+                context,
+                e
+            );
+            None
+        }
+    };
+    if let Some(mut dispute) = dispute {
         let dispute_id = dispute.id;
         let opened_at = dispute.created_at;
 
@@ -321,7 +336,7 @@ pub async fn close_dispute_after_user_resolution(
             );
         } else {
             tracing::info!(
-                "Dispute {} closed automatically after {} of order {}",
+                "Dispute {} closed after {} of order {}",
                 dispute_id,
                 context,
                 order.id
@@ -373,8 +388,10 @@ pub async fn close_dispute_after_user_resolution(
             let solver_action = match new_status {
                 DisputeStatus::CooperativelyCanceled => Some(Action::CooperativeCancelAccepted),
                 DisputeStatus::SellerRefunded => Some(Action::CooperativeCancelAccepted),
-                DisputeStatus::Settled | DisputeStatus::Released => Some(Action::Released),
-                DisputeStatus::Initiated | DisputeStatus::InProgress => None,
+                DisputeStatus::Released => Some(Action::Released),
+                DisputeStatus::Settled | DisputeStatus::Initiated | DisputeStatus::InProgress => {
+                    None
+                }
             };
 
             if let (Some(action), Some(pk_str)) = (solver_action, solver_pubkey_opt.as_ref()) {
@@ -797,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_is_noop_without_dispute_row() {
+    async fn close_dispute_after_resolution_is_noop_without_dispute_row() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -805,7 +822,7 @@ mod tests {
         let order = create_order(Some(buyer), Some(seller), Status::Active);
 
         // No dispute row exists: must be a silent no-op
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::Released,
@@ -821,7 +838,7 @@ mod tests {
     /// initiator branch; the dispute row is updated even though the final
     /// event publish fails offline (error is only logged).
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_updates_dispute_status() {
+    async fn close_dispute_after_resolution_updates_dispute_status() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -835,7 +852,7 @@ mod tests {
             .await
             .unwrap();
 
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::CooperativelyCanceled,
@@ -854,7 +871,7 @@ mod tests {
     /// Inconsistent flags (both unset) fall into the "unknown" initiator
     /// branch; the dispute status update must still be persisted.
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_handles_inconsistent_flags() {
+    async fn close_dispute_after_resolution_handles_inconsistent_flags() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -870,7 +887,7 @@ mod tests {
             .await
             .unwrap();
 
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::Released,
@@ -1016,7 +1033,7 @@ mod tests {
     /// cooperative cancel (SellerRefunded), the solver must receive
     /// Action::CooperativeCancelAccepted so their client knows the case is closed.
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_notifies_solver() {
+    async fn close_dispute_after_resolution_notifies_solver() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -1031,7 +1048,7 @@ mod tests {
         dispute.solver_pubkey = Some(solver.public_key().to_string());
         dispute.create(&pool).await.unwrap();
 
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::CooperativelyCanceled,
@@ -1061,11 +1078,8 @@ mod tests {
         ));
     }
 
-    /// When a dispute has a solver assigned and users resolve it via
-    /// release (Settled), the solver must receive Action::Released
-    /// so their client knows the case is closed.
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_notifies_solver_on_settled() {
+    async fn close_dispute_after_resolution_does_not_duplicate_admin_settle_notification() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -1080,39 +1094,26 @@ mod tests {
         dispute.solver_pubkey = Some(solver.public_key().to_string());
         dispute.create(&pool).await.unwrap();
 
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::Settled,
             &Keys::generate(),
-            "release",
+            "admin settle",
         )
         .await;
 
-        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
-        let solver_msgs: Vec<_> = queue
-            .iter()
-            .filter(|(msg, dest)| {
-                *dest == solver.public_key()
-                    && msg.get_inner_message_kind().action == Action::Released
-                    && msg.get_inner_message_kind().id == Some(order.id)
-            })
-            .collect();
-
-        assert_eq!(solver_msgs.len(), 1);
-
-        // Verify the payload contains the dispute_id
         let dispute = find_dispute_by_order_id(&pool, order.id).await.unwrap();
-        let (msg, _) = solver_msgs[0];
-        assert!(matches!(
-            msg.get_inner_message_kind().payload,
-            Some(Payload::Dispute(id, None)) if id == dispute.id
-        ));
+        assert_eq!(dispute.status, DisputeStatus::Settled.to_string());
+        let queue = MESSAGE_QUEUES.queue_order_msg.read().await;
+        assert!(queue.iter().all(|(msg, dest)| {
+            *dest != solver.public_key() || msg.get_inner_message_kind().id != Some(order.id)
+        }));
     }
 
     /// When no solver is assigned (solver_pubkey is None), no DM is queued.
     #[tokio::test]
-    async fn close_dispute_after_user_resolution_skips_notification_without_solver() {
+    async fn close_dispute_after_resolution_skips_notification_without_solver() {
         let pool = create_test_pool().await;
         let ctx = build_ctx(&pool);
         let buyer = Keys::generate().public_key();
@@ -1126,7 +1127,7 @@ mod tests {
             .await
             .unwrap();
 
-        close_dispute_after_user_resolution(
+        close_dispute_after_resolution(
             &ctx,
             &order,
             DisputeStatus::SellerRefunded,

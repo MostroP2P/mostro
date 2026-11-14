@@ -40,6 +40,14 @@ const LNURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// loop longer than the HTTP timeouts below.
 const LNURL_DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cap on a single LNURL response body, in bytes. The timeouts above bound
+/// how long a buyer-chosen server may talk, not how much it may send: 4 s at
+/// datacenter speed is hundreds of MiB held in memory. Measured legitimate
+/// bodies are 0.3-0.8 KB, and 4.6 KB for the one server seen shipping a base64
+/// thumbnail in `metadata` (LUD-06 allows up to ~133 KiB, which this cap would
+/// refuse). Mostro never reads `metadata`, so such a server is not supported.
+const MAX_LNURL_RESPONSE_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 static ALLOW_PRIVATE_LNURL_HOSTS: AtomicBool = AtomicBool::new(false);
 
@@ -245,6 +253,28 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
         .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))
 }
 
+/// The response body as text, or `None` if it is longer than
+/// [`MAX_LNURL_RESPONSE_BYTES`] (announced by `content-length` or not) or the
+/// stream fails. Callers map `None` as they mapped a failed `text()` read.
+async fn read_body_capped(mut response: reqwest::Response) -> Option<String> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_LNURL_RESPONSE_BYTES as u64)
+    {
+        warn!("LNURL response refused: announced body over {MAX_LNURL_RESPONSE_BYTES} bytes");
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_LNURL_RESPONSE_BYTES {
+            warn!("LNURL response refused: body over {MAX_LNURL_RESPONSE_BYTES} bytes");
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Parse a Lightning Address or bech32 LNURL into an http(s) [`Url`].
 ///
 /// - Lightning Address (`user@domain`) → well-known LNURL-pay endpoint URL
@@ -293,10 +323,9 @@ pub async fn ln_exists(address: &str) -> Result<(), MostroError> {
     let res = lnurl_get(url).await?;
     let status = res.status();
     if status.is_success() {
-        let body = res
-            .text()
+        let body = read_body_capped(res)
             .await
-            .map_err(|_| MostroInternalErr(ServiceError::NoAPIResponse))?;
+            .ok_or(MostroInternalErr(ServiceError::NoAPIResponse))?;
         let body: Value = serde_json::from_str(&body)
             .map_err(|_| MostroInternalErr(ServiceError::MalformedAPIRes))?;
         let tag = body["tag"].as_str().unwrap_or("");
@@ -390,10 +419,9 @@ pub async fn resolv_ln_address(
     if !res.status().is_success() {
         return Err(MostroInternalErr(ServiceError::MalformedAPIRes));
     }
-    let body = res
-        .text()
+    let body = read_body_capped(res)
         .await
-        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        .ok_or(MostroInternalErr(ServiceError::MessageSerializationError))?;
     let body: Value = serde_json::from_str(&body)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     if body["status"].as_str() == Some("ERROR") {
@@ -417,10 +445,9 @@ pub async fn resolv_ln_address(
     if !res.status().is_success() {
         return Err(MostroInternalErr(ServiceError::MalformedAPIRes));
     }
-    let body = res
-        .text()
+    let body = read_body_capped(res)
         .await
-        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+        .ok_or(MostroInternalErr(ServiceError::MessageSerializationError))?;
     let body: Value = serde_json::from_str(&body)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
     if body["status"].as_str() == Some("ERROR") {
@@ -910,8 +937,7 @@ mod tests {
         );
     }
 
-    /// Largest LNURL body the tests below expect to be read.
-    const BODY_CAP: usize = 1024 * 1024;
+    const BODY_CAP: usize = MAX_LNURL_RESPONSE_BYTES;
 
     /// The two ways a server can send a body of `body.len()` bytes: announced
     /// by `content-length`, or streamed until the connection closes.
@@ -992,6 +1018,39 @@ mod tests {
                 "{head:?}: a body at the cap must be read: {result:?}"
             );
         }
+    }
+
+    /// A body announced over the cap is refused before any of it is read: the
+    /// server here sends a valid document but never closes, so waiting for the
+    /// announced bytes would last until `LNURL_REQUEST_TIMEOUT`.
+    #[tokio::test]
+    async fn ln_exists_refuses_an_announced_oversize_without_waiting_for_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"tag":"payRequest"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                MAX_LNURL_RESPONSE_BYTES + 1
+            );
+            let _ = socket.write_all(format!("{head}{body}").as_bytes()).await;
+            tokio::time::sleep(LNURL_REQUEST_TIMEOUT * 2).await;
+        });
+
+        let started = std::time::Instant::now();
+        let result = ln_exists(&lnurl_for(addr, "/.well-known/lnurlp/alice")).await;
+        assert!(result.is_err(), "an announced oversize must be refused");
+        assert!(
+            started.elapsed() < LNURL_REQUEST_TIMEOUT - Duration::from_secs(1),
+            "refused only after {:?}: the announced length was not checked first",
+            started.elapsed()
+        );
     }
 
     /// The LNURL-pay document (first fetch of `resolv_ln_address`) over the cap.

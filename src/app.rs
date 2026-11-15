@@ -2497,6 +2497,7 @@ mod tests {
 
     mod dispatch_cashu_tests {
         use super::*;
+        use crate::config::types::CashuSettings;
 
         fn is_invalid_action(result: Result<()>) -> bool {
             matches!(
@@ -2504,6 +2505,59 @@ mod tests {
                 Err(e) if e.downcast_ref::<MostroError>()
                     == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
             )
+        }
+
+        /// A migrated context whose `[cashu]` block is exactly `cashu`. The
+        /// dispatch gate reads `ctx.settings()`, never the process-global
+        /// config, so each context pins the gate for its own test.
+        async fn cashu_ctx(cashu: CashuSettings) -> AppContext {
+            use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+            let pool =
+                std::sync::Arc::new(sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap());
+            sqlx::migrate!("./migrations")
+                .run(pool.as_ref())
+                .await
+                .unwrap();
+            let mut settings = test_settings();
+            settings.cashu = Some(cashu);
+            TestContextBuilder::new()
+                .with_pool(pool)
+                .with_settings(settings)
+                .build()
+        }
+
+        /// The post-lock Cashu lifecycle is incomplete: there is no release,
+        /// no cooperative cancellation, no dispute path (and therefore no
+        /// `P_M` signature delivery), and no timeout for taken-but-unfunded
+        /// orders. Until those ship, `dispatch_cashu` must not route order
+        /// creation, taking, or escrow funding to their handlers: a node
+        /// that accepts a lock cannot get out of it. All four entry actions
+        /// must be refused with `CantDo(InvalidAction)`.
+        #[tokio::test]
+        async fn blocks_order_creation_take_and_funding_while_lifecycle_incomplete() {
+            // Key absent: the Default must keep the gate closed.
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: true,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [
+                Action::NewOrder,
+                Action::TakeBuy,
+                Action::TakeSell,
+                Action::AddCashuEscrow,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_invalid_action(result),
+                    "{action:?} must be blocked with InvalidAction while the \
+                     post-lock lifecycle is incomplete"
+                );
+            }
         }
 
         /// Actions with no Cashu handler yet — release/cancel/dispute, the

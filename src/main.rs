@@ -222,9 +222,11 @@ async fn main() -> Result<()> {
     // connect the configured mints instead, attach them to the context, and
     // hand off to the Cashu event loop. Makers choose a mint per order, so an
     // unreachable mint is a warning, not a reason to refuse to boot: orders
-    // on it fail to lock until it is back (issue #1046). Every trade action is still rejected with
-    // `CantDo(InvalidAction)` until the feature tracks land. The default
-    // Lightning path below is left byte-for-byte unchanged.
+    // on it fail to lock until it is back (issue #1046). Order creation,
+    // taking and escrow funding are gated in `dispatch_cashu` behind
+    // `[cashu].unsafe_allow_incomplete_trades` (off by default) until the
+    // post-lock lifecycle lands; the warnings below spell out what is live.
+    // The default Lightning path below is left byte-for-byte unchanged.
     if Settings::is_cashu_enabled() {
         // The `mint_urls` entries were validated at config load (CF-1); this
         // expect is unreachable for a validated config.
@@ -239,6 +241,26 @@ async fn main() -> Result<()> {
             tracing::info!(
                 "Starting in Cashu escrow mode — connecting mints {} (LND not initialised)",
                 mint_urls.join(", ")
+            );
+        }
+        // Say out loud what the dispatch gate does with the lifecycle still
+        // incomplete: with the default settings the node refuses to create,
+        // take or fund Cashu trades; only the development override routes
+        // those actions to their handlers.
+        if Settings::get_cashu().is_some_and(|cfg| cfg.unsafe_allow_incomplete_trades) {
+            tracing::warn!(
+                "UNSAFE DEVELOPMENT MODE: [cashu].unsafe_allow_incomplete_trades = true — \
+                 order creation, taking and escrow funding are ACCEPTED even though release, \
+                 cancellation and dispute resolution are not implemented. A funded escrow has \
+                 no protocol-level exit until those tracks land. DO NOT use with real funds."
+            );
+        } else {
+            tracing::warn!(
+                "Cashu lifecycle is incomplete: order creation, taking and escrow funding \
+                 (NewOrder, TakeBuy, TakeSell, AddCashuEscrow) are disabled until release, \
+                 the unfunded-take timeout, cooperative cancellation and dispute resolution \
+                 land. Orders funded in an earlier run are NOT resolved by this: they still \
+                 need coordination between the parties and a future protocol path."
             );
         }
         let cashu_mints = Arc::new(cashu::mints::CashuMints::connect_configured(&mint_urls).await);

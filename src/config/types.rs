@@ -268,6 +268,20 @@ pub struct CashuSettings {
     /// `>= 1`; validated at startup.
     #[serde(default = "default_escrow_locktime_days")]
     pub escrow_locktime_days: u32,
+    /// DEVELOPMENT-ONLY override. The post-lock Cashu lifecycle is
+    /// incomplete: no release, no cooperative cancellation, no dispute
+    /// path (hence no `P_M` signature delivery), and no timeout for
+    /// taken-but-unfunded orders. While that holds, `dispatch_cashu`
+    /// refuses `NewOrder`, `TakeBuy`, `TakeSell` and `AddCashuEscrow`
+    /// with `CantDo(InvalidAction)` so the node cannot accept escrow it
+    /// has no protocol-level exit from. Setting this flag to `true`
+    /// (together with `enabled = true`) restores that routing for
+    /// development and testing only. It is not a production safety
+    /// measure and not the buyer's acceptance of risk: a funded token
+    /// can otherwise only be pulled back by the seller alone once the
+    /// locktime passes. Never enable it with real funds.
+    #[serde(default)]
+    pub unsafe_allow_incomplete_trades: bool,
 }
 
 fn default_escrow_locktime_days() -> u32 {
@@ -280,6 +294,7 @@ impl Default for CashuSettings {
             enabled: false,
             mint_urls: Vec::new(),
             escrow_locktime_days: default_escrow_locktime_days(),
+            unsafe_allow_incomplete_trades: false,
         }
     }
 }
@@ -1425,6 +1440,10 @@ mod cashu_settings_tests {
         assert!(!cfg.enabled);
         assert!(cfg.mint_urls.is_empty());
         assert_eq!(cfg.escrow_locktime_days, 15);
+        assert!(
+            !cfg.unsafe_allow_incomplete_trades,
+            "the development override must never be on by default"
+        );
     }
 
     #[test]
@@ -1442,6 +1461,10 @@ mod cashu_settings_tests {
         assert!(!cashu.enabled);
         assert!(cashu.mint_urls.is_empty());
         assert_eq!(cashu.escrow_locktime_days, 15);
+        assert!(
+            !cashu.unsafe_allow_incomplete_trades,
+            "an absent unsafe_allow_incomplete_trades key must default to false"
+        );
     }
 
     #[test]
@@ -1465,6 +1488,45 @@ mod cashu_settings_tests {
         assert!(cashu.enabled);
         assert_eq!(cashu.mint_urls, vec!["https://mint.example.com"]);
         assert_eq!(cashu.escrow_locktime_days, 30);
+    }
+
+    #[test]
+    fn toml_deserializes_the_unsafe_development_override() {
+        let parsed: Stub =
+            toml::from_str("[cashu]\nenabled = true\nunsafe_allow_incomplete_trades = true\n")
+                .expect("override block");
+        assert!(
+            parsed
+                .cashu
+                .expect("block present")
+                .unsafe_allow_incomplete_trades,
+            "the explicit development override must deserialize as true"
+        );
+
+        let off: Stub =
+            toml::from_str("[cashu]\nenabled = true\nunsafe_allow_incomplete_trades = false\n")
+                .expect("override off block");
+        assert!(
+            !off.cashu
+                .expect("block present")
+                .unsafe_allow_incomplete_trades
+        );
+    }
+
+    #[test]
+    fn override_needs_enabled_to_be_effective() {
+        // `dispatch_cashu` gates on `cfg.enabled &&
+        // cfg.unsafe_allow_incomplete_trades`: a disabled Cashu block keeps
+        // the entry actions refused no matter what the override says.
+        let parsed: Stub =
+            toml::from_str("[cashu]\nenabled = false\nunsafe_allow_incomplete_trades = true\n")
+                .expect("disabled override block");
+        let cashu = parsed.cashu.expect("block present");
+        assert!(cashu.unsafe_allow_incomplete_trades);
+        assert!(
+            !(cashu.enabled && cashu.unsafe_allow_incomplete_trades),
+            "enabled = false must keep the gate closed"
+        );
     }
 
     #[test]

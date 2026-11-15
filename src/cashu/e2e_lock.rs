@@ -256,8 +256,10 @@ async fn temp_pool() -> SqlitePool {
 }
 
 /// A taken Cashu order parked in `WaitingPayment` — the state TA-2 will
-/// produce, seeded here by hand because `dispatch_cashu` still rejects
-/// `NewOrder`/`TakeSell` until TA-2 lands.
+/// produce, seeded here by hand because this harness drives
+/// `add_cashu_escrow_action` directly (the mint-backed token must be built
+/// outside the daemon; order entry itself stays behind the
+/// `unsafe_allow_incomplete_trades` gate in `dispatch_cashu`).
 async fn seed_waiting_payment_order(
     pool: &SqlitePool,
     keys: &EscrowKeys,
@@ -343,6 +345,7 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
         enabled: true,
         mint_urls: vec![mint_url.clone()],
         escrow_locktime_days: days as u32,
+        ..Default::default()
     });
     let _ = crate::config::settings::init_mostro_settings(settings);
 

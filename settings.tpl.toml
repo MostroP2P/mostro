@@ -387,6 +387,13 @@ lnd_resynced_clear_after = 300
 # the order. Mutually exclusive with [anti_abuse_bond] — enabling both is a
 # startup error.
 #
+# By default NewOrder, TakeBuy, TakeSell and AddCashuEscrow are DISABLED,
+# and read-only actions still work, because the post-lock Cashu lifecycle is
+# incomplete: there is no release, no unfunded-take timeout, no cooperative
+# cancellation, and no dispute resolution with P_M signature delivery before
+# the locktime. Accepting a funded escrow without those exits would leave the
+# token recoverable only by the seller alone after the locktime.
+#
 # [cashu]
 # enabled = false
 # # Mints this node accepts for new orders (http/https). Orders on any other
@@ -395,6 +402,10 @@ lnd_resynced_clear_after = 300
 # # Seller-recovery locktime floor in days: escrow tokens must carry
 # # locktime >= now + this. Sellers may set a longer locktime, never shorter.
 # escrow_locktime_days = 15
+# # DANGER — DEVELOPMENT ONLY. Enables order creation, taking and escrow funding
+# # even though release, cancellation and dispute resolution are not implemented.
+# # Never enable this with real funds.
+# unsafe_allow_incomplete_trades = false
 
 # Reputation import (docs/REPUTATION_PORTABILITY.md). Opt-in, disabled by
 # default. Lets users bring reputation earned elsewhere (another Mostro, or

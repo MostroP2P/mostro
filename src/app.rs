@@ -669,9 +669,10 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
 /// [`handle_message_action`] — there is no `ln_client` in Cashu mode. It
 /// differs from `run` in exactly one line: the dispatch call.
 ///
-/// During the foundation milestone every escrow/trade action is rejected with
-/// `CantDo(InvalidAction)`; the feature tracks replace those arms one at a time
-/// (see `docs/cashu/01-fundamentals.md` §6 action-ownership matrix).
+/// Order creation, taking and escrow funding are gated inside
+/// [`dispatch_cashu`] by `[cashu].unsafe_allow_incomplete_trades`; with the
+/// default (closed) gate they are refused with `CantDo(InvalidAction)`, like
+/// every other lifecycle action whose feature track has not landed yet.
 pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
@@ -708,19 +709,22 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
 
 /// Route a validated action in Cashu mode (CF-5).
 ///
-/// The allow-list is drawn at *"escrow-independent actions that neither create
-/// nor advance an order"* (`docs/cashu/01-fundamentals.md` §6, closed
-/// decision):
+/// The routing rule is a strict allow-list. The read-only / session and
+/// reputation actions are always safe: they neither create nor advance an
+/// order (`docs/cashu/01-fundamentals.md` §6, closed decision):
 ///
-/// - **Allowed** → `handle_message_action_no_ln` (read-only / session; never
-///   touch escrow, LND, or order lifecycle): `Orders`, `LastTradeIndex`,
-///   `UserInfo`, `RestoreSession`, `TradePubkey`.
-/// - **`AddCashuEscrow`** → `add_cashu_escrow_action` (a CF-5 stub Track A
-///   fills in). Frozen here so Track A edits only its own file (G-1).
-/// - **Blocked** → `CantDo(InvalidAction)` — everything that creates, advances,
-///   or settles an order (there is no escrow behind it yet). The feature tracks
-///   replace these arms one at a time; the action-ownership matrix in
-///   fundamentals §6 guarantees every blocked action has an owner.
+/// - **Always allowed** → `handle_message_action_no_ln`: `Orders`,
+///   `LastTradeIndex`, `UserInfo`, `RestoreSession`, `TradePubkey`,
+///   `ImportReputation`, `ExportReputation`.
+/// - **Development-only gate** → `NewOrder`, `TakeBuy`, `TakeSell` (via
+///   `handle_message_action_no_ln`) and `AddCashuEscrow` (via
+///   `add_cashu_escrow_action`) are routed only when the operator opts into
+///   `unsafe_allow_incomplete_trades`; otherwise they fall through to the
+///   catch-all and answer `CantDo(InvalidAction)`.
+/// - **Blocked** → `CantDo(InvalidAction)` — everything that advances or
+///   settles an order past the lock. The feature tracks replace these arms
+///   one at a time; the action-ownership matrix in fundamentals §6
+///   guarantees every blocked action has an owner.
 async fn dispatch_cashu(
     action: &Action,
     msg: Message,
@@ -728,6 +732,28 @@ async fn dispatch_cashu(
     my_keys: &Keys,
     ctx: &AppContext,
 ) -> Result<()> {
+    // Cashu order creation, taking, and funding remain disabled by default until the
+    // complete post-lock lifecycle is implemented and tested: release, unfunded-take
+    // timeout, cooperative cancellation, and dispute resolution with P_M signature
+    // delivery before locktime. The override is for development only.
+    //
+    // Concretely, unblocking means: the full Track B (FiatSent + release +
+    // RateUser), the scheduler timeout for takes left unfunded, the full Track C
+    // (cooperative cancellation), and the full Track D (dispute with executable
+    // P_M signature delivery before the locktime) — each with E2E coverage of
+    // the normal release, an absent seller, cancellation, dispute, daemon
+    // restart, and behaviour near the locktime. Handing the token to the buyer
+    // alone is not an exit: without a P_S or P_M signature there is no spend
+    // path when the seller disappears.
+    //
+    // Read per context, not from the process-global config, so tests can pin
+    // the gate both ways.
+    let allow_incomplete = ctx
+        .settings()
+        .cashu
+        .as_ref()
+        .is_some_and(|cfg| cfg.enabled && cfg.unsafe_allow_incomplete_trades);
+
     match action {
         // Escrow-independent, read-only / session actions — safe in Cashu mode.
         Action::Orders
@@ -741,20 +767,20 @@ async fn dispatch_cashu(
         Action::ImportReputation | Action::ExportReputation => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
-        // Order creation + the take flow (Track A TA-2). Creating a pending
-        // order touches no escrow; the take handlers branch on cashu mode and
-        // emit the escrow request (`show_cashu_escrow_request`) instead of a
-        // hold invoice. Creatable and takeable ship together so the book never
-        // fills with untakeable orders.
-        Action::NewOrder | Action::TakeBuy | Action::TakeSell => {
+        // Order creation + the take flow, and the escrow funding submission
+        // (Track A). Gated by `unsafe_allow_incomplete_trades`: with the gate
+        // closed these fall to the catch-all arm below and answer
+        // `CantDo(InvalidAction)`.
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell if allow_incomplete => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
-        // Cashu escrow lock — TA-1 fills the stub body; the routing is frozen.
-        Action::AddCashuEscrow => add_cashu_escrow_action(ctx, msg, event, my_keys)
-            .await
-            .map_err(|e| e.into()),
+        Action::AddCashuEscrow if allow_incomplete => {
+            add_cashu_escrow_action(ctx, msg, event, my_keys)
+                .await
+                .map_err(|e| e.into())
+        }
         // Everything that advances or settles an order past the lock has no
-        // handler yet during Track A — reject it cleanly. Later tracks
+        // handler yet — reject it cleanly. Later tracks
         // (release/cancel/dispute) replace these arms one at a time.
         _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
     }
@@ -2185,6 +2211,22 @@ mod tests {
             )
         }
 
+        fn is_not_invalid_action(result: &Result<()>) -> bool {
+            !matches!(
+                result,
+                Err(e) if e.downcast_ref::<MostroError>()
+                    == Some(&MostroError::MostroCantDo(CantDoReason::InvalidAction))
+            )
+        }
+
+        fn is_cant_do(result: &Result<()>, reason: CantDoReason) -> bool {
+            matches!(
+                result,
+                Err(e) if e.downcast_ref::<MostroError>()
+                    == Some(&MostroError::MostroCantDo(reason.clone()))
+            )
+        }
+
         /// A migrated context whose `[cashu]` block is exactly `cashu`. The
         /// dispatch gate reads `ctx.settings()`, never the process-global
         /// config, so each context pins the gate for its own test.
@@ -2238,12 +2280,222 @@ mod tests {
             }
         }
 
+        /// The same refusal with `unsafe_allow_incomplete_trades = false`
+        /// spelled out in the config: the explicit default gates identically
+        /// to the absent key.
+        #[tokio::test]
+        async fn blocks_entry_actions_with_the_flag_explicitly_false() {
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: true,
+                unsafe_allow_incomplete_trades: false,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [
+                Action::NewOrder,
+                Action::TakeBuy,
+                Action::TakeSell,
+                Action::AddCashuEscrow,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_invalid_action(result),
+                    "{action:?} must be blocked with InvalidAction when the \
+                     development flag is explicitly false"
+                );
+            }
+        }
+
+        /// The gate also requires `enabled`: the override alone never opens
+        /// it (`cfg.enabled && cfg.unsafe_allow_incomplete_trades`).
+        #[tokio::test]
+        async fn override_without_enabled_does_not_open_the_gate() {
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: false,
+                unsafe_allow_incomplete_trades: true,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [
+                Action::NewOrder,
+                Action::TakeBuy,
+                Action::TakeSell,
+                Action::AddCashuEscrow,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_invalid_action(result),
+                    "{action:?} must stay blocked while cashu.enabled is false, \
+                     even with unsafe_allow_incomplete_trades = true"
+                );
+            }
+        }
+
+        /// Development mode: with `enabled = true` and the override set, the
+        /// four entry actions must NOT be short-circuited by the dispatch
+        /// gate — they reach their handlers. The fixture messages are
+        /// deliberately incomplete, so the handlers answer with their own
+        /// errors; anything but `InvalidAction` from `dispatch_cashu` proves
+        /// the routing. `AddCashuEscrow` is pinned exactly: a seeded
+        /// `WaitingPayment` order and no `CashuLockProof` payload must
+        /// produce the handler's `InvalidCashuToken`, proving funding a
+        /// taken order is no longer blocked once the override is on.
+        #[tokio::test]
+        async fn development_override_routes_entry_actions_to_their_handlers() {
+            use mostro_core::db::Crud;
+            use mostro_core::prelude::{Kind, Order, Status};
+
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: true,
+                unsafe_allow_incomplete_trades: true,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [Action::NewOrder, Action::TakeBuy, Action::TakeSell] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_not_invalid_action(&result),
+                    "{action:?} must reach its handler under the development \
+                     override, got {result:?}"
+                );
+            }
+
+            // AddCashuEscrow past the dispatch gate: seed the WaitingPayment
+            // order the take flow would have produced, and submit without a
+            // lock proof. The handler's payload rejection — not the gate —
+            // must be what answers.
+            let seller = create_test_keys();
+            let buyer = create_test_keys();
+            let order = Order {
+                id: uuid::Uuid::new_v4(),
+                status: Status::WaitingPayment.to_string(),
+                kind: Kind::Sell.to_string(),
+                fiat_code: "USD".to_string(),
+                creator_pubkey: buyer.public_key().to_string(),
+                buyer_pubkey: Some(buyer.public_key().to_string()),
+                master_buyer_pubkey: Some(buyer.public_key().to_string()),
+                seller_pubkey: Some(seller.public_key().to_string()),
+                master_seller_pubkey: Some(seller.public_key().to_string()),
+                amount: 1000,
+                fee: 0,
+                fiat_amount: 10,
+                cashu_mint_url: Some("https://mint.example.com".to_string()),
+                ..Default::default()
+            }
+            .create(ctx.pool())
+            .await
+            .unwrap();
+            let mut seller_event = create_test_unwrapped_message();
+            seller_event.sender = seller.public_key();
+            seller_event.identity = seller.public_key();
+            let msg = Message::new_order(
+                Some(order.id),
+                Some(1),
+                None,
+                Action::AddCashuEscrow,
+                None, // no CashuLockProof
+            );
+            let result =
+                dispatch_cashu(&Action::AddCashuEscrow, msg, &seller_event, &my_keys, &ctx).await;
+            assert!(
+                is_cant_do(&result, CantDoReason::InvalidCashuToken),
+                "AddCashuEscrow must reach add_cashu_escrow_action and fail on \
+                 the missing lock proof, got {result:?}"
+            );
+        }
+
+        /// The override is scoped to the four entry actions: everything that
+        /// advances or settles an order past the lock stays refused with
+        /// `InvalidAction` even in development mode.
+        #[tokio::test]
+        async fn development_override_keeps_post_lock_actions_blocked() {
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: true,
+                unsafe_allow_incomplete_trades: true,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            for action in [
+                Action::FiatSent,
+                Action::Release,
+                Action::Cancel,
+                Action::Dispute,
+                Action::RateUser,
+                Action::AdminCancel,
+                Action::AdminSettle,
+                Action::AdminTakeDispute,
+                Action::AdminAddSolver,
+                Action::AddInvoice,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_invalid_action(result),
+                    "{action:?} must stay blocked with InvalidAction even under \
+                     the development override"
+                );
+            }
+        }
+
+        /// Read-only / session actions are always routed, whatever the gate:
+        /// with the default (closed) gate they must still reach their
+        /// handlers.
+        #[tokio::test]
+        async fn read_only_actions_stay_allowed_with_the_default_gate() {
+            let ctx = cashu_ctx(CashuSettings {
+                enabled: true,
+                ..Default::default()
+            })
+            .await;
+            let my_keys = create_test_keys();
+            let event = create_test_unwrapped_message();
+
+            let msg = Message::new_restore(None);
+            let result = dispatch_cashu(&Action::RestoreSession, msg, &event, &my_keys, &ctx).await;
+            assert!(
+                result.is_ok(),
+                "RestoreSession must route to the no-LN handler with the gate \
+                 closed, got {result:?}"
+            );
+
+            for action in [
+                Action::Orders,
+                Action::LastTradeIndex,
+                Action::UserInfo,
+                Action::TradePubkey,
+            ] {
+                let msg = create_test_message(action.clone(), None);
+                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
+                assert!(
+                    is_not_invalid_action(&result),
+                    "{action:?} is escrow-independent and must not be refused \
+                     with InvalidAction, got {result:?}"
+                );
+            }
+        }
+
         /// Actions with no Cashu handler yet — release/cancel/dispute, the
         /// permanently-blocked buyer-invoice/bond actions, and Track D admin
-        /// actions — must still be rejected with `CantDo(InvalidAction)`. The
-        /// Track A actions (`NewOrder`, `TakeBuy`, `TakeSell` in TA-2;
-        /// `AddCashuEscrow` in TA-1) are excluded: they now route to their real
-        /// handlers, not to `InvalidAction`.
+        /// actions — must still be rejected with `CantDo(InvalidAction)`.
+        /// The entry actions (`NewOrder`, `TakeBuy`, `TakeSell`,
+        /// `AddCashuEscrow`) are refused too while the gate is closed, as
+        /// the gate tests above pin; they are excluded here because the
+        /// development override routes them to their real handlers.
         #[tokio::test]
         async fn blocks_every_order_lifecycle_action_with_invalid_action() {
             let _ =

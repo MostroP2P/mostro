@@ -1512,6 +1512,7 @@ mod tests {
             enabled: true,
             mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 21,
+            ..Default::default()
         }
     }
 

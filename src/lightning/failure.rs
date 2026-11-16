@@ -20,9 +20,12 @@ struct AttemptFailure {
     /// `n` is the `n`-th hop of the route.
     hop_index: u32,
     route_hops: usize,
-    /// The failing node's pubkey; `None` for our node or an index past the
-    /// end of the route.
+    /// The failing node's pubkey; `None` for our node, an index past the
+    /// end of the route, or an unknown source.
     node: Option<String>,
+    /// False for `UNREADABLE_FAILURE`: LND could not decrypt the failure, so
+    /// it does not know which hop sent it and leaves the index at 0.
+    source_known: bool,
 }
 
 /// Why a payment failed, built from LND's terminal `Payment` update.
@@ -63,10 +66,12 @@ fn attempt_failure(attempt: &HtlcAttempt) -> Option<AttemptFailure> {
         .map(|route| route.hops.as_slice())
         .unwrap_or_default();
     let hop_index = failure.failure_source_index;
+    let source_known = failure.code != FailureCode::UnreadableFailure as i32;
     // LND's route lists the hops after our node, so index `n` (n >= 1) is
     // `hops[n - 1]`; index 0 is our node, which has no hop entry.
     let node = usize::try_from(hop_index)
         .ok()
+        .filter(|_| source_known)
         .and_then(|index| index.checked_sub(1))
         .and_then(|index| hops.get(index))
         .map(|hop| hop.pub_key.clone());
@@ -78,6 +83,7 @@ fn attempt_failure(attempt: &HtlcAttempt) -> Option<AttemptFailure> {
         hop_index,
         route_hops: hops.len(),
         node,
+        source_known,
     })
 }
 
@@ -85,6 +91,11 @@ impl fmt::Display for PayoutFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "reason={} attempts={}", self.reason, self.attempts)?;
         match &self.last_failure {
+            Some(last) if !last.source_known => write!(
+                f,
+                " last_failure={} on a route of {} hops (source unknown)",
+                last.code, last.route_hops
+            )?,
             Some(last) => {
                 write!(
                     f,
@@ -213,6 +224,28 @@ mod tests {
 
         assert!(
             text.contains("last_failure=TEMPORARY_CHANNEL_FAILURE at hop 0 of 2 (our node)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_failure_is_not_blamed_on_our_node() {
+        // LND leaves `failure_source_index` at 0 when it cannot decrypt the
+        // failure, so 0 does not mean our node here.
+        let payment = failed_payment(
+            PaymentFailureReason::FailureReasonError,
+            vec![failed_attempt(
+                &[PEER, LSP, PAYEE],
+                FailureCode::UnreadableFailure,
+                0,
+            )],
+        );
+
+        let text = PayoutFailure::from_payment(&payment, 128).to_string();
+
+        assert!(!text.contains("our node"), "{text}");
+        assert!(
+            text.contains("last_failure=UNREADABLE_FAILURE on a route of 3 hops (source unknown)"),
             "{text}"
         );
     }

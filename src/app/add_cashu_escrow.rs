@@ -13,13 +13,17 @@
 //! persistence failure leaves the order exactly as it was and the seller can
 //! retry.
 //!
-//! Fee collection (Option 2, §4A) is **not** handled here — it lands in TA-1f.
+//! The seller-funded fee token (Option 2, §4A) is validated and persisted here
+//! (TA-1f); collecting it at the mint is a follow-up.
 
 use crate::app::context::AppContext;
 use crate::cashu::mint_policy::normalize_mint_url;
-use crate::cashu::{cashu_pubkey_from_xonly_hex, Error as CashuError};
+use crate::cashu::{cashu_pubkey_from_xonly_hex, proof_ys_hex, Error as CashuError};
 use crate::config::settings::Settings;
-use crate::db::{cashu_escrow_token_in_use, update_order_cashu_escrow};
+use crate::db::{
+    cashu_escrow_token_in_use, update_order_cashu_escrow, update_order_cashu_escrow_with_fee,
+    CashuLockOutcome,
+};
 use crate::util::{enqueue_order_msg, get_order, update_order_event};
 use chrono::Utc;
 use mostro_core::db::Crud;
@@ -121,6 +125,48 @@ async fn classify_zero_row_cas(
     }
 }
 
+/// [`classify_zero_row_cas`] for a lock that carries a fee token.
+///
+/// The fee token is a 1-of-1 to `P_M` with no refund path, so once the seller
+/// built it only Mostro can spend it. A zero-row result is therefore a no-op
+/// only when this very submission is what the order holds (a duplicate
+/// delivery of the lock that won). Anything else is reported to the seller:
+/// - the escrow token is stored with a different fee token ⇒ the one sent
+///   here was not accepted;
+/// - the order moved on unlocked (expired, canceled) or is gone ⇒ the lock
+///   failed, rather than the silent success the plain lock answers.
+async fn classify_zero_row_fee_cas(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+    token: &str,
+    fee_token: &str,
+) -> Result<(), MostroError> {
+    classify_zero_row_cas(pool, order_id, token).await?;
+
+    let stored: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT cashu_escrow_token, cashu_fee_token FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    match stored {
+        Some((Some(escrow), Some(fee))) if escrow == token && fee == fee_token => Ok(()),
+        Some((Some(escrow), _)) if escrow == token => {
+            tracing::warn!(
+                "cashu lock: order {order_id} holds this escrow with another fee token — rejected"
+            );
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        }
+        _ => {
+            tracing::warn!(
+                "cashu lock: fee-bearing lock for order {order_id} was not persisted — rejected"
+            );
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        }
+    }
+}
+
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
 ///
 /// On success the order advances `WaitingPayment → Active` in one atomic write
@@ -183,10 +229,15 @@ pub async fn add_cashu_escrow_action(
     //     notifications and stop — no mint round-trip, no second write, and the
     //     buyer finally gets its cue to send fiat. A *different* token on an
     //     already-locked order is a second funding attempt, which the escrow
-    //     can never honour, so it is rejected outright. Only the seller trade
-    //     key (checked in step 2) can reach this path.
+    //     can never honour, so it is rejected outright. The fee token must
+    //     match the stored one too (none on a fee-free order): a different one
+    //     is spendable by `P_M` alone and would never be stored, so the seller
+    //     must learn it was refused. Only the seller trade key (checked in
+    //     step 2) can reach this path.
     if replayable {
-        if order.cashu_escrow_token.as_deref() != Some(proof.token.as_str()) {
+        if order.cashu_escrow_token.as_deref() != Some(proof.token.as_str())
+            || stored_fee_token(pool, order.id).await? != proof.fee_token
+        {
             return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
         }
         tracing::info!(
@@ -195,6 +246,14 @@ pub async fn add_cashu_escrow_action(
         );
         notify_escrow_locked(order.id, buyer_pubkey, seller_pubkey, request_id).await;
         return Ok(());
+    }
+
+    // 4b. An order with no fee takes no fee token. The fee-free path stores
+    //     none, so a supplied token, spendable by `P_M` alone, would be dropped
+    //     while the seller hears the lock succeeded. Rejected before any mint
+    //     round-trip.
+    if fee_token_amount(&order).is_none() && proof.fee_token.is_some() {
+        return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
     }
 
     // 5. Bind the mint: the escrow goes on the mint the maker chose and the
@@ -280,23 +339,82 @@ pub async fn add_cashu_escrow_action(
         .await
         .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
 
-    // 8. Atomically persist the escrow and advance the status in one write. A
-    //    `false` return is classified by `classify_zero_row_cas`: a benign
+    // 7A. Fee token (Option 2, §4A). An order that carries a fee needs the
+    //     seller to fund the WHOLE Mostro fee (`2 * order.fee`) as a separate
+    //     P2PK-1-of-1 token locked to `P_M`, on the order's mint, submitted in
+    //     the same message. Validated alongside the escrow token: both must be
+    //     valid before any state changes.
+    let fee_ctx = match fee_token_amount(&order) {
+        Some(expected_fee) => {
+            let fee_token = proof
+                .fee_token
+                .clone()
+                .ok_or(MostroCantDo(CantDoReason::CashuSignatureMissing))?;
+            let parsed = cashu_client
+                .verify_fee_token(&fee_token, p_m, expected_fee)
+                .await
+                .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+            let fee_ys = proof_ys_hex(&parsed).map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+            Some((fee_token, fee_ys))
+        }
+        None => None,
+    };
+
+    // 8. Atomically persist the escrow (+ fee token and anti-reuse guard when
+    //    the order carries a fee) and advance the status in one write. A
+    //    zero-row result is classified by `classify_zero_row_cas`: a benign
     //    no-op returns `Ok(())` without notifying (idempotent; same shape as
     //    the `rows_affected() == 0` guard in `release_action`), while a race
-    //    that left this submission's token unaccepted is rejected.
-    let locked = update_order_cashu_escrow(
-        pool,
-        order.id,
-        &order_mint,
-        &proof.token,
-        now,
-        Status::WaitingPayment,
-        Status::Active,
-    )
-    .await?;
+    //    that left this submission's token unaccepted is rejected. With a fee
+    //    token, `classify_zero_row_fee_cas` is stricter: only a duplicate of
+    //    the stored submission is a no-op, so the seller always learns that a
+    //    fee token it can no longer spend was not accepted.
+    let locked = match &fee_ctx {
+        Some((fee_token, fee_ys)) => {
+            match update_order_cashu_escrow_with_fee(
+                pool,
+                order.id,
+                &order_mint,
+                &proof.token,
+                fee_token,
+                fee_ys,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?
+            {
+                CashuLockOutcome::Locked => true,
+                CashuLockOutcome::StatusMismatch => false,
+                CashuLockOutcome::FeeReuse => {
+                    tracing::warn!(
+                        "cashu lock: fee token reused across orders for {} — rejected",
+                        order.id
+                    );
+                    return Err(MostroCantDo(CantDoReason::InvalidCashuToken));
+                }
+            }
+        }
+        None => {
+            update_order_cashu_escrow(
+                pool,
+                order.id,
+                &order_mint,
+                &proof.token,
+                now,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await?
+        }
+    };
     if !locked {
-        classify_zero_row_cas(pool, order.id, &proof.token).await?;
+        match &fee_ctx {
+            Some((fee_token, _)) => {
+                classify_zero_row_fee_cas(pool, order.id, &proof.token, fee_token).await?
+            }
+            None => classify_zero_row_cas(pool, order.id, &proof.token).await?,
+        }
         tracing::info!(
             "cashu lock: compare-and-set matched zero rows for order {} (replay or status moved on) — no-op",
             order.id
@@ -335,6 +453,31 @@ pub async fn add_cashu_escrow_action(
     Ok(())
 }
 
+/// Sats the seller must fund as the fee token, `None` when the order carries
+/// no fee. Read from the stored `order.fee`, the value the parties agreed to:
+/// the live `[mostro].fee` can have changed since, and a small order can round
+/// down to no fee at all.
+fn fee_token_amount(order: &Order) -> Option<u64> {
+    u64::try_from(order.fee.saturating_mul(2))
+        .ok()
+        .filter(|fee| *fee > 0)
+}
+
+/// The fee token stored with the order's lock. `Order` (mostro-core) does not
+/// carry the column, so the replay path reads it here.
+async fn stored_fee_token(
+    pool: &SqlitePool,
+    order_id: uuid::Uuid,
+) -> Result<Option<String>, MostroError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT cashu_fee_token FROM orders WHERE id = ?1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(row.and_then(|(fee,)| fee))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +497,17 @@ mod tests {
             .with_pool(Arc::new(pool.clone()))
             .with_settings(test_settings())
             .build()
+    }
+
+    #[test]
+    fn fee_token_amount_follows_the_stored_order_fee() {
+        let with_fee = |fee| Order {
+            fee,
+            ..Default::default()
+        };
+
+        assert_eq!(fee_token_amount(&with_fee(0)), None);
+        assert_eq!(fee_token_amount(&with_fee(21)), Some(42));
     }
 
     /// A `WaitingPayment` sell order — the state a taken Cashu order sits in
@@ -712,6 +866,91 @@ mod tests {
         assert_eq!(locked_at, Some(1700000100));
     }
 
+    /// Step 3b: a replay must carry the fee token Mostro stored, not only the
+    /// escrow token. A different fee token is locked to `P_M` alone and would
+    /// never be stored, so acknowledging it would silently strand it. The
+    /// stored fee token itself still replays.
+    #[tokio::test]
+    async fn replay_rejects_a_fee_token_other_than_the_stored_one() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let order = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, order.id, "cashuAlockedtoken", Status::Active).await;
+        sqlx::query("UPDATE orders SET cashu_fee_token = ?1 WHERE id = ?2")
+            .bind("cashuAfeestored")
+            .bind(order.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let replay_with_fee = |fee: &str| {
+            let proof = CashuLockProof::new(
+                "cashuAlockedtoken".to_string(),
+                "https://mint.example.com".to_string(),
+                buyer.to_string(),
+                seller.to_string(),
+                my_keys.public_key().to_string(),
+            )
+            .with_fee_token(fee.to_string());
+            lock_message(order.id, Some(Payload::CashuLockProof(proof)))
+        };
+        let event = unwrapped_from(seller);
+
+        let result =
+            add_cashu_escrow_action(&ctx, replay_with_fee("cashuAfeeother"), &event, &my_keys)
+                .await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+
+        let result =
+            add_cashu_escrow_action(&ctx, replay_with_fee("cashuAfeestored"), &event, &my_keys)
+                .await;
+        assert!(result.is_ok(), "the stored fee token must still replay");
+    }
+
+    /// Step 4b: an order with no fee takes no fee token. The fee-free path
+    /// stores none, so a supplied token, spendable by `P_M` alone, would be
+    /// dropped while the seller is told the lock succeeded. Rejected before
+    /// any mint contact (this test runs with no mint attached).
+    #[tokio::test]
+    async fn rejects_a_fee_token_on_a_fee_free_order() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let my_keys = Keys::generate();
+        let mut order = waiting_payment_order(seller, buyer);
+        order.fee = 0;
+        order.cashu_mint_url = Some("https://mint.example.com".to_string());
+        let order = order.create(&pool).await.unwrap();
+
+        let proof = CashuLockProof::new(
+            "cashuAescrow".to_string(),
+            "https://mint.example.com".to_string(),
+            buyer.to_string(),
+            seller.to_string(),
+            my_keys.public_key().to_string(),
+        )
+        .with_fee_token("cashuAfee".to_string());
+        let msg = lock_message(order.id, Some(Payload::CashuLockProof(proof)));
+
+        let result = add_cashu_escrow_action(&ctx, msg, &unwrapped_from(seller), &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+        let (token, locked_at) = escrow_columns(&pool, order.id).await;
+        assert_eq!((token, locked_at), (None, None), "nothing may be locked");
+    }
+
     /// Step 8, cause (b): a concurrent submission locked THIS order with a
     /// different token, so this submission was never accepted. Answering
     /// `Ok(())` would let the seller believe an untouched, still-unspent token
@@ -798,6 +1037,64 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A fee-bearing lock that matched zero rows must not answer success
+    /// unless this very submission (escrow AND fee token) is what is stored:
+    /// the fee token is spendable only by `P_M`, so the seller has to learn
+    /// that it was not accepted.
+    #[tokio::test]
+    async fn fee_zero_row_cas_rejects_unless_this_submission_is_stored() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        // Duplicate delivery of the submission that won: a no-op.
+        let duplicate = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        mark_locked(&pool, duplicate.id, "cashuAdup", Status::Active).await;
+        sqlx::query("UPDATE orders SET cashu_fee_token = ?1 WHERE id = ?2")
+            .bind("cashuAfeedup")
+            .bind(duplicate.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            classify_zero_row_fee_cas(&pool, duplicate.id, "cashuAdup", "cashuAfeedup")
+                .await
+                .is_ok()
+        );
+
+        // Same escrow token stored with another fee token: ours was not kept.
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, duplicate.id, "cashuAdup", "cashuAfeeother").await,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+
+        // The order moved on unlocked (expired, canceled): the lock failed.
+        let moved = waiting_payment_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET status = ?1 WHERE id = ?2")
+            .bind(Status::Expired.to_string())
+            .bind(moved.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, moved.id, "cashuAmoved", "cashuAfeemoved").await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
+
+        // A vanished order is never reported as a success either.
+        assert!(matches!(
+            classify_zero_row_fee_cas(&pool, uuid::Uuid::new_v4(), "cashuAgone", "cashuAfeegone")
+                .await,
+            Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+        ));
     }
 
     /// The replay path is scoped to `Active`: a locked order whose trade has

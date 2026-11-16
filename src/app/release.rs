@@ -1139,8 +1139,15 @@ async fn dispatch_payout(
                             }
                             PaymentStatus::Failed => {
                                 warn!(
-                                    "Order Id {}: Invoice with hash: {} has failed!",
-                                    order.id, msg.payment.payment_hash
+                                    "Order Id {}: Invoice with hash: {} has failed: {}",
+                                    order.id,
+                                    msg.payment.payment_hash,
+                                    crate::lightning::failure::PayoutFailure::from_payment(
+                                        &msg.payment,
+                                        crate::lightning::routing_fee_cap_sats(
+                                            msg.payment.value_sat
+                                        ),
+                                    )
                                 );
                                 // Release our own claim (scoped to this hash and
                                 // the per-claim timestamp) and re-arm retry. Only

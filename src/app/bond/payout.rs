@@ -850,8 +850,11 @@ async fn pay_counterparty(
                     }
                     PaymentStatus::Failed => {
                         outcome = StreamOutcome::Failed(format!(
-                            "payment failed: reason {}",
-                            msg.payment.failure_reason
+                            "payment failed: {}",
+                            crate::lightning::failure::PayoutFailure::from_payment(
+                                &msg.payment,
+                                routing_fee_cap,
+                            )
                         ));
                         break;
                     }

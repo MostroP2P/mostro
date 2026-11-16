@@ -342,9 +342,12 @@ impl CashuLockProof {
 **protocol-shape** check with no access to `Settings`, so it **cannot** know
 whether this node charges a fee. Presence/amount of `fee_token` is therefore a
 **daemon-side, config-dependent** check (in `add_cashu_escrow_action`, §4A), not
-a protocol invariant. When `mostro.fee > 0` the handler rejects a `None` or
-mis-valued `fee_token` with `CantDo(CashuSignatureMissing)` /
-`InvalidCashuToken`; when `mostro.fee == 0` a `None` is valid and a `Some` ⇒
+a protocol invariant. It reads the fee stored on the order (`order.fee`, the
+value the parties agreed to), never the current `mostro.fee`, which the operator
+can change after the order was created. When `2 * order.fee > 0` the handler
+rejects a `None` or a `fee_token` not worth exactly `2 * order.fee` with
+`CantDo(CashuSignatureMissing)` / `InvalidCashuToken`; when the stored fee is
+zero (including one that rounded to zero) a `None` is valid and a `Some` ⇒
 `CantDo(InvalidCashuToken)`, checked before any mint round-trip: the fee-free
 path stores no fee token, so accepting one would strand it.
 

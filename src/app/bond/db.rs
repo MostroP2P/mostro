@@ -253,6 +253,64 @@ pub async fn find_maker_bond_for_order(
     find_bond_by_order_and_role(pool, root.id, BondRole::Maker).await
 }
 
+/// The bond rows an `admin-order-info` reply reports for `order`, oldest
+/// first.
+///
+/// Bond rows are never deleted, and every prospective taker of an order gets
+/// one, so an order that was taken and republished keeps the rows of takers
+/// who are long gone. The reply is about the trade as it stands, so of the
+/// rows whose `order_id` is this order it keeps:
+///
+/// - every `maker` row: the maker bond and, on a range order, the child rows
+///   stored on this same order. A slice slash is stored on its slice and the
+///   maker refund on the root, so a slice shows its own slash and the root
+///   shows the refund; the root does not list the slashes of its slices,
+///   which the reply has no field to tell apart (#1107);
+/// - the `taker` row of a current party of the order (its `pubkey` is the
+///   order's buyer or seller trade key);
+/// - any row still owed a payout (`pending-payout` or `failed`), whoever
+///   posted it: a taker slashed on a timeout is removed from the order, but
+///   the maker is still waiting for that payout.
+///
+/// What is left out are the rows of other prospective takers: bonds
+/// requested and never locked, released, or already paid out.
+///
+/// When `order` is a slice of a range order, the maker bond lives on the
+/// root order; it is returned first, and its `order_id` is the root's.
+pub async fn find_bonds_for_order_info(
+    pool: &Pool<Sqlite>,
+    order: &Order,
+) -> Result<Vec<Bond>, MostroError> {
+    let mut bonds = Vec::new();
+    if order.range_parent_id.is_some() {
+        if let Some(root_bond) = find_maker_bond_for_order(pool, order).await? {
+            if root_bond.order_id != order.id {
+                bonds.push(root_bond);
+            }
+        }
+    }
+
+    let own = sqlx::query_as::<_, Bond>(
+        "SELECT * FROM bonds \
+         WHERE order_id = ?1 \
+           AND (role = ?2 OR pubkey IN (?3, ?4) OR state IN (?5, ?6)) \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(order.id)
+    .bind(BondRole::Maker.to_string())
+    // A NULL party never matches: `pubkey IN (NULL, NULL)` is not true.
+    .bind(order.buyer_pubkey.as_deref())
+    .bind(order.seller_pubkey.as_deref())
+    .bind(BondState::PendingPayout.to_string())
+    .bind(BondState::Failed.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    bonds.extend(own);
+
+    Ok(bonds)
+}
+
 /// Every child slash row that belongs to `parent_bond_id` (Phase 6
 /// range-order accounting). Ordered oldest-first for deterministic
 /// iteration at parent-close.

@@ -205,6 +205,44 @@ impl fmt::Display for BondParseError {
 
 impl std::error::Error for BondParseError {}
 
+// Conversions to the wire enums of `mostro-core` (`order_info`), which the
+// `admin-order-info` reply carries. The enums above stay the daemon's own
+// strict ones: the wire enums add an `unknown` fallback for clients, which
+// the daemon never produces from a value it knows. The matches are
+// exhaustive, so a variant added here must be given a wire name there.
+
+impl From<BondRole> for mostro_core::order_info::BondRole {
+    fn from(role: BondRole) -> Self {
+        match role {
+            BondRole::Maker => Self::Maker,
+            BondRole::Taker => Self::Taker,
+        }
+    }
+}
+
+impl From<BondState> for mostro_core::order_info::BondState {
+    fn from(state: BondState) -> Self {
+        match state {
+            BondState::Requested => Self::Requested,
+            BondState::Locked => Self::Locked,
+            BondState::Released => Self::Released,
+            BondState::PendingPayout => Self::PendingPayout,
+            BondState::Slashed => Self::Slashed,
+            BondState::Forfeited => Self::Forfeited,
+            BondState::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<BondSlashReason> for mostro_core::order_info::BondSlashReason {
+    fn from(reason: BondSlashReason) -> Self {
+        match reason {
+            BondSlashReason::LostDispute => Self::LostDispute,
+            BondSlashReason::Timeout => Self::Timeout,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +273,44 @@ mod tests {
     fn slash_reason_roundtrip() {
         for s in [BondSlashReason::LostDispute, BondSlashReason::Timeout] {
             assert_eq!(BondSlashReason::from_str(&s.to_string()).unwrap(), s);
+        }
+    }
+
+    /// The name a wire enum of `mostro-core` travels with.
+    fn wire_name<T: serde::Serialize>(value: T) -> String {
+        match serde_json::to_value(value).unwrap() {
+            serde_json::Value::String(name) => name,
+            other => panic!("a wire enum must serialize to a string, got {other}"),
+        }
+    }
+
+    /// The daemon stores a bond enum with `Display` and `mostro-core` sends
+    /// it with serde. Both must use the same name for every variant, or an
+    /// `admin-order-info` reply would show a state the database does not
+    /// hold, or `unknown`.
+    #[test]
+    fn wire_enums_use_the_stored_names() {
+        use mostro_core::order_info as wire;
+
+        for role in [BondRole::Maker, BondRole::Taker] {
+            assert_eq!(wire_name(wire::BondRole::from(role)), role.to_string());
+        }
+        for state in [
+            BondState::Requested,
+            BondState::Locked,
+            BondState::Released,
+            BondState::PendingPayout,
+            BondState::Slashed,
+            BondState::Forfeited,
+            BondState::Failed,
+        ] {
+            assert_eq!(wire_name(wire::BondState::from(state)), state.to_string());
+        }
+        for reason in [BondSlashReason::LostDispute, BondSlashReason::Timeout] {
+            assert_eq!(
+                wire_name(wire::BondSlashReason::from(reason)),
+                reason.to_string()
+            );
         }
     }
 

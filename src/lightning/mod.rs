@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod failure;
 pub mod invoice;
 
 use crate::config::settings::Settings;

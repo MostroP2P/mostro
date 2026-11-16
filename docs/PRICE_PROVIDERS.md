@@ -325,7 +325,8 @@ given tick, not the providers configured: a currency only two providers
 cover, or a three-source currency with one provider down, lands here.
 Each tick logs a `warn!` per refused currency naming every candidate
 (provider and value, and the base for a fiat-cross) and whether the
-Nostr fallback (§11.7) or last-known-good is served instead.
+Nostr fallback (§11.7) was selected or the currency keeps its
+last-known-good value.
 
 ### 6.3 PerBase resolution (fiat-cross sources)
 

@@ -325,9 +325,14 @@ impl PriceManager {
             self.settings.outlier_threshold_pct,
         );
         // Audit #9: a currency whose local candidates `combine` refuses (two
-        // that disagree, no median to arbitrate) is either served from the
-        // Nostr fallback or left on last-known-good. Name the candidates so
-        // the operator can tell which upstream is wrong.
+        // that disagree, no median to arbitrate) either gets the Nostr rate
+        // alone as its fallback or no fresh value this tick. Name the
+        // candidates so the operator can tell which upstream is wrong.
+        //
+        // This runs before the store write, so it describes the *selection*,
+        // not what ends up served: the store's monotonicity guard can still
+        // drop a Nostr fallback older than the value it already holds
+        // (`store_with_observation_time`).
         for refusal in &refusals {
             warn!(
                 "price: {} — local sources disagree by more than {}% ({}); {}",
@@ -335,9 +340,9 @@ impl PriceManager {
                 self.settings.outlier_threshold_pct,
                 refusal.describe_candidates(),
                 if refusal.nostr_fallback {
-                    "serving the trusted-node (Nostr) rate alone as fallback"
+                    "selected the trusted-node (Nostr) rate alone as fallback"
                 } else {
-                    "serving last-known-good until the staleness window"
+                    "no fresh value this tick (last-known-good stays until it goes stale)"
                 }
             );
         }
@@ -884,7 +889,7 @@ struct Candidate {
 struct Refusal {
     currency: String,
     candidates: Vec<Candidate>,
-    /// Whether Nostr is served alone for it instead of last-known-good.
+    /// Whether Nostr alone is selected as its fallback this tick.
     nostr_fallback: bool,
 }
 

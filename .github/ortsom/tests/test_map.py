@@ -15,7 +15,10 @@ REPO_ROOT = GATE_DIR.parents[1]
 
 sys.path.insert(0, str(GATE_DIR))
 
+import money_path  # noqa: E402
 import select_scenarios as sel  # noqa: E402
+
+MONEY_OWNERS = {"@grunch", "@Catrya", "@arkanoider"}
 
 
 def load_map():
@@ -61,6 +64,31 @@ class MapTest(unittest.TestCase):
 
     def test_every_tag_and_scenario_exists_in_the_registry(self):
         sel.check_references(load_map(), load_registry())
+
+    def test_settings_and_config_changes_run_the_settings_variants(self):
+        # mostro#1104: the configuration code the stack's own template never
+        # exercises runs under the variants' overlays.
+        registry = load_registry()
+        for changed in (["settings.tpl.toml"], ["src/config/types.rs"]):
+            result = sel.select(changed, load_map(), registry)
+            names = {v["name"] for v in result["variants"]}
+            self.assertTrue({"price-pegged-only", "bond-hold-cltv-298"} <= names, changed)
+            self.assertEqual((result["unmapped_files"], result["uncovered_files"]), ([], {}), changed)
+
+    def test_every_overlay_file_is_a_variant_and_every_variant_has_one(self):
+        named = {v["overlay"] for v in load_map().get("variant", [])}
+        on_disk = {f"variants/{p.name}" for p in (GATE_DIR / "variants").glob("*")}
+        self.assertEqual(named, on_disk)
+
+    def test_codeowners_names_the_money_paths(self):
+        globs = money_path.validate_globs(load_map())
+        owners = {}
+        for line in (REPO_ROOT / ".github" / "CODEOWNERS").read_text().splitlines():
+            if line.strip() and not line.startswith("#"):
+                pattern, *names = line.split()
+                owners[pattern] = set(names)
+        expected = {"/" + (g[:-2] if g.endswith("/**") else g): MONEY_OWNERS for g in globs}
+        self.assertEqual(owners, expected, "CODEOWNERS and [money_path] paths must list the same paths")
 
     def test_registry_snapshot_is_well_formed(self):
         registry = load_registry()

@@ -1,0 +1,4 @@
+# bond_cltv_delta at its floor: the smallest value above
+# hold_invoice_cltv_delta (144, the template's) + 144 that the daemon accepts.
+[anti_abuse_bond]
+bond_cltv_delta = 289

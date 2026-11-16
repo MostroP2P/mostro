@@ -285,7 +285,9 @@ override's own `list --json`.
   "matched_rules": ["trade flow"],
   "uncovered_files": {"src/rpc/service.rs": "ortsom has no gRPC client; …"},
   "unmapped_files": ["src/new_module.rs"],
-  "ignored_files": ["docs/ARCHITECTURE.md"]
+  "ignored_files": ["docs/ARCHITECTURE.md"],
+  "variants": [{"name": "price-pegged-only", "overlay": "variants/price-pegged-only.toml",
+                "sha256": "…", "scenarios": ["market_price_order"]}]
 }
 ```
 
@@ -293,6 +295,11 @@ override's own `list --json`.
 `uncovered_files` and `unmapped_files` explicitly: they are code paths
 Ortsom did not exercise, and the comment must not imply they were
 tested.
+
+A remaining file matched by a settings variant's `paths` (§4.5) selects
+that variant, and a `full` selection selects every variant. A file that
+only variants match, or that `uncovered` rules and a variant match, is
+neither unmapped nor uncovered: the variants exercise it.
 
 ### 4.4 Keeping the map complete
 
@@ -307,6 +314,64 @@ push to `main`, together with the scripts' unit tests. It is independent
 of `ortsom-pr.yml` and its skip path, so neither `ortsom:skip` nor a
 draft or Dependabot pull request lets an unmapped file through; a
 failure shows as a red check on that workflow.
+
+### 4.5 Settings variants
+
+The stack starts mostrod from Ortsom's own settings template, so a bug
+that only shows under another configuration never runs. Two of them
+shipped in 0.20.2 from pull requests labelled `ortsom:pass` (#1098, a node
+with bonds on and a high `hold_invoice_cltv_delta` refused to start;
+#1099, a lone `[price.providers.pegged]` left the node with no fiat
+price), and the comments of both listed `settings.tpl.toml` as
+unexercised (#1104).
+
+A **settings variant** in `map.toml` names a configuration and the
+scenarios to run under it:
+
+```toml
+[[variant]]
+name = "price-pegged-only"
+why = "a lone [price.providers.pegged], as the template's opt-in block reads (#1099)"
+overlay = "variants/price-pegged-only.toml"
+paths = ["src/price/**", "src/bitcoin_price.rs", "src/config/**", "settings.tpl.toml"]
+scenarios = ["market_price_order"]
+```
+
+The overlay, under `.github/ortsom/variants/`, is laid over the Ortsom
+template (after the bond table) by `ortsom stack restart-daemon
+--settings-overlay`: its values replace the template's, and
+`[ortsom] remove = ["dotted.path"]` drops keys or tables first. Ortsom
+refuses an overlay that touches a key the harness owns (identity, relay,
+LND connection, database, transport and the windows its config
+declares); the format is in Ortsom's `docs/ci-regtest.md`.
+
+After the selected scenarios, `run_variants.py` takes each selected
+variant in turn on the same stack: it restarts mostrod with a fresh
+identity and an empty database under the overlay, runs `ortsom doctor`,
+and runs the variant's scenarios. The chain, nodes and channels stay up,
+so a variant costs about two minutes, not a new stack. It writes
+`variants/variants.json` (each variant's stack state, overlay hash and
+suite exit code) and one `summary.json` per variant. The baseline runs
+every variant of the map.
+
+The verdict reads a variant's results as rows named
+`<scenario>@<variant>`, classified like any other row against the same
+rows of the baseline (§7.2): a scenario that passes on `main` under the
+overlay and fails in the pull request is a regression. A daemon that
+refuses the variant's settings (`restart-daemon` exit 4) fails every
+scenario of that variant; if `main` starts under the same overlay, those
+rows are regressions — #1098 exactly. A variant whose stack did not come
+up for reasons outside the daemon, whose doctor failed, whose suite did
+not finish or that never ran is left out of the comparison and named in
+the comment, and a verdict that would otherwise be `pass` is
+`inconclusive` (reason `variant-not-compared`): a configuration that was
+not run is no evidence. `run_variants.py` caps each variant (five minutes
+per restart, doctor or cleanup, fifteen for the scenarios) and rewrites
+`variants.json` after each one, so a step cut short keeps the variants
+that finished. A
+baseline variant measured with another overlay (its sha256 differs) is
+not used, so editing an overlay gives its rows no baseline until `main`
+is measured again.
 
 ## 5. Baseline of `main` — `ortsom-baseline.yml`
 
@@ -342,7 +407,7 @@ compares against those measurements.
     (`ok`, `build_failed`, `daemon_failed`, `infra_failed` or
     `doctor_failed`, classified as in §6), `run_id` and `started_at`,
   - `suite.log`, `stack.log`, `events.jsonl` for debugging.
-- **Timeout:** job 330 min, suite step 300 min (same structure as
+- **Timeout:** job 360 min, suite step 270 min, settings variants 60 min (same structure as
   Ortsom's nightly: always-steps must still run).
 - The run's own conclusion is informational; a failing scenario on
   `main` is exactly the information the baseline records. It is also
@@ -461,8 +526,8 @@ request that bumps `ortsom_ref`.
   `pull-requests: read`): for a pull
   request from a fork it runs in the environment `ortsom-fork`, whose
   required reviewers are the maintainers (§9.3). Concurrency group
-  `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 330 min, suite
-  step 300 min, as in §5.
+  `ortsom-pr-<number>`, `cancel-in-progress: true`; timeout 360 min, suite
+  step 270 min, settings variants 60 min, as in §5.
 - **Job `verdict`**: see §7 and §9.1.
 - **`workflow_dispatch`** with the ID of an `ortsom-pr.yml` run re-runs
   `resolve` and `suite` for it, for maintainers.
@@ -956,6 +1021,12 @@ Baseline: about four scheduled runs a day plus one per merge.
 
 ## 14. Known gaps
 
+- **Settings variants cover chosen configurations only.** The variants
+  run the price provider toggles and the bond CLTV limits, the
+  configurations of #1098 and #1099. Mostro's own `settings.tpl.toml`
+  and the previous release's are not yet run as operator files: they
+  name production paths and timings the harness owns, so they need a
+  generated overlay with those keys stripped. Follow-up work.
 - **Bonds.** The stack runs with bonds (`stack_with_bonds`), but
   Ortsom's bond table sets `apply_to = "take"`: the maker bond
   (`waiting-maker-bond`, the maker's deadline) has no scenario yet, and
@@ -981,3 +1052,39 @@ Baseline: about four scheduled runs a day plus one per merge.
   both use the copy, so a drift never skews a verdict; it only makes the
   gate's daemon differ from the one a developer gets locally with
   `ortsom stack up --ref`.
+
+## 15. Money paths
+
+Every production incident with an identified origin touched payments,
+bonds or the dev fee, and those pull requests were reviewed almost
+entirely by bots (#1104). A pull request that touches a **money path**
+needs more than a green build to merge:
+
+- **`ortsom:pass`.** `money_path.py` posts the `ortsom/money-path`
+  commit status on the pull request's head: success when no money path
+  changed; pending from `resolve` until the verdict is in; success after
+  the verdict only when it is `pass`; failure for any other verdict, a
+  skip (`ortsom:skip`, a draft, Dependabot) or a run cancelled by hand
+  included, and for a `pass` that compared no scenario with `main`. When
+  GitHub cannot list every changed file the pull request is treated as a
+  money path. When `resolve` rejects a run (it failed, or its artifact
+  did not check out), every open pull request at that commit that has no
+  status yet gets one — failure on a money path, success otherwise — so a
+  run that never reached a verdict cannot leave the check missing; a
+  status already posted is never overwritten. Branch protection requires
+  the status.
+- **A second human.** `.github/CODEOWNERS` names grunch, Catrya and
+  arkanoider for the same paths, and branch protection requires a code
+  owner's approval. GitHub never counts an author's approval of their own
+  pull request, so it is a review by someone else.
+
+The paths are `[money_path] paths` in `map.toml`: `src/lightning/**`,
+`src/app/bond/**`, `src/app/release.rs`, `src/app/add_invoice.rs`,
+`src/app/dev_fee.rs` and `src/scheduler.rs` (its payment, payout and
+dev-fee jobs). A unit test fails when CODEOWNERS and the map disagree.
+
+Repository administrators can merge past both rules, as they can past
+the rest of branch protection (`enforce_admins` is off): the rules bind
+everyone else. A money-path pull request whose verdict cannot be `pass`
+for a reason outside the change (Ortsom down, a flaky baseline) waits for
+`ortsom:run` or a push, or for an administrator.

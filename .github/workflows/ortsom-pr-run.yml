@@ -40,6 +40,7 @@ jobs:
       actions: read
       pull-requests: read
       contents: read
+      statuses: write
     outputs:
       proceed: ${{ steps.resolve.outputs.proceed }}
       reason: ${{ steps.resolve.outputs.reason }}
@@ -71,6 +72,32 @@ jobs:
           python3 .github/ortsom/resolve_run.py resolve --meta ortsom-pr/meta.json \
             ${RUN_ID:+--run-id "$RUN_ID"}
 
+      # § 15: success at once when no money path changed, pending until the
+      # verdict otherwise. A post that fails leaves the check missing, which
+      # blocks the merge: nothing is lost by not failing the job over it.
+      - name: Money path status
+        if: steps.resolve.outputs.reason == 'ok'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        run: python3 .github/ortsom/money_path.py --pr "$PR" --head "$HEAD_SHA" --pending
+
+      # A run resolve rejected (it failed, or its artifact did not check out)
+      # reaches no verdict. Without this a pull request at that commit could
+      # be left with no ortsom/money-path at all, which blocks even one that
+      # touches no money path. A status already posted is left alone.
+      - name: Money path status for a rejected run
+        if: >-
+          always() && github.event_name == 'workflow_run'
+          && (steps.resolve.outputs.reason == 'rejected' || steps.resolve.outcome == 'failure')
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: python3 .github/ortsom/money_path.py --fill-gap "$RUN_HEAD"
+
   # An authenticated skip (a draft, `ortsom:skip`, Dependabot) runs no
   # suite, so it would never enter the suite's concurrency group: this job
   # enters it instead and cancels a suite still running or waiting for
@@ -99,7 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     # A fork's code waits here for grunch, Catrya or arkanoider (§ 9.3).
     environment: ${{ needs.resolve.outputs.fork == 'true' && 'ortsom-fork' || '' }}
-    timeout-minutes: 330
+    timeout-minutes: 360
     permissions:
       actions: read
       pull-requests: read
@@ -262,7 +289,7 @@ jobs:
       - name: Run the selected scenarios
         if: steps.stack.outputs.stack == 'ok'
         working-directory: ortsom
-        timeout-minutes: 300
+        timeout-minutes: 270
         run: |
           set +e -o pipefail
           mkdir -p artifacts
@@ -273,6 +300,25 @@ jobs:
           fi
           $ORTSOM run "${args[@]}" 2>&1 | tee ../result/suite.log
           echo "$?" > ../result/suite_exit
+          # The only summary so far; the settings variants write their own.
+          summary="$(find artifacts -name summary.json -print -quit)"
+          if [ -n "$summary" ]; then cp "$summary" ../result/summary.json; fi
+
+      # § 4.5: mostrod restarted under each selected variant's overlay, on
+      # the same stack, and the variant's scenarios run again. The overlays
+      # come from main's map, like the selection.
+      - name: Run the settings variants
+        if: steps.stack.outputs.stack == 'ok'
+        working-directory: ortsom
+        # Five variants take about ten minutes; run_variants.py caps each
+        # one, and records each as it finishes.
+        timeout-minutes: 60
+        run: |
+          bonds="$(python3 -c 'import tomllib; print(tomllib.load(open("../mostro/.github/ortsom/map.toml", "rb"))["settings"].get("stack_with_bonds", False))')"
+          bonds_flag=""
+          if [ "$bonds" = True ]; then bonds_flag="--with-bonds"; fi
+          python3 ../mostro/.github/ortsom/run_variants.py --selection ../result/selection.json \
+            --image "ortsom-pr/mostro:$HEAD_SHA" $bonds_flag --ortsom-dir . --out ../result/variants
 
       - name: Write meta.json
         if: always()
@@ -283,8 +329,6 @@ jobs:
           STALE: ${{ steps.registry.outputs.stale || 'false' }}
         run: |
           mkdir -p result
-          summary="$(find ortsom/artifacts -name summary.json -print -quit 2>/dev/null || true)"
-          [ -n "$summary" ] && cp "$summary" result/summary.json
           if [ "$SELECT_STATE" != go ]; then stack="${SELECT_STATE:-infra_failed}"
           elif [ "$LOAD_OK" != true ]; then stack=bad_image
           else stack="${STACK:-infra_failed}"; fi
@@ -305,12 +349,17 @@ jobs:
               echo
               jq -r '"| scenario | outcome |", "|---|---|", (.results[] | "| \(.name) | \(.outcome) |")' result/summary.json
             fi
+            if [ "$(jq 'length' result/variants/variants.json 2>/dev/null || echo 0)" -gt 0 ]; then
+              echo
+              jq -r '"| settings variant | stack | suite exit |", "|---|---|---|", (to_entries[] | "| \(.key) | \(.value.stack) | \(.value.suite_exit) |")' result/variants/variants.json
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cancel orphaned orders
         if: always() && hashFiles('ortsom/ortsom.regtest.local.toml') != ''
         working-directory: ortsom
-        run: $ORTSOM cleanup
+        # The last settings variant may have left a daemon that never started.
+        run: $ORTSOM cleanup || echo "::warning::ortsom cleanup failed"
 
       - name: Collect logs
         if: always() && steps.load.outputs.ok == 'true'
@@ -357,6 +406,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+      statuses: write
     concurrency:
       group: ortsom-verdict-${{ needs.resolve.outputs.pr }}
       cancel-in-progress: false
@@ -380,6 +430,19 @@ jobs:
         run: |
           python3 .github/ortsom/verdict.py --pr "$PR" --reason "$REASON" \
             ${HEAD_SHA:+--head-sha "$HEAD_SHA"} --result result --out verdict
+
+      # § 15: the final state for a money path: success only on `pass`. No
+      # verdict.json (a newer head, a crash) posts nothing, which keeps a
+      # money-path pull request blocked.
+      - name: Money path status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+        run: |
+          python3 .github/ortsom/money_path.py --pr "$PR" ${HEAD_SHA:+--head "$HEAD_SHA"} \
+            --verdict-file verdict/verdict.json
 
       - uses: actions/upload-artifact@v7
         if: always()

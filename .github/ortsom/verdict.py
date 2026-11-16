@@ -144,6 +144,68 @@ def count(rows):
 
 COMPARED = {"pass", "regression", "missing"}
 
+# --- Settings variants (§ 4.5) -----------------------------------------------
+
+VARIANT_FAILED_DETAIL = "mostrod did not start with this variant's settings"
+VARIANT_SKIP_TEXT = {
+    "not-run": "not run",
+    "incomplete": "its suite did not finish",
+    "infra_failed": "the stack did not come up, for reasons outside the daemon",
+    "doctor_failed": "`ortsom doctor` failed after the restart",
+}
+
+
+def read_variants(directory):
+    """The variants document of a result or baseline directory:
+    {runs: variants.json, summaries: {name: summary}}, or None."""
+    runs = read_json(directory / "variants" / "variants.json")
+    if not isinstance(runs, dict):
+        return None
+    summaries = {}
+    for name in runs:
+        doc = read_json(directory / "variants" / str(name) / "summary.json")
+        if doc is not None:
+            summaries[name] = doc
+    return {"runs": runs, "summaries": summaries}
+
+
+def variant_results(doc, wanted):
+    """(results named `<scenario>@<variant>`, {variant: why not compared})
+    for the `wanted` variants (name -> selection entry). A run measured with
+    another overlay than the one `wanted` names is not this variant's. A
+    daemon that refused the settings fails every scenario of the variant."""
+    runs = (doc or {}).get("runs") or {}
+    summaries = (doc or {}).get("summaries") or {}
+    results, skipped = [], {}
+    for name, want in wanted.items():
+        run = runs.get(name)
+        if not isinstance(run, dict) or run.get("overlay_sha256") != want["sha256"]:
+            skipped[name] = "not-run"
+            continue
+        stack = run.get("stack")
+        if stack == "daemon_failed":
+            results += [{"name": f"{s}@{name}", "outcome": "failed", "detail": VARIANT_FAILED_DETAIL, "flaky": False}
+                        for s in want["scenarios"]]
+        elif stack == "ok" and complete(summaries.get(name)):
+            results += [{**r, "name": f"{r['name']}@{name}"} for r in results_by_name(summaries[name]).values()]
+        else:
+            skipped[name] = "incomplete" if stack == "ok" else str(stack)
+    return results, skipped
+
+
+def with_variants(summary, doc, wanted):
+    """`summary` with the wanted variants' results appended, and the
+    variants that could not be judged."""
+    results, skipped = variant_results(doc, wanted)
+    if not results:
+        return summary, skipped
+    return {**(summary or {}), "results": list((summary or {}).get("results") or []) + results}, skipped
+
+
+def variant_scenarios(selection, skipped):
+    return [f"{s}@{v['name']}" for v in selection.get("variants") or [] if v["name"] not in skipped
+            for s in v["scenarios"]]
+
 
 def blind_spots(rows, selection, changed, gate_map, registry):
     """Rules the pull request matched whose own scenarios were none of them
@@ -258,6 +320,11 @@ def read_baseline_zip(data):
                 return None
             meta = json.loads(z.read("meta.json"))
             summary = json.loads(z.read("summary.json")) if "summary.json" in names else None
+            if "variants/variants.json" in names:
+                runs = json.loads(z.read("variants/variants.json"))
+                meta["variants"] = {"runs": runs, "summaries": {
+                    name: json.loads(z.read(f"variants/{name}/summary.json"))
+                    for name in runs if f"variants/{name}/summary.json" in names}}
     except (zipfile.BadZipFile, ValueError, KeyError):
         return None
     return meta, summary
@@ -321,6 +388,9 @@ INCONCLUSIVE = {
     "doctor-failed": "`ortsom doctor` failed after the stack came up.",
     "incomplete-run": "The suite did not finish (a timeout, a cancellation or a lost runner).",
     "unknown-stack": "The run reported a stack state this version of the gate does not know.",
+    "variant-not-compared": "Every compared scenario passed, but a settings variant this pull request "
+                            "selects could not be compared (below), so the configuration it stands for "
+                            "is untested. Push a commit or add `ortsom:run` to run it again.",
 }
 SKIP_TEXT = {
     "skipped-draft": "this pull request is a draft",
@@ -379,6 +449,10 @@ def render_comment(outcome, meta, selection, ctx):
     if verdict == "would-close":
         lines += ["", "> Shadow mode: this pull request would have been closed. It stays open; "
                       "a maintainer reviews this verdict."]
+    skipped = outcome.get("variants_skipped") or {}
+    if skipped:
+        why = "; ".join(f"{code(n)}: {VARIANT_SKIP_TEXT.get(r, code(r))}" for n, r in sorted(skipped.items()))
+        lines += ["", f"> ⚠️ Settings variants not compared ({why})."]
     for spot in outcome.get("blind_spots") or []:
         why = "; ".join(f"{cls}: {', '.join(code(n) for n in names)}" for cls, names in sorted(spot["scenarios"].items()))
         files = [code(f) for f in spot["files"][:FILES_MAX]]
@@ -389,7 +463,10 @@ def render_comment(outcome, meta, selection, ctx):
 
     lines += ["", f"Daemon `{meta.get('head_sha', '')[:12]}`, Ortsom `{meta.get('ortsom_ref', '')}`"
                   + (" (override)" if meta.get("ortsom_ref_overridden") else "")
-                  + f", selection `{selection.get('mode', '?')}`."]
+                  + f", selection `{selection.get('mode', '?')}`"
+                  + (", settings variants " + ", ".join(code(v["name"]) for v in selection.get("variants") or [])
+                     if selection.get("variants") else "")
+                  + "."]
     if outcome["history"]:
         ref = outcome["history"][0]
         d = ref["distance"]
@@ -534,7 +611,17 @@ def run(args, repo, get, send, find_history, settings, gate_map=None, registry=N
         outcome = {"verdict": early[0], "reason": early[1], "rows": [], "counts": count([]),
                    "history": [], "caps": caps}
     else:
-        outcome = judge(meta, selection["scenarios"], pr_summary, find_history(meta), settings, caps)
+        wanted = {v["name"]: v for v in selection.get("variants") or []}
+        pr_summary, skipped = with_variants(pr_summary, read_variants(res), wanted)
+        history = [{**h, "summary": with_variants(h["summary"], h["meta"].get("variants"), wanted)[0]}
+                   for h in find_history(meta)]
+        scenarios = selection["scenarios"] + variant_scenarios(selection, skipped)
+        outcome = judge(meta, scenarios, pr_summary, history, settings, caps)
+        outcome["variants_skipped"] = skipped if meta.get("stack") == "ok" else {}
+        if outcome["variants_skipped"] and outcome["verdict"] == "pass":
+            # A variant that never ran is no evidence either way (§ 4.5):
+            # like a main stack that did not come up, it is not a pass.
+            outcome.update(verdict="inconclusive", reason="variant-not-compared")
         outcome["blind_spots"] = blind_spots(outcome["rows"], selection, changed, gate_map, registry)
 
     body = render_comment(outcome, meta, selection or {}, {"pr": pr, "run_url": args["run_url"], "settings": settings})

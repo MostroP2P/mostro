@@ -1,0 +1,6 @@
+# Bonds on, a hold_invoice_cltv_delta of 298 and no bond_cltv_delta: a node
+# that set its hold CLTV above the default before bond_cltv_delta existed.
+# MostroP2P/mostro#1098: 0.20.2 refused to start (bond_cltv_delta defaulted
+# to 432, below 298 + 144). The gate's stack runs with bonds on.
+[lightning]
+hold_invoice_cltv_delta = 298

@@ -1,0 +1,4 @@
+# The pegged provider next to the market provider the Ortsom template
+# already enables: both sources at once.
+[price.providers.pegged]
+enabled = true

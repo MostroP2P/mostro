@@ -40,7 +40,7 @@ jobs:
     # Above the suite step's cap, with room for the build, the stack and
     # the always-steps: the job timeout must never be what stops a run, or
     # it takes the artifact and the teardown with it.
-    timeout-minutes: 330
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
         with:
@@ -137,7 +137,7 @@ jobs:
       - name: Run the full suite
         if: steps.stack.outputs.stack == 'ok'
         working-directory: ortsom
-        timeout-minutes: 300
+        timeout-minutes: 270
         # The exit code goes to a file rather than a step output so that a
         # step timeout leaves no file, which meta.json records as null.
         run: |
@@ -145,6 +145,25 @@ jobs:
           mkdir -p artifacts
           $ORTSOM run --jobs 1 2>&1 | tee ../baseline/suite.log
           echo "$?" > ../baseline/suite_exit
+          # The only summary so far; the settings variants write their own.
+          summary="$(find artifacts -name summary.json -print -quit)"
+          if [ -n "$summary" ]; then cp "$summary" ../baseline/summary.json; fi
+
+      # Every settings variant of the map (spec § 4.5), so a pull request
+      # that runs any of them has a baseline to compare with.
+      - name: Run the settings variants
+        if: steps.stack.outputs.stack == 'ok'
+        working-directory: ortsom
+        # Five variants take about ten minutes; run_variants.py caps each
+        # one, and records each as it finishes.
+        timeout-minutes: 60
+        env:
+          WITH_BONDS: ${{ steps.pin.outputs.bonds }}
+        run: |
+          bonds_flag=""
+          if [ "$WITH_BONDS" = true ]; then bonds_flag="--with-bonds"; fi
+          python3 ../mostro/.github/ortsom/run_variants.py --all \
+            --image "ortsom-baseline/mostro:$GITHUB_SHA" $bonds_flag --ortsom-dir . --out ../baseline/variants
 
       - name: Write meta.json
         if: always()
@@ -155,10 +174,6 @@ jobs:
           STARTED_AT: ${{ steps.pin.outputs.started_at }}
         run: |
           mkdir -p baseline
-          summary="$(find ortsom/artifacts -name summary.json -print -quit 2>/dev/null || true)"
-          if [ -n "$summary" ]; then
-            cp "$summary" baseline/summary.json
-          fi
           python3 - <<'EOF'
           import json, os
           exit_file = "baseline/suite_exit"
@@ -197,6 +212,10 @@ jobs:
             else
               echo "No summary.json: the suite did not run to the end."
             fi
+            if [ "$(jq 'length' baseline/variants/variants.json 2>/dev/null || echo 0)" -gt 0 ]; then
+              echo
+              jq -r '"| settings variant | stack | suite exit |", "|---|---|---|", (to_entries[] | "| \(.key) | \(.value.stack) | \(.value.suite_exit) |")' baseline/variants/variants.json
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cancel orphaned orders
@@ -204,7 +223,8 @@ jobs:
         # even load; skip rather than report a second failure.
         if: always() && hashFiles('ortsom/ortsom.regtest.local.toml') != ''
         working-directory: ortsom
-        run: $ORTSOM cleanup
+        # The last settings variant may have left a daemon that never started.
+        run: $ORTSOM cleanup || echo "::warning::ortsom cleanup failed"
 
       - name: Collect logs
         if: always()

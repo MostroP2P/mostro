@@ -78,11 +78,11 @@ Comprehensive validation supporting:
 
 Source: `src/lnurl.rs`
 
-Buyer- and operator-supplied Lightning Addresses and LNURL-pay strings are resolved over HTTP. Those URLs are attacker-influenced, so every GET goes through `lnurl_get`:
+Buyer- and operator-supplied Lightning Addresses and LNURL-pay strings are resolved over HTTPS. Those URLs are attacker-influenced, so every GET goes through `lnurl_get`:
 
 | Control | Behavior |
 |---------|----------|
-| Scheme | `http` / `https` only; userinfo rejected |
+| Scheme | `https` only, plus plain `http` for `.onion` hosts (LUD-01); clearnet `http` is refused, since anyone on the path could swap the callback's invoice and take the payout. Applies to the metadata URL and the callback, and an `http` LNURL is rejected when the buyer submits it. Userinfo rejected |
 | Host policy | Rejects link-local, CGNAT (`100.64.0.0/10`), NAT64 (`64:ff9b::/96`), multicast, unspecified, documentation ranges; loopback/RFC1918 forbidden in production (test-only allow guard for local mocks) |
 | DNS | Lookup capped (~2s); result pinned via reqwest `.resolve` (no rebinding) |
 | Redirects | Disabled (`Policy::none()`) |

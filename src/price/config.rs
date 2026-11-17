@@ -580,4 +580,54 @@ only = ["USDT", "USDC"]
             assert!(words.contains(code), "the template does not name {code}");
         }
     }
+
+    /// The template's multi-source `[price]` example parses and validates
+    /// once uncommented, and its per-provider scoping (#1109, the
+    /// two-source refusal) is sane: every scoped code is a known fiat, and
+    /// no code is scoped out of both Yadio and currency-api — that would
+    /// leave it unpriced instead of choosing a source.
+    #[test]
+    fn template_multi_source_block_validates_and_scopes_sanely() {
+        #[derive(Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        let template = include_str!("../../settings.tpl.toml");
+        let start = template
+            .find("# [price]\n")
+            .expect("the template documents the [price] block");
+        let end = template
+            .find("# # Pegged currencies as order currencies")
+            .expect("the pegged section follows");
+        let block: String = template[start..end]
+            .lines()
+            .filter(|l| l.starts_with('#') && !l.starts_with("# #") && *l != "#")
+            .map(|l| l.trim_start_matches("# ").to_string() + "\n")
+            .collect();
+        let parsed: Stub = toml::from_str(&block).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        parsed.price.validate().unwrap();
+
+        let except = |id: &str| -> Vec<String> {
+            parsed.price.providers[id]
+                .except
+                .clone()
+                .unwrap_or_else(|| panic!("{id} has an except list"))
+        };
+        let yadio = except("yadio");
+        let currency_api = except("currency_api");
+        for code in yadio.iter().chain(&currency_api) {
+            assert!(
+                crate::price::fiat::is_known_fiat(code),
+                "{code} is not a known fiat"
+            );
+        }
+        for code in &yadio {
+            assert!(
+                !currency_api.contains(code),
+                "{code} is scoped out of both yadio and currency_api"
+            );
+        }
+        assert!(currency_api.iter().any(|c| c == "VES"), "parallel markets");
+        assert!(yadio.iter().any(|c| c == "BZD"), "pegs Yadio misquotes");
+    }
 }

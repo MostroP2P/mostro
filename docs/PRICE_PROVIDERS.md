@@ -318,7 +318,12 @@ With exactly two candidates there is no median to tell which one is
 wrong, so a pair that disagrees beyond the threshold is **refused**
 rather than averaged: the currency keeps its last-known-good value and,
 once that passes `max_price_staleness_seconds`, market-priced operations
-on it fail with `PriceTooStale`. A plain mean would let one corrupt
+on it fail with `PriceTooStale`. The store is in memory, so after a
+restart a currency refused from the first tick has **no** last-known-good:
+the lookup fails with `NoCurrency`, and until #1116 is fixed a
+market-priced order in it gets no reply at all. Scope the sources of a
+currency that disagrees persistently (§6.6 "Two-source currencies")
+rather than relying on the refusal. A plain mean would let one corrupt
 source move the price by half its error (security audit item #9). Note
 that `n` counts the candidates that survive cleaning and scoping on a
 given tick, not the providers configured: a currency only two providers
@@ -468,6 +473,30 @@ heterogeneous providers safely comparable.
     the "no authoritative override" decision (§4): scoping restricts a
     source's *coverage*, it does not pick a winner among legitimate
     same-market contributors.
+  - **Two-source currencies.** Many minor fiats are quoted only by Yadio
+    and `currency-api`, so the two-source refusal (§6.2) decides them. On
+    live feeds (2026-11-17, ToRyVand on #1109) the four-source
+    config with only CUP/MLC scoped served 136 of 161 currencies; the
+    other 25 disagreed on every tick, not on a glitch. They fall into
+    groups that need scoping in **opposite directions**:
+    - *Parallel market* — Yadio tracks the street rate (what P2P users
+      trade at), `currency-api` the official one: AOA, BIF, DZD, ETB, GNF,
+      IQD, IRR, LYD, MWK, MZN, SDG, SLE, TND, TTD, VES, YER (Yadio ×1.13
+      to ×19.6 per USD). Scope them out of `currency-api`. SYP belongs
+      here too: `currency-api` still quotes pre-redenomination units
+      (100× off).
+    - *Yadio wrong* — the official rate is the market and Yadio misses it:
+      BZD (its 2:1 USD peg quoted 1:1), BND, BTN, NPR (all ×1.10 off
+      their pegs), ALL and JMD (quoted *below* the official rate, which a
+      parallel market cannot explain). Scope them out of Yadio.
+
+    Scoping only one source would be worse than refusing: with BZD out
+    of `currency-api`, Yadio alone would serve it 50% off. With both
+    lists the same feeds served 159 of 161; HTG and MRU (Yadio ×1.09, the
+    same offset as its broken pegs) are left unscoped and refused until
+    someone checks them. These lists drift as markets and feeds change:
+    the per-tick refusal `warn!` names both values and is how an operator
+    spots a new one.
 - **Mid-market only.** Adapters discard bid/ask; Mostro never applies an
   exchange spread (contrast BTCPay, §11.6). The order premium/fee is the
   only markup, applied downstream in `get_market_quote` / `get_fee`.
@@ -499,20 +528,30 @@ publish_to_nostr = true
 [price.providers.yadio]
 enabled = true
 url = "https://api.yadio.io"
+# Codes Yadio misquotes against an official rate that is the real market
+# (pegs it gets wrong, quotes below the official rate). Measured 2026-11-17;
+# see §6.6 "Two-source currencies".
+except = ["ALL", "BND", "BTN", "BZD", "JMD", "NPR"]
 
 [price.providers.coingecko]
 enabled = true
 url = "https://api.coingecko.com/api/v3"
 # api_key = "CG-xxxx"   # optional demo/pro key; raises rate limits
 
-# Keyless, CDN-hosted, 300+ currencies incl. CUP (OFFICIAL rate) — so CUP
-# is excluded to avoid mixing it with the informal-market sources (§6.6).
+# Keyless, CDN-hosted, 300+ currencies at the OFFICIAL rate — so codes with
+# a parallel market (CUP, VES, …) are excluded to avoid mixing official with
+# informal-market sources (§6.6). SYP: still in pre-redenomination units.
 [price.providers.currency_api]
 enabled = true
 url = "https://currency-api.pages.dev/v1"
 # Optional ordered mirrors, tried in sequence if `url` fails (§7).
 fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
-except = ["CUP", "MLC"]
+except = [
+  "CUP", "MLC",
+  # Parallel markets, measured 2026-11-17 (§6.6 "Two-source currencies").
+  "AOA", "BIF", "DZD", "ETB", "GNF", "IQD", "IRR", "LYD", "MWK", "MZN",
+  "SDG", "SLE", "SYP", "TND", "TTD", "VES", "YER",
+]
 
 # Keyless, 28 major fiats, no CUP/MLC.
 [price.providers.blockchain]

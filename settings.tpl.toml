@@ -243,6 +243,9 @@ lnd_resynced_clear_after = 300
 # [price.providers.yadio]
 # enabled = true
 # url = "https://api.yadio.io"
+# # Codes Yadio misquotes against an official rate that is the real market
+# # (measured 2026-11-17; docs/PRICE_PROVIDERS.md §6.6 "Two-source currencies").
+# except = ["ALL", "BND", "BTN", "BZD", "JMD", "NPR"]
 #
 # [price.providers.coingecko]
 # enabled = true
@@ -251,15 +254,22 @@ lnd_resynced_clear_after = 300
 # # plans use url = "https://pro-api.coingecko.com/api/v3" (the adapter picks
 # # the matching auth header from the host).
 #
-# # Keyless, CDN-hosted, 300+ currencies incl. CUP at the OFFICIAL rate — so
-# # CUP/MLC are excluded to avoid mixing official with the informal-market
-# # sources (docs/PRICE_PROVIDERS.md §6.6).
+# # Keyless, CDN-hosted, 300+ currencies at the OFFICIAL rate — so codes with
+# # a parallel market (CUP, VES, …) are excluded to avoid mixing official with
+# # informal-market sources (docs/PRICE_PROVIDERS.md §6.6). With only two
+# # sources for a code, a disagreement refuses it: these lists keep the
+# # minor fiats priced. They drift; the price refusal warnings name new ones.
 # [price.providers.currency_api]
 # enabled = true
 # url = "https://currency-api.pages.dev/v1"
 # # Ordered mirrors tried in sequence when `url` fails this tick.
 # fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
-# except = ["CUP", "MLC"]
+# except = [
+#   "CUP", "MLC",
+#   # Parallel markets (measured 2026-11-17); SYP: pre-redenomination units.
+#   "AOA", "BIF", "DZD", "ETB", "GNF", "IQD", "IRR", "LYD", "MWK", "MZN",
+#   "SDG", "SLE", "SYP", "TND", "TTD", "VES", "YER",
+# ]
 #
 # # Keyless, ~28 major fiats, no CUP/MLC. Mid-market (`last`) only.
 # [price.providers.blockchain]

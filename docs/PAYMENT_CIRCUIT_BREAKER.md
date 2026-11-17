@@ -30,7 +30,8 @@ sats" but "we lost sats all night while nobody was watching".
    path forgets one.
 2. **Fail closed.** If the ledger cannot be read, the DB is unavailable, or the
    breaker state cannot be determined, the gate **rejects the payment**. A gate
-   that fails open is not a gate.
+   that fails open is not a gate. This applies with `enforce = true`. In
+   observe-only mode nothing is ever rejected, errors included (§5.3).
 3. **The latch is persistent and manual-reset only.** Once tripped, the state
    survives a daemon restart and only an admin can clear it. A breaker that
    resets on restart is exactly the condition an attacker will induce.
@@ -175,7 +176,8 @@ fee-inclusive net-outflow rule.
 reconciliation re-arms a retry for the same payment (§3.1), the retry violates
 the invariant. When the violation is **entirely** explained by `unknown` rows of
 the same `kind` on that order, that is, when the invariant would hold if those
-rows were `failed`, the gate rejects that one payment and notifies the admins
+rows were `failed`, the gate rejects that one payment and alerts the operator
+(§5.7)
 with the order id and the hashes. It does **not** trip the global latch. The
 order stays held until an operator resolves the `unknown` rows (§5.6). Any
 other violation trips the breaker. The distinction matters: "LND forgot a
@@ -363,9 +365,30 @@ nothing — decoding is local and touches no network — and guarantees every
 reservation is reconcilable. The reservation still precedes any LND dispatch,
 so the write-ahead property of principle 4 is unchanged.
 
-In observe-only mode (`enforce = false`), steps 1–4 still evaluate and log at
-`warn!`/`error!`, and step 4 still writes the row, but nothing is rejected and
-the latch is not set.
+#### 5.3.1 Observe-only mode (`enabled = true`, `enforce = false`)
+
+The breaker runs exactly as it would when enforcing, short of stopping
+anything:
+
+- The ledger is written in full: `reserved` rows before dispatch, terminal
+  states after, inflows at settlement. The reaper runs.
+- Every rule is evaluated: the §4.1 invariant and `max_payment_sats`
+  synchronously in the gate, and the §4.2 window rules in the watcher job.
+- A violation is logged at `warn!`/`error!` and appends a `would-trip` row to
+  `circuit_breaker_event`, carrying the full `TripReason`. Rows are written for
+  the §4.1 `unknown`-row exception too, as `would-hold`. The operator is alerted
+  through §5.7.
+- **The payment is dispatched anyway.** The latch is never set, maintenance
+  mode is not touched, `payments_paused` stays `false`, and no order is held.
+- **Errors do not block either.** A DB or query failure while evaluating is
+  logged, recorded in the health event's breaker section as `last_error`, and
+  the payment proceeds. Principle 2 (fail closed) applies only with
+  `enforce = true`. Otherwise the trial period could stop payouts, which is the
+  one thing it promises not to do.
+
+The `would-trip` rows serve two purposes. They are what an operator reviews to
+tell false positives from real ones before enforcing, and they are what the
+regtest simulation of §10.1 asserts on, instead of parsing logs.
 
 ### 5.4 Reserved-row reaper
 
@@ -389,7 +412,7 @@ three outcomes and they are not interchangeable:
 | `Ok(Some(Succeeded))` | `confirmed`, with the real `fee_sats` | Definitive |
 | `Ok(Some(Failed))` | `failed`, budget released | Definitive |
 | `Ok(Some(InFlight))` | stays `reserved` | Not terminal yet; retry next tick |
-| `Ok(None)` | `unknown`, kept charged, admin notified | LND has no record — see below |
+| `Ok(None)` | `unknown`, kept charged, operator alerted (§5.7) | LND has no record — see below |
 | `Err(_)` | stays `reserved` | Transport failure says nothing about the payment |
 
 `Ok(None)` is the dangerous one. It means LND has no record of the hash, which
@@ -409,7 +432,7 @@ confirms what happened.
 1. Persist `tripped` to the `daemon_state` latch keys (§5.1), append a `trip`
    row to `circuit_breaker_event`, and update the atomic cache.
 2. `error!` log with the full `TripReason`.
-3. Notify admins over the existing message queue.
+3. Alert the operator through the health event and mostro-watchdog (§5.7).
 4. Turn on maintenance mode with the reserved reason `circuit_breaker` (§5.5.1),
    which refuses new orders and takes.
 5. Scheduler payment jobs skip their tick (Phase 2).
@@ -493,6 +516,74 @@ previous one. The audit trail is a separate append-only table,
 operator investigating a drain needs the *first* trip, and a breaker that tripped
 twice would otherwise have overwritten exactly the record that mattered.
 
+### 5.7 Operator alerts: health event and mostro-watchdog
+
+Alerts go through the path operators already run for node health. mostrod
+publishes the health event (kind 38389, `docs/HEALTH.md`), with its content
+NIP-44 encrypted to `[health].watchdog_pubkey`. mostro-watchdog reads it and
+alerts on Telegram, only on state changes, with hysteresis and reminders. The
+breaker adds a section to that event and the watchdog adds rules for it.
+No new channel is built. Other channels can be added later on top of the same
+data.
+
+**Public tags.** One new `check`, `circuit_breaker`, Lightning mode only:
+
+| State | When |
+|---|---|
+| `ok` | Breaker closed, or observe-only |
+| `fail` | Latch tripped. `status` becomes `down`: the node takes trades it cannot pay out |
+| `unknown` | The latch cannot be read |
+
+The public check deliberately ignores would-trips and held orders. A public
+signal that flips when a rule *almost* fires is an oracle: an attacker could
+send probe payments and watch it to learn the thresholds, then drain just below
+them. A trip is no secret, since `payments_paused` is already public.
+
+**Encrypted content** (`src/app/health/content.rs`), a `circuit_breaker`
+object:
+
+- `mode`: `off` | `observe` | `enforce`;
+- `state`, `reason` (serialized `TripReason`), `tripped_at`;
+- `would_trip_total`: monotonic count of `would-trip` rows, persisted in
+  `daemon_state` so a restart does not reset it;
+- `recent`: the last 10 `would-trip` / `would-hold` / `order-held` events, each
+  with rule, order id, observed value and cap;
+- `held_orders`: orders held by the §4.1 `unknown`-row exception;
+- `headroom`: for each §4.2 window rule, the current value and its cap;
+- `last_error`: the last evaluation error in observe-only mode, or `null`.
+
+A monotonic counter is needed because the health event is a periodic
+snapshot. The watchdog can count the would-trips between two snapshots even if
+it missed one in between.
+
+**Republish timing.** A trip and a reset change the public check, so they
+publish at once, still at most once every 10 seconds. Would-trips and held
+orders do **not** trigger an immediate republish. They wait for the next
+regular `[health].interval` (60 s by default). Otherwise the publication time
+itself would leak what the encrypted content hides: an event appearing seconds
+after a probe payment tells the prober it crossed a rule. A minute of latency
+costs nothing during a calibration period.
+
+**mostro-watchdog rules** (companion PR in MostroP2P/mostro-watchdog,
+`src/health/rules.rs`):
+
+| Signal | Alert |
+|---|---|
+| `circuit_breaker` check is `fail` | 🔴 Critical, with the reason; reminders every `renotify_interval`; "resolved" on reset |
+| `would_trip_total` increased (observe-only) | 🟡 One warning per new event, from `recent`, with rule, order and value against cap |
+| A new order in `held_orders` | 🟡 Warning with the order id and hashes |
+| `last_error` set | 🟡 Warning: the trial period is not evaluating |
+
+**Without a watchdog.** If `watchdog_pubkey` is empty, the content is empty and
+the operator has the logs, the `circuit_breaker_event` table and the
+`CircuitBreakerStatus` RPC. The runbook (Phase 3) recommends running the
+watchdog as part of enabling the breaker, and mostrod logs a startup warning
+when `[circuit_breaker]` is enabled without a watchdog key.
+
+The health event's format is specified in the protocol book
+(`health_event.md`), so the new check and content fields need a protocol book
+update next to the mostrod change.
+
 ## 6. Schema
 
 `migrations/<ts>_payment_circuit_breaker.sql`, where `<ts>` is the timestamp of
@@ -543,7 +634,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_ledger_inflow_hash
 -- interesting one, and the latch alone would have overwritten it on the second.
 CREATE TABLE IF NOT EXISTS circuit_breaker_event (
   id               char(36) primary key not null,
-  -- 'trip' | 'reset' | 'order-held' | 'unknown-resolved'
+  -- 'trip' | 'reset' | 'order-held' | 'unknown-resolved', and in
+  -- observe-only mode 'would-trip' | 'would-hold' (spec §5.3.1)
   event            varchar(16) not null,
   -- Serialized TripReason for 'trip'; the order id and hashes for
   -- 'order-held'; the ledger row id and resolution for 'unknown-resolved';
@@ -643,8 +735,19 @@ Each phase is one PR.
 - Ledger rows written on both sides: `reserved`/`confirmed` at outflow points,
   `in` rows at the `settle_hold_invoice` call sites of §3.
 - All rules evaluate and log. **Nothing is rejected. The latch is never set.**
+  Violations append `would-trip` / `would-hold` rows, and evaluation errors
+  never block (§5.3.1).
+- The `circuit_breaker` section of the health event (§5.7): the public check
+  and the encrypted content.
+- Companion PRs: the protocol book (`health_event.md`) for the new check and
+  content fields, and mostro-watchdog for the §5.7 rules, so the trial period
+  alerts on Telegram from day one.
 
 Ships dark and safe. Its purpose is to produce real numbers for §7.
+
+**Gate to Phase 1:** the §10.1 regtest simulation records zero `would-trip`
+rows across the whole scenario catalogue and all four configuration variants,
+and every positive control is caught.
 
 ### Phase 1 — Per-order invariant, persistent latch, live gate
 
@@ -674,9 +777,10 @@ Ships dark and safe. Its purpose is to produce real numbers for §7.
 - `CircuitBreakerStatus` / `CircuitBreakerReset` /
   `CircuitBreakerResolveUnknown` in `proto/admin.proto` and
   `src/rpc/service.rs`.
-- Admin notification on trip.
 - `payments_paused` tag on the NIP-33 info event.
-- Operator runbook section in `docs/LIGHTNING_OPS.md`.
+- Operator runbook section in `docs/LIGHTNING_OPS.md`, covering how to set up
+  mostro-watchdog for the breaker, how to read a `would-trip` alert during the
+  trial period, and how to resolve a trip, a held order and an `unknown` row.
 
 ## 9. Failure modes and calibration
 
@@ -739,8 +843,14 @@ Per phase, co-located Rust unit tests:
 - Audit trail: two consecutive trips leave two `circuit_breaker_event` rows, and
   the first one is still readable after the second.
 - Fail-closed: a failing pool makes the gate reject rather than allow.
-- Observe-only: with `enforce = false`, a violating payment is logged and still
-  dispatched, and the latch stays closed.
+- Observe-only: with `enforce = false`, a violating payment is logged, writes a
+  `would-trip` row and is still dispatched; the latch stays closed, maintenance
+  is untouched and no order is held. A failing pool in observe-only mode lets
+  the payment through and sets `last_error`.
+- Health event: the `circuit_breaker` check is `ok` in observe-only mode even
+  after would-trips, `fail` when tripped (and `status` is `down`), and absent in
+  Cashu mode. The encrypted content carries `would_trip_total`, which survives a
+  restart. A would-trip does not trigger an immediate republish; a trip does.
 - Config validation: zero or negative `check_interval_seconds` and
   `reserved_row_timeout_seconds` are rejected at startup.
 - Velocity: each rule of §4.2 passes at exactly its cap and trips one unit
@@ -762,3 +872,71 @@ Per phase, co-located Rust unit tests:
   still `circuit_breaker`.
 - Disabled: with no `[circuit_breaker]` block, no ledger rows are written and
   every existing test stays green.
+
+### 10.1 Regtest simulation
+
+Unit tests prove the logic against mocks. The question they cannot answer is
+whether **real** Lightning behavior makes the breaker fire on legitimate
+traffic: real routing fees, real retries, real LND records, real timing. That
+is answered on regtest before any phase can enforce.
+
+**Harness.** Use [Mortsom](https://github.com/MostroP2P/mortsom) rather than a
+new one. `mortsom stack up` brings up a regtest chain, three LND nodes (alice,
+bob, carol), a relay and a mostrod built from `main`; `--profile cli` drives
+trades through mostro-cli with no app; the scenario catalogue already covers
+the money paths (`happy`, `bond`, `dispute`, `cancellation`, `expiration`,
+`payment_failure`, `recovery`); and the daemon's settings come from
+`stack/mostro-settings.tpl.toml`.
+
+**Method.** Run the whole catalogue with `[circuit_breaker] enabled = true,
+enforce = false`, then assert on `circuit_breaker_event`: **zero `would-trip`
+and zero `would-hold` rows**. A non-empty table names the rule, the order and
+the values, which is the false positive to fix before enforcing.
+
+**Configuration variants.** The fee bug this spec once had was a function of
+configuration, so the catalogue runs under each of these:
+
+| Variant | What it exercises |
+|---|---|
+| `fee = 0` | The template default: the invariant holds at exact equality |
+| `fee = 0.006`, trades of 1 000 sats or less | The 10-sat routing floor above the node's margin |
+| Bonds on, `slash_node_share_pct = 0` | A bond payout equal to the slashed inflow |
+| Range orders | Parent versus child keys on payouts and bonds |
+
+**Breaker-specific scenarios** the catalogue does not force today:
+
+- **Real routing fees.** Route the buyer payout through carol (multi-hop) so
+  `fee_sats` is non-zero and the routing-fee and net-outflow rules see real
+  numbers.
+- **LND forgets a payment.** After a payout, delete its record
+  (`lncli deletepayments`). The reaper must park the row as `unknown`, a
+  re-armed retry must be held for that order only, and the node-wide latch must
+  stay closed.
+- **Concurrency.** A `release` and the dev-fee job on the same order at the
+  same moment. Both legitimate payments pass, and nothing is double-counted.
+- **Restart mid-payout.** Kill mostrod between the `reserved` row and the
+  terminal result. After restart, the reaper resolves the row from LND.
+- **"Already settled" replay.** A bond slash retried after LND settled it books
+  one inflow, not two.
+- **Dispute settled by a solver** through `admin-settle`.
+
+**Positive controls.** A breaker that never fires also reports zero
+false positives. A test-only cargo feature in mostrod (for example
+`circuit-breaker-fault-injection`, never built into releases) injects
+draining bugs on purpose:
+
+- pay the same order's buyer payout a second time with a different invoice;
+- pay out an order whose escrow was never settled;
+- inflate a payout above the escrowed amount.
+
+With `enforce = true`, each scenario must see the breaker trip before the bad
+payment leaves, and Mortsom's wallet observer must show that the receiving
+wallet got **nothing** from it. With `enforce = false`, the same scenarios must
+produce exactly one `would-trip` row each and a watchdog alert, which also
+tests the §5.7 path end to end.
+
+**What regtest cannot settle.** The §4.2 window thresholds depend on real
+volume, and regtest traffic is synthetic. The simulation validates the logic:
+the invariant, the reaper, the latch and its interplay with maintenance mode.
+The thresholds come only from Phase 0 running on real nodes. A green
+simulation must not be read as calibrated thresholds.

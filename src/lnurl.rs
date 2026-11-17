@@ -254,7 +254,8 @@ async fn assert_url_host_safe(url: &Url) -> Result<SocketAddr, MostroError> {
 ///
 /// Applies [`LNURL_CONNECT_TIMEOUT`] and [`LNURL_REQUEST_TIMEOUT`]. Callers
 /// must only pass URLs produced by [`extract_lnurl`] or [`build_callback_url`]
-/// (scheme already constrained to http/https).
+/// (scheme already constrained to http/https); the LUD-01 rule (`https`, or
+/// `http` only for `.onion`) is then enforced here via [`assert_url_host_safe`].
 async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
     let pinned = assert_url_host_safe(&url).await?;
     let host = url
@@ -287,8 +288,9 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
 /// - Bech32 LNURL (`lnurl1…`) → decoded callback/pay URL
 ///
 /// Returns a parsed [`Url`] (not a raw string) so callers can pass it straight
-/// to [`lnurl_get`] without a second parse. Scheme must be `http`/`https`;
-/// host/IP safety is enforced later by [`lnurl_get`].
+/// to [`lnurl_get`] without a second parse. Scheme must be `http`/`https`
+/// here; the stricter LUD-01 rule (clearnet `http` refused) and host/IP
+/// safety are enforced later by [`lnurl_get`].
 ///
 /// # Errors
 ///

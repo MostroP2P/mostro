@@ -57,8 +57,8 @@ Every point where sats leave the node today:
 |---|---|---|
 | Trade payout to buyer | `src/app/release.rs`, `fn do_payment` | `release` handler (hot path, user-driven) |
 | Dev fee | `src/app/dev_fee.rs`, `fn send_dev_fee_payment` | `fn job_process_dev_fee_payment` (`src/scheduler.rs`) |
-| Bond payout to counterparty | `src/app/bond/slash.rs`, `src/app/bond/flow.rs` | `fn job_process_bond_payouts` (`src/scheduler.rs`) |
-| Failed-payment retries | `fn job_retry_failed_payments` (`src/scheduler.rs`) | scheduler |
+| Bond payout to counterparty | `src/app/bond/payout.rs`, `fn pay_counterparty` | `fn job_process_bond_payouts` (`src/scheduler.rs`) |
+| Failed and deferred payout retries | `fn job_retry_failed_payments` (`src/scheduler.rs`) → `fn do_payment` | scheduler |
 | Dispute resolution payout | `src/app/admin_settle.rs` → release path | admin/solver |
 
 All of them funnel into `LndConnector::send_payment`.
@@ -76,43 +76,111 @@ path (`src/util.rs`, `fn settle_seller_hold_invoice`) and the bond slash paths
 (`src/app/bond/slash.rs`, `fn slash_one` and
 `fn resolve_range_maker_bond_at_close`).
 
+### 3.1 Existing defenses, and where the breaker sits among them
+
+Several controls on the outflow path already exist. The breaker does not
+replace any of them, and none of them makes the breaker redundant: each one
+answers a narrower question.
+
+| Control | Where | What it stops | What it does not stop |
+|---|---|---|---|
+| Duplicate-dispatch guard | `LndConnector::send_payment` | Re-sending a hash LND already reports as in flight or settled | Paying the same order a second time with a **different** invoice; it is advisory and proceeds when the lookup fails or times out |
+| At-most-once buyer payout | `fn do_payment` (CAS on `orders.payout_payment_hash`), reconciled by `fn job_reconcile_inflight_payouts` | Two concurrent dispatches of the buyer payout of one order | Outflows other than the buyer payout; a bug that clears or rewrites the marker |
+| In-flight payout caps | `fn claim_payout_slot`, `PayoutCaps` (`src/lightning/mod.rs`), used by `fn do_payment` and `fn pay_counterparty` | Too many payouts in flight per destination or node-wide | Amounts; it counts payments, not sats, and **fails open** when the count is unavailable |
+| Deferral while LND is unsynced | `fn do_payment` → `fn defer_payout_durably` (`crate::db::mark_payout_deferred`) | Dispatching while LND cannot be trusted | Anything once LND is synced |
+| Maintenance mode | `src/app/maintenance.rs`, `MaintenanceState` | New orders and takes while the node drains | Payouts of orders already escrowed, by design |
+
+The breaker adds the one property none of these has: **an amount-based, fail
+closed limit that holds across outflow kinds and across restarts.** The
+in-flight cap fails open on purpose, because it is a liveness throttle and a
+stranded payout is the worse outcome there. The breaker is the safety control,
+so it fails closed (principle 2). The two must not share state or failure
+policy.
+
+Order of checks on a payout, outermost first:
+
+1. LND-sync deferral and the breaker latch (§5.5) in `fn do_payment` — both
+   defer the payout durably instead of failing it.
+2. The at-most-once CAS on `payout_payment_hash`.
+3. `claim_payout_slot`.
+4. Inside `send_payment`: the breaker gate (§5.3), then the duplicate-dispatch
+   guard, then LND.
+
+A breaker rejection inside `send_payment` (step 4) is an error like any other
+send failure, so the caller's existing failure path releases the in-flight slot
+and the payout marker. It must **not** be counted as a failed payment attempt:
+an operator who resets the breaker should find the payout still retryable, not
+exhausted.
+
+The existing reconciliation of the payout marker treats an `Unknown` or absent
+LND record as failed and re-arms the retry. The breaker's ledger keeps that same
+payment charged as `unknown` (§5.4), so the re-armed retry is rejected by the
+§4.1 invariant. §4.1 defines how that case is handled without tripping the whole
+node.
+
 ## 4. Detection layers
 
 Two layers, evaluated at different points.
 
 ### 4.1 Per-order invariant (synchronous, inside the gate)
 
-> For any order, the sats paid out must never exceed the sats taken in.
+> For any order, the principal paid out must never exceed the sats taken in.
 
 ```text
-Σ outflow(order_id) + pending_amount ≤ Σ inflow(order_id) + tolerance_sats
+Σ out_principal(order_id) + amount ≤ Σ inflow(order_id) + tolerance_sats
 ```
+
+`out_principal` is the `amount_sats` of every `reserved`, `confirmed` and
+`unknown` outflow row for the order. `amount` is the principal of the payment
+under evaluation, the `amount` argument of `send_payment`. **Routing fees are
+not part of this comparison**; they have their own budget (below and §4.2).
 
 This is the fast, precise layer. Nearly every conceivable draining bug violates
 it: paying an order twice, paying an order whose escrow was never settled,
 paying more than the escrow held, replaying a payout against a different
 invoice. It is checked **before** dispatch, so the bad payment never leaves.
 
-The direction is naturally safe: routing fees and the node fee mean a healthy
-order always has `out < in`. Default `tolerance_sats = 0`.
+**Why routing fees are kept out.** Routing fees are paid by the node on top of
+the principal, so they push a healthy order's outflow *up*, not down. Counting
+them would make the invariant false for legitimate trades:
 
-**Routing fees are inside the invariant, reserved at their cap.** `fee_sats` is
-only known once a payment confirms, but the gate runs before dispatch, so a
-reservation of `amount_sats` alone could approve a payment whose amount plus its
-routing fee later exceeds the inflow. Both sides of the comparison are therefore
-defined in fee-inclusive terms:
+- On a node with `fee = 0` (the `settings.tpl.toml` default) the seller's hold
+  invoice is exactly `amount` and the buyer payout is exactly `amount`. Any
+  routing fee at all puts outflow above inflow, so every release would trip.
+- On a node that does charge a fee, `routing_fee_cap_sats` has a 10-sat floor
+  for payments of 1 000 sats or less. A 1 000-sat trade at `fee = 0.006` leaves
+  the node 6 sats of margin and reserves a 10-sat cap, so it trips too.
+- A bond payout pays the counterparty its share of the slashed bond. With a
+  small `slash_node_share_pct` the node keeps less than the routing cap.
 
-- `pending_amount` for the payment under evaluation is
-  `amount + routing_fee_cap_sats(amount)` — the same ceiling `send_payment`
-  already hands LND as `fee_limit_sat`, so the reservation can never be
-  under-stated by the actual route.
-- `Σ outflow` sums `amount_sats + COALESCE(fee_sats, routing_fee_cap_sats(amount_sats))`,
-  so a row that is still `reserved` keeps charging the cap and a `confirmed` row
-  drops back to the fee actually paid.
+On the principal alone, a healthy order satisfies the invariant with
+`tolerance_sats = 0` in all three cases. The buyer payout is `amount − buyer
+fee`, the dev fee is part of the Mostro fee, and the inflow is
+`amount + seller fee`. For a bond, the counterparty share is at most the slashed
+amount. Equality is allowed (§4.2 on strict caps), and it is the normal case on
+a zero-fee node.
 
-Confirmation therefore only ever *releases* budget, never consumes more than was
-reserved. The equal-to-inflow boundary case in §10 is evaluated against this
-fee-inclusive figure.
+**What leaving fees out costs, and what bounds it.** A payment the invariant
+admits can still spend up to `routing_fee_cap_sats(amount)` in routing fees,
+because `send_payment` hands LND that value as `fee_limit_sat` and LND enforces
+it. A payment can only be admitted while its principal fits the order's inflow,
+and a failed payment pays no fee. The fee leak an attacker can extract this way
+is therefore bounded by the routing cap of the payments that legitimately fit,
+and it is visible in aggregate: the ledger records `fee_sats` on confirmation,
+and §4.2 has a rolling `max_routing_fees_sats_per_day` budget plus the
+fee-inclusive net-outflow rule.
+
+**Unknown rows on the same order.** A row the reaper parked as `unknown`
+(§5.4) keeps its principal charged. If the order's existing payout
+reconciliation re-arms a retry for the same payment (§3.1), the retry violates
+the invariant. When the violation is **entirely** explained by `unknown` rows of
+the same `kind` on that order, that is, when the invariant would hold if those
+rows were `failed`, the gate rejects that one payment and notifies the admins
+with the order id and the hashes. It does **not** trip the global latch. The
+order stays held until an operator resolves the `unknown` rows (§5.6). Any
+other violation trips the breaker. The distinction matters: "LND forgot a
+payment" is a per-order question for a human, and "an order is being paid
+twice" is a node-wide emergency.
 
 **Bond ledger key.** Range-order bonds carry both `order_id` and
 `child_order_id` (see `migrations/20260423120000_anti_abuse_bond.sql`). The
@@ -131,7 +199,15 @@ Rolling-window aggregates over the ledger, evaluated every
 | Outflow in the last hour exceeds cap | `max_outflow_sats_per_hour` |
 | Outflow in the last 24h exceeds cap | `max_outflow_sats_per_day` |
 | Payment count in the last hour exceeds cap | `max_payments_per_hour` |
+| Routing fees in the last 24h exceed cap | `max_routing_fees_sats_per_day` |
 | Net outflow (`Σ out − Σ in`) over 24h exceeds cap | `max_net_outflow_sats_24h` |
+
+The outflow, routing-fee and net-outflow aggregates are **fee-inclusive**. An
+outflow row contributes `amount_sats + COALESCE(fee_sats,
+routing_fee_cap_sats(amount_sats))`, so a row still `reserved` or `unknown`
+charges the routing cap, and a `confirmed` row drops back to the fee actually
+paid. Confirmation can only release budget. The routing-fee rule sums the same
+`COALESCE(fee_sats, routing_fee_cap_sats(amount_sats))` term on its own.
 
 **Every cap is strict (`>`), never `>=`.** A value exactly equal to its
 configured cap is allowed; only a value above it trips. A cap is the largest
@@ -143,8 +219,12 @@ single oversized payment must be stopped before it leaves, not detected a minute
 later.
 
 The net-outflow rule is the direct expression of the requirement ("more sats
-leaving than entering"). Because inflow and outflow are roughly balanced
-per-order in healthy operation, a sustained positive net outflow is a leak.
+leaving than entering"). In healthy operation the principal balances per
+order, and the Mostro fee the node keeps usually covers the routing fees, so a
+sustained net outflow well above routing costs is a leak. **On a zero-fee node
+the healthy net outflow is not zero.** It equals the routing fees the node pays,
+so `max_net_outflow_sats_24h` must sit above the expected daily routing spend.
+The Phase 0 numbers are what set it.
 
 ### 4.3 Deliberately out of scope: balance reconciliation against LND
 
@@ -202,8 +282,25 @@ pub enum TripReason {
 ```
 
 `PaymentGuard` holds the pool and caches the latch in an `AtomicU8` so the hot
-path does not hit the DB just to learn the breaker is closed. The DB row remains
-the source of truth; the atomic is a cache refreshed on write and on boot.
+path does not hit the DB just to learn the breaker is closed. The persisted
+latch remains the source of truth, and the atomic is a cache refreshed on write
+and on boot. The guard follows the `MaintenanceState` pattern
+(`src/app/maintenance.rs`): it lives on `AppContext`, it shares one clone with
+the RPC server, and it writes the DB first and the atomic second, so a crash in
+between leaves the persisted value authoritative.
+
+The latch is stored in the existing `daemon_state` key/value table
+(`migrations/20260901120000_daemon_state.sql`), not in a table of its own:
+
+| Key | Value |
+|---|---|
+| `circuit_breaker_state` | `"closed"` / `"tripped"` |
+| `circuit_breaker_reason` | serialized `TripReason` of the current trip; empty while closed |
+| `circuit_breaker_tripped_at` | unix seconds; empty while closed |
+
+A missing key reads as `closed`. Only the explicit value `"tripped"` blocks, so a
+fresh database starts closed. A key that is present but unreadable, or a read
+that fails, counts as tripped (principle 2).
 
 ### 5.2 `send_payment` signature change
 
@@ -234,11 +331,12 @@ reusing the existing variant so no `mostro-core` change is required.
    and reject (strict comparison, §4.2).
 3. Decode the invoice to derive its `payment_hash`. A decode failure rejects
    here, before anything has been written.
-4. In **one serialized transaction**: re-read `Σ in` / `Σ out` (including
-   `reserved`) for `intent.order_id`, evaluate the §4.1 invariant against
-   `amount + routing_fee_cap_sats(amount)`, and — only if it holds — insert the
-   `reserved` ledger row carrying the `payment_hash` from step 3. A violation
-   rolls the transaction back, trips, and rejects.
+4. In **one serialized transaction**: re-read `Σ in` and the principal
+   `Σ out` (including `reserved` and `unknown`) for `intent.order_id`, evaluate
+   the §4.1 invariant against the principal `amount`, and insert the `reserved`
+   ledger row carrying the `payment_hash` from step 3 only if the invariant
+   holds. A violation rolls the transaction back and rejects. It also trips the
+   breaker, unless §4.1's `unknown`-row exception applies.
 5. Dispatch to LND, only after that transaction has committed.
 6. Terminal result confirms the row (`confirmed` with the real fee, or `failed`).
 
@@ -308,20 +406,59 @@ confirms what happened.
 
 ### 5.5 Trip actions
 
-1. Persist `Tripped` to `circuit_breaker_state` and update the atomic cache.
+1. Persist `tripped` to the `daemon_state` latch keys (§5.1), append a `trip`
+   row to `circuit_breaker_event`, and update the atomic cache.
 2. `error!` log with the full `TripReason`.
 3. Notify admins over the existing message queue.
-4. Scheduler payment jobs skip their tick (Phase 2).
-5. `release` and `admin-settle` handlers reject early with a clear user-facing
-   message, rather than letting the request travel to LND to fail there.
-6. Publish `payments_paused = true` on the NIP-33 info event (`src/nip33.rs`,
-   alongside the existing `bond_*` policy tags) so clients can warn users.
+4. Turn on maintenance mode with the reserved reason `circuit_breaker` (§5.5.1),
+   which refuses new orders and takes.
+5. Scheduler payment jobs skip their tick (Phase 2).
+6. `fn do_payment` checks the latch next to its existing LND-sync check and
+   **defers** the payout through `fn defer_payout_durably` instead of
+   dispatching it. The order stays settled with its payout pending, it is not
+   charged a failed attempt, and `job_retry_failed_payments` picks it up once
+   the breaker is reset. That covers `release`, `admin-settle` and the retry
+   job with one check. The user receives the same notice a deferred payout
+   already produces, not an error.
+7. Publish `payments_paused = true` on the NIP-33 info event, from
+   `info_tags_from_settings` (`src/nip33.rs`) next to `maintenance_mode`. The
+   immediate republish uses the same notify mechanism `MaintenanceState` uses.
+   The tag is always emitted, like `maintenance_mode`, so clients can tell
+   "not paused" from "older daemon".
 
 Explicitly **not** done on trip: cancelling hold invoices, settling anything,
 pausing inbound flows other than order creation (see below), auto-resetting.
 
 New order creation is also refused while tripped. Accepting users into a system
 that provably cannot pay them out only widens the blast radius.
+
+#### 5.5.1 Reusing maintenance mode for the order-creation block
+
+Maintenance mode (`src/app/maintenance.rs`) already refuses `NewOrder`,
+`TakeBuy` and `TakeSell` at the right place in `accept_event`, persists across
+restarts, and is advertised on the info event. The breaker does not build a
+second gate. On trip it turns maintenance on with a new reserved reason,
+`REASON_CIRCUIT_BREAKER = "circuit_breaker"`, next to `REASON_LND_UNSYNCED`.
+
+Ownership has to be handled with care, because the daemon already lifts its own
+maintenance by itself:
+
+- The breaker's maintenance is written with `maintenance_automatic = 0`.
+  `disable_if_automatic` lifts any maintenance flagged automatic, whatever its
+  reason. It runs when LND has been resynced and in the boot paths of
+  `load_for_lightning` / `load_for_cashu`. If the breaker used the automatic
+  flag, a resync or a restart would reopen order creation under a tripped
+  breaker.
+- If the automatic `lnd_unsynced` maintenance is already on when the breaker
+  trips, the breaker takes it over: reason `circuit_breaker`, automatic `0`.
+- If an operator's maintenance is already on, the breaker leaves it alone.
+  Order creation is already refused, and the operator's reason stands.
+- `SetMaintenanceMode` refuses the reserved reason `circuit_breaker`, as it
+  already refuses `lnd_unsynced`, so that reason always means the breaker.
+- Lifting maintenance never clears the breaker. The latch, not maintenance,
+  is what stops payouts. An operator who lifts maintenance while the breaker is
+  tripped reopens order creation and nothing else, and `SetMaintenanceMode`
+  warns when that happens.
 
 That refusal is **Lightning-mode only, and cannot reach a Cashu order.** Escrow
 mode is node-wide and exclusive (`Settings::escrow_mode`): a node with `[cashu]`
@@ -338,12 +475,19 @@ mode, rather than assumed to run only on Lightning nodes.
 Admin-only, via RPC (`proto/admin.proto`, `src/rpc/service.rs`), subject to the
 existing admin auth and rate limiting:
 
-- `CircuitBreakerStatus` — current state, reason, `tripped_at`, and the
-  window aggregates that drove it, read from the single-row latch.
-- `CircuitBreakerReset` — clears the latch. Requires an operator note.
-  **No timeout-based auto-reset exists.**
+- `CircuitBreakerStatus` returns the current state, the reason, `tripped_at`,
+  the window aggregates that drove the trip, and the orders held by §4.1's
+  `unknown`-row exception.
+- `CircuitBreakerReset` clears the latch. It requires an operator note.
+  **No timeout-based auto-reset exists.** If maintenance is still on with the
+  reason `circuit_breaker`, the reset also lifts it. Maintenance with any other
+  reason stays on.
+- `CircuitBreakerResolveUnknown` takes a ledger row id, a resolution
+  (`confirmed` or `failed`) and an operator note. It is the only way an
+  `unknown` row leaves that state, and `failed` is what releases a held order
+  for retry.
 
-The latch row holds **current state only**; every trip and reset overwrites the
+The latch holds **current state only**; every trip and reset overwrites the
 previous one. The audit trail is a separate append-only table,
 `circuit_breaker_event` (§6): one row per trip and per reset, never updated. An
 operator investigating a drain needs the *first* trip, and a breaker that tripped
@@ -351,7 +495,9 @@ twice would otherwise have overwritten exactly the record that mattered.
 
 ## 6. Schema
 
-`migrations/20260811120000_payment_circuit_breaker.sql`:
+`migrations/<ts>_payment_circuit_breaker.sql`, where `<ts>` is the timestamp of
+the Phase 0 PR. It must sort after every migration already on `main`. The latch
+itself needs no migration, because it lives in `daemon_state` (§5.1).
 
 ```sql
 -- Append-only record of every sat entering or leaving the node.
@@ -391,36 +537,19 @@ CREATE INDEX IF NOT EXISTS idx_payment_ledger_state ON payment_ledger(state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_ledger_inflow_hash
   ON payment_ledger(payment_hash) WHERE direction = 'in' AND payment_hash IS NOT NULL;
 
--- Single-row latch holding CURRENT STATE ONLY. Persistent so a restart cannot
--- clear a trip. Each trip and reset overwrites these fields; the history lives
--- in circuit_breaker_event below (spec §5.6).
-CREATE TABLE IF NOT EXISTS circuit_breaker_state (
-  id               integer primary key check (id = 1),
-  -- 'closed' | 'tripped'
-  state            varchar(8) not null,
-  -- Serialized TripReason of the current trip. NULL while closed.
-  reason           text,
-  tripped_at       integer,
-  -- Note from the most recent reset. NULL until one happens.
-  reset_note       text,
-  reset_at         integer,
-  updated_at       integer not null
-);
-
-INSERT OR IGNORE INTO circuit_breaker_state (id, state, updated_at)
-  VALUES (1, 'closed', 0);
-
--- Append-only audit trail: one row per trip and per reset, never updated or
--- deleted. This is what an operator reads when reconstructing an incident —
--- the first trip is the interesting one, and the latch alone would have
--- overwritten it on the second.
+-- Append-only audit trail, never updated or deleted. The current latch lives
+-- in daemon_state (spec §5.1) and holds current state only; this table is what
+-- an operator reads when reconstructing an incident. The first trip is the
+-- interesting one, and the latch alone would have overwritten it on the second.
 CREATE TABLE IF NOT EXISTS circuit_breaker_event (
   id               char(36) primary key not null,
-  -- 'trip' | 'reset'
-  event            varchar(5) not null,
-  -- Serialized TripReason for 'trip'; NULL for 'reset'.
+  -- 'trip' | 'reset' | 'order-held' | 'unknown-resolved'
+  event            varchar(16) not null,
+  -- Serialized TripReason for 'trip'; the order id and hashes for
+  -- 'order-held'; the ledger row id and resolution for 'unknown-resolved';
+  -- NULL for 'reset'.
   reason           text,
-  -- Operator note for 'reset'; NULL for 'trip'.
+  -- Operator note for 'reset' and 'unknown-resolved'; NULL otherwise.
   note             text,
   created_at       integer not null
 );
@@ -429,14 +558,30 @@ CREATE INDEX IF NOT EXISTS idx_circuit_breaker_event_created
   ON circuit_breaker_event(created_at);
 ```
 
-Example rows (synthetic) for a completed trade of 50 000 sats:
+Example rows (synthetic) for a completed trade of 50 000 sats at `fee = 0.004`
+(100 sats from each side) and `dev_fee_percentage = 0.30`:
 
 ```text
 id                                    direction kind          order_id   amount_sats fee_sats state      created_at
 7f1c…-…-0001                          in        escrow-settle 3a9e…-0007       50100     NULL confirmed  1786500000
-7f1c…-…-0002                          out       trade-payout  3a9e…-0007       50000       12 confirmed  1786500004
-7f1c…-…-0003                          out       dev-fee       3a9e…-0007          50        1 confirmed  1786500061
+7f1c…-…-0002                          out       trade-payout  3a9e…-0007       49900       12 confirmed  1786500004
+7f1c…-…-0003                          out       dev-fee       3a9e…-0007          60        1 confirmed  1786500061
 ```
+
+Principal out is 49 960, which is ≤ 50 100 in, so the §4.1 invariant holds. The
+13 sats of routing fees count only toward the §4.2 aggregates.
+
+The same trade on a zero-fee node:
+
+```text
+id                                    direction kind          order_id   amount_sats fee_sats state      created_at
+7f1c…-…-0004                          in        escrow-settle 3a9e…-0008       50000     NULL confirmed  1786500100
+7f1c…-…-0005                          out       trade-payout  3a9e…-0008       50000       12 confirmed  1786500104
+```
+
+Principal out equals inflow, so the invariant holds at equality. The node is
+12 sats down on this order, and those sats count toward the routing-fee and
+net-outflow rules.
 
 ## 7. Configuration
 
@@ -453,17 +598,23 @@ enabled = true
 enforce = false
 # Watcher job cadence (seconds).
 check_interval_seconds = 60
-# Slack allowed on the per-order invariant (sats). 0 is correct in normal
-# operation, since routing fees make a healthy order's outflow strictly
-# smaller than its inflow.
+# Slack allowed on the per-order invariant (sats). The invariant compares
+# principal only (routing fees are budgeted separately), and a healthy order's
+# principal out never exceeds its inflow, so 0 is correct, including on a
+# zero-fee node where the two are equal.
 tolerance_sats = 0
 # Also enforced synchronously in the gate, not only by the watcher.
 max_payment_sats = 1000000
 max_outflow_sats_per_hour = 5000000
 max_outflow_sats_per_day = 20000000
 max_payments_per_hour = 200
-# Ceiling on (outflow - inflow) over a rolling 24h window. This is the direct
-# "more sats leaving than entering" rule.
+# Routing fees paid (or reserved at their cap) over a rolling 24h window. The
+# per-order invariant does not count fees, so this is what bounds them.
+max_routing_fees_sats_per_day = 50000
+# Ceiling on (outflow - inflow), fee-inclusive, over a rolling 24h window. This
+# is the direct "more sats leaving than entering" rule. On a zero-fee node the
+# healthy value equals the routing spend, so keep this above
+# max_routing_fees_sats_per_day.
 max_net_outflow_sats_24h = 1000000
 # How long a ledger row may sit 'reserved' before the reaper resolves it
 # against LND. It counts against every budget until then.
@@ -475,7 +626,7 @@ Validating deserializers reject the following at startup, following the
 a safety limit must stop the daemon, not silently widen it:
 
 - non-positive caps (`max_payment_sats`, the outflow and count caps,
-  `max_net_outflow_sats_24h`);
+  `max_routing_fees_sats_per_day`, `max_net_outflow_sats_24h`);
 - negative `tolerance_sats`;
 - non-positive `check_interval_seconds` — zero would busy-loop the watcher job;
 - non-positive `reserved_row_timeout_seconds` — zero would make every
@@ -497,10 +648,15 @@ Ships dark and safe. Its purpose is to produce real numbers for §7.
 
 ### Phase 1 — Per-order invariant, persistent latch, live gate
 
-- `circuit_breaker_state` read/write plus the `AtomicU8` cache, loaded at boot.
-- §4.1 invariant and `max_payment_sats` enforced synchronously in the gate.
+- The `daemon_state` latch keys (§5.1) plus the `AtomicU8` cache, loaded at
+  boot.
+- §4.1 invariant and `max_payment_sats` enforced synchronously in the gate,
+  including the `unknown`-row exception that holds one order without tripping.
 - `enforce = true` becomes meaningful: violations trip and reject.
 - Fail-closed behavior on DB/query errors.
+- `fn do_payment` defers the payout through `fn defer_payout_durably` while the
+  latch is tripped (§5.5), so no payout is lost or charged a failed attempt by
+  the gate going live.
 
 ### Phase 2 — Velocity rules, watcher job, propagation
 
@@ -510,12 +666,13 @@ Ships dark and safe. Its purpose is to produce real numbers for §7.
 - Rolling-window rules of §4.2 plus the reserved-row reaper.
 - `job_process_dev_fee_payment`, `job_process_bond_payouts`, and
   `job_retry_failed_payments` skip their tick while tripped.
-- `release` / `admin-settle` handlers and order creation reject early with a
-  user-facing message.
+- Trip turns on maintenance mode with the reserved reason `circuit_breaker`,
+  with the ownership rules of §5.5.1. `SetMaintenanceMode` refuses that reason.
 
 ### Phase 3 — Operator surface
 
-- `CircuitBreakerStatus` / `CircuitBreakerReset` in `proto/admin.proto` and
+- `CircuitBreakerStatus` / `CircuitBreakerReset` /
+  `CircuitBreakerResolveUnknown` in `proto/admin.proto` and
   `src/rpc/service.rs`.
 - Admin notification on trip.
 - `payments_paused` tag on the NIP-33 info event.
@@ -524,7 +681,9 @@ Ships dark and safe. Its purpose is to produce real numbers for §7.
 ## 9. Failure modes and calibration
 
 - **False positives.** Routing fees, unusual bond timing, and legitimate
-  large trades all move the aggregates. This is why Phase 0 is observe-only and
+  large trades all move the aggregates. Routing fees cannot trip the per-order
+  invariant (§4.1 leaves them out on purpose), but they do feed the routing-fee
+  and net-outflow rules. This is why Phase 0 is observe-only and
   why `max_payment_sats` should be set relative to `max_order_amount`, not
   guessed. A tripped breaker is an outage; the thresholds must be earned from
   data.
@@ -537,8 +696,10 @@ Ships dark and safe. Its purpose is to produce real numbers for §7.
   is invisible to all of them.
 - **Cashu mode is not covered.** The gate is Lightning-only. Cashu outflows
   (`src/cashu/`) pass through no equivalent chokepoint and are out of scope for
-  Phases 0–3. Extending containment there is a follow-up and should be tracked
-  separately rather than assumed.
+  Phases 0–3. The escrow seam `EscrowBackend` (`src/escrow.rs`) is the natural
+  place for that follow-up: handlers already go through it, so it can play the
+  role `send_payment` plays here. That work should be tracked separately rather
+  than assumed.
 
 ## 10. Test plan
 
@@ -554,10 +715,22 @@ Per phase, co-located Rust unit tests:
 - Inflow idempotency: replaying a settled invoice (the "already settled" retry
   branch) writes exactly one `in` row, and the per-order allowance is unchanged
   by the replay.
-- Invariant: payout equal to inflow passes; payout exceeding inflow by one sat
-  trips; a second payout against an already-paid order trips; range-order bond
-  child payout keyed on the parent order does **not** trip. Boundary cases are
-  evaluated fee-inclusive per §4.1.
+- Invariant: payout principal equal to inflow passes; principal exceeding
+  inflow by one sat trips; a second payout against an already-paid order trips;
+  range-order bond child payout keyed on the parent order does **not** trip.
+- Fee exclusion (regression for the zero-fee default): with `fee = 0`, a full
+  trade (settle `amount`, pay out `amount`) passes the invariant even though
+  `routing_fee_cap_sats(amount)` is positive. A 1 000-sat trade at
+  `fee = 0.006`, where the 10-sat routing floor exceeds the node's margin,
+  passes. A bond payout with `slash_node_share_pct = 0` passes.
+- Unknown-row exception: an order whose only excess comes from an `unknown` row
+  of the same kind is held (one payment rejected, an `order-held` event, admins
+  notified) and the latch stays closed. An excess that remains after the
+  `unknown` rows are discounted trips. `CircuitBreakerResolveUnknown` with
+  `failed` releases the held order, and with `confirmed` keeps it held.
+- Routing-fee budget: reserved rows charge `routing_fee_cap_sats`, confirmed
+  rows charge `fee_sats`, and `max_routing_fees_sats_per_day` trips one sat
+  above its cap.
 - Concurrency: two payouts for the same `order_id` submitted simultaneously —
   exactly one reserves and dispatches, the other is rejected. Asserts the §5.3
   check-and-reserve transaction is genuinely atomic.
@@ -572,7 +745,20 @@ Per phase, co-located Rust unit tests:
   `reserved_row_timeout_seconds` are rejected at startup.
 - Velocity: each rule of §4.2 passes at exactly its cap and trips one unit
   above it (strict `>`, per §4.2).
-- Propagation: while tripped, the payment jobs no-op, `release` rejects, and the
-  info event carries `payments_paused`.
+- Propagation: while tripped, the payment jobs no-op, `release` defers the
+  payout through `defer_payout_durably` without spending a payment attempt, and
+  the info event carries `payments_paused`. After a reset, the deferred payout
+  is dispatched by `job_retry_failed_payments`.
+- Coexistence (§3.1): a breaker rejection inside `send_payment` releases the
+  in-flight slot taken by `claim_payout_slot` and the `payout_payment_hash`
+  marker. With the slot gate failing open (count unavailable), the breaker
+  still rejects.
+- Maintenance interplay (§5.5.1): a trip turns maintenance on with reason
+  `circuit_breaker` and automatic `0`. Neither an LND resync nor a restart
+  lifts it. A trip during the automatic `lnd_unsynced` maintenance takes it
+  over. An operator's maintenance is left untouched. `SetMaintenanceMode`
+  refuses the reason `circuit_breaker`. Lifting maintenance leaves the latch
+  tripped, and `CircuitBreakerReset` lifts only maintenance whose reason is
+  still `circuit_breaker`.
 - Disabled: with no `[circuit_breaker]` block, no ledger rows are written and
   every existing test stays green.

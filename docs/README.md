@@ -13,6 +13,7 @@ Quick links to architecture and feature guides.
 - Reputation Portability: REPUTATION_PORTABILITY.md (import reputation earned on lnp2pBot or another Mostro; opt-in, off by default; §11 has the status and the operator steps)
 - Maintenance Mode & LN Node Migration: MAINTENANCE_MODE_LN_MIGRATION.md (design spec; operator procedure lives in LIGHTNING_OPS.md)
 - Contribution Quality Bar: [CONTRIBUTION_QUALITY_SPEC.md](./CONTRIBUTION_QUALITY_SPEC.md) (design spec: PR template, Manual testing, triage bot, red test on `main`; label-only at first)
+- [Payment Circuit Breaker](./PAYMENT_CIRCUIT_BREAKER.md) (halts outgoing payments when outflow outruns inflow; off by default)
 - RPC Interface Reference: RPC.md
 - NIP-01 Kind 0 Metadata: NIP01_KIND0_METADATA.md
 - Ortsom on Pull Requests: [ORTSOM_PR_E2E_SPEC.md](./ORTSOM_PR_E2E_SPEC.md) (design spec for the automated e2e gate; label-only at first)

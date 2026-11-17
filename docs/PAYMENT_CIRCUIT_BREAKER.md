@@ -280,6 +280,9 @@ pub enum TripReason {
     NetOutflow { net: i64, cap: i64 },
     /// Set by an admin via RPC. Lets an operator halt payments manually.
     Manual { note: String },
+    /// Set at boot when `enforce = true` and the §5.8 reconciliation left
+    /// gaps it could not fill.
+    LedgerIncomplete { order_ids: Vec<Uuid> },
 }
 ```
 
@@ -290,6 +293,16 @@ and on boot. The guard follows the `MaintenanceState` pattern
 (`src/app/maintenance.rs`): it lives on `AppContext`, it shares one clone with
 the RPC server, and it writes the DB first and the atomic second, so a crash in
 between leaves the persisted value authoritative.
+
+**Latch writes are serialized.** Every trip and every reset takes one async
+mutex inside `PaymentGuard` and holds it across both the DB write and the
+atomic update. The atomic is set from the value just committed, never from the
+value the caller intended. Without that, a reset could commit `closed` and then
+pause, a trip could commit `tripped` and update the atomic, and the resumed
+reset would overwrite the atomic with `closed`. The gate would then allow
+payments while the persisted latch is tripped. The atomic is only a fast-path
+cache, and §5.3 step 4 re-reads the persisted latch anyway, but the cache must
+never disagree with the DB in the permissive direction.
 
 The latch is stored in the existing `daemon_state` key/value table
 (`migrations/20260901120000_daemon_state.sql`), not in a table of its own:
@@ -328,13 +341,16 @@ reusing the existing variant so no `mostro-core` change is required.
 
 ### 5.3 Gate sequence (inside `send_payment`)
 
-1. Read the latch. If `Tripped`, log and return an error. No LND call.
+1. Read the cached latch. If `Tripped`, log and return an error. No LND call.
+   This is the cheap fast path. The authoritative check is in step 4.
 2. Reject a non-positive `amount` outright. If `amount > max_payment_sats`, trip
    and reject (strict comparison, §4.2).
 3. Decode the invoice to derive its `payment_hash`. A decode failure rejects
    here, before anything has been written.
-4. In **one serialized transaction**: re-read `Σ in` and the principal
-   `Σ out` (including `reserved` and `unknown`) for `intent.order_id`, evaluate
+4. In **one serialized transaction**: re-read the persisted latch from
+   `daemon_state` and reject if it is `tripped`; then re-read `Σ in` and the
+   principal `Σ out` (including `reserved` and `unknown`) for
+   `intent.order_id`, evaluate
    the §4.1 invariant against the principal `amount`, and insert the `reserved`
    ledger row carrying the `payment_hash` from step 3 only if the invariant
    holds. A violation rolls the transaction back and rejects. It also trips the
@@ -355,6 +371,14 @@ atomic unit — a single `BEGIN IMMEDIATE` transaction serialized per `order_id`
 — and dispatch happens only once it has committed. Splitting or reordering
 steps 4 and 5 reintroduces exactly the double-payment the invariant exists to
 contain.
+
+**Why the latch is read again inside step 4.** Step 1 reads the latch outside
+the transaction. A trip committed between step 1 and step 4 would otherwise not
+stop that payment, and it would reserve and dispatch after the trip. A trip
+writes the latch under a `BEGIN IMMEDIATE` transaction too, so the two
+serialize. A payment that committed its reservation before the trip still
+dispatches, because it was admitted while the breaker was closed. Every payment
+reserved after the trip is rejected.
 
 **Why the hash is derived before reserving.** The reaper of §5.4 reconciles a
 stale `reserved` row by looking its `payment_hash` up at LND. A row written
@@ -400,16 +424,27 @@ this design avoids.
 Instead, **a `reserved` row counts against every budget as if it succeeded.**
 Confirmation is an accuracy improvement, not a safety requirement. A reaper
 inside the watcher job resolves rows still `reserved` after
-`reserved_row_timeout_seconds` by calling `LndConnector::lookup_payment_status`
-(`src/lightning/mod.rs`, `fn lookup_payment_status`) on the stored hash. Until
-it does, the conservative assumption stands.
+`reserved_row_timeout_seconds` by calling `LndConnector::lookup_payment`
+(`src/lightning/mod.rs`, `fn lookup_payment`) on the stored hash. It also runs
+once at boot, so rows stranded by a process stop are resolved before the first
+payment of the new process. Until it resolves a row, the conservative
+assumption stands.
+
+`lookup_payment` returns a `PaymentLookup`, which today carries the status,
+`resolved_at` and the failure reason, but **no fee**. Phase 0 adds
+`fee_sat: Option<i64>` to `PaymentLookup`, filled from the `fee_sat` of the
+`Payment` that `TrackPaymentV2` already streams, so a succeeded row can be
+confirmed with its real fee. If a succeeded payment comes back without a fee,
+the row is still `confirmed`, with `fee_sats = NULL`. The aggregates then keep
+charging `routing_fee_cap_sats` for it (§4.2), which can only overstate the
+outflow.
 
 **Only a definitive terminal answer may clear a reservation.** The lookup has
 three outcomes and they are not interchangeable:
 
 | LND result | Row becomes | Why |
 |---|---|---|
-| `Ok(Some(Succeeded))` | `confirmed`, with the real `fee_sats` | Definitive |
+| `Ok(Some(Succeeded))` | `confirmed`, with `fee_sats` from `PaymentLookup.fee_sat` | Definitive |
 | `Ok(Some(Failed))` | `failed`, budget released | Definitive |
 | `Ok(Some(InFlight))` | stays `reserved` | Not terminal yet; retry next tick |
 | `Ok(None)` | `unknown`, kept charged, operator alerted (§5.7) | LND has no record — see below |
@@ -544,17 +579,28 @@ object:
 
 - `mode`: `off` | `observe` | `enforce`;
 - `state`, `reason` (serialized `TripReason`), `tripped_at`;
-- `would_trip_total`: monotonic count of `would-trip` rows, persisted in
-  `daemon_state` so a restart does not reset it;
-- `recent`: the last 10 `would-trip` / `would-hold` / `order-held` events, each
-  with rule, order id, observed value and cap;
+- `would_trip_total` and `would_hold_total`: monotonic counts of `would-trip`
+  and `would-hold` rows, persisted in `daemon_state` so a restart does not
+  reset them;
+- `recent`: the last 10 `would-trip` / `would-hold` / `order-held` /
+  `ledger-gap` events, each with a monotonic `seq`, its kind, rule, order id,
+  observed value and cap;
 - `held_orders`: orders held by the §4.1 `unknown`-row exception;
 - `headroom`: for each §4.2 window rule, the current value and its cap;
 - `last_error`: the last evaluation error in observe-only mode, or `null`.
 
-A monotonic counter is needed because the health event is a periodic
-snapshot. The watchdog can count the would-trips between two snapshots even if
-it missed one in between.
+Monotonic counters are needed because the health event is a periodic
+snapshot. The watchdog can count the events between two snapshots even if it
+missed one in between.
+
+`recent` is bounded, so a burst can outrun it: 11 would-trips between two
+snapshots raise the counter by 11 while `recent` holds 10. The watchdog keeps
+the highest `seq` it has alerted on. For each snapshot it sends one detailed
+warning per entry in `recent` with a higher `seq`. If the counters rose by more
+than the number of such entries, it sends **one aggregate warning** for the
+rest: "N more would-trips without details", pointing to `CircuitBreakerStatus`
+and the `circuit_breaker_event` table, where every event is kept. A burst
+therefore never goes unreported, and it never floods the chat either.
 
 **Republish timing.** A trip and a reset change the public check, so they
 publish at once, still at most once every 10 seconds. Would-trips and held
@@ -570,8 +616,10 @@ costs nothing during a calibration period.
 | Signal | Alert |
 |---|---|
 | `circuit_breaker` check is `fail` | 🔴 Critical, with the reason; reminders every `renotify_interval`; "resolved" on reset |
-| `would_trip_total` increased (observe-only) | 🟡 One warning per new event, from `recent`, with rule, order and value against cap |
+| `would_trip_total` increased (observe-only) | 🟡 One warning per new event in `recent`, with rule, order and value against cap, plus one aggregate warning for any excess |
+| `would_hold_total` increased (observe-only) | 🟡 Warning per new `would-hold`: this order would have been held for an `unknown` row (same aggregate rule) |
 | A new order in `held_orders` | 🟡 Warning with the order id and hashes |
+| A new `ledger-gap` event (§5.8) | 🟡 Warning: a payment moved without a ledger row; enforcement is blocked until it is reconciled |
 | `last_error` set | 🟡 Warning: the trial period is not evaluating |
 
 **Without a watchdog.** If `watchdog_pubkey` is empty, the content is empty and
@@ -583,6 +631,53 @@ when `[circuit_breaker]` is enabled without a watchdog key.
 The health event's format is specified in the protocol book
 (`health_event.md`), so the new check and content fields need a protocol book
 update next to the mostrod change.
+
+### 5.8 Ledger completeness before enforcing
+
+The §4.1 invariant only protects an order whose ledger history is complete.
+Two situations leave it incomplete, and either one would make enforcement
+wrong:
+
+- **Orders that predate the ledger.** An escrow settled before Phase 0 has no
+  inflow row. If its buyer payout or dev fee is still pending when enforcement
+  starts, the gate compares that payout against an inflow of zero and trips on
+  a legitimate payment.
+- **Writes lost in observe-only mode.** In observe-only mode a failed ledger
+  write never blocks the payment (§5.3.1). The payment can then succeed with no
+  outflow row. Once the DB recovers and enforcement is on, the order's inflow is
+  visible but its payout is not, and the gate would admit a second payment
+  against the same inflow. That one is the dangerous direction.
+
+Both are closed by a **reconciliation pass** that rebuilds missing rows from
+the records the daemon already keeps for its own payment flows:
+
+| Ledger row | Authoritative source |
+|---|---|
+| Escrow inflow | `orders` with a settled hold invoice (`hold_settled_at`, falling back to `invoice_held_at`); amount `amount + fee` |
+| Buyer payout | `orders.payout_payment_hash` and the order's success status, confirmed against `lookup_payment` |
+| Dev fee | `orders.dev_fee_paid` / `orders.dev_fee_payment_hash` |
+| Bond slash inflow and bond payout | `bonds`, including `payout_payment_hash` |
+
+Rows written this way carry `source = 'reconciled'`, so the regular write path
+is never confused with a reconstruction. Every outflow they reconstruct is
+looked up at LND by hash, and only a `Succeeded` answer becomes `confirmed`.
+Anything else becomes `unknown`, which keeps the order charged.
+
+When it runs:
+
+- **In Phase 0**, at boot and after every ledger write failure. Each gap it
+  finds and fills appends a `ledger-gap` event, which the watchdog reports.
+  Each gap it cannot fill stays listed in `CircuitBreakerStatus`.
+- **Before `enforce = true` takes effect**, at boot. If any gap remains
+  unresolved, mostrod **starts with the latch tripped**, with reason
+  `LedgerIncomplete` and the order ids, rather than enforcing on a ledger it
+  knows is wrong. That is fail closed, and it is visible on the watchdog. The
+  operator resolves the orders with `CircuitBreakerResolveUnknown` or lets the
+  pending payouts finish, then resets.
+
+The same reconciliation runs as the first step of the Phase 0 migration, so a
+node that upgrades with settled-but-unpaid orders starts with their inflows on
+record.
 
 ## 6. Schema
 
@@ -607,6 +702,9 @@ CREATE TABLE IF NOT EXISTS payment_ledger (
   -- Actual routing fee, known only after a payment confirms. NULL otherwise.
   fee_sats         integer,
   payment_hash     char(64),
+  -- 'live' (written by the payment path) | 'reconciled' (rebuilt by the
+  -- spec §5.8 reconciliation from the orders and bonds tables)
+  source           varchar(10) not null default 'live',
   -- 'reserved' | 'confirmed' | 'failed' | 'unknown'. 'reserved' and 'unknown'
   -- both count against every budget as if they had succeeded (spec §5.4).
   state            varchar(10) not null,
@@ -635,7 +733,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_ledger_inflow_hash
 CREATE TABLE IF NOT EXISTS circuit_breaker_event (
   id               char(36) primary key not null,
   -- 'trip' | 'reset' | 'order-held' | 'unknown-resolved', and in
-  -- observe-only mode 'would-trip' | 'would-hold' (spec §5.3.1)
+  -- observe-only mode 'would-trip' | 'would-hold' (spec §5.3.1), and
+  -- 'ledger-gap' from the reconciliation (spec §5.8)
   event            varchar(16) not null,
   -- Serialized TripReason for 'trip'; the order id and hashes for
   -- 'order-held'; the ledger row id and resolution for 'unknown-resolved';
@@ -734,6 +833,14 @@ Each phase is one PR.
 - `PaymentIntent` threaded through `send_payment` and all call sites.
 - Ledger rows written on both sides: `reserved`/`confirmed` at outflow points,
   `in` rows at the `settle_hold_invoice` call sites of §3.
+- `fee_sat` added to `PaymentLookup` (§5.4).
+- `job_circuit_breaker_watch` registered in `src/scheduler.rs`
+  (`fn start_scheduler`), inside the `!Settings::is_cashu_enabled()` block
+  alongside the other Lightning-only jobs. It evaluates the §4.2 window rules
+  and runs the reserved-row reaper, also once at boot. Without the watcher,
+  Phase 0 could not collect the window-rule numbers it exists to collect.
+- The §5.8 reconciliation, run by the migration, at boot and after every
+  ledger write failure, with `ledger-gap` events.
 - All rules evaluate and log. **Nothing is rejected. The latch is never set.**
   Violations append `would-trip` / `would-hold` rows, and evaluation errors
   never block (§5.3.1).
@@ -746,41 +853,45 @@ Each phase is one PR.
 Ships dark and safe. Its purpose is to produce real numbers for §7.
 
 **Gate to Phase 1:** the §10.1 regtest simulation records zero `would-trip`
-rows across the whole scenario catalogue and all four configuration variants,
-and every positive control is caught.
+and zero `would-hold` rows across the whole scenario catalogue and all four
+configuration variants, and every positive control is caught.
 
-### Phase 1 — Per-order invariant, persistent latch, live gate
+### Phase 1 — Per-order invariant, persistent latch, live gate, reset
 
 - The `daemon_state` latch keys (§5.1) plus the `AtomicU8` cache, loaded at
-  boot.
+  boot, with serialized latch writes.
 - §4.1 invariant and `max_payment_sats` enforced synchronously in the gate,
-  including the `unknown`-row exception that holds one order without tripping.
+  including the latch re-check inside the reservation transaction and the
+  `unknown`-row exception that holds one order without tripping.
 - `enforce = true` becomes meaningful: violations trip and reject.
 - Fail-closed behavior on DB/query errors.
+- The §5.8 pre-enforcement check: unresolved ledger gaps start the daemon
+  tripped with `LedgerIncomplete`.
 - `fn do_payment` defers the payout through `fn defer_payout_durably` while the
   latch is tripped (§5.5), so no payout is lost or charged a failed attempt by
   the gate going live.
+- `CircuitBreakerStatus` / `CircuitBreakerReset` /
+  `CircuitBreakerResolveUnknown` in `proto/admin.proto` and
+  `src/rpc/service.rs`. **The phase that can trip must also be able to
+  recover**: shipping the latch without its authenticated reset would leave
+  an operator with no supported way out of a Phase 1 trip.
 
-### Phase 2 — Velocity rules, watcher job, propagation
+### Phase 2 — Window rules enforced, propagation
 
-- `job_circuit_breaker_watch` registered in `src/scheduler.rs`
-  (`fn start_scheduler`), inside the `!Settings::is_cashu_enabled()` block
-  alongside the other Lightning-only jobs.
-- Rolling-window rules of §4.2 plus the reserved-row reaper.
+- The §4.2 window rules, already evaluated since Phase 0, now trip when
+  `enforce = true`.
 - `job_process_dev_fee_payment`, `job_process_bond_payouts`, and
   `job_retry_failed_payments` skip their tick while tripped.
 - Trip turns on maintenance mode with the reserved reason `circuit_breaker`,
   with the ownership rules of §5.5.1. `SetMaintenanceMode` refuses that reason.
 
-### Phase 3 — Operator surface
+### Phase 3 — Client signal and runbook
 
-- `CircuitBreakerStatus` / `CircuitBreakerReset` /
-  `CircuitBreakerResolveUnknown` in `proto/admin.proto` and
-  `src/rpc/service.rs`.
 - `payments_paused` tag on the NIP-33 info event.
 - Operator runbook section in `docs/LIGHTNING_OPS.md`, covering how to set up
   mostro-watchdog for the breaker, how to read a `would-trip` alert during the
-  trial period, and how to resolve a trip, a held order and an `unknown` row.
+  trial period, and how to resolve a trip, a held order, a ledger gap and an
+  `unknown` row.
 
 ## 9. Failure modes and calibration
 
@@ -835,6 +946,22 @@ Per phase, co-located Rust unit tests:
 - Routing-fee budget: reserved rows charge `routing_fee_cap_sats`, confirmed
   rows charge `fee_sats`, and `max_routing_fees_sats_per_day` trips one sat
   above its cap.
+- Latch races: a reset and a trip interleaved at every await point never leave
+  the cache `closed` while the DB says `tripped`. A trip committed between
+  step 1 and step 4 of §5.3 rejects the payment in step 4.
+- Reaper fee: a succeeded lookup confirms the row with `PaymentLookup.fee_sat`.
+  A succeeded lookup without a fee confirms it with `fee_sats = NULL`, and the
+  aggregates keep charging the routing cap. A row left `reserved` by a
+  simulated crash is resolved by the boot pass before the first payment.
+- Reconciliation (§5.8): an order settled before the ledger existed gets its
+  inflow from `orders` and its pending payout passes. A payout whose ledger
+  write failed in observe-only mode is rebuilt from `payout_payment_hash` and a
+  `Succeeded` lookup, so a second payment against the same inflow trips. A gap
+  the pass cannot fill starts an enforcing daemon tripped with
+  `LedgerIncomplete`.
+- Watchdog counters: 11 would-trips between two snapshots produce 10 detailed
+  warnings and one aggregate warning. A `would-hold` raises
+  `would_hold_total` and produces its own warning.
 - Concurrency: two payouts for the same `order_id` submitted simultaneously —
   exactly one reserves and dispatches, the other is rejected. Asserts the §5.3
   check-and-reserve transaction is genuinely atomic.

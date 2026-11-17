@@ -533,8 +533,12 @@ mod tests {
         let _guard = AllowPrivateLnurlHostsGuard {
             previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
         };
-        let url = Url::parse("http://127.0.0.1/cb").unwrap();
-        assert!(assert_url_host_safe(&url).await.is_err());
+        // https so the scheme check passes and the IP policy does the refusing.
+        let url = Url::parse("https://127.0.0.1/cb").unwrap();
+        assert!(matches!(
+            assert_url_host_safe(&url).await,
+            Err(MostroInternalErr(ServiceError::LnAddressParseError))
+        ));
     }
 
     #[tokio::test]
@@ -805,7 +809,7 @@ mod tests {
                     Json(json!({
                         "status": "OK",
                         "tag": "payRequest",
-                        "callback": "http://169.254.169.254/latest/meta-data",
+                        "callback": "https://169.254.169.254/latest/meta-data",
                         "minSendable": 1000,
                         "maxSendable": 100000000,
                         "metadata": "[]"
@@ -825,9 +829,14 @@ mod tests {
         .encode();
 
         let result = resolv_ln_address(&lnurl_string, 100, None).await;
+        // The IP policy refuses with `LnAddressParseError`; a request that got
+        // past it would fail to connect with `NoAPIResponse` instead.
         assert!(
-            result.is_err(),
-            "link-local callback must be refused: {result:?}"
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::LnAddressParseError))
+            ),
+            "link-local callback must be refused by the IP policy: {result:?}"
         );
         assert!(
             hits.lock().unwrap().is_empty(),
@@ -919,14 +928,20 @@ mod tests {
         });
 
         let lnurl_string = LnUrl {
-            url: format!("http://127.0.0.1:{port_a}/.well-known/lnurlp/alice"),
+            url: format!("https://127.0.0.1:{port_a}/.well-known/lnurlp/alice"),
         }
         .encode();
 
         let result = resolv_ln_address(&lnurl_string, 100, None).await;
+        // https so the scheme check passes and the IP policy does the refusing.
+        // Past the policy, the TLS handshake with this plain-http listener would
+        // fail with `NoAPIResponse` instead.
         assert!(
-            result.is_err(),
-            "loopback LNURL must be refused before any GET: {result:?}"
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::LnAddressParseError))
+            ),
+            "loopback LNURL must be refused by the IP policy: {result:?}"
         );
         assert_eq!(
             *hits.lock().unwrap(),

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::aggregate::Thresholds;
 use super::fiat::is_known_pegged;
 
 /// Top-level `[price]` configuration.
@@ -23,9 +24,18 @@ pub struct PriceSettings {
     #[serde(default = "default_max_price_staleness_seconds")]
     pub max_price_staleness_seconds: i64,
     /// Discard a source whose value deviates more than this percent from the
-    /// median (only applies with ≥ 3 sources for a currency).
+    /// median (with ≥ 3 sources for a currency). With exactly 2 there is no
+    /// median: a pair differing by more than `pair_divergence_pct` (this
+    /// value unless set) percent of its mean is refused, and the currency
+    /// serves last-known-good until it goes stale.
     #[serde(default = "default_outlier_threshold_pct")]
     pub outlier_threshold_pct: f64,
+    /// Tolerance for a currency with exactly 2 sources, in percent of their
+    /// mean. Unset means `outlier_threshold_pct`. Loosening it trades the
+    /// pair's protection against one corrupt source for availability,
+    /// without widening the band used with 3 or more sources.
+    #[serde(default)]
+    pub pair_divergence_pct: Option<f64>,
     /// Per-provider request timeout.
     #[serde(default = "default_provider_timeout_seconds")]
     pub provider_timeout_seconds: u64,
@@ -173,10 +183,28 @@ impl PriceSettings {
                 self.outlier_threshold_pct
             ));
         }
+        if let Some(pct) = self.pair_divergence_pct {
+            if !(pct.is_finite() && pct > 0.0 && pct <= 100.0) {
+                return Err(format!(
+                    "price: pair_divergence_pct must be in (0, 100], got {pct}"
+                ));
+            }
+        }
         for (id, p) in &self.providers {
             p.validate(id)?;
         }
         Ok(())
+    }
+
+    /// The tolerances the aggregation uses; the pair tolerance falls back to
+    /// `outlier_threshold_pct` when `pair_divergence_pct` is unset.
+    pub fn thresholds(&self) -> Thresholds {
+        Thresholds {
+            outlier_pct: self.outlier_threshold_pct,
+            pair_pct: self
+                .pair_divergence_pct
+                .unwrap_or(self.outlier_threshold_pct),
+        }
     }
 }
 
@@ -208,6 +236,7 @@ impl Default for PriceSettings {
             update_interval_seconds: default_update_interval_seconds(),
             max_price_staleness_seconds: default_max_price_staleness_seconds(),
             outlier_threshold_pct: default_outlier_threshold_pct(),
+            pair_divergence_pct: None,
             provider_timeout_seconds: default_provider_timeout_seconds(),
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_failure_cooldown_seconds: default_provider_failure_cooldown_seconds(),
@@ -317,6 +346,37 @@ trusted_nodes = ["82fa8cb978b43c79b2156585bac2c011176a21d2aead6d9f7c575c005be883
         assert!(with_pct(0.0).validate().is_err());
         assert!(with_pct(150.0).validate().is_err());
         with_pct(5.0).validate().unwrap();
+    }
+
+    #[test]
+    fn pair_divergence_defaults_to_the_outlier_threshold() {
+        let cfg = PriceSettings {
+            outlier_threshold_pct: 7.0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.thresholds(), Thresholds::from(7.0));
+
+        let loose = PriceSettings {
+            outlier_threshold_pct: 7.0,
+            pair_divergence_pct: Some(20.0),
+            ..Default::default()
+        };
+        loose.validate().unwrap();
+        assert_eq!(
+            loose.thresholds(),
+            Thresholds {
+                outlier_pct: 7.0,
+                pair_pct: 20.0
+            }
+        );
+
+        for bad in [0.0, -1.0, 150.0, f64::NAN] {
+            let cfg = PriceSettings {
+                pair_divergence_pct: Some(bad),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]
@@ -577,5 +637,55 @@ only = ["USDT", "USDC"]
         for (code, _) in crate::price::fiat::known_pegged() {
             assert!(words.contains(code), "the template does not name {code}");
         }
+    }
+
+    /// The template's multi-source `[price]` example parses and validates
+    /// once uncommented, and its per-provider scoping (#1109, the
+    /// two-source refusal) is sane: every scoped code is a known fiat, and
+    /// no code is scoped out of both Yadio and currency-api — that would
+    /// leave it unpriced instead of choosing a source.
+    #[test]
+    fn template_multi_source_block_validates_and_scopes_sanely() {
+        #[derive(Deserialize)]
+        struct Stub {
+            price: PriceSettings,
+        }
+        let template = include_str!("../../settings.tpl.toml");
+        let start = template
+            .find("# [price]\n")
+            .expect("the template documents the [price] block");
+        let end = template
+            .find("# # Pegged currencies as order currencies")
+            .expect("the pegged section follows");
+        let block: String = template[start..end]
+            .lines()
+            .filter(|l| l.starts_with('#') && !l.starts_with("# #") && *l != "#")
+            .map(|l| l.trim_start_matches("# ").to_string() + "\n")
+            .collect();
+        let parsed: Stub = toml::from_str(&block).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        parsed.price.validate().unwrap();
+
+        let except = |id: &str| -> Vec<String> {
+            parsed.price.providers[id]
+                .except
+                .clone()
+                .unwrap_or_else(|| panic!("{id} has an except list"))
+        };
+        let yadio = except("yadio");
+        let currency_api = except("currency_api");
+        for code in yadio.iter().chain(&currency_api) {
+            assert!(
+                crate::price::fiat::is_known_fiat(code),
+                "{code} is not a known fiat"
+            );
+        }
+        for code in &yadio {
+            assert!(
+                !currency_api.contains(code),
+                "{code} is scoped out of both yadio and currency_api"
+            );
+        }
+        assert!(currency_api.iter().any(|c| c == "VES"), "parallel markets");
+        assert!(yadio.iter().any(|c| c == "BZD"), "pegs Yadio misquotes");
     }
 }

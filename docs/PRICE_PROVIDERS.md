@@ -302,7 +302,8 @@ PerBase resolution, §6.3):
 n = len(xs)
 n == 0 -> no fresh value (fall through to last-known-good, §6.4)
 n == 1 -> xs[0]
-n == 2 -> mean(xs)
+n == 2 -> if |a - b| / mean(xs) <= pair_divergence_pct/100: mean(xs)
+          else: no fresh value (fall through to last-known-good, §6.4)
 n >= 3 -> m   = median(xs)
           kept = [x in xs if |x - m| / m <= outlier_threshold_pct/100]
           result = mean(kept)          # `kept` always contains m, so non-empty
@@ -311,7 +312,31 @@ n >= 3 -> m   = median(xs)
 `outlier_threshold_pct` defaults to **5.0**. The median anchors the
 "truth"; values too far from it are discarded before the mean, so one
 corrupt/stale source cannot move the result while genuine small spreads
-between honest sources are still averaged in.
+between honest sources are still averaged in. `pair_divergence_pct` is
+optional and defaults to `outlier_threshold_pct`: it lets an operator
+loosen the tolerance for a pair (a refusal costs availability) without
+widening the band used with three or more sources.
+
+With exactly two candidates there is no median to tell which one is
+wrong, so a pair that disagrees beyond the threshold is **refused**
+rather than averaged: the currency keeps its last-known-good value and,
+once that passes `max_price_staleness_seconds`, market-priced operations
+on it fail with `PriceTooStale`. The store is in memory, so after a
+restart a currency refused from the first tick has **no** last-known-good:
+the lookup fails with `NoCurrency`, and until #1116 is fixed a
+market-priced order in it gets no reply at all. Scope the sources of a
+currency that disagrees persistently (§6.6 "Two-source currencies")
+rather than relying on the refusal. A plain mean would let one corrupt
+source move the price by half its error (security audit item #9). Note
+that `n` counts the candidates that survive cleaning and scoping on a
+given tick, not the providers configured: a currency only two providers
+cover, or a three-source currency with one provider down, lands here.
+Each tick that **starts** refusing a currency logs a `warn!` naming every
+candidate (provider and value, and the base for a fiat-cross) and whether
+the Nostr fallback (§11.7) was selected or the currency keeps its
+last-known-good value. While the refusal persists the repeat on later
+ticks is a `debug!`, and an `info!` marks the tick it recovers, so a
+standing refusal does not drown the log.
 
 ### 6.3 PerBase resolution (fiat-cross sources)
 
@@ -446,12 +471,37 @@ heterogeneous providers safely comparable.
   combine, so a mis-marked source never enters the median at all.
   - The §6.2 outlier guard is the **safety net** for *accidental*
     divergence with ≥3 honest sources (the official-rate value is
-    discarded as an outlier), but it does **not** help with only two
-    sources (`mean` of official + informal = garbage). Scoping is the
+    discarded as an outlier); with only two sources the divergence check
+    refuses the pair (the currency goes stale instead of serving
+    garbage), which is safe but leaves the currency unpriced. Scoping is the
     deterministic fix; the outlier guard backstops it. Note this refines
     the "no authoritative override" decision (§4): scoping restricts a
     source's *coverage*, it does not pick a winner among legitimate
     same-market contributors.
+  - **Two-source currencies.** Many minor fiats are quoted only by Yadio
+    and `currency-api`, so the two-source refusal (§6.2) decides them. On
+    live feeds (2026-11-17, ToRyVand on #1109) the four-source
+    config with only CUP/MLC scoped served 136 of 161 currencies; the
+    other 25 disagreed on every tick, not on a glitch. They fall into
+    groups that need scoping in **opposite directions**:
+    - *Parallel market* — Yadio tracks the street rate (what P2P users
+      trade at), `currency-api` the official one: AOA, BIF, DZD, ETB, GNF,
+      IQD, IRR, LYD, MWK, MZN, SDG, SLE, TND, TTD, VES, YER (Yadio ×1.13
+      to ×19.6 per USD). Scope them out of `currency-api`. SYP belongs
+      here too: `currency-api` still quotes pre-redenomination units
+      (100× off).
+    - *Yadio wrong* — the official rate is the market and Yadio misses it:
+      BZD (its 2:1 USD peg quoted 1:1), BND, BTN, NPR (all ×1.10 off
+      their pegs), ALL and JMD (quoted *below* the official rate, which a
+      parallel market cannot explain). Scope them out of Yadio.
+
+    Scoping only one source would be worse than refusing: with BZD out
+    of `currency-api`, Yadio alone would serve it 50% off. With both
+    lists the same feeds served 159 of 161; HTG and MRU (Yadio ×1.09, the
+    same offset as its broken pegs) are left unscoped and refused until
+    someone checks them. These lists drift as markets and feeds change:
+    the refusal `warn!` (once, when the refusal starts) names both values
+    and is how an operator spots a new one.
 - **Mid-market only.** Adapters discard bid/ask; Mostro never applies an
   exchange spread (contrast BTCPay, §11.6). The order premium/fee is the
   only markup, applied downstream in `get_market_quote` / `get_fee`.
@@ -468,8 +518,14 @@ update_interval_seconds = 300
 # Serve a currency's last-known-good value up to this age; then refuse.
 max_price_staleness_seconds = 1800
 # Discard a source whose value deviates more than this % from the median
-# (only applies with >= 3 sources for a currency).
+# (>= 3 sources). With exactly 2, a pair differing by more than
+# pair_divergence_pct (default: this value) % of its mean is refused
+# (last-known-good until stale).
 outlier_threshold_pct = 5.0
+# Optional: tolerance for a currency with exactly 2 sources, defaulting to
+# outlier_threshold_pct. Loosen it to refuse fewer pairs without widening
+# the band used with 3 or more sources.
+# pair_divergence_pct = 5.0
 # Per-provider request timeout.
 provider_timeout_seconds = 10
 # Circuit breaker.
@@ -482,20 +538,30 @@ publish_to_nostr = true
 [price.providers.yadio]
 enabled = true
 url = "https://api.yadio.io"
+# Codes Yadio misquotes against an official rate that is the real market
+# (pegs it gets wrong, quotes below the official rate). Measured 2026-11-17;
+# see §6.6 "Two-source currencies".
+except = ["ALL", "BND", "BTN", "BZD", "JMD", "NPR"]
 
 [price.providers.coingecko]
 enabled = true
 url = "https://api.coingecko.com/api/v3"
 # api_key = "CG-xxxx"   # optional demo/pro key; raises rate limits
 
-# Keyless, CDN-hosted, 300+ currencies incl. CUP (OFFICIAL rate) — so CUP
-# is excluded to avoid mixing it with the informal-market sources (§6.6).
+# Keyless, CDN-hosted, 300+ currencies at the OFFICIAL rate — so codes with
+# a parallel market (CUP, VES, …) are excluded to avoid mixing official with
+# informal-market sources (§6.6). SYP: still in pre-redenomination units.
 [price.providers.currency_api]
 enabled = true
 url = "https://currency-api.pages.dev/v1"
 # Optional ordered mirrors, tried in sequence if `url` fails (§7).
 fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
-except = ["CUP", "MLC"]
+except = [
+  "CUP", "MLC",
+  # Parallel markets, measured 2026-11-17 (§6.6 "Two-source currencies").
+  "AOA", "BIF", "DZD", "ETB", "GNF", "IQD", "IRR", "LYD", "MWK", "MZN",
+  "SDG", "SLE", "SYP", "TND", "TTD", "VES", "YER",
+]
 
 # Keyless, 28 major fiats, no CUP/MLC.
 [price.providers.blockchain]
@@ -651,6 +717,8 @@ they can land in one PR or be split per provider.
 - non-fiat codes (`eth`, `bnb`) from `currency-api` are dropped by the
   allowlist.
 - One provider returns a wild outlier with ≥3 sources → discarded.
+- Two sources that disagree beyond the threshold → currency refused,
+  last-known-good kept (audit #9).
 - A provider down → currencies fall back to the remaining sources; a
   provider's `fallback_urls` is tried before the provider is marked failed.
 - Circuit breaker opens after N failures and closes after cooldown.
@@ -964,6 +1032,18 @@ for Venezuelan ISPs) but who can still reach a Nostr relay.
   with no in-provider outlier guard; operators mitigate by choosing
   `trusted_nodes` they actually trust, same as any other single-sourced
   provider.
+- **Fallback only, and always alone.** A relayed rate is an aggregate, not
+  an independent sample, so it never joins this node's own sources in the
+  §6.2 combine. It is dropped for every currency the local providers can
+  price this tick (after fiat-cross resolution), and kept for the rest.
+  "Can price" means the local candidates actually aggregate: when they
+  are refused (two sources that disagree, §6.2), the currency counts as
+  uncovered, the relayed rate is served **alone**, and that currency's
+  local quotes are set aside for the tick, with a `warn!`. Letting the
+  relayed rate arbitrate between disagreeing local sources would let it
+  pick a side (the corrupt one, if the remote priced from the same
+  upstream) and would republish a mixed value as a fresh local
+  observation.
 - **Publish cadence bounds the serving window.** A relayed rate is stamped
   with the source event's `created_at`, not with when it arrived (§6.4), so
   its serving window on this node is `max_price_staleness_seconds` **minus

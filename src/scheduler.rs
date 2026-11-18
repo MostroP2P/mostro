@@ -548,11 +548,11 @@ pub(crate) async fn notify_users_canceled_order(
     // Neutral wording on purpose: this helper serves several closure paths
     // (waiting-state timeout, hold-invoice cancel, actual cancels), so the
     // specific cause is logged by each caller, not here.
+    // No party keys here: maker and taker in one line pairs the two
+    // counterparties, and the published order event carries neither.
     tracing::info!(
-        "Notifying maker {} and taker {} that order {} was not completed",
-        maker_pubkey.to_string(),
-        taker_pubkey.to_string(),
-        old_order.id
+        order_id = %old_order.id,
+        "notifying maker and taker that the order was not completed"
     );
 
     // get payload
@@ -869,10 +869,7 @@ async fn job_cancel_orders(ctx: AppContext) {
                             };
 
                         // Get edited order to use for update_order_event
-                        let edited_order = if let Ok(edited_order) = edited_order {
-                            println!("Edited order: {:?}", edited_order);
-                            edited_order
-                        } else {
+                        let Ok(edited_order) = edited_order else {
                             tracing::warn!("Error editing pubkeys in order {} cancel", order.id);
                             continue;
                         };
@@ -2270,6 +2267,26 @@ mod tests {
         let actions = queued_actions_for(order.id).await;
         assert_eq!(actions.len(), 2);
         assert!(actions.iter().all(|a| *a == Action::Canceled));
+    }
+
+    /// #836: maker and taker in one line pairs the two counterparties.
+    #[tokio::test]
+    async fn notify_cancel_logs_no_party_keys() {
+        init_test_settings();
+        let order = order_for_cancel(Kind::Sell, true);
+        let ((), logs) = crate::app::context::test_utils::logged_on_this_thread(
+            notify_users_canceled_order(&order, &order, Some(Action::Canceled)),
+        )
+        .await;
+        let id = order.id.to_string();
+        assert!(
+            logs.lines()
+                .any(|l| l.to_lowercase().contains("notifying maker") && l.contains(&id)),
+            "cancel notice not reached"
+        );
+        for key in [&order.creator_pubkey, order.buyer_pubkey.as_ref().unwrap()] {
+            assert!(!logs.contains(key.as_str()), "party key logged");
+        }
     }
 
     #[tokio::test]

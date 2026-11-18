@@ -707,6 +707,37 @@ fn stamp_protocol_version(message: &mut Message, transport: Transport) {
     }
 }
 
+/// `relay (category)` for each refusal, for logs.
+///
+/// The relay's reason text is never logged: it is remote input, and a hostile
+/// relay could echo the event back, `p` tag included. Only the relay URL
+/// (from the operator's own config) and a category from NIP-01's fixed set of
+/// machine-readable prefixes are kept; anything else, such as a timeout or a
+/// connection error, is `other`.
+fn relay_refusals(failed: &[(RelayUrl, String)]) -> String {
+    const PREFIXES: [&str; 8] = [
+        "duplicate",
+        "pow",
+        "blocked",
+        "rate-limited",
+        "invalid",
+        "restricted",
+        "auth-required",
+        "error",
+    ];
+    failed
+        .iter()
+        .map(|(url, reason)| {
+            let category = reason
+                .split_once(':')
+                .and_then(|(prefix, _)| PREFIXES.into_iter().find(|p| *p == prefix.trim()))
+                .unwrap_or("other");
+            format!("{url} ({category})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Displays an optional log field, `-` when absent, without allocating.
 struct OrDash<T>(Option<T>);
 
@@ -766,26 +797,30 @@ pub async fn send_dm(
     // payloads carry invoices, payout addresses, amounts, payer hashes and
     // dispute data, and the receiver is the user's trade pubkey. Logged
     // together they would be a cleartext record of who traded what, outside
-    // the encrypted channel.
+    // the encrypted channel. Not the event id either: the kind-14 event is
+    // public and carries a `p` tag for the receiver, so a relay lookup by id
+    // would recover it.
     let kind = message.get_inner_message_kind();
+    let (action, order_id, request_id) = (kind.action.clone(), kind.id, kind.request_id);
     info!(
-        event_id = %event.id,
-        action = %kind.action,
-        order_id = %OrDash(kind.id),
-        request_id = %OrDash(kind.request_id),
+        action = %action,
+        order_id = %OrDash(order_id),
+        request_id = %OrDash(request_id),
         "Sending message"
     );
 
     if let Ok(client) = get_nostr_client() {
         // Resolves on the first relay's `OK`: a relay that never answers must
         // not hold the reply queue for its whole timeout (#991).
-        let event_id = event.id;
         crate::publish::send_event_first_ack(client, &event, move |report| {
             if !report.failed.is_empty() {
                 tracing::warn!(
-                    "message {event_id} not accepted by {} relay(s): {:?}",
-                    report.failed.len(),
-                    report.failed
+                    action = %action,
+                    order_id = %OrDash(order_id),
+                    request_id = %OrDash(request_id),
+                    failed = report.failed.len(),
+                    relays = %relay_refusals(&report.failed),
+                    "message not accepted by every relay"
                 );
             }
         })
@@ -2484,7 +2519,10 @@ mod tests {
             .find(|l| l.contains("Sending message"))
             .unwrap_or_else(|| panic!("send_dm logged no message line: {logs}"));
 
-        assert!(line.contains("event_id="), "{line}");
+        assert!(
+            !line.contains("event_id"),
+            "the event id leads to the receiver: {line}"
+        );
         assert!(line.contains(&format!("action={action}")), "{line}");
         assert!(line.contains(&format!("order_id={id}")), "{line}");
         let request = request_id.map_or_else(|| "-".to_string(), |r| r.to_string());
@@ -2539,6 +2577,36 @@ mod tests {
             &[&hash],
         )
         .await;
+    }
+
+    #[test]
+    fn relay_refusals_keep_only_the_url_and_a_known_category() {
+        let receiver = Keys::generate().public_key().to_hex();
+        let url = |u: &str| RelayUrl::parse(u).unwrap();
+        let failed = vec![
+            (
+                url("wss://a.example"),
+                "blocked: not on the allowlist".to_string(),
+            ),
+            (
+                url("wss://b.example"),
+                "rate-limited: slow down".to_string(),
+            ),
+            (url("wss://c.example"), "timeout".to_string()),
+            // A hostile relay echoing the event back, `p` tag included.
+            (
+                url("wss://d.example"),
+                format!("invalid: [\"p\",\"{receiver}\"] content=Ag..."),
+            ),
+            (url("wss://e.example"), format!("{receiver}: echoed")),
+        ];
+        let summary = relay_refusals(&failed);
+        assert_eq!(
+            summary,
+            "wss://a.example (blocked), wss://b.example (rate-limited), \
+             wss://c.example (other), wss://d.example (invalid), wss://e.example (other)"
+        );
+        assert!(!summary.contains(&receiver));
     }
 
     #[test]

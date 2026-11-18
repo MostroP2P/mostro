@@ -34,7 +34,7 @@ use mostro_core::error::{MostroError, ServiceError};
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use super::aggregate::{aggregate_tick, combine, AggregateResult};
+use super::aggregate::{aggregate_tick, combine, AggregateResult, Thresholds};
 use super::config::{PriceSettings, ProviderConfig};
 use super::fiat::{is_known_fiat, is_known_pegged, known_pegged};
 use super::provider::{
@@ -90,6 +90,9 @@ pub struct PriceManager {
     warned_stale: RwLock<HashSet<String>>,
     warned_refused: RwLock<HashSet<String>>,
     warned_single_source: RwLock<HashSet<String>>,
+    /// Currencies whose local candidates were refused on the previous tick,
+    /// so the refusal `warn!` fires on the transition only.
+    warned_divergent: RwLock<HashSet<String>>,
 }
 
 impl PriceManager {
@@ -145,6 +148,7 @@ impl PriceManager {
             warned_stale: RwLock::new(HashSet::new()),
             warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
+            warned_divergent: RwLock::new(HashSet::new()),
         })
     }
 
@@ -320,24 +324,29 @@ impl PriceManager {
         // direct sources would double-count correlated information and skew
         // the result. Keep it strictly fallback — only for currencies no
         // other provider covered this tick.
-        let (filtered_with_ids, refusals) = restrict_nostr_to_fallback_reporting(
-            filtered_with_ids,
-            self.settings.outlier_threshold_pct,
-        );
+        let thresholds = self.settings.thresholds();
+        let (filtered_with_ids, refusals) =
+            restrict_nostr_to_fallback_reporting(filtered_with_ids, thresholds);
         // Audit #9: a currency whose local candidates `combine` refuses (two
         // that disagree, no median to arbitrate) either gets the Nostr rate
         // alone as its fallback or no fresh value this tick. Name the
         // candidates so the operator can tell which upstream is wrong.
         //
+        // A refusal can persist for as long as the upstreams disagree, so
+        // `warn!` only when a currency starts being refused (and `info!` when
+        // it recovers); the repeats on later ticks stay at `debug!`.
+        //
         // This runs before the store write, so it describes the *selection*,
         // not what ends up served: the store's monotonicity guard can still
         // drop a Nostr fallback older than the value it already holds
         // (`store_with_observation_time`).
+        let (started, recovered) = self.refusal_transitions(&refusals);
         for refusal in &refusals {
-            warn!(
+            let new = started.contains(&refusal.currency);
+            let message = format_args!(
                 "price: {} — local sources disagree by more than {}% ({}); {}",
                 refusal.currency,
-                self.settings.outlier_threshold_pct,
+                thresholds.pair_pct,
                 refusal.describe_candidates(),
                 if refusal.nostr_fallback {
                     "selected the trusted-node (Nostr) rate alone as fallback"
@@ -345,9 +354,17 @@ impl PriceManager {
                     "no fresh value this tick (last-known-good stays until it goes stale)"
                 }
             );
+            if new {
+                warn!("{message}");
+            } else {
+                debug!("{message}");
+            }
+        }
+        for currency in &recovered {
+            info!("price: {currency} — local sources agree again");
         }
 
-        let aggregates = aggregate_tick(&filtered_with_ids, self.settings.outlier_threshold_pct);
+        let aggregates = aggregate_tick(&filtered_with_ids, thresholds);
         if aggregates.is_empty() {
             warn!("price: tick produced no fresh aggregates — keeping last-known-good");
             // Last-known-good is exactly what this path preserves, so report
@@ -716,6 +733,31 @@ impl PriceManager {
         }
     }
 
+    /// Compare this tick's refusals with the previous tick's: returns the
+    /// currencies that just started being refused and those that stopped
+    /// (both sorted), and records the new set. A poisoned lock reports no
+    /// transitions, like [`Self::mark_warned`].
+    fn refusal_transitions(&self, refusals: &[Refusal]) -> (Vec<String>, Vec<String>) {
+        let Ok(mut known) = self.warned_divergent.write() else {
+            return (Vec::new(), Vec::new());
+        };
+        let now: HashSet<&str> = refusals.iter().map(|r| r.currency.as_str()).collect();
+        let mut started: Vec<String> = now
+            .iter()
+            .filter(|c| !known.contains(**c))
+            .map(|c| c.to_string())
+            .collect();
+        let mut recovered: Vec<String> = known
+            .iter()
+            .filter(|c| !now.contains(c.as_str()))
+            .cloned()
+            .collect();
+        started.sort();
+        recovered.sort();
+        *known = now.into_iter().map(str::to_string).collect();
+        (started, recovered)
+    }
+
     /// Publish the aggregated map to Nostr (NIP-33 kind 30078). Phase 1
     /// preserves the legacy Yadio-shaped wrapper so downstream consumers
     /// keep working byte-for-byte; the `source` tag becomes the list of
@@ -838,9 +880,9 @@ impl PriceManager {
 /// can warn about each one with the values involved.
 fn restrict_nostr_to_fallback_reporting(
     results: Vec<(ProviderId, ProviderQuotes)>,
-    outlier_pct: f64,
+    thresholds: impl Into<Thresholds>,
 ) -> (Vec<(ProviderId, ProviderQuotes)>, Vec<Refusal>) {
-    let coverage = local_coverage(&results, outlier_pct);
+    let coverage = local_coverage(&results, thresholds.into());
     let filtered = results
         .into_iter()
         .map(|(id, quotes)| {
@@ -922,7 +964,10 @@ impl Refusal {
 ///   local fiat-crosses resolved against those anchors — must `combine` to
 ///   a value. One individually valid quote is not enough: a refused local
 ///   pair is uncovered (ermeme on #1109).
-fn local_coverage(results: &[(ProviderId, ProviderQuotes)], outlier_pct: f64) -> LocalCoverage {
+fn local_coverage(
+    results: &[(ProviderId, ProviderQuotes)],
+    thresholds: Thresholds,
+) -> LocalCoverage {
     let mut local: HashMap<String, Vec<Candidate>> = HashMap::new();
     let mut relayed: HashMap<String, Vec<f64>> = HashMap::new();
     for (id, quotes) in results {
@@ -946,25 +991,29 @@ fn local_coverage(results: &[(ProviderId, ProviderQuotes)], outlier_pct: f64) ->
     let values = |cs: &[Candidate]| cs.iter().map(|c| c.value).collect::<Vec<f64>>();
 
     let mut anchors: HashMap<String, f64> = HashMap::new();
+    // Bases whose anchor is Nostr's quote because their local directs do not
+    // combine.
+    let mut nostr_anchored: HashSet<String> = HashSet::new();
     for currency in local.keys().chain(relayed.keys()) {
         if anchors.contains_key(currency) {
             continue;
         }
-        let value = local
+        let local_value = local
             .get(currency)
-            .and_then(|cs| combine(&values(cs), outlier_pct))
-            .or_else(|| {
-                relayed
-                    .get(currency)
-                    .and_then(|xs| combine(xs, outlier_pct))
-            });
+            .and_then(|cs| combine(&values(cs), thresholds));
+        let value =
+            local_value.or_else(|| relayed.get(currency).and_then(|xs| combine(xs, thresholds)));
         if let Some(v) = value {
             anchors.insert(currency.clone(), v);
+            if local_value.is_none() {
+                nostr_anchored.insert(currency.clone());
+            }
         }
     }
 
     // Local candidates per currency: direct quotes plus resolved crosses.
     let mut candidates: HashMap<String, Vec<Candidate>> = local.clone();
+    let mut cross_bases: HashSet<String> = HashSet::new();
     for (id, quotes) in results {
         if *id == ProviderId::Nostr {
             continue;
@@ -975,6 +1024,7 @@ fn local_coverage(results: &[(ProviderId, ProviderQuotes)], outlier_pct: f64) ->
                 if let Some(anchor) = anchors.get(&base) {
                     let candidate = value * anchor;
                     if candidate.is_finite() && candidate > 0.0 {
+                        cross_bases.insert(base.clone());
                         candidates
                             .entry(currency.to_uppercase())
                             .or_default()
@@ -992,15 +1042,28 @@ fn local_coverage(results: &[(ProviderId, ProviderQuotes)], outlier_pct: f64) ->
     let mut covered: HashSet<String> = HashSet::new();
     let mut refused_sets: Vec<(String, Vec<Candidate>)> = Vec::new();
     for (currency, cs) in candidates {
-        if combine(&values(&cs), outlier_pct).is_some() {
+        if combine(&values(&cs), thresholds).is_some() {
             covered.insert(currency);
         } else {
             refused_sets.push((currency, cs));
         }
     }
+    // A base that crosses resolve against and whose anchor is Nostr's quote
+    // (its local directs refuse) must not itself be covered by local cross
+    // quotes: `aggregate_tick` would then have no anchor for it while this
+    // function anchored it on Nostr, so crosses on it would count as covered
+    // here but fail to resolve there. No adapter quotes a base as a
+    // `PerBase` today, so this cannot happen yet; it would become a silent
+    // mismatch if one ever did.
+    debug_assert!(
+        !nostr_anchored
+            .iter()
+            .any(|base| cross_bases.contains(base) && covered.contains(base)),
+        "a Nostr-anchored cross base is covered by local crosses"
+    );
     let nostr_fallback: HashSet<String> = relayed
         .iter()
-        .filter(|(currency, xs)| !covered.contains(*currency) && combine(xs, outlier_pct).is_some())
+        .filter(|(currency, xs)| !covered.contains(*currency) && combine(xs, thresholds).is_some())
         .map(|(currency, _)| currency.clone())
         .collect();
     let mut refused: Vec<Refusal> = refused_sets
@@ -1356,6 +1419,7 @@ mod tests {
             warned_stale: RwLock::new(HashSet::new()),
             warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
+            warned_divergent: RwLock::new(HashSet::new()),
         }
     }
 
@@ -1978,6 +2042,54 @@ mod tests {
         assert!(described.contains("coingecko=500000"), "{described}");
     }
 
+    #[test]
+    fn a_looser_pair_tolerance_keeps_a_pair_the_outlier_band_would_refuse() {
+        let thresholds = Thresholds {
+            outlier_pct: 5.0,
+            pair_pct: 30.0,
+        };
+        let results = || {
+            vec![
+                (ProviderId::Yadio, usd_anchor(50_000.0)),
+                (ProviderId::CoinGecko, usd_anchor(55_000.0)),
+            ]
+        };
+        let (_, refusals) = restrict_nostr_to_fallback_reporting(results(), thresholds);
+        assert!(refusals.is_empty());
+        let (_, refusals) = restrict_nostr_to_fallback_reporting(results(), 5.0);
+        assert_eq!(refusals.len(), 1);
+    }
+
+    fn refusal(currency: &str) -> Refusal {
+        Refusal {
+            currency: currency.into(),
+            candidates: Vec::new(),
+            nostr_fallback: false,
+        }
+    }
+
+    #[test]
+    fn refusal_transitions_report_only_changes_between_ticks() {
+        let manager = manager_with_many(Vec::new());
+        let (started, recovered) = manager.refusal_transitions(&[refusal("HTG"), refusal("MRU")]);
+        assert_eq!(started, ["HTG", "MRU"]);
+        assert!(recovered.is_empty());
+
+        // Same refusals again: nothing new to warn about.
+        let (started, recovered) = manager.refusal_transitions(&[refusal("HTG"), refusal("MRU")]);
+        assert!(started.is_empty() && recovered.is_empty());
+
+        // MRU recovers, CUP starts being refused.
+        let (started, recovered) = manager.refusal_transitions(&[refusal("HTG"), refusal("CUP")]);
+        assert_eq!(started, ["CUP"]);
+        assert_eq!(recovered, ["MRU"]);
+
+        // A recovered currency that diverges again warns again.
+        manager.refusal_transitions(&[]);
+        let (started, _) = manager.refusal_transitions(&[refusal("CUP")]);
+        assert_eq!(started, ["CUP"]);
+    }
+
     #[tokio::test]
     async fn no_providers_returns_no_currency() {
         // Spec §9 Phase 1 acceptance: enabled=false on every provider →
@@ -1994,6 +2106,7 @@ mod tests {
             warned_stale: RwLock::new(HashSet::new()),
             warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
+            warned_divergent: RwLock::new(HashSet::new()),
         };
         let r = manager.update_all().await;
         assert_eq!(r.servable_currencies, 0);
@@ -3821,6 +3934,7 @@ mod coverage_tests {
             warned_stale: RwLock::new(HashSet::new()),
             warned_refused: RwLock::new(HashSet::new()),
             warned_single_source: RwLock::new(HashSet::new()),
+            warned_divergent: RwLock::new(HashSet::new()),
         }
     }
 

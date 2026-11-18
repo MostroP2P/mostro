@@ -302,7 +302,7 @@ PerBase resolution, §6.3):
 n = len(xs)
 n == 0 -> no fresh value (fall through to last-known-good, §6.4)
 n == 1 -> xs[0]
-n == 2 -> if |a - b| / mean(xs) <= outlier_threshold_pct/100: mean(xs)
+n == 2 -> if |a - b| / mean(xs) <= pair_divergence_pct/100: mean(xs)
           else: no fresh value (fall through to last-known-good, §6.4)
 n >= 3 -> m   = median(xs)
           kept = [x in xs if |x - m| / m <= outlier_threshold_pct/100]
@@ -312,7 +312,10 @@ n >= 3 -> m   = median(xs)
 `outlier_threshold_pct` defaults to **5.0**. The median anchors the
 "truth"; values too far from it are discarded before the mean, so one
 corrupt/stale source cannot move the result while genuine small spreads
-between honest sources are still averaged in.
+between honest sources are still averaged in. `pair_divergence_pct` is
+optional and defaults to `outlier_threshold_pct`: it lets an operator
+loosen the tolerance for a pair (a refusal costs availability) without
+widening the band used with three or more sources.
 
 With exactly two candidates there is no median to tell which one is
 wrong, so a pair that disagrees beyond the threshold is **refused**
@@ -328,10 +331,12 @@ source move the price by half its error (security audit item #9). Note
 that `n` counts the candidates that survive cleaning and scoping on a
 given tick, not the providers configured: a currency only two providers
 cover, or a three-source currency with one provider down, lands here.
-Each tick logs a `warn!` per refused currency naming every candidate
-(provider and value, and the base for a fiat-cross) and whether the
-Nostr fallback (§11.7) was selected or the currency keeps its
-last-known-good value.
+Each tick that **starts** refusing a currency logs a `warn!` naming every
+candidate (provider and value, and the base for a fiat-cross) and whether
+the Nostr fallback (§11.7) was selected or the currency keeps its
+last-known-good value. While the refusal persists the repeat on later
+ticks is a `debug!`, and an `info!` marks the tick it recovers, so a
+standing refusal does not drown the log.
 
 ### 6.3 PerBase resolution (fiat-cross sources)
 
@@ -495,8 +500,8 @@ heterogeneous providers safely comparable.
     lists the same feeds served 159 of 161; HTG and MRU (Yadio ×1.09, the
     same offset as its broken pegs) are left unscoped and refused until
     someone checks them. These lists drift as markets and feeds change:
-    the per-tick refusal `warn!` names both values and is how an operator
-    spots a new one.
+    the refusal `warn!` (once, when the refusal starts) names both values
+    and is how an operator spots a new one.
 - **Mid-market only.** Adapters discard bid/ask; Mostro never applies an
   exchange spread (contrast BTCPay, §11.6). The order premium/fee is the
   only markup, applied downstream in `get_market_quote` / `get_fee`.
@@ -513,9 +518,14 @@ update_interval_seconds = 300
 # Serve a currency's last-known-good value up to this age; then refuse.
 max_price_staleness_seconds = 1800
 # Discard a source whose value deviates more than this % from the median
-# (>= 3 sources). With exactly 2, a pair differing by more than this % of
-# its mean is refused (last-known-good until stale).
+# (>= 3 sources). With exactly 2, a pair differing by more than
+# pair_divergence_pct (default: this value) % of its mean is refused
+# (last-known-good until stale).
 outlier_threshold_pct = 5.0
+# Optional: tolerance for a currency with exactly 2 sources, defaulting to
+# outlier_threshold_pct. Loosen it to refuse fewer pairs without widening
+# the band used with 3 or more sources.
+# pair_divergence_pct = 5.0
 # Per-provider request timeout.
 provider_timeout_seconds = 10
 # Circuit breaker.

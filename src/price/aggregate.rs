@@ -30,6 +30,27 @@ pub struct AggregateResult {
     pub nostr_anchor_dependent: bool,
 }
 
+/// The two divergence tolerances [`combine`] applies, both in percent.
+///
+/// `From<f64>` sets both to the same value, which is what a config without
+/// `pair_divergence_pct` means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    /// Band around the median applied with three or more candidates.
+    pub outlier_pct: f64,
+    /// Tolerance between the two candidates of a pair (no median to use).
+    pub pair_pct: f64,
+}
+
+impl From<f64> for Thresholds {
+    fn from(pct: f64) -> Self {
+        Self {
+            outlier_pct: pct,
+            pair_pct: pct,
+        }
+    }
+}
+
 /// Combine a currency's candidate per-BTC prices into one figure (spec §6.2).
 ///
 /// Inputs are first cleaned of non-finite and non-positive values (a
@@ -38,7 +59,8 @@ pub struct AggregateResult {
 ///
 /// - `n == 0` → `None` (no usable value),
 /// - `n == 1` → that value,
-/// - `n == 2` → their mean, **only if** the two agree within `outlier_pct`
+/// - `n == 2` → their mean, **only if** the two agree within the pair
+///   tolerance (`pair_pct`, which is `outlier_pct` unless set separately)
 ///   percent of that mean; otherwise `None`. With two sources there is no
 ///   median to tell which one is wrong, so a divergent pair is refused and
 ///   the currency falls back to last-known-good (and, past the staleness
@@ -52,7 +74,11 @@ pub struct AggregateResult {
 /// The median anchors the truth; values too far from it are dropped before
 /// the mean, so one corrupt/stale source cannot move the result while
 /// genuine small spreads between honest sources are still averaged in.
-pub fn combine(xs: &[f64], outlier_pct: f64) -> Option<f64> {
+pub fn combine(xs: &[f64], thresholds: impl Into<Thresholds>) -> Option<f64> {
+    let Thresholds {
+        outlier_pct,
+        pair_pct,
+    } = thresholds.into();
     let mut clean: Vec<f64> = xs
         .iter()
         .copied()
@@ -66,7 +92,7 @@ pub fn combine(xs: &[f64], outlier_pct: f64) -> Option<f64> {
     match clean.len() {
         1 => Some(clean[0]),
         2 => {
-            if pair_diverges(clean[0], clean[1], outlier_pct) {
+            if pair_diverges(clean[0], clean[1], pair_pct) {
                 None
             } else {
                 Some(mean(&clean))
@@ -140,8 +166,9 @@ pub fn resolve_per_base(
 ///    `source` tag actually represents (spec §9 Phase 1).
 pub fn aggregate_tick(
     provider_results: &[(ProviderId, ProviderQuotes)],
-    outlier_pct: f64,
+    thresholds: impl Into<Thresholds>,
 ) -> HashMap<String, AggregateResult> {
+    let thresholds = thresholds.into();
     // Per-currency direct (PerBtc) quotes paired with their source id.
     let mut direct: HashMap<String, Vec<(ProviderId, f64)>> = HashMap::new();
     // PerBase quotes paired with their source id; resolved in step 2.
@@ -168,9 +195,9 @@ pub fn aggregate_tick(
     let mut anchor_uses_nostr: HashMap<String, bool> = HashMap::new();
     for (currency, pairs) in &direct {
         let values: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
-        if let Some(v) = combine(&values, outlier_pct) {
+        if let Some(v) = combine(&values, thresholds) {
             anchors.insert(currency.clone(), v);
-            let kept = kept_contributors(pairs, outlier_pct);
+            let kept = kept_contributors(pairs, thresholds);
             anchor_uses_nostr.insert(currency.clone(), kept.contains(&ProviderId::Nostr));
         }
     }
@@ -212,8 +239,8 @@ pub fn aggregate_tick(
             pairs.extend_from_slice(r);
         }
         let candidates: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
-        if let Some(value) = combine(&candidates, outlier_pct) {
-            let contributors = kept_contributors(&pairs, outlier_pct);
+        if let Some(value) = combine(&candidates, thresholds) {
+            let contributors = kept_contributors(&pairs, thresholds);
             let sources = candidates
                 .iter()
                 .filter(|x| x.is_finite() && **x > 0.0)
@@ -243,8 +270,8 @@ pub fn aggregate_tick(
 ///
 /// - clean: drop non-finite and non-positive,
 /// - `n == 1`: that provider contributes,
-/// - `n == 2`: both contribute if they agree within `outlier_pct` of their
-///   mean, none if they diverge (`combine` returns `None` then),
+/// - `n == 2`: both contribute if they agree within the pair tolerance of
+///   their mean, none if they diverge (`combine` returns `None` then),
 /// - `n >= 3`: only providers whose value lies within
 ///   `outlier_pct` percent of the median contribute,
 /// - `n >= 3` with no value inside the outlier band (the
@@ -254,7 +281,11 @@ pub fn aggregate_tick(
 ///
 /// Multiple paths from the same provider for the same currency (a direct
 /// + a fiat-cross resolution, for example) are deduplicated.
-fn kept_contributors(pairs: &[(ProviderId, f64)], outlier_pct: f64) -> Vec<ProviderId> {
+fn kept_contributors(pairs: &[(ProviderId, f64)], thresholds: Thresholds) -> Vec<ProviderId> {
+    let Thresholds {
+        outlier_pct,
+        pair_pct,
+    } = thresholds;
     let clean: Vec<(ProviderId, f64)> = pairs
         .iter()
         .copied()
@@ -263,7 +294,7 @@ fn kept_contributors(pairs: &[(ProviderId, f64)], outlier_pct: f64) -> Vec<Provi
     if clean.is_empty() {
         return Vec::new();
     }
-    if clean.len() == 2 && pair_diverges(clean[0].1, clean[1].1, outlier_pct) {
+    if clean.len() == 2 && pair_diverges(clean[0].1, clean[1].1, pair_pct) {
         return Vec::new();
     }
     if clean.len() <= 2 {
@@ -295,11 +326,11 @@ fn dedup_sort(mut ids: Vec<ProviderId>) -> Vec<ProviderId> {
 }
 
 /// Whether two clean (finite, positive) candidates disagree by more than
-/// `outlier_pct` percent of their mean. Symmetric in its arguments, and
+/// `pair_pct` percent of their mean. Symmetric in its arguments, and
 /// inclusive at the boundary like the `n >= 3` band.
-pub(crate) fn pair_diverges(a: f64, b: f64, outlier_pct: f64) -> bool {
+pub(crate) fn pair_diverges(a: f64, b: f64, pair_pct: f64) -> bool {
     let m = (a + b) / 2.0;
-    (a - b).abs() > m * (outlier_pct / 100.0)
+    (a - b).abs() > m * (pair_pct / 100.0)
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -351,6 +382,19 @@ mod tests {
         // mean 100, tol 5 → a gap of exactly 5 is kept, just over is refused.
         approx(combine(&[97.5, 102.5], PCT).unwrap(), 100.0);
         assert!(combine(&[97.4, 102.6], PCT).is_none());
+    }
+
+    #[test]
+    fn combine_two_sources_use_the_pair_tolerance_not_the_outlier_band() {
+        let loose_pair = Thresholds {
+            outlier_pct: PCT,
+            pair_pct: 30.0,
+        };
+        // 20% apart: refused by the default pair tolerance, kept by a looser one.
+        assert!(combine(&[100.0, 120.0], PCT).is_none());
+        approx(combine(&[100.0, 120.0], loose_pair).unwrap(), 110.0);
+        // The outlier band for 3+ sources is unchanged by the pair tolerance.
+        approx(combine(&[100.0, 101.0, 200.0], loose_pair).unwrap(), 100.5);
     }
 
     #[test]
@@ -626,7 +670,7 @@ mod tests {
     #[test]
     fn kept_contributors_two_diverged_is_empty() {
         let pairs = [(ProviderId::Yadio, 100.0), (ProviderId::CoinGecko, 1000.0)];
-        assert!(kept_contributors(&pairs, PCT).is_empty());
+        assert!(kept_contributors(&pairs, PCT.into()).is_empty());
     }
 
     #[test]

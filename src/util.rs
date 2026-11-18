@@ -707,17 +707,31 @@ fn stamp_protocol_version(message: &mut Message, transport: Transport) {
     }
 }
 
+/// The log line for an outbound DM: event id, action, order id and request
+/// id only.
+///
+/// Never the payload or the receiver: payloads carry invoices, payout
+/// addresses, amounts, payer hashes and dispute data, and the receiver is the
+/// user's trade pubkey. Logged together they would be a cleartext record of
+/// who traded what, outside the encrypted channel.
+fn outbound_log_line(event_id: &EventId, message: &Message) -> String {
+    let kind = message.get_inner_message_kind();
+    let id = kind.id.map_or_else(|| "-".to_string(), |id| id.to_string());
+    let request_id = kind
+        .request_id
+        .map_or_else(|| "-".to_string(), |r| r.to_string());
+    format!(
+        "Sending message {event_id}: action {}, order {id}, request {request_id}",
+        kind.action
+    )
+}
+
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
     sender_keys: &Keys,
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -755,19 +769,7 @@ pub async fn send_dm(
     )
     .await?;
 
-    // Payer hashes and histories are identifiers that must stay inside the
-    // encrypted channel; log the action only.
-    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
-        "<payer-history payload redacted>"
-    } else {
-        payload
-    };
-    info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        logged_payload
-    );
+    info!("{}", outbound_log_line(&event.id, &message));
 
     if let Ok(client) = get_nostr_client() {
         // Resolves on the first relay's `OK`: a relay that never answers must
@@ -2434,6 +2436,78 @@ mod tests {
         INIT.call_once(|| {
             // Any initialization code goes here
         });
+    }
+
+    // ───────────────── outbound DM log line ─────────────────
+
+    /// Builds the log line for `payload` and asserts it names the action,
+    /// order and request but leaks none of `secrets`.
+    fn assert_log_line_redacts(
+        action: Action,
+        payload: Payload,
+        request_id: Option<u64>,
+        secrets: &[&str],
+    ) {
+        let id = uuid::Uuid::new_v4();
+        let message = Message::new_order(Some(id), request_id, None, action.clone(), Some(payload));
+        let line = outbound_log_line(&EventId::from_byte_array([0; 32]), &message);
+
+        assert!(line.contains(&format!("action {action}")), "{line}");
+        assert!(line.contains(&format!("order {id}")), "{line}");
+        let request = request_id.map_or_else(|| "-".to_string(), |r| r.to_string());
+        assert!(line.contains(&format!("request {request}")), "{line}");
+        for secret in secrets {
+            assert!(!line.contains(secret), "log line leaks {secret:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn outbound_log_line_omits_the_hold_invoice() {
+        let invoice = "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4s";
+        assert_log_line_redacts(
+            Action::PayInvoice,
+            Payload::PaymentRequest(None, invoice.to_string(), None),
+            Some(42),
+            &[invoice, "lnbcrt"],
+        );
+    }
+
+    #[test]
+    fn outbound_log_line_omits_the_buyer_payout_address() {
+        let address = "buyer@wallet.example";
+        assert_log_line_redacts(
+            Action::AddInvoice,
+            Payload::PaymentRequest(None, address.to_string(), None),
+            None,
+            &[address, "wallet.example"],
+        );
+    }
+
+    #[test]
+    fn outbound_log_line_omits_payer_data() {
+        let hash = "a".repeat(64);
+        assert_log_line_redacts(
+            Action::PayerDeclared,
+            Payload::PayerDeclaration(PayerDeclaration::new(hash.clone())),
+            Some(7),
+            &[&hash],
+        );
+        assert_log_line_redacts(
+            Action::PaymentHistory,
+            Payload::PaymentHistory(PaymentHistory::unavailable(hash.clone())),
+            None,
+            &[&hash],
+        );
+    }
+
+    #[test]
+    fn outbound_log_line_without_order_id() {
+        let message = Message::new_order(None, None, None, Action::CantDo, None);
+        let line = outbound_log_line(&EventId::from_byte_array([0; 32]), &message);
+        assert!(
+            line.ends_with(&format!("action {}, order -, request -", Action::CantDo)),
+            "{line}"
+        );
     }
 
     // ───────────────── first-trade date (`since`) ─────────────────

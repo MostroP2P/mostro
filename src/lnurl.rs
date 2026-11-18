@@ -1,7 +1,8 @@
 //! LNURL-pay and Lightning Address resolution for Mostro.
 //!
 //! Every outbound LNURL HTTP fetch goes through [`lnurl_get`], which:
-//! - allows only `http`/`https` (and rejects userinfo)
+//! - allows only `https`, plus plain `http` for `.onion` hosts as LUD-01
+//!   permits (see [`lnurl_scheme_allowed`]), and rejects userinfo
 //! - resolves DNS under a short timeout and rejects forbidden destinations
 //!   (loopback/private unless the test-only allow flag is set, plus link-local,
 //!   CGNAT `100.64.0.0/10`, NAT64 `64:ff9b::/96`, multicast, etc.)
@@ -164,13 +165,48 @@ pub(crate) fn ip_is_forbidden(ip: IpAddr) -> bool {
     }
 }
 
+/// LUD-01 scheme rule for every LNURL fetch: `https`, or plain `http` only
+/// for a Tor `.onion` host.
+///
+/// Clearnet `http` is refused: the callback response carries the invoice we
+/// pay, and the later checks (chain, CLTV, expiry, amount) cannot tell an
+/// attacker's invoice for the same amount from the real one. Anyone on the
+/// path could otherwise swap it and take the buyer's payout.
+///
+/// Under the test-only private-host flag, plain `http` is also allowed to
+/// `localhost` and loopback/private IP literals, so local mock LNURL servers
+/// keep working. A public `http` host stays refused even then; production
+/// never sets the flag.
+fn lnurl_scheme_allowed(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => {
+            let Some(host) = url.host_str() else {
+                return false;
+            };
+            let host = host.trim_end_matches('.');
+            if host.ends_with(".onion") {
+                return true;
+            }
+            private_hosts_allowed()
+                && match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+                    Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+                    Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unique_local(),
+                    Err(_) => host == "localhost",
+                }
+        }
+        _ => false,
+    }
+}
+
 /// Resolve `url`'s host and reject non-public destinations before any GET.
 ///
 /// DNS lookup is bounded by [`LNURL_DNS_TIMEOUT`]. Returns one checked
 /// [`SocketAddr`] suitable for reqwest's `.resolve` pin so the subsequent
 /// request cannot be steered to a different IP via DNS rebinding.
 async fn assert_url_host_safe(url: &Url) -> Result<SocketAddr, MostroError> {
-    if !crate::util::is_http_or_https(url) {
+    if !lnurl_scheme_allowed(url) {
+        warn!("LNURL refused: clearnet URLs must use https");
         return Err(MostroInternalErr(ServiceError::LnAddressParseError));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -218,7 +254,8 @@ async fn assert_url_host_safe(url: &Url) -> Result<SocketAddr, MostroError> {
 ///
 /// Applies [`LNURL_CONNECT_TIMEOUT`] and [`LNURL_REQUEST_TIMEOUT`]. Callers
 /// must only pass URLs produced by [`extract_lnurl`] or [`build_callback_url`]
-/// (scheme already constrained to http/https).
+/// (scheme already constrained to http/https); the LUD-01 rule (`https`, or
+/// `http` only for `.onion`) is then enforced here via [`assert_url_host_safe`].
 async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
     let pinned = assert_url_host_safe(&url).await?;
     let host = url
@@ -251,8 +288,9 @@ async fn lnurl_get(url: Url) -> Result<reqwest::Response, MostroError> {
 /// - Bech32 LNURL (`lnurl1…`) → decoded callback/pay URL
 ///
 /// Returns a parsed [`Url`] (not a raw string) so callers can pass it straight
-/// to [`lnurl_get`] without a second parse. Scheme must be `http`/`https`;
-/// host/IP safety is enforced later by [`lnurl_get`].
+/// to [`lnurl_get`] without a second parse. Scheme must be `http`/`https`
+/// here; the stricter LUD-01 rule (clearnet `http` refused) and host/IP
+/// safety are enforced later by [`lnurl_get`].
 ///
 /// # Errors
 ///
@@ -326,8 +364,9 @@ fn fit_comment(comment: Option<&str>, max_len: usize) -> Option<String> {
 /// `amount`/`comment` pair on `callback` is dropped first so the values we
 /// compute here are the ones actually sent, not appended duplicates.
 ///
-/// Scheme must be `http`/`https`. Host/IP safety (reject private, loopback,
-/// link-local, etc., and DNS-pin the request) is enforced by [`lnurl_get`]
+/// Scheme must be `http`/`https` here. The stricter LUD-01 rule (`https`, or
+/// `http` only for `.onion`) and host/IP safety (reject private, loopback,
+/// link-local, etc., and DNS-pin the request) are enforced by [`lnurl_get`]
 /// before the callback is fetched.
 fn build_callback_url(
     callback: &str,
@@ -494,14 +533,95 @@ mod tests {
         let _guard = AllowPrivateLnurlHostsGuard {
             previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
         };
-        let url = Url::parse("http://127.0.0.1/cb").unwrap();
-        assert!(assert_url_host_safe(&url).await.is_err());
+        // https so the scheme check passes and the IP policy does the refusing.
+        let url = Url::parse("https://127.0.0.1/cb").unwrap();
+        assert!(matches!(
+            assert_url_host_safe(&url).await,
+            Err(MostroInternalErr(ServiceError::LnAddressParseError))
+        ));
     }
 
     #[tokio::test]
     async fn assert_url_host_safe_rejects_userinfo() {
         let url = Url::parse("https://user:pass@example.com/cb").unwrap();
         assert!(assert_url_host_safe(&url).await.is_err());
+    }
+
+    /// Strict policy: clearnet `http` is refused (a MITM could swap the
+    /// invoice), `https` and LUD-01's `http` `.onion` exception pass.
+    #[test]
+    fn lnurl_scheme_allowed_requires_https_on_clearnet() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy_sync();
+        let _guard = AllowPrivateLnurlHostsGuard {
+            previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
+        };
+        let allowed = |u: &str| lnurl_scheme_allowed(&Url::parse(u).unwrap());
+
+        assert!(allowed("https://pay.example.com/.well-known/lnurlp/alice"));
+        assert!(allowed("https://8.8.8.8/cb"));
+        assert!(allowed("http://abcdefghijklmnop.onion/cb"));
+        assert!(allowed("http://ABCDEFGHIJKLMNOP.ONION./cb"));
+
+        assert!(!allowed("http://pay.example.com/cb"));
+        assert!(!allowed("http://8.8.8.8/cb"));
+        assert!(!allowed("http://onion.example.com/cb"));
+        assert!(!allowed("http://example.onion.evil.com/cb"));
+        // Local hosts need the test flag; production never has it.
+        assert!(!allowed("http://127.0.0.1/cb"));
+        assert!(!allowed("http://localhost/cb"));
+        assert!(!allowed("ftp://pay.example.com/cb"));
+    }
+
+    /// The test flag lets local mock servers use `http`, but never a public
+    /// host, so payout tests can still exercise the clearnet refusal.
+    #[test]
+    fn lnurl_scheme_allowed_test_guard_only_lifts_local_hosts() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy_sync();
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+        let allowed = |u: &str| lnurl_scheme_allowed(&Url::parse(u).unwrap());
+
+        assert!(allowed("http://127.0.0.1:8080/cb"));
+        assert!(allowed("http://10.0.0.1/cb"));
+        assert!(allowed("http://[::1]:8080/cb"));
+        assert!(allowed("http://localhost:8080/cb"));
+
+        assert!(!allowed("http://pay.example.com/cb"));
+        assert!(!allowed("http://8.8.8.8/cb"));
+    }
+
+    /// The scheme check runs before the IP policy: a public IP literal passes
+    /// the host checks, so only the scheme can refuse it.
+    #[tokio::test]
+    async fn assert_url_host_safe_rejects_clearnet_http() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard {
+            previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
+        };
+        let http = Url::parse("http://8.8.8.8/cb").unwrap();
+        assert!(matches!(
+            assert_url_host_safe(&http).await,
+            Err(MostroInternalErr(ServiceError::LnAddressParseError))
+        ));
+        let https = Url::parse("https://8.8.8.8/cb").unwrap();
+        assert!(assert_url_host_safe(&https).await.is_ok());
+    }
+
+    /// A bech32 LNURL decoding to clearnet `http` is refused when the buyer
+    /// submits it, not only at payout.
+    #[tokio::test]
+    async fn ln_exists_refuses_clearnet_http_lnurl() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard {
+            previous: ALLOW_PRIVATE_LNURL_HOSTS.swap(false, Ordering::SeqCst),
+        };
+        let encoded = LnUrl {
+            url: "http://8.8.8.8/.well-known/lnurlp/alice".to_string(),
+        }
+        .encode();
+        assert!(matches!(
+            ln_exists(&encoded).await,
+            Err(MostroInternalErr(ServiceError::LnAddressParseError))
+        ));
     }
 
     #[tokio::test]
@@ -689,7 +809,7 @@ mod tests {
                     Json(json!({
                         "status": "OK",
                         "tag": "payRequest",
-                        "callback": "http://169.254.169.254/latest/meta-data",
+                        "callback": "https://169.254.169.254/latest/meta-data",
                         "minSendable": 1000,
                         "maxSendable": 100000000,
                         "metadata": "[]"
@@ -709,13 +829,64 @@ mod tests {
         .encode();
 
         let result = resolv_ln_address(&lnurl_string, 100, None).await;
+        // The IP policy refuses with `LnAddressParseError`; a request that got
+        // past it would fail to connect with `NoAPIResponse` instead.
         assert!(
-            result.is_err(),
-            "link-local callback must be refused: {result:?}"
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::LnAddressParseError))
+            ),
+            "link-local callback must be refused by the IP policy: {result:?}"
         );
         assert!(
             hits.lock().unwrap().is_empty(),
             "no request must reach any internal listener"
+        );
+    }
+
+    /// MITM regression: the LNURL server answers with a clearnet `http`
+    /// callback. The callback response carries the invoice we pay, so it
+    /// must be refused before any request; without the scheme rule this
+    /// tried to connect and failed with `NoAPIResponse` instead.
+    #[tokio::test]
+    async fn resolv_ln_address_refuses_clearnet_http_callback() {
+        let _lock = AllowPrivateLnurlHostsGuard::lock_policy().await;
+        let _guard = AllowPrivateLnurlHostsGuard::enable();
+
+        let app = Router::new().route(
+            "/.well-known/lnurlp/alice",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "OK",
+                        "tag": "payRequest",
+                        "callback": "http://8.8.8.8/cb",
+                        "minSendable": 1000,
+                        "maxSendable": 100000000,
+                        "metadata": "[]"
+                    })),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let lnurl_string = LnUrl {
+            url: format!("http://127.0.0.1:{port}/.well-known/lnurlp/alice"),
+        }
+        .encode();
+
+        let result = resolv_ln_address(&lnurl_string, 100, None).await;
+        assert!(
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::LnAddressParseError))
+            ),
+            "clearnet http callback must be refused: {result:?}"
         );
     }
 
@@ -757,14 +928,20 @@ mod tests {
         });
 
         let lnurl_string = LnUrl {
-            url: format!("http://127.0.0.1:{port_a}/.well-known/lnurlp/alice"),
+            url: format!("https://127.0.0.1:{port_a}/.well-known/lnurlp/alice"),
         }
         .encode();
 
         let result = resolv_ln_address(&lnurl_string, 100, None).await;
+        // https so the scheme check passes and the IP policy does the refusing.
+        // Past the policy, the TLS handshake with this plain-http listener would
+        // fail with `NoAPIResponse` instead.
         assert!(
-            result.is_err(),
-            "loopback LNURL must be refused before any GET: {result:?}"
+            matches!(
+                result,
+                Err(MostroInternalErr(ServiceError::LnAddressParseError))
+            ),
+            "loopback LNURL must be refused by the IP policy: {result:?}"
         );
         assert_eq!(
             *hits.lock().unwrap(),

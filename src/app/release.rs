@@ -1754,6 +1754,28 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     // it is how the child got its counterparty. Never carry it forward.
     new_order.next_trade_index = None;
     new_order.next_trade_pubkey = None;
+    // The dispute flags belong to the slice that just closed, not to the
+    // offer. A child that keeps one is born "already disputed" with no
+    // dispute row, and `setup_dispute` then refuses that party's dispute
+    // for good (#1126).
+    new_order.buyer_dispute = false;
+    new_order.seller_dispute = false;
+    // Same for a cooperative cancel one party asked for before the seller
+    // released: an inherited initiator turns the child's first `cancel`
+    // into a confirmation checked against a key from the previous trade.
+    new_order.cancel_initiator_pubkey = None;
+    new_order.buyer_cooperativecancel = false;
+    new_order.seller_cooperativecancel = false;
+    // Rating, payout and dev-fee bookkeeping are written after the child
+    // is spawned, so they are clean here today. Reset them anyway: they
+    // describe the closed slice, and the child must not depend on when it
+    // was cloned.
+    new_order.buyer_sent_rate = false;
+    new_order.seller_sent_rate = false;
+    new_order.failed_payment = false;
+    new_order.payment_attempts = 0;
+    new_order.dev_fee_paid = false;
+    new_order.dev_fee_payment_hash = None;
 
     match new_order.get_order_kind().map_err(MostroInternalErr)? {
         mostro_core::order::Kind::Sell => {
@@ -2825,6 +2847,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_of_a_disputed_slice_is_persisted_without_dispute_flags() {
+        // #1126: the buyer disputed the parent slice and the seller released.
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_dispute = true;
+        let child = create_base_order(&order).unwrap();
+
+        handle_child_order(
+            child.clone(),
+            &order,
+            Some((next_seller.to_string(), 6)),
+            &pool,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
+        assert!(!db_child.buyer_dispute);
+        assert!(!db_child.seller_dispute);
+    }
+
+    #[tokio::test]
     async fn handle_child_order_rejects_invalid_type_or_creator() {
         // Arrange: sell order whose creator is the buyer — neither branch fits.
         let pool = create_test_pool().await;
@@ -2892,6 +2940,40 @@ mod tests {
         // ... and drop the consumed next-trade rotation.
         assert_eq!(base.next_trade_pubkey, None);
         assert_eq!(base.next_trade_index, None);
+    }
+
+    #[test]
+    fn create_base_order_drops_the_closed_slice_trade_state() {
+        // A parent slice that saw a dispute and a cooperative-cancel request
+        // before the seller released: none of it belongs to the remainder.
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_dispute = true;
+        order.seller_dispute = true;
+        order.cancel_initiator_pubkey = Some(buyer.to_string());
+        order.buyer_cooperativecancel = true;
+        order.seller_cooperativecancel = true;
+        order.buyer_sent_rate = true;
+        order.seller_sent_rate = true;
+        order.failed_payment = true;
+        order.payment_attempts = 3;
+        order.dev_fee_paid = true;
+        order.dev_fee_payment_hash = Some("aa".to_string());
+
+        let base = create_base_order(&order).unwrap();
+
+        assert!(!base.buyer_dispute);
+        assert!(!base.seller_dispute);
+        assert_eq!(base.cancel_initiator_pubkey, None);
+        assert!(!base.buyer_cooperativecancel);
+        assert!(!base.seller_cooperativecancel);
+        assert!(!base.buyer_sent_rate);
+        assert!(!base.seller_sent_rate);
+        assert!(!base.failed_payment);
+        assert_eq!(base.payment_attempts, 0);
+        assert!(!base.dev_fee_paid);
+        assert_eq!(base.dev_fee_payment_hash, None);
     }
 
     #[test]

@@ -1760,6 +1760,22 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     // for good (#1126).
     new_order.buyer_dispute = false;
     new_order.seller_dispute = false;
+    // Same for a cooperative cancel one party asked for before the seller
+    // released: an inherited initiator turns the child's first `cancel`
+    // into a confirmation checked against a key from the previous trade.
+    new_order.cancel_initiator_pubkey = None;
+    new_order.buyer_cooperativecancel = false;
+    new_order.seller_cooperativecancel = false;
+    // Rating, payout and dev-fee bookkeeping are written after the child
+    // is spawned, so they are clean here today. Reset them anyway: they
+    // describe the closed slice, and the child must not depend on when it
+    // was cloned.
+    new_order.buyer_sent_rate = false;
+    new_order.seller_sent_rate = false;
+    new_order.failed_payment = false;
+    new_order.payment_attempts = 0;
+    new_order.dev_fee_paid = false;
+    new_order.dev_fee_payment_hash = None;
 
     match new_order.get_order_kind().map_err(MostroInternalErr)? {
         mostro_core::order::Kind::Sell => {
@@ -2928,18 +2944,36 @@ mod tests {
 
     #[test]
     fn create_base_order_drops_the_closed_slice_trade_state() {
-        // A dispute on the parent slice, resolved by a release, is not the
-        // remainder's dispute.
+        // A parent slice that saw a dispute and a cooperative-cancel request
+        // before the seller released: none of it belongs to the remainder.
         let seller = Keys::generate().public_key();
         let buyer = Keys::generate().public_key();
         let mut order = fiat_sent_sell_order(seller, buyer);
         order.buyer_dispute = true;
         order.seller_dispute = true;
+        order.cancel_initiator_pubkey = Some(buyer.to_string());
+        order.buyer_cooperativecancel = true;
+        order.seller_cooperativecancel = true;
+        order.buyer_sent_rate = true;
+        order.seller_sent_rate = true;
+        order.failed_payment = true;
+        order.payment_attempts = 3;
+        order.dev_fee_paid = true;
+        order.dev_fee_payment_hash = Some("aa".to_string());
 
         let base = create_base_order(&order).unwrap();
 
         assert!(!base.buyer_dispute);
         assert!(!base.seller_dispute);
+        assert_eq!(base.cancel_initiator_pubkey, None);
+        assert!(!base.buyer_cooperativecancel);
+        assert!(!base.seller_cooperativecancel);
+        assert!(!base.buyer_sent_rate);
+        assert!(!base.seller_sent_rate);
+        assert!(!base.failed_payment);
+        assert_eq!(base.payment_attempts, 0);
+        assert!(!base.dev_fee_paid);
+        assert_eq!(base.dev_fee_payment_hash, None);
     }
 
     #[test]

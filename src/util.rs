@@ -707,17 +707,55 @@ fn stamp_protocol_version(message: &mut Message, transport: Transport) {
     }
 }
 
+/// `relay (category)` for each refusal, for logs.
+///
+/// The relay's reason text is never logged: it is remote input, and a hostile
+/// relay could echo the event back, `p` tag included. Only the relay URL
+/// (from the operator's own config) and a category from NIP-01's fixed set of
+/// machine-readable prefixes are kept; anything else, such as a timeout or a
+/// connection error, is `other`.
+fn relay_refusals(failed: &[(RelayUrl, String)]) -> String {
+    const PREFIXES: [&str; 8] = [
+        "duplicate",
+        "pow",
+        "blocked",
+        "rate-limited",
+        "invalid",
+        "restricted",
+        "auth-required",
+        "error",
+    ];
+    failed
+        .iter()
+        .map(|(url, reason)| {
+            let category = reason
+                .split_once(':')
+                .and_then(|(prefix, _)| PREFIXES.into_iter().find(|p| *p == prefix.trim()))
+                .unwrap_or("other");
+            format!("{url} ({category})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Displays an optional log field, `-` when absent, without allocating.
+struct OrDash<T>(Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for OrDash<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(value) => value.fmt(f),
+            None => f.write_str("-"),
+        }
+    }
+}
+
 pub async fn send_dm(
     receiver_pubkey: PublicKey,
     sender_keys: &Keys,
     payload: &str,
     expiration: Option<Timestamp>,
 ) -> Result<(), MostroError> {
-    info!(
-        "sender key {} - receiver key {}",
-        sender_keys.public_key().to_hex(),
-        receiver_pubkey.to_hex()
-    );
     let mut message = Message::from_json(payload)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -755,30 +793,34 @@ pub async fn send_dm(
     )
     .await?;
 
-    // Payer hashes and histories are identifiers that must stay inside the
-    // encrypted channel; log the action only.
-    let logged_payload = if crate::app::payer::carries_payer_data(&message) {
-        "<payer-history payload redacted>"
-    } else {
-        payload
-    };
+    // Allowlisted identifiers only. Never the payload or the receiver:
+    // payloads carry invoices, payout addresses, amounts, payer hashes and
+    // dispute data, and the receiver is the user's trade pubkey. Logged
+    // together they would be a cleartext record of who traded what, outside
+    // the encrypted channel. Not the event id either: the kind-14 event is
+    // public and carries a `p` tag for the receiver, so a relay lookup by id
+    // would recover it.
+    let kind = message.get_inner_message_kind();
+    let (action, order_id, request_id) = (kind.action.clone(), kind.id, kind.request_id);
     info!(
-        "Sending message, Event ID: {} to {} with payload: {:#?}",
-        event.id,
-        receiver_pubkey.to_hex(),
-        logged_payload
+        action = %action,
+        order_id = %OrDash(order_id),
+        request_id = %OrDash(request_id),
+        "Sending message"
     );
 
     if let Ok(client) = get_nostr_client() {
         // Resolves on the first relay's `OK`: a relay that never answers must
         // not hold the reply queue for its whole timeout (#991).
-        let event_id = event.id;
         crate::publish::send_event_first_ack(client, &event, move |report| {
             if !report.failed.is_empty() {
                 tracing::warn!(
-                    "message {event_id} not accepted by {} relay(s): {:?}",
-                    report.failed.len(),
-                    report.failed
+                    action = %action,
+                    order_id = %OrDash(order_id),
+                    request_id = %OrDash(request_id),
+                    failed = report.failed.len(),
+                    relays = %relay_refusals(&report.failed),
+                    "message not accepted by every relay"
                 );
             }
         })
@@ -2432,8 +2474,145 @@ mod tests {
 
     fn initialize() {
         INIT.call_once(|| {
-            // Any initialization code goes here
+            // `send_dm` reads the global config (DM expiration). Set the shared
+            // test defaults so these tests don't depend on another module
+            // having set it first; a no-op if one already did.
+            let _ =
+                crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
         });
+    }
+
+    // ───────────────── outbound DM log line ─────────────────
+
+    /// Sends `payload` through `send_dm` and returns what it logged.
+    async fn send_dm_logs(
+        action: Action,
+        payload: Option<Payload>,
+        request_id: Option<u64>,
+    ) -> (uuid::Uuid, PublicKey, String) {
+        initialize();
+        let id = uuid::Uuid::new_v4();
+        let receiver = Keys::generate().public_key();
+        let message = Message::new_order(Some(id), request_id, None, action, payload);
+        let json = message.as_json().unwrap();
+        let (_, logs) = crate::app::context::test_utils::logged_on_this_thread(send_dm(
+            receiver,
+            &Keys::generate(),
+            &json,
+            None,
+        ))
+        .await;
+        (id, receiver, logs)
+    }
+
+    /// The `send_dm` log names the event, action, order and request, and
+    /// leaks neither the receiver's trade pubkey nor any of `secrets`.
+    async fn assert_send_dm_log_redacts(
+        action: Action,
+        payload: Payload,
+        request_id: Option<u64>,
+        secrets: &[&str],
+    ) {
+        let (id, receiver, logs) = send_dm_logs(action.clone(), Some(payload), request_id).await;
+        let line = logs
+            .lines()
+            .find(|l| l.contains("Sending message"))
+            .unwrap_or_else(|| panic!("send_dm logged no message line: {logs}"));
+
+        assert!(
+            !line.contains("event_id"),
+            "the event id leads to the receiver: {line}"
+        );
+        assert!(line.contains(&format!("action={action}")), "{line}");
+        assert!(line.contains(&format!("order_id={id}")), "{line}");
+        let request = request_id.map_or_else(|| "-".to_string(), |r| r.to_string());
+        assert!(line.contains(&format!("request_id={request}")), "{line}");
+        assert!(
+            !logs.contains(&receiver.to_hex()),
+            "log leaks the receiver: {logs}"
+        );
+        for secret in secrets {
+            assert!(!logs.contains(secret), "log leaks {secret:?}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_dm_log_omits_the_hold_invoice() {
+        let invoice = "lnbcrt500u1p3l8zyapp5nc0ctxjt98xq9tgdgk9m8fepnp0kv6mnj6a83mfsannw46awdp4s";
+        assert_send_dm_log_redacts(
+            Action::PayInvoice,
+            Payload::PaymentRequest(None, invoice.to_string(), None),
+            Some(42),
+            &[invoice, "lnbcrt"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_dm_log_omits_the_buyer_payout_address() {
+        let address = "buyer@wallet.example";
+        assert_send_dm_log_redacts(
+            Action::AddInvoice,
+            Payload::PaymentRequest(None, address.to_string(), None),
+            None,
+            &[address, "wallet.example"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_dm_log_omits_payer_data() {
+        let hash = "a".repeat(64);
+        assert_send_dm_log_redacts(
+            Action::PayerDeclared,
+            Payload::PayerDeclaration(PayerDeclaration::new(hash.clone())),
+            Some(7),
+            &[&hash],
+        )
+        .await;
+        assert_send_dm_log_redacts(
+            Action::PaymentHistory,
+            Payload::PaymentHistory(PaymentHistory::unavailable(hash.clone())),
+            None,
+            &[&hash],
+        )
+        .await;
+    }
+
+    #[test]
+    fn relay_refusals_keep_only_the_url_and_a_known_category() {
+        let receiver = Keys::generate().public_key().to_hex();
+        let url = |u: &str| RelayUrl::parse(u).unwrap();
+        let failed = vec![
+            (
+                url("wss://a.example"),
+                "blocked: not on the allowlist".to_string(),
+            ),
+            (
+                url("wss://b.example"),
+                "rate-limited: slow down".to_string(),
+            ),
+            (url("wss://c.example"), "timeout".to_string()),
+            // A hostile relay echoing the event back, `p` tag included.
+            (
+                url("wss://d.example"),
+                format!("invalid: [\"p\",\"{receiver}\"] content=Ag..."),
+            ),
+            (url("wss://e.example"), format!("{receiver}: echoed")),
+        ];
+        let summary = relay_refusals(&failed);
+        assert_eq!(
+            summary,
+            "wss://a.example (blocked), wss://b.example (rate-limited), \
+             wss://c.example (other), wss://d.example (invalid), wss://e.example (other)"
+        );
+        assert!(!summary.contains(&receiver));
+    }
+
+    #[test]
+    fn or_dash_prints_the_value_or_a_dash() {
+        assert_eq!(OrDash(Some(42)).to_string(), "42");
+        assert_eq!(OrDash(None::<u64>).to_string(), "-");
     }
 
     // ───────────────── first-trade date (`since`) ─────────────────
@@ -2899,25 +3078,23 @@ mod tests {
         assert_eq!(result, "");
     }
 
+    /// The valid path is covered by the `send_dm_log_*` tests; whether a
+    /// send then succeeds depends on the global Nostr client, so only the
+    /// deterministic refusal is asserted here.
     #[tokio::test]
-    async fn test_send_dm() {
+    async fn send_dm_rejects_an_unparseable_payload() {
         initialize();
-        // Mock the send_dm function
-        let receiver_pubkey = Keys::generate().public_key();
-        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
-        let message = Message::Order(MessageKind::new(
-            Some(uuid),
+        let result = send_dm(
+            Keys::generate().public_key(),
+            &Keys::generate(),
+            "not a mostro message",
             None,
-            None,
-            Action::FiatSent,
-            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(MostroInternalErr(ServiceError::MessageSerializationError))
         ));
-        let payload = message.as_json().unwrap();
-        let sender_keys = Keys::generate();
-        // Now error is well manager this call will fail now, previously test was ok becuse error was not managed
-        // now just make it ok and then will make a better test
-        let result = send_dm(receiver_pubkey, &sender_keys, &payload, None).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]

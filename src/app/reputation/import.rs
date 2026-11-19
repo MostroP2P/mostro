@@ -513,6 +513,73 @@ mod tests {
         assert_eq!(rows[0].trade_pubkey, Some(first.sender.to_hex()));
     }
 
+    async fn ban(f: &Fixture, identity: &PublicKey) {
+        sqlx::query("UPDATE users SET is_banned = 1 WHERE pubkey = ?1")
+            .bind(identity.to_hex())
+            .execute(f.ctx.pool())
+            .await
+            .unwrap();
+    }
+
+    /// A banned account cannot bring reputation in: nothing is recorded and
+    /// its figures stay as they were.
+    #[tokio::test]
+    async fn a_banned_identity_cannot_import() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let mut user = User::new(identity.to_hex(), 0, 0, 0, 0, 1);
+        user.update_rating(4);
+        add_new_user(f.ctx.pool(), user).await.unwrap();
+        ban(&f, &identity).await;
+        let before = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+
+        let (msg, event) = request(&identity, &attestation(&f.issuer, &identity, "acct-1"));
+        let result = import_reputation_action(&f.ctx, msg, &event, f.ctx.keys()).await;
+
+        assert_eq!(refused(result), CantDoReason::NotAuthorized);
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "nothing was recorded");
+        let after = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(after.total_reviews, before.total_reviews);
+        assert_eq!(after.total_rating, before.total_rating);
+        assert_eq!(after.seeded_reviews, before.seeded_reviews);
+        assert!(replies_to(event.sender).await.is_empty());
+    }
+
+    /// A banned account gets no confirmation either: an exact retry of an
+    /// import committed before the ban is refused, and nothing changes.
+    #[tokio::test]
+    async fn a_banned_identity_is_refused_even_when_retrying_an_earlier_import() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = attestation(&f.issuer, &identity, "acct-1");
+        let (msg, first) = request(&identity, &json);
+        import_reputation_action(&f.ctx, msg, &first, f.ctx.keys())
+            .await
+            .unwrap();
+        ban(&f, &identity).await;
+
+        let (msg, retry) = request(&identity, &json);
+        let result = import_reputation_action(&f.ctx, msg, &retry, f.ctx.keys()).await;
+
+        assert_eq!(refused(result), CantDoReason::NotAuthorized);
+        assert!(replies_to(retry.sender).await.is_empty());
+        let user = is_user_present(f.ctx.pool(), identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(user.total_reviews, 214, "the refused retry changed nothing");
+        let rows = reputation_imports_for_identity(f.ctx.pool(), &identity.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     /// Seed an import committed while the attestation was valid, then retry
     /// it after expiration without sleeping or changing the system clock.
     async fn recorded_expired_attestation(f: &Fixture, identity: &PublicKey) -> String {
@@ -527,6 +594,22 @@ mod tests {
             .await
             .unwrap();
         json
+    }
+
+    /// The expired-retry path never reaches `record_import`, so it checks the
+    /// ban itself: a banned account is refused there too.
+    #[tokio::test]
+    async fn a_banned_identity_is_refused_on_an_expired_retry_too() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let json = recorded_expired_attestation(&f, &identity).await;
+        ban(&f, &identity).await;
+
+        let (msg, retry) = request(&identity, &json);
+        let result = import_reputation_action(&f.ctx, msg, &retry, f.ctx.keys()).await;
+
+        assert_eq!(refused(result), CantDoReason::NotAuthorized);
+        assert!(replies_to(retry.sender).await.is_empty());
     }
 
     #[tokio::test]

@@ -1754,6 +1754,12 @@ fn create_base_order(order: &Order) -> Result<Order, MostroError> {
     // it is how the child got its counterparty. Never carry it forward.
     new_order.next_trade_index = None;
     new_order.next_trade_pubkey = None;
+    // The dispute flags belong to the slice that just closed, not to the
+    // offer. A child that keeps one is born "already disputed" with no
+    // dispute row, and `setup_dispute` then refuses that party's dispute
+    // for good (#1126).
+    new_order.buyer_dispute = false;
+    new_order.seller_dispute = false;
 
     match new_order.get_order_kind().map_err(MostroInternalErr)? {
         mostro_core::order::Kind::Sell => {
@@ -2825,6 +2831,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_of_a_disputed_slice_is_persisted_without_dispute_flags() {
+        // #1126: the buyer disputed the parent slice and the seller released.
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let next_seller = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_dispute = true;
+        let child = create_base_order(&order).unwrap();
+
+        handle_child_order(
+            child.clone(),
+            &order,
+            Some((next_seller.to_string(), 6)),
+            &pool,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let db_child = Order::by_id(&pool, child.id).await.unwrap().unwrap();
+        assert!(!db_child.buyer_dispute);
+        assert!(!db_child.seller_dispute);
+    }
+
+    #[tokio::test]
     async fn handle_child_order_rejects_invalid_type_or_creator() {
         // Arrange: sell order whose creator is the buyer — neither branch fits.
         let pool = create_test_pool().await;
@@ -2892,6 +2924,22 @@ mod tests {
         // ... and drop the consumed next-trade rotation.
         assert_eq!(base.next_trade_pubkey, None);
         assert_eq!(base.next_trade_index, None);
+    }
+
+    #[test]
+    fn create_base_order_drops_the_closed_slice_trade_state() {
+        // A dispute on the parent slice, resolved by a release, is not the
+        // remainder's dispute.
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let mut order = fiat_sent_sell_order(seller, buyer);
+        order.buyer_dispute = true;
+        order.seller_dispute = true;
+
+        let base = create_base_order(&order).unwrap();
+
+        assert!(!base.buyer_dispute);
+        assert!(!base.seller_dispute);
     }
 
     #[test]

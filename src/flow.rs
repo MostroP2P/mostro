@@ -269,7 +269,8 @@ pub async fn hold_invoice_settlement(hash: &str, pool: &SqlitePool) -> Result<()
 ///   operator;
 /// - `Active` additionally transitions to `Canceled`: with no fiat claim
 ///   on record the trade is simply dead, and leaving it `Active` would
-///   keep showing a trade that no escrow backs;
+///   keep showing a trade that no escrow backs. Its bonds are released
+///   with it — no terminal order may keep one locked;
 /// - `FiatSent` / `Dispute` keep their status — the fiat leg may already
 ///   have moved, so a human must resolve the fallout. The notifications
 ///   and the `error!` are the alarm.
@@ -340,6 +341,24 @@ pub async fn hold_invoice_canceled(
                     &updated,
                     &order,
                     Some(Action::Canceled),
+                )
+                .await;
+                // The trade is over with nobody at fault, so the bonds go
+                // back, as on the guardian's own cancel. The order is
+                // `canceled` from here on and no other path would release
+                // the taker's bond: it would stay locked until LND refunds
+                // it at the bond's own CLTV expiry. Both calls are
+                // idempotent, so running after the guardian is harmless.
+                crate::app::bond::release_taker_bonds_for_order_or_warn(
+                    pool,
+                    order.id,
+                    "hold_invoice_canceled",
+                )
+                .await;
+                crate::app::bond::resolve_range_maker_bond_at_close_or_warn(
+                    pool,
+                    &order,
+                    "hold_invoice_canceled",
                 )
                 .await;
             }
@@ -854,6 +873,83 @@ mod tests {
             Status::Canceled.to_string(),
             "an Active order whose escrow evaporated must stop looking live"
         );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_releases_the_taker_bond_of_the_order_it_closes() {
+        use crate::app::bond::{db::create_bond, Bond, BondRole, BondState};
+
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f5".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::Active,
+            None,
+            Some(buyer.clone()),
+            Some(seller),
+            None,
+        )
+        .await;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+        // The taker's bond, locked for the whole trade. No hash, so the
+        // release needs no LND.
+        let mut taker_bond = Bond::new_requested(order.id, buyer, BondRole::Taker, 1_000);
+        taker_bond.state = BondState::Locked.to_string();
+        taker_bond.hash = None;
+        let taker_bond = create_bond(&pool, taker_bond).await.unwrap();
+
+        hold_invoice_canceled(&hash, &pool, &create_test_keys())
+            .await
+            .unwrap();
+
+        let after = Bond::by_id(&pool, taker_bond.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            BondState::Released.to_string(),
+            "a canceled order must not keep the taker's bond locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_invoice_canceled_keeps_the_taker_bond_of_a_fiat_sent_order() {
+        use crate::app::bond::{db::create_bond, Bond, BondRole, BondState};
+
+        init_global_settings();
+        let pool = create_migrated_pool().await;
+        let hash = "f6".repeat(32);
+        let buyer = create_test_keys().public_key().to_string();
+        let seller = create_test_keys().public_key().to_string();
+        let order = insert_order_with_hash(
+            &pool,
+            &hash,
+            Status::FiatSent,
+            Some("lnbcrt1invoice".to_string()),
+            Some(buyer.clone()),
+            Some(seller),
+            None,
+        )
+        .await;
+        crate::db::update_order_invoice_held_at_time(&pool, order.id, 1_700_000_000)
+            .await
+            .unwrap();
+        let mut taker_bond = Bond::new_requested(order.id, buyer, BondRole::Taker, 1_000);
+        taker_bond.state = BondState::Locked.to_string();
+        taker_bond.hash = None;
+        let taker_bond = create_bond(&pool, taker_bond).await.unwrap();
+
+        hold_invoice_canceled(&hash, &pool, &create_test_keys())
+            .await
+            .unwrap();
+
+        // The order stays open for a solver, who may still slash the bond.
+        let after = Bond::by_id(&pool, taker_bond.id).await.unwrap().unwrap();
+        assert_eq!(after.state, BondState::Locked.to_string());
     }
 
     #[tokio::test]

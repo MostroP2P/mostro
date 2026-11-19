@@ -1129,6 +1129,12 @@ async fn enforce_escrow_deadline_pass(
                     order.id
                 );
                 notify_users_canceled_order(&updated, &order, Some(Action::Canceled)).await;
+                // The trade is over with nobody at fault, so the taker's
+                // bond goes back. The order is `canceled` from here on and
+                // no other path would release it: it would stay locked
+                // until LND refunds it at the bond's own CLTV expiry.
+                bond::release_taker_bonds_for_order_or_warn(pool, order.id, "escrow_deadline")
+                    .await;
                 // Idempotent close of any range maker bond, mirroring the
                 // waiting-state timeout path.
                 bond::resolve_range_maker_bond_at_close_or_warn(pool, &order, "escrow_deadline")
@@ -2429,6 +2435,106 @@ mod tests {
         let actions = queued_actions_for(order.id).await;
         assert_eq!(actions.len(), 2, "both parties must be told: {actions:?}");
         assert!(actions.iter().all(|a| *a == Action::Canceled));
+    }
+
+    /// The `Locked` taker bond of `order`, posted by its buyer. No hash,
+    /// so the release needs no LND.
+    async fn locked_taker_bond(pool: &sqlx::SqlitePool, order: &Order) -> bond::Bond {
+        let mut taker_bond = bond::Bond::new_requested(
+            order.id,
+            order.buyer_pubkey.clone().unwrap(),
+            bond::BondRole::Taker,
+            1_000,
+        );
+        taker_bond.state = bond::BondState::Locked.to_string();
+        taker_bond.hash = None;
+        bond::db::create_bond(pool, taker_bond).await.unwrap()
+    }
+
+    async fn bond_state(pool: &sqlx::SqlitePool, bond_id: Uuid) -> String {
+        bond::Bond::by_id(pool, bond_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_releases_the_taker_bond_of_the_order_it_cancels() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::Active, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let taker_bond = locked_taker_bond(ctx.pool(), &order).await;
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Canceled.to_string()
+        );
+        assert_eq!(
+            bond_state(ctx.pool(), taker_bond.id).await,
+            bond::BondState::Released.to_string(),
+            "a canceled order must not keep the taker's bond locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_keeps_the_taker_bond_while_the_cancel_is_retried() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::Active, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let taker_bond = locked_taker_bond(ctx.pool(), &order).await;
+        let mut escrow = StubEscrow::failing("transport: connection refused");
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        // The trade is still live, so the bond still backs it.
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Active.to_string()
+        );
+        assert_eq!(
+            bond_state(ctx.pool(), taker_bond.id).await,
+            bond::BondState::Locked.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn escrow_deadline_opening_a_dispute_keeps_the_taker_bond() {
+        let ctx = escrow_guardian_ctx(144, 24).await;
+        let now = Utc::now().timestamp();
+        let order = escrow_backed_order(Status::FiatSent, now - 80_000)
+            .create(ctx.pool())
+            .await
+            .unwrap();
+        let taker_bond = locked_taker_bond(ctx.pool(), &order).await;
+        let mut escrow = StubEscrow::ok();
+
+        enforce_escrow_deadline_pass(&ctx, &mut escrow)
+            .await
+            .unwrap();
+
+        // The order is open for a solver, who may still slash the bond.
+        assert_eq!(
+            status_of(ctx.pool(), order.id).await,
+            Status::Dispute.to_string()
+        );
+        assert_eq!(
+            bond_state(ctx.pool(), taker_bond.id).await,
+            bond::BondState::Locked.to_string()
+        );
     }
 
     #[tokio::test]

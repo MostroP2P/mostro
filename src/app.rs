@@ -720,6 +720,13 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     }
 }
 
+/// How many `AddCashuEscrow` locks may wait on mints at the same time. A lock
+/// that waits on a silent mint holds its slot until the mint's timeout, so the
+/// cap keeps a flood of them from piling up work; the rest queue for a slot.
+const MAX_CONCURRENT_ESCROW_LOCKS: usize = 16;
+static ESCROW_LOCK_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ESCROW_LOCKS);
+
 /// Route a validated action in Cashu mode (CF-5).
 ///
 /// The allow-list is drawn at *"escrow-independent actions that neither create
@@ -773,9 +780,27 @@ async fn dispatch_cashu(
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
         // Cashu escrow lock — TA-1 fills the stub body; the routing is frozen.
-        Action::AddCashuEscrow => add_cashu_escrow_action(ctx, msg, event, my_keys)
-            .await
-            .map_err(|e| e.into()),
+        //
+        // The lock talks to a mint the maker chose, and a mint that accepts the
+        // connection and never answers costs the full request timeout, several
+        // times over. Run inline, that would stall the one-at-a-time event loop
+        // for every other message, so the lock runs in its own task and the
+        // loop moves on. The task reports a failure to the seller itself, as
+        // the loop does for every other action, and `ESCROW_LOCK_SLOTS` caps
+        // how many locks wait on mints at once.
+        Action::AddCashuEscrow => {
+            let (ctx, msg, event, my_keys) = (ctx.clone(), msg, event.clone(), my_keys.clone());
+            tokio::spawn(async move {
+                let Ok(_slot) = ESCROW_LOCK_SLOTS.acquire().await else {
+                    return;
+                };
+                if let Err(err) = add_cashu_escrow_action(&ctx, msg.clone(), &event, &my_keys).await
+                {
+                    manage_errors(err, msg, event, &Action::AddCashuEscrow).await;
+                }
+            });
+            Ok(())
+        }
         // Everything that advances or settles an order past the lock has no
         // handler yet during Track A — reject it cleanly. Later tracks
         // (release/cancel/dispute) replace these arms one at a time.

@@ -878,4 +878,66 @@ mod tests {
             "dispatching a lock must not wait for the mint to answer"
         );
     }
+
+    /// The seller's rejection is sent by the task that ran the lock, and a
+    /// lock waits for a free slot when every slot is busy: it neither blocks
+    /// the loop nor gets lost.
+    #[tokio::test]
+    async fn a_lock_waits_for_a_free_slot_and_still_reports_its_failure() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        // Nothing listens on port 1: the connection is refused at once.
+        let mint = "http://127.0.0.1:1";
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(mint)).await;
+        let msg = lock_message(
+            order.id,
+            Some(proof_on_mint(mint, buyer, seller, my_keys.public_key())),
+        );
+        let reasons = || async {
+            crate::config::MESSAGE_QUEUES
+                .queue_order_cantdo
+                .read()
+                .await
+                .iter()
+                .filter(|(_, to)| *to == seller)
+                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                    Some(Payload::CantDo(Some(r))) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Every slot busy: the dispatch still returns, and nothing is sent yet.
+        let busy = crate::app::ESCROW_LOCK_SLOTS
+            .acquire_many(crate::app::MAX_CONCURRENT_ESCROW_LOCKS as u32)
+            .await
+            .unwrap();
+        crate::app::dispatch_cashu(
+            &Action::AddCashuEscrow,
+            msg,
+            &unwrapped_from(seller),
+            &my_keys,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            reasons().await.is_empty(),
+            "no slot free: the lock must wait"
+        );
+
+        // A slot frees up: the lock runs and the seller hears why it failed.
+        drop(busy);
+        let mut heard = Vec::new();
+        for _ in 0..50 {
+            heard = reasons().await;
+            if !heard.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(heard, vec![CantDoReason::CashuMintUnavailable]);
+    }
 }

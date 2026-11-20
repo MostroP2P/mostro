@@ -1293,9 +1293,12 @@ pub(crate) fn monotonic_rating_event_timestamp(
 ///   rebuilds the revision from the DB row, so without the intent a failed
 ///   take would be retried as a transition that publishes nothing, and the
 ///   relays would keep advertising the order as `pending`.
-static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<Uuid, (u64, u8, OrderPublication)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<std::sync::Mutex<RepublishQueue>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// `order_id → (generation, attempts, publication)`; see
+/// [`PENDING_ORDERBOOK_REPUBLISH`].
+type RepublishQueue = HashMap<Uuid, (u64, u8, OrderPublication)>;
 
 /// The intent a queue entry keeps when two failures merge: a take is never
 /// downgraded, because the take is the revision that must reach the relays.

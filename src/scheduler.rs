@@ -1429,7 +1429,7 @@ const ORDERBOOK_QUIESCENT_SECS: u64 = 120;
 /// matching the CAS-miss repair path: the DB row's status is the source
 /// of truth being re-advertised, not mutated.
 async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
-    for (order_id, generation, attempts) in util::take_failed_orderbook_publishes() {
+    for (order_id, generation, attempts, publication) in util::take_failed_orderbook_publishes() {
         if attempts >= util::MAX_ORDERBOOK_REPUBLISH_ATTEMPTS {
             warn!(
                 "orderbook reconciler: giving up on order {order_id} after {attempts} failed \
@@ -1449,12 +1449,21 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
                     // the attempt cap would never trip. A full success
                     // clears the entry (its stamp generation is newer), a
                     // quiescent skip leaves it untouched for the next pass.
-                    util::requeue_orderbook_publish_failure(order_id, generation, attempts);
+                    util::requeue_orderbook_publish_failure(
+                        order_id,
+                        generation,
+                        attempts,
+                        publication,
+                    );
                     match util::update_order_event_if_quiescent(
                         keys,
                         status,
                         &order,
                         ORDERBOOK_QUIESCENT_SECS,
+                        // A failed take is retried as the take: rebuilt as a
+                        // transition, a sell order in `waiting-payment`
+                        // publishes nothing (issue #1129).
+                        publication,
                     )
                     .await
                     {
@@ -1470,7 +1479,11 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
                             warn!(
                                 "orderbook reconciler: republish of order {order_id} failed: {e}"
                             );
-                            util::mark_orderbook_publish_failed_at(order_id, generation);
+                            util::mark_orderbook_publish_failed_at_for(
+                                order_id,
+                                generation,
+                                publication,
+                            );
                         }
                     }
                 }
@@ -1482,7 +1495,12 @@ async fn reconcile_orderbook_once(pool: &sqlx::SqlitePool, keys: &Keys) {
                 warn!("orderbook reconciler: could not reload order {order_id}: {e}");
                 // Transient DB error: keep it queued for the next pass
                 // without consuming an attempt — nothing was published.
-                util::requeue_orderbook_publish_failure(order_id, generation, attempts);
+                util::requeue_orderbook_publish_failure(
+                    order_id,
+                    generation,
+                    attempts,
+                    publication,
+                );
             }
         }
     }
@@ -2161,6 +2179,100 @@ mod tests {
         );
     }
 
+    /// A sell order taken into `waiting-payment` is published as
+    /// `in-progress` only by the take itself (issue #1129). When that publish
+    /// fails, the reconciler must retry it as the take; retried as an
+    /// ordinary transition it would publish nothing, and the relays would keep
+    /// advertising the order as `pending`. A queued ordinary transition of the
+    /// same row (`add_invoice` after `waiting-buyer-invoice`) stays silent.
+    #[tokio::test]
+    async fn reconciler_retries_a_failed_take_as_the_take() {
+        use crate::nip33::OrderPublication;
+
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let taken_sell = || Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::WaitingPayment.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let take = taken_sell().create(ctx.pool()).await.unwrap();
+        let transition = taken_sell().create(ctx.pool()).await.unwrap();
+        crate::util::mark_orderbook_publish_failed_at_for(take.id, 1, OrderPublication::Take);
+        crate::util::mark_orderbook_publish_failed_at(transition.id, 1);
+
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+
+        // A republish stamps the order through the monotonic registry, which
+        // bumps a past candidate to `last + 1`; an untouched order gets the
+        // candidate back unchanged.
+        let probe = |id| {
+            crate::util::stamp_orderbook_event(
+                id,
+                nostr_sdk::prelude::Timestamp::from(1_700_000_000),
+            )
+            .created_at
+            .as_secs()
+        };
+        assert_ne!(
+            probe(take.id),
+            1_700_000_000,
+            "a failed take must be republished, as in-progress"
+        );
+        assert_eq!(
+            probe(transition.id),
+            1_700_000_000,
+            "an ordinary sell transition into waiting-payment must stay silent"
+        );
+        // Leave the shared queue clean for other tests.
+        let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
+    /// Escrow can fund within the reconciler's quiet window, so a failed take
+    /// may be retried when the order is already `active`. The trade is still
+    /// running and its take never reached the relays: the retry must publish
+    /// `in-progress`, not skip the order (issue #1129).
+    #[tokio::test]
+    async fn reconciler_retries_a_failed_take_after_the_order_went_active() {
+        use crate::nip33::OrderPublication;
+
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Active.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+        crate::util::mark_orderbook_publish_failed_at_for(order.id, 1, OrderPublication::Take);
+
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+
+        let probe = crate::util::stamp_orderbook_event(
+            order.id,
+            nostr_sdk::prelude::Timestamp::from(1_700_000_000),
+        );
+        assert_ne!(
+            probe.created_at.as_secs(),
+            1_700_000_000,
+            "a failed take retried in active must be republished, as in-progress"
+        );
+        // Leave the shared queue clean for other tests.
+        let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
     /// The drained entry is re-seeded before the republish attempt, so a
     /// failed send increments the consumed-attempt count instead of
     /// restarting it at 1 — and a quiescence skip consumes nothing.
@@ -2230,6 +2342,7 @@ mod tests {
             order.id,
             1,
             crate::util::MAX_ORDERBOOK_REPUBLISH_ATTEMPTS,
+            crate::nip33::OrderPublication::Transition,
         );
 
         reconcile_orderbook_once(ctx.pool(), &keys).await;

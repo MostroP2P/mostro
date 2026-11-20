@@ -35,10 +35,11 @@ async fn update_order_status(
                     let won =
                         crate::db::cas_complete_pretrade_take(pool, &order_updated, false).await?;
                     if !won {
-                        crate::util::republish_winning_state_after_cas_miss(
+                        crate::util::republish_winning_state_after_cas_miss_for(
                             pool,
                             my_keys,
                             order_updated.id,
+                            crate::nip33::OrderPublication::Take,
                         )
                         .await;
                         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
@@ -828,5 +829,72 @@ mod tests {
             assert_eq!(stored.status, Status::WaitingBuyerInvoice.to_string());
             assert_eq!(stored.buyer_pubkey, Some(taker.to_string()));
         }
+    }
+
+    /// A no-invoice sell take that loses the CAS to a take which left the
+    /// order in `waiting-payment` has already published its own
+    /// `in-progress` revision. The repair must republish the winner as the
+    /// take, or nothing replaces the loser's tags and event id on relays
+    /// (issue #1129).
+    #[tokio::test]
+    async fn lost_take_republishes_a_winner_in_waiting_payment_as_the_take() {
+        use crate::nip33::OrderPublication;
+        use crate::util::{
+            clear_orderbook_publish_failure_up_to, orderbook_publish_intent,
+            ORDERBOOK_QUEUE_TEST_LOCK,
+        };
+        use mostro_core::db::Crud;
+
+        let _ = crate::config::MOSTRO_CONFIG.set(crate::app::context::test_utils::test_settings());
+        let _ = crate::config::NOSTR_CLIENT.set(Client::default());
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let pool = create_test_pool().await;
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // The winning take carried an invoice: the order already waits for
+        // the seller's payment.
+        let seller = create_test_keys().public_key();
+        let winner = Order {
+            id: uuid::Uuid::new_v4(),
+            kind: OrderKind::Sell.to_string(),
+            status: Status::WaitingPayment.to_string(),
+            payment_method: "SEPA".to_string(),
+            amount: 1_000,
+            fee: 10,
+            fiat_code: "USD".to_string(),
+            fiat_amount: 100,
+            seller_pubkey: Some(seller.to_string()),
+            buyer_pubkey: Some(create_test_keys().public_key().to_string()),
+            created_at: Timestamp::now().as_secs() as i64,
+            expires_at: Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        }
+        .create(&pool)
+        .await
+        .unwrap();
+
+        // The losing take read the order while it was still `pending`.
+        let mut loser = winner.clone();
+        loser.status = Status::Pending.to_string();
+        loser.buyer_pubkey = Some(create_test_keys().public_key().to_string());
+
+        let res = update_order_status(&mut loser, &create_test_keys(), &pool, None).await;
+        assert!(res.is_err(), "the losing take must be refused");
+
+        // The test client has no relays, so publications are queued for the
+        // reconciler with the intent they were built for.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while orderbook_publish_intent(winner.id) != Some(OrderPublication::Take)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let intent = orderbook_publish_intent(winner.id);
+        clear_orderbook_publish_failure_up_to(winner.id, u64::MAX);
+        assert_eq!(
+            intent,
+            Some(OrderPublication::Take),
+            "the winner must be republished as in-progress"
+        );
     }
 }

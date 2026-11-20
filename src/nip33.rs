@@ -345,20 +345,50 @@ pub(crate) fn create_platform_tag_values(instance_name: Option<&str>) -> Vec<Str
         .collect()
 }
 
+/// Why a kind-38383 revision of an order is being built.
+///
+/// The NIP-69 status of most revisions follows from the order's status
+/// alone, but `in-progress` must be published exactly once per trade, at
+/// the take, and the status a take leaves the order in depends on the take
+/// path: a sell order taken with the buyer's invoice, or on a Cashu node,
+/// goes straight to `waiting-payment`, the same status a sell order reaches
+/// later when the buyer adds the invoice (issue #1129).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderPublication {
+    /// Any status change other than a take.
+    Transition,
+    /// The order is being taken: a waiting status publishes as
+    /// `in-progress` whatever the order kind. A take retried by the
+    /// orderbook reconciler is rebuilt from the current row, so `active`,
+    /// `fiat-sent`, `settled-hold-invoice`, `dispute` and `in-progress`
+    /// also publish as `in-progress`; terminal statuses keep their mapping.
+    Take,
+}
+
 ///
 /// # Arguments
 ///
 /// * `order` - the order struct
+/// * `publication` - whether this revision is the take
 ///
 /// # Returns a json string with order status according to nip69
 /// Possible states for nostr event are pending, in-progress, success, canceled
-fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
+fn create_status_tags(
+    order: &Order,
+    publication: OrderPublication,
+) -> Result<(bool, Status), MostroError> {
     // Check if the order is pending/in-progress/success/canceled
     let status = order.get_order_status().map_err(MostroInternalErr)?;
+    let at_take = publication == OrderPublication::Take;
 
     match status {
-        Status::WaitingBuyerInvoice => Ok((order.is_sell_order().is_ok(), Status::InProgress)),
-        Status::WaitingPayment => Ok((order.is_buy_order().is_ok(), Status::InProgress)),
+        // `in-progress` is published once per trade. Outside the take, each
+        // kind publishes it on the status its take without an invoice leads
+        // to, so the later waiting status of the same trade stays silent.
+        Status::WaitingBuyerInvoice => {
+            Ok((at_take || order.is_sell_order().is_ok(), Status::InProgress))
+        }
+        Status::WaitingPayment => Ok((at_take || order.is_buy_order().is_ok(), Status::InProgress)),
         Status::Canceled
         | Status::CanceledByAdmin
         | Status::CooperativelyCanceled
@@ -372,6 +402,21 @@ fn create_status_tags(order: &Order) -> Result<(bool, Status), MostroError> {
         // principle 8). A malicious taker who never pays cannot park
         // the order off the book — concurrent takers race to lock.
         Status::WaitingTakerBond => Ok((true, Status::Pending)),
+        // A take retried by the orderbook reconciler is rebuilt from the
+        // current row, which may already have moved past the waiting status
+        // the take left — escrow can fund within the reconciler's quiet
+        // window. The trade is still running and its take has not reached
+        // the relays, so it publishes as `in-progress` (issue #1129).
+        // Terminal statuses above keep their own mapping.
+        Status::Active
+        | Status::FiatSent
+        | Status::SettledHoldInvoice
+        | Status::Dispute
+        | Status::InProgress
+            if at_take =>
+        {
+            Ok((true, Status::InProgress))
+        }
         _ => Ok((false, status)),
     }
 }
@@ -499,12 +544,28 @@ pub fn order_to_tags(
     reputation_data: Option<(f64, i64, i64)>,
     mostro_pubkey: Option<&str>,
 ) -> Result<Option<Tags>, MostroError> {
+    order_to_tags_for(
+        order,
+        reputation_data,
+        mostro_pubkey,
+        OrderPublication::Transition,
+    )
+}
+
+/// [`order_to_tags`] for a revision built for `publication`: a take
+/// publishes a waiting status as `in-progress` for any order kind.
+pub fn order_to_tags_for(
+    order: &Order,
+    reputation_data: Option<(f64, i64, i64)>,
+    mostro_pubkey: Option<&str>,
+    publication: OrderPublication,
+) -> Result<Option<Tags>, MostroError> {
     // Position of the tags in the list
     const RATING_TAG_INDEX: usize = 7;
     const SOURCE_TAG_INDEX: usize = 8;
 
     // Check if the order is pending/in-progress/success/canceled
-    let (create_event, status) = create_status_tags(order)?;
+    let (create_event, status) = create_status_tags(order, publication)?;
     // Create mostro: scheme link in case of pending order creation
     // Include the Mostro pubkey so clients can identify the instance
     let pubkey = match mostro_pubkey {
@@ -900,7 +961,7 @@ fn bond_policy_tags(
 mod tests {
     use super::create_platform_tag_values;
     use super::create_status_tags;
-    use super::{info_to_tags, order_to_tags};
+    use super::{info_to_tags, order_to_tags, order_to_tags_for, OrderPublication};
     use crate::app::context::test_utils::test_settings;
     use crate::config::types::ReputationImportSettings;
     use crate::config::MOSTRO_CONFIG;
@@ -2438,21 +2499,23 @@ mod tests {
         // WaitingBuyerInvoice on a sell order → publish as InProgress.
         order.status = Status::WaitingBuyerInvoice.to_string();
         assert_eq!(
-            create_status_tags(&order).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (true, Status::InProgress)
         );
 
-        // WaitingPayment on a sell order → not a buy order → don't emit.
+        // WaitingPayment on a sell order outside the take: the buyer added
+        // the invoice after `waiting-buyer-invoice` already published
+        // `in-progress` → don't emit a second one.
         order.status = Status::WaitingPayment.to_string();
         assert_eq!(
-            create_status_tags(&order).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (false, Status::InProgress)
         );
 
         // WaitingPayment on a buy order → emit as InProgress.
         order.kind = mostro_core::order::Kind::Buy.to_string();
         assert_eq!(
-            create_status_tags(&order).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (true, Status::InProgress)
         );
 
@@ -2465,26 +2528,112 @@ mod tests {
         ] {
             order.status = cancelish.to_string();
             assert_eq!(
-                create_status_tags(&order).unwrap(),
+                create_status_tags(&order, OrderPublication::Transition).unwrap(),
                 (true, Status::Canceled)
             );
         }
 
         // Success family keeps its own status.
         order.status = Status::Success.to_string();
-        assert_eq!(create_status_tags(&order).unwrap(), (true, Status::Success));
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
+            (true, Status::Success)
+        );
         order.status = Status::CompletedByAdmin.to_string();
         assert_eq!(
-            create_status_tags(&order).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (true, Status::CompletedByAdmin)
         );
 
         // Internal statuses are not published.
         order.status = Status::Dispute.to_string();
         assert_eq!(
-            create_status_tags(&order).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (false, Status::Dispute)
         );
+    }
+
+    /// Every take path publishes `in-progress`, whatever status it leaves
+    /// the order in: a sell order taken with an invoice, or on a Cashu node,
+    /// lands in `waiting-payment` and must not skip it (issue #1129).
+    #[test]
+    fn status_tags_publish_every_take_as_in_progress() {
+        let mut order = make_pending_order();
+        for kind in [
+            mostro_core::order::Kind::Sell,
+            mostro_core::order::Kind::Buy,
+        ] {
+            order.kind = kind.to_string();
+            for waiting in [Status::WaitingBuyerInvoice, Status::WaitingPayment] {
+                order.status = waiting.to_string();
+                assert_eq!(
+                    create_status_tags(&order, OrderPublication::Take).unwrap(),
+                    (true, Status::InProgress),
+                    "{kind:?} order taken into {waiting:?}"
+                );
+            }
+        }
+
+        // A take never turns the other statuses into `in-progress`.
+        order.status = Status::Pending.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            (true, Status::Pending)
+        );
+        // A take retried after the trade moved on — escrow funded, fiat sent,
+        // a dispute — still publishes `in-progress`: the trade is running and
+        // its take never reached the relays.
+        for running in [
+            Status::Active,
+            Status::FiatSent,
+            Status::SettledHoldInvoice,
+            Status::Dispute,
+            Status::InProgress,
+        ] {
+            order.status = running.to_string();
+            assert_eq!(
+                create_status_tags(&order, OrderPublication::Take).unwrap(),
+                (true, Status::InProgress),
+                "a take retried in {running:?}"
+            );
+        }
+        // An ordinary transition into those statuses stays silent.
+        order.status = Status::Active.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
+            (false, Status::Active)
+        );
+        // Terminal statuses keep their own mapping under a take.
+        order.status = Status::Success.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            (true, Status::Success)
+        );
+        order.status = Status::Canceled.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            (true, Status::Canceled)
+        );
+    }
+
+    #[test]
+    fn order_to_tags_for_take_tags_a_sell_order_in_waiting_payment_as_in_progress() {
+        init_test_settings();
+        let mut order = make_pending_order();
+        order.status = Status::WaitingPayment.to_string();
+
+        assert!(order_to_tags(&order, None, Some(TEST_MOSTRO_PUBKEY))
+            .unwrap()
+            .is_none());
+        let tags = order_to_tags_for(
+            &order,
+            None,
+            Some(TEST_MOSTRO_PUBKEY),
+            OrderPublication::Take,
+        )
+        .unwrap()
+        .expect("the take is published");
+        assert_eq!(get_tag_value(&tags, "s").as_deref(), Some("in-progress"));
     }
 
     // ── order_to_tags: non-pending, reputation, and get_keys paths ───────
@@ -2600,7 +2749,8 @@ mod tests {
         let mut order = make_pending_order();
         order.status = Status::WaitingTakerBond.to_string();
 
-        let (emit, mapped) = create_status_tags(&order).expect("status tags");
+        let (emit, mapped) =
+            create_status_tags(&order, OrderPublication::Transition).expect("status tags");
         assert!(
             emit,
             "WaitingTakerBond must emit the order event so the orderbook keeps showing it"
@@ -2625,7 +2775,8 @@ mod tests {
         let mut order = make_pending_order();
         order.status = Status::WaitingMakerBond.to_string();
 
-        let (emit, _mapped) = create_status_tags(&order).expect("status tags");
+        let (emit, _mapped) =
+            create_status_tags(&order, OrderPublication::Transition).expect("status tags");
         assert!(
             !emit,
             "WaitingMakerBond must NOT emit an order event — the order is invisible until the bond locks"
@@ -2642,8 +2793,10 @@ mod tests {
         let mut wtb = make_pending_order();
         wtb.status = Status::WaitingTakerBond.to_string();
 
-        let (emit_p, status_p) = create_status_tags(&pending).expect("status tags pending");
-        let (emit_w, status_w) = create_status_tags(&wtb).expect("status tags wtb");
+        let (emit_p, status_p) = create_status_tags(&pending, OrderPublication::Transition)
+            .expect("status tags pending");
+        let (emit_w, status_w) =
+            create_status_tags(&wtb, OrderPublication::Transition).expect("status tags wtb");
 
         assert_eq!(emit_p, emit_w);
         assert_eq!(status_p, status_w);

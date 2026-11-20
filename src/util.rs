@@ -13,6 +13,7 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
 use crate::nip33::{
     create_platform_tag_values, new_order_event_with_created_at, new_rating_event, order_to_tags,
+    order_to_tags_for, OrderPublication,
 };
 use crate::Result;
 
@@ -999,6 +1000,27 @@ pub async fn republish_winning_state_after_cas_miss(
     my_keys: &Keys,
     order_id: Uuid,
 ) {
+    republish_winning_state_after_cas_miss_for(
+        pool,
+        my_keys,
+        order_id,
+        OrderPublication::Transition,
+    )
+    .await
+}
+
+/// Same as [`republish_winning_state_after_cas_miss`], for a caller whose
+/// stale revision was built for `publication`. A take that lost to another
+/// take passes [`OrderPublication::Take`]: when the winner left a sell order
+/// in `waiting-payment`, an ordinary transition publishes nothing and the
+/// loser's `in-progress` revision (its tags, its event id) would stay on
+/// relays (issue #1129).
+pub async fn republish_winning_state_after_cas_miss_for(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    order_id: Uuid,
+    publication: OrderPublication,
+) {
     let current = match Order::by_id(pool, order_id).await {
         Ok(Some(order)) => order,
         Ok(None) => return,
@@ -1014,11 +1036,14 @@ pub async fn republish_winning_state_after_cas_miss(
             // event id, so stamp the repair strictly after `now` to guarantee
             // it replaces the stale event on relays.
             let repair_created_at = repair_timestamp(Timestamp::now());
-            if let Err(e) = update_order_event_with_created_at(
+            if let Err(e) = update_order_event_stamped(
                 my_keys,
                 status,
                 &current,
-                Some(repair_created_at),
+                StampPolicy::Always {
+                    created_at: Some(repair_created_at),
+                },
+                publication,
             )
             .await
             {
@@ -1272,7 +1297,7 @@ pub(crate) fn monotonic_rating_event_timestamp(
 /// the wire converges — or until [`MAX_ORDERBOOK_REPUBLISH_ATTEMPTS`] is
 /// reached.
 ///
-/// Each entry carries `(generation, attempts)`:
+/// Each entry carries `(generation, attempts, publication)`:
 ///
 /// - the publication generation that recorded the failure (see
 ///   [`ORDERBOOK_REGISTRY`]). A successful send clears an entry only if
@@ -1285,10 +1310,29 @@ pub(crate) fn monotonic_rating_event_timestamp(
 ///   rate-limiting, refusing the kind) would put every touched order into a
 ///   permanent republish cycle: each retry stamps a fresh `created_at` that
 ///   the *healthy* relays dutifully replace, churning the public book while
-///   converging nothing — the retry cannot reach the relay that failed.
-static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<Uuid, (u64, u8)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+///   converging nothing — the retry cannot reach the relay that failed;
+/// - the [`OrderPublication`] the failed revision was built for. A take
+///   publishes a sell order in `waiting-payment` as `in-progress`, which an
+///   ordinary transition of the same row does not (issue #1129). The retry
+///   rebuilds the revision from the DB row, so without the intent a failed
+///   take would be retried as a transition that publishes nothing, and the
+///   relays would keep advertising the order as `pending`.
+static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<std::sync::Mutex<RepublishQueue>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// `order_id → (generation, attempts, publication)`; see
+/// [`PENDING_ORDERBOOK_REPUBLISH`].
+type RepublishQueue = HashMap<Uuid, (u64, u8, OrderPublication)>;
+
+/// The intent a queue entry keeps when two failures merge: a take is never
+/// downgraded, because the take is the revision that must reach the relays.
+fn merged_publication(kept: OrderPublication, new: OrderPublication) -> OrderPublication {
+    if kept == OrderPublication::Take || new == OrderPublication::Take {
+        OrderPublication::Take
+    } else {
+        OrderPublication::Transition
+    }
+}
 
 /// Failed publish attempts after which the reconciler gives up on an
 /// order and drops its queue entry. Bounds the churn of a persistent
@@ -1303,12 +1347,25 @@ pub(crate) const MAX_ORDERBOOK_REPUBLISH_ATTEMPTS: u8 = 5;
 /// attempt at `generation`. A newer failure already recorded for the
 /// order is never downgraded.
 pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) {
+    mark_orderbook_publish_failed_at_for(order_id, generation, OrderPublication::Transition);
+}
+
+/// [`mark_orderbook_publish_failed_at`] for a revision built for
+/// `publication`, so the reconciler retries it with the same intent.
+pub(crate) fn mark_orderbook_publish_failed_at_for(
+    order_id: Uuid,
+    generation: u64,
+    publication: OrderPublication,
+) {
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = queue.entry(order_id).or_insert((generation, 0));
+    let entry = queue
+        .entry(order_id)
+        .or_insert((generation, 0, publication));
     entry.0 = entry.0.max(generation);
     entry.1 = entry.1.saturating_add(1);
+    entry.2 = merged_publication(entry.2, publication);
 }
 
 /// Re-insert a drained entry without consuming an attempt, for reconciler
@@ -1316,13 +1373,21 @@ pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) 
 /// the order row could not be reloaded). Merges with any failure recorded
 /// concurrently: neither the generation nor the attempt count is ever
 /// downgraded.
-pub(crate) fn requeue_orderbook_publish_failure(order_id: Uuid, generation: u64, attempts: u8) {
+pub(crate) fn requeue_orderbook_publish_failure(
+    order_id: Uuid,
+    generation: u64,
+    attempts: u8,
+    publication: OrderPublication,
+) {
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = queue.entry(order_id).or_insert((generation, attempts));
+    let entry = queue
+        .entry(order_id)
+        .or_insert((generation, attempts, publication));
     entry.0 = entry.0.max(generation);
     entry.1 = entry.1.max(attempts);
+    entry.2 = merged_publication(entry.2, publication);
 }
 
 /// Queue `order_id` for republish stamped with a fresh generation, for
@@ -1349,7 +1414,7 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&(failed_at, _)) = queue.get(&order_id) {
+    if let Some(&(failed_at, _, _)) = queue.get(&order_id) {
         if failed_at <= generation {
             queue.remove(&order_id);
         }
@@ -1357,15 +1422,17 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
 }
 
 /// Take the current set of orders awaiting republish (with the generation
-/// that recorded each failure and the attempts consumed so far), leaving
-/// the queue empty. Failed retries re-queue themselves via
-/// `update_order_event`.
-pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64, u8)> {
+/// that recorded each failure, the attempts consumed so far and the
+/// publication intent to retry with), leaving the queue empty. Failed
+/// retries re-queue themselves via `update_order_event`.
+pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64, u8, OrderPublication)> {
     PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain()
-        .map(|(order_id, (generation, attempts))| (order_id, generation, attempts))
+        .map(|(order_id, (generation, attempts, publication))| {
+            (order_id, generation, attempts, publication)
+        })
         .collect()
 }
 
@@ -1401,7 +1468,17 @@ pub(crate) fn orderbook_publish_attempts(order_id: Uuid) -> Option<u8> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&order_id)
-        .map(|&(_, attempts)| attempts)
+        .map(|&(_, attempts, _)| attempts)
+}
+
+/// Test-only visibility into an entry's publication intent.
+#[cfg(test)]
+pub(crate) fn orderbook_publish_intent(order_id: Uuid) -> Option<OrderPublication> {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&order_id)
+        .map(|&(_, _, publication)| publication)
 }
 
 pub async fn update_order_event(
@@ -1421,9 +1498,37 @@ pub async fn update_order_event_with_created_at(
     order: &Order,
     created_at: Option<Timestamp>,
 ) -> Result<Order, MostroError> {
-    update_order_event_stamped(keys, status, order, StampPolicy::Always { created_at })
-        .await
-        .map(|order| order.expect("StampPolicy::Always always stamps"))
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::Always { created_at },
+        OrderPublication::Transition,
+    )
+    .await
+    .map(|order| order.expect("StampPolicy::Always always stamps"))
+}
+
+/// Same as [`update_order_event`], for a revision built for `publication`.
+/// A take passes [`OrderPublication::Take`] so the order goes out as
+/// `in-progress` even when the take leaves a sell order in `waiting-payment`
+/// (buyer invoice in the take message, or Cashu escrow), which an ordinary
+/// transition does not publish (issue #1129).
+pub async fn update_order_event_for(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    publication: OrderPublication,
+) -> Result<Order, MostroError> {
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::Always { created_at: None },
+        publication,
+    )
+    .await
+    .map(|order| order.expect("StampPolicy::Always always stamps"))
 }
 
 /// Same as [`update_order_event`], but publishes only when the order has
@@ -1437,8 +1542,16 @@ pub(crate) async fn update_order_event_if_quiescent(
     status: Status,
     order: &Order,
     quiet_secs: u64,
+    publication: OrderPublication,
 ) -> Result<Option<Order>, MostroError> {
-    update_order_event_stamped(keys, status, order, StampPolicy::IfQuiescent { quiet_secs }).await
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::IfQuiescent { quiet_secs },
+        publication,
+    )
+    .await
 }
 
 /// How [`update_order_event_stamped`] obtains its [`OrderbookStamp`].
@@ -1455,6 +1568,7 @@ async fn update_order_event_stamped(
     status: Status,
     order: &Order,
     policy: StampPolicy,
+    publication: OrderPublication,
 ) -> Result<Option<Order>, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
@@ -1465,7 +1579,12 @@ async fn update_order_event_stamped(
 
     // We transform the order fields to tags to use in the event
     let mostro_pubkey = keys.public_key().to_hex();
-    if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
+    if let Some(tags) = order_to_tags_for(
+        &order_updated,
+        reputation_data,
+        Some(&mostro_pubkey),
+        publication,
+    )? {
         // Every revision of an order's kind-38383 event is stamped through
         // the monotonic registry so two transitions in the same Unix second
         // (create + instant take, create + maker cancel, …) never tie on
@@ -1527,7 +1646,7 @@ async fn update_order_event_stamped(
                         status,
                         report.failed
                     );
-                    mark_orderbook_publish_failed_at(order_id, generation);
+                    mark_orderbook_publish_failed_at_for(order_id, generation, publication);
                 })
                 .await;
                 if let Err(e) = published {
@@ -1540,7 +1659,7 @@ async fn update_order_event_stamped(
                     order_updated.id,
                     status
                 );
-                mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                mark_orderbook_publish_failed_at_for(order.id, stamp.generation, publication);
             }
         }
     };
@@ -1666,6 +1785,15 @@ impl HoldInvoiceOrigin {
     fn allows_waiting_buyer_invoice(self) -> bool {
         matches!(self, Self::BuyerInvoice)
     }
+
+    /// The take publishes the order as `in-progress`; `add_invoice` follows a
+    /// `waiting-buyer-invoice` revision that already did.
+    fn publication(self) -> OrderPublication {
+        match self {
+            Self::Take => OrderPublication::Take,
+            Self::BuyerInvoice => OrderPublication::Transition,
+        }
+    }
 }
 
 pub async fn show_hold_invoice(
@@ -1719,9 +1847,14 @@ pub async fn show_hold_invoice(
     let pool = db::connect()
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let order_updated = update_order_event_for(
+        my_keys,
+        Status::WaitingPayment,
+        &order,
+        origin.publication(),
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     // Compare-and-swap the escrow storage: if the order left the pre-trade
     // window while the hold invoice was being created at LND (e.g. a maker
     // cancel committed), persisting this snapshot would resurrect the row
@@ -1742,7 +1875,8 @@ pub async fn show_hold_invoice(
                 order.id
             );
         }
-        republish_winning_state_after_cas_miss(&pool, my_keys, order.id).await;
+        republish_winning_state_after_cas_miss_for(&pool, my_keys, order.id, origin.publication())
+            .await;
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
@@ -1856,9 +1990,17 @@ pub async fn show_cashu_escrow_request(
     // at this point the row carries no `buyer_pubkey` for the lock handler to
     // validate against. Do not move either `enqueue_order_msg` above the
     // `update` without re-reading the row (or narrowing the write) first.
-    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    //
+    // This is the take, so it publishes `in-progress`: nothing after it on
+    // the Cashu path (`active`, `fiat-sent`) is published.
+    let order_updated = update_order_event_for(
+        my_keys,
+        Status::WaitingPayment,
+        &order,
+        OrderPublication::Take,
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     order_updated
         .update(pool)
         .await
@@ -2864,7 +3006,7 @@ mod tests {
 
         // A drained entry stays drained until the next failure.
         let drained = take_failed_orderbook_publishes();
-        assert!(drained.iter().any(|(id, _, _)| *id == order.id));
+        assert!(drained.iter().any(|(id, ..)| *id == order.id));
         assert!(!is_orderbook_publish_queued(order.id));
     }
 
@@ -2885,13 +3027,13 @@ mod tests {
         );
 
         // A requeue preserves the count and never downgrades it.
-        requeue_orderbook_publish_failure(order_id, 2, 1);
+        requeue_orderbook_publish_failure(order_id, 2, 1, OrderPublication::Transition);
         assert_eq!(
             orderbook_publish_attempts(order_id),
             Some(2),
             "a requeue must not downgrade the consumed attempts"
         );
-        requeue_orderbook_publish_failure(order_id, 2, 4);
+        requeue_orderbook_publish_failure(order_id, 2, 4, OrderPublication::Transition);
         assert_eq!(
             orderbook_publish_attempts(order_id),
             Some(4),
@@ -2908,6 +3050,32 @@ mod tests {
             "a new failure after a success starts a fresh attempt budget"
         );
         clear_orderbook_publish_failure_up_to(order_id, 3);
+    }
+
+    /// A failed take keeps its intent through every merge, so the reconciler
+    /// retries it as the take (issue #1129): a later ordinary failure or a
+    /// requeue never downgrades it, and an ordinary failure on its own stays
+    /// an ordinary transition.
+    #[tokio::test]
+    async fn republish_queue_never_downgrades_a_failed_take() {
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let take = Uuid::new_v4();
+        let transition = Uuid::new_v4();
+
+        mark_orderbook_publish_failed_at_for(take, 1, OrderPublication::Take);
+        mark_orderbook_publish_failed_at(take, 2);
+        requeue_orderbook_publish_failure(take, 2, 2, OrderPublication::Transition);
+        mark_orderbook_publish_failed_at(transition, 1);
+
+        assert_eq!(orderbook_publish_intent(take), Some(OrderPublication::Take));
+        assert_eq!(
+            orderbook_publish_intent(transition),
+            Some(OrderPublication::Transition)
+        );
+        let drained = take_failed_orderbook_publishes();
+        assert!(drained
+            .iter()
+            .any(|&(id, _, _, publication)| id == take && publication == OrderPublication::Take));
     }
 
     // ───────────────── take-window gate ─────────────────
@@ -4019,6 +4187,34 @@ mod tests {
         assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
     }
 
+    /// A Cashu take leaves a sell order in `WaitingPayment`, and nothing after
+    /// it (`active`, `fiat-sent`) is published, so the take itself must
+    /// publish the order as `in-progress`. Without that the order goes from
+    /// `pending` straight to `success` on the wire (issue #1129). A published
+    /// revision is the only way the persisted `event_id` changes.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_publishes_the_take_as_in_progress() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.event_id = "pending-revision".to_string();
+        let order = order.create(&pool).await.unwrap();
+
+        show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(11))
+            .await
+            .expect("escrow request must succeed offline");
+
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_ne!(
+            db.event_id, "pending-revision",
+            "the take must publish a new kind-38383 revision"
+        );
+    }
+
     /// Two concurrent takes on the same pending order: the second one holds a
     /// stale `Pending` copy, and without the status claim its full-row write
     /// would drag the order back and null the columns it does not carry. It
@@ -4291,6 +4487,23 @@ mod tests {
             .is_err());
     }
 
+    /// A sell order taken with the buyer's invoice in the take message goes
+    /// straight to `waiting-payment`; its take must publish `in-progress`
+    /// (issue #1129). `add_invoice` follows a `waiting-buyer-invoice`
+    /// revision that already published it, so it stays an ordinary
+    /// transition.
+    #[test]
+    fn only_the_take_publishes_the_hold_invoice_revision_as_the_take() {
+        assert_eq!(
+            HoldInvoiceOrigin::Take.publication(),
+            OrderPublication::Take
+        );
+        assert_eq!(
+            HoldInvoiceOrigin::BuyerInvoice.publication(),
+            OrderPublication::Transition
+        );
+    }
+
     /// Regression: `show_hold_invoice` used to hardcode
     /// `allow_waiting_buyer_invoice = true` for every caller, so a take that
     /// raced in behind an already-committed no-invoice take (row at
@@ -4346,6 +4559,48 @@ mod tests {
             after.buyer_pubkey,
             Some("aa".repeat(32)),
             "the first taker must survive"
+        );
+    }
+
+    /// A take that loses the pre-trade CAS has already published its own
+    /// `in-progress` revision (issue #1129). When the winning take left a
+    /// sell order in `waiting-payment`, the repair must republish the winner
+    /// as the take: an ordinary transition publishes nothing for that
+    /// status, which would leave the loser's tags and event id on relays.
+    #[tokio::test]
+    async fn cas_miss_repair_republishes_a_winning_sell_take_as_the_take() {
+        use mostro_core::db::Crud;
+
+        init_globals();
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let pool = migrated_pool().await;
+        let mut winner = base_order(OrderKind::Sell, Status::WaitingPayment);
+        winner.buyer_pubkey = Some("aa".repeat(32));
+        winner.seller_pubkey = Some("bb".repeat(32));
+        let winner = winner.create(&pool).await.unwrap();
+
+        // The test client has no relays, so the republish is queued for the
+        // reconciler with the intent it was built for.
+        republish_winning_state_after_cas_miss_for(
+            &pool,
+            &Keys::generate(),
+            winner.id,
+            OrderPublication::Take,
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while orderbook_publish_intent(winner.id).is_none()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let intent = orderbook_publish_intent(winner.id);
+        clear_orderbook_publish_failure_up_to(winner.id, u64::MAX);
+        assert_eq!(
+            intent,
+            Some(OrderPublication::Take),
+            "the winning sell take must be republished as in-progress"
         );
     }
 

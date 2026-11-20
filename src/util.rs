@@ -13,6 +13,7 @@ use crate::lightning::invoice::is_valid_invoice;
 use crate::messages;
 use crate::nip33::{
     create_platform_tag_values, new_order_event_with_created_at, new_rating_event, order_to_tags,
+    order_to_tags_for, OrderPublication,
 };
 use crate::Result;
 
@@ -1421,9 +1422,37 @@ pub async fn update_order_event_with_created_at(
     order: &Order,
     created_at: Option<Timestamp>,
 ) -> Result<Order, MostroError> {
-    update_order_event_stamped(keys, status, order, StampPolicy::Always { created_at })
-        .await
-        .map(|order| order.expect("StampPolicy::Always always stamps"))
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::Always { created_at },
+        OrderPublication::Transition,
+    )
+    .await
+    .map(|order| order.expect("StampPolicy::Always always stamps"))
+}
+
+/// Same as [`update_order_event`], for a revision built for `publication`.
+/// A take passes [`OrderPublication::Take`] so the order goes out as
+/// `in-progress` even when the take leaves a sell order in `waiting-payment`
+/// (buyer invoice in the take message, or Cashu escrow), which an ordinary
+/// transition does not publish (issue #1129).
+pub async fn update_order_event_for(
+    keys: &Keys,
+    status: Status,
+    order: &Order,
+    publication: OrderPublication,
+) -> Result<Order, MostroError> {
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::Always { created_at: None },
+        publication,
+    )
+    .await
+    .map(|order| order.expect("StampPolicy::Always always stamps"))
 }
 
 /// Same as [`update_order_event`], but publishes only when the order has
@@ -1438,7 +1467,14 @@ pub(crate) async fn update_order_event_if_quiescent(
     order: &Order,
     quiet_secs: u64,
 ) -> Result<Option<Order>, MostroError> {
-    update_order_event_stamped(keys, status, order, StampPolicy::IfQuiescent { quiet_secs }).await
+    update_order_event_stamped(
+        keys,
+        status,
+        order,
+        StampPolicy::IfQuiescent { quiet_secs },
+        OrderPublication::Transition,
+    )
+    .await
 }
 
 /// How [`update_order_event_stamped`] obtains its [`OrderbookStamp`].
@@ -1455,6 +1491,7 @@ async fn update_order_event_stamped(
     status: Status,
     order: &Order,
     policy: StampPolicy,
+    publication: OrderPublication,
 ) -> Result<Option<Order>, MostroError> {
     let mut order_updated = order.clone();
     // update order.status with new status
@@ -1465,7 +1502,12 @@ async fn update_order_event_stamped(
 
     // We transform the order fields to tags to use in the event
     let mostro_pubkey = keys.public_key().to_hex();
-    if let Some(tags) = order_to_tags(&order_updated, reputation_data, Some(&mostro_pubkey))? {
+    if let Some(tags) = order_to_tags_for(
+        &order_updated,
+        reputation_data,
+        Some(&mostro_pubkey),
+        publication,
+    )? {
         // Every revision of an order's kind-38383 event is stamped through
         // the monotonic registry so two transitions in the same Unix second
         // (create + instant take, create + maker cancel, …) never tie on
@@ -1666,6 +1708,15 @@ impl HoldInvoiceOrigin {
     fn allows_waiting_buyer_invoice(self) -> bool {
         matches!(self, Self::BuyerInvoice)
     }
+
+    /// The take publishes the order as `in-progress`; `add_invoice` follows a
+    /// `waiting-buyer-invoice` revision that already did.
+    fn publication(self) -> OrderPublication {
+        match self {
+            Self::Take => OrderPublication::Take,
+            Self::BuyerInvoice => OrderPublication::Transition,
+        }
+    }
 }
 
 pub async fn show_hold_invoice(
@@ -1719,9 +1770,14 @@ pub async fn show_hold_invoice(
     let pool = db::connect()
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    let order_updated = update_order_event_for(
+        my_keys,
+        Status::WaitingPayment,
+        &order,
+        origin.publication(),
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     // Compare-and-swap the escrow storage: if the order left the pre-trade
     // window while the hold invoice was being created at LND (e.g. a maker
     // cancel committed), persisting this snapshot would resurrect the row
@@ -1856,9 +1912,17 @@ pub async fn show_cashu_escrow_request(
     // at this point the row carries no `buyer_pubkey` for the lock handler to
     // validate against. Do not move either `enqueue_order_msg` above the
     // `update` without re-reading the row (or narrowing the write) first.
-    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    //
+    // This is the take, so it publishes `in-progress`: nothing after it on
+    // the Cashu path (`active`, `fiat-sent`) is published.
+    let order_updated = update_order_event_for(
+        my_keys,
+        Status::WaitingPayment,
+        &order,
+        OrderPublication::Take,
+    )
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     order_updated
         .update(pool)
         .await
@@ -4317,6 +4381,23 @@ mod tests {
         assert!(publish_dev_fee_audit_event(&order, "deadbeef")
             .await
             .is_err());
+    }
+
+    /// A sell order taken with the buyer's invoice in the take message goes
+    /// straight to `waiting-payment`; its take must publish `in-progress`
+    /// (issue #1129). `add_invoice` follows a `waiting-buyer-invoice`
+    /// revision that already published it, so it stays an ordinary
+    /// transition.
+    #[test]
+    fn only_the_take_publishes_the_hold_invoice_revision_as_the_take() {
+        assert_eq!(
+            HoldInvoiceOrigin::Take.publication(),
+            OrderPublication::Take
+        );
+        assert_eq!(
+            HoldInvoiceOrigin::BuyerInvoice.publication(),
+            OrderPublication::Transition
+        );
     }
 
     /// Regression: `show_hold_invoice` used to hardcode

@@ -833,4 +833,49 @@ mod tests {
             "a locked order past Active must be rejected, not re-notified"
         );
     }
+
+    /// A mint that accepts the connection and never answers.
+    async fn silent_mint() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        (url, held)
+    }
+
+    /// The Cashu event loop handles one message at a time, so a lock that
+    /// waits on a mint holds up every other message. Dispatching an
+    /// `AddCashuEscrow` for an order on a silent mint must hand control back
+    /// at once instead of waiting out the mint's timeout.
+    #[tokio::test]
+    async fn a_silent_mint_does_not_hold_up_the_message_loop() {
+        let (mint, held) = silent_mint().await;
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(&mint)).await;
+        let proof = proof_on_mint(&mint, buyer, seller, my_keys.public_key());
+        let msg = lock_message(order.id, Some(proof));
+
+        let dispatched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::app::dispatch_cashu(
+                &Action::AddCashuEscrow,
+                msg,
+                &unwrapped_from(seller),
+                &my_keys,
+                &ctx,
+            ),
+        )
+        .await;
+        held.abort();
+        assert!(
+            dispatched.is_ok(),
+            "dispatching a lock must not wait for the mint to answer"
+        );
+    }
 }

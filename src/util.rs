@@ -1000,6 +1000,27 @@ pub async fn republish_winning_state_after_cas_miss(
     my_keys: &Keys,
     order_id: Uuid,
 ) {
+    republish_winning_state_after_cas_miss_for(
+        pool,
+        my_keys,
+        order_id,
+        OrderPublication::Transition,
+    )
+    .await
+}
+
+/// Same as [`republish_winning_state_after_cas_miss`], for a caller whose
+/// stale revision was built for `publication`. A take that lost to another
+/// take passes [`OrderPublication::Take`]: when the winner left a sell order
+/// in `waiting-payment`, an ordinary transition publishes nothing and the
+/// loser's `in-progress` revision (its tags, its event id) would stay on
+/// relays (issue #1129).
+pub async fn republish_winning_state_after_cas_miss_for(
+    pool: &Pool<Sqlite>,
+    my_keys: &Keys,
+    order_id: Uuid,
+    publication: OrderPublication,
+) {
     let current = match Order::by_id(pool, order_id).await {
         Ok(Some(order)) => order,
         Ok(None) => return,
@@ -1015,11 +1036,14 @@ pub async fn republish_winning_state_after_cas_miss(
             // event id, so stamp the repair strictly after `now` to guarantee
             // it replaces the stale event on relays.
             let repair_created_at = repair_timestamp(Timestamp::now());
-            if let Err(e) = update_order_event_with_created_at(
+            if let Err(e) = update_order_event_stamped(
                 my_keys,
                 status,
                 &current,
-                Some(repair_created_at),
+                StampPolicy::Always {
+                    created_at: Some(repair_created_at),
+                },
+                publication,
             )
             .await
             {
@@ -1851,7 +1875,8 @@ pub async fn show_hold_invoice(
                 order.id
             );
         }
-        republish_winning_state_after_cas_miss(&pool, my_keys, order.id).await;
+        republish_winning_state_after_cas_miss_for(&pool, my_keys, order.id, origin.publication())
+            .await;
         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
@@ -4534,6 +4559,48 @@ mod tests {
             after.buyer_pubkey,
             Some("aa".repeat(32)),
             "the first taker must survive"
+        );
+    }
+
+    /// A take that loses the pre-trade CAS has already published its own
+    /// `in-progress` revision (issue #1129). When the winning take left a
+    /// sell order in `waiting-payment`, the repair must republish the winner
+    /// as the take: an ordinary transition publishes nothing for that
+    /// status, which would leave the loser's tags and event id on relays.
+    #[tokio::test]
+    async fn cas_miss_repair_republishes_a_winning_sell_take_as_the_take() {
+        use mostro_core::db::Crud;
+
+        init_globals();
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let pool = migrated_pool().await;
+        let mut winner = base_order(OrderKind::Sell, Status::WaitingPayment);
+        winner.buyer_pubkey = Some("aa".repeat(32));
+        winner.seller_pubkey = Some("bb".repeat(32));
+        let winner = winner.create(&pool).await.unwrap();
+
+        // The test client has no relays, so the republish is queued for the
+        // reconciler with the intent it was built for.
+        republish_winning_state_after_cas_miss_for(
+            &pool,
+            &Keys::generate(),
+            winner.id,
+            OrderPublication::Take,
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while orderbook_publish_intent(winner.id).is_none()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let intent = orderbook_publish_intent(winner.id);
+        clear_orderbook_publish_failure_up_to(winner.id, u64::MAX);
+        assert_eq!(
+            intent,
+            Some(OrderPublication::Take),
+            "the winning sell take must be republished as in-progress"
         );
     }
 

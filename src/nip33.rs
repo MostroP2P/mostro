@@ -358,7 +358,10 @@ pub enum OrderPublication {
     /// Any status change other than a take.
     Transition,
     /// The order is being taken: a waiting status publishes as
-    /// `in-progress` whatever the order kind.
+    /// `in-progress` whatever the order kind. A take retried by the
+    /// orderbook reconciler is rebuilt from the current row, so `active`,
+    /// `fiat-sent`, `settled-hold-invoice`, `dispute` and `in-progress`
+    /// also publish as `in-progress`; terminal statuses keep their mapping.
     Take,
 }
 

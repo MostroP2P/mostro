@@ -275,10 +275,19 @@ pub async fn add_cashu_escrow_action(
         .map(|c| c.escrow_locktime_days)
         .unwrap_or(15) as u64;
     let min_locktime = (now as u64).saturating_add(locktime_days.saturating_mul(SECONDS_PER_DAY));
-    cashu_client
+    if let Err(e) = cashu_client
         .verify_escrow_token(&proof.token, p_b, p_s, p_m, expected_amount, min_locktime)
         .await
-        .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+    {
+        // A mint that connected and then went quiet mid-lock costs the next
+        // lock the same wait: leave it alone for a while.
+        if matches!(e, CashuError::MintConnection(_)) {
+            if let Some(mints) = ctx.cashu_mints() {
+                mints.mark_unreachable(&order_mint).await;
+            }
+        }
+        return Err(MostroCantDo(cashu_reason(&e)));
+    }
 
     // 8. Atomically persist the escrow and advance the status in one write. A
     //    `false` return is classified by `classify_zero_row_cas`: a benign
@@ -909,10 +918,7 @@ mod tests {
         };
 
         // Every slot busy: the dispatch still returns, and nothing is sent yet.
-        let busy = crate::app::ESCROW_LOCK_SLOTS
-            .acquire_many(crate::app::MAX_CONCURRENT_ESCROW_LOCKS as u32)
-            .await
-            .unwrap();
+        let busy = crate::app::ESCROW_LOCKS.acquire_all_slots_for_test().await;
         crate::app::dispatch_cashu(
             &Action::AddCashuEscrow,
             msg,
@@ -939,5 +945,35 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(heard, vec![CantDoReason::CashuMintUnavailable]);
+    }
+
+    /// The line of locks has a size: past `max_pending` running or waiting
+    /// locks a new one is refused at once with `TooManyRequests`, and a place
+    /// frees up when a lock ends.
+    #[tokio::test]
+    async fn locks_past_the_pending_limit_are_refused_at_once() {
+        let gate: &'static crate::app::EscrowLockGate =
+            Box::leak(Box::new(crate::app::EscrowLockGate::new(1, 2)));
+        let (mint, held) = silent_mint().await;
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(&mint)).await;
+        let send = || {
+            let msg = lock_message(
+                order.id,
+                Some(proof_on_mint(&mint, buyer, seller, my_keys.public_key())),
+            );
+            crate::app::spawn_escrow_lock(gate, &ctx, msg, &unwrapped_from(seller), &my_keys)
+        };
+
+        send().expect("first lock takes a place");
+        send().expect("second lock takes the last place");
+        let refused = send().expect_err("a third lock has no place");
+        assert!(matches!(
+            refused.downcast_ref::<MostroError>(),
+            Some(MostroCantDo(CantDoReason::TooManyRequests))
+        ));
+        held.abort();
     }
 }

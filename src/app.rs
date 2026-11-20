@@ -720,12 +720,92 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     }
 }
 
-/// How many `AddCashuEscrow` locks may wait on mints at the same time. A lock
-/// that waits on a silent mint holds its slot until the mint's timeout, so the
-/// cap keeps a flood of them from piling up work; the rest queue for a slot.
+/// How many `AddCashuEscrow` locks may talk to mints at the same time, and how
+/// many more may wait for a turn. Both numbers were chosen by eye, not
+/// measured: a lock that waits on a silent mint holds its slot for the mint's
+/// timeout, so the first cap keeps a flood from piling up work, and the second
+/// refuses the excess at once so the queue cannot grow without bound either.
 const MAX_CONCURRENT_ESCROW_LOCKS: usize = 16;
-static ESCROW_LOCK_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ESCROW_LOCKS);
+const MAX_PENDING_ESCROW_LOCKS: usize = 64;
+static ESCROW_LOCKS: EscrowLockGate =
+    EscrowLockGate::new(MAX_CONCURRENT_ESCROW_LOCKS, MAX_PENDING_ESCROW_LOCKS);
+
+/// Limits for `AddCashuEscrow` locks: `slots` bound the locks running at once,
+/// `max_pending` bounds the running plus the waiting ones.
+struct EscrowLockGate {
+    slots: tokio::sync::Semaphore,
+    #[cfg(test)]
+    slot_count: usize,
+    pending: std::sync::atomic::AtomicUsize,
+    max_pending: usize,
+}
+
+/// One lock that is running or waiting; frees its place when dropped.
+struct PendingLock(&'static EscrowLockGate);
+
+impl Drop for PendingLock {
+    fn drop(&mut self) {
+        self.0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl EscrowLockGate {
+    const fn new(slots: usize, max_pending: usize) -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::const_new(slots),
+            #[cfg(test)]
+            slot_count: slots,
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            max_pending,
+        }
+    }
+
+    /// A place in the line, or `None` when it is full.
+    fn enter(&'static self) -> Option<PendingLock> {
+        use std::sync::atomic::Ordering::AcqRel;
+        if self.pending.fetch_add(1, AcqRel) >= self.max_pending {
+            self.pending.fetch_sub(1, AcqRel);
+            return None;
+        }
+        Some(PendingLock(self))
+    }
+
+    #[cfg(test)]
+    async fn acquire_all_slots_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.slots
+            .acquire_many(self.slot_count as u32)
+            .await
+            .unwrap()
+    }
+}
+
+/// Run an `AddCashuEscrow` lock in its own task (see `dispatch_cashu`), or
+/// refuse it with `TooManyRequests` when `gate` already holds as many as it
+/// allows.
+fn spawn_escrow_lock(
+    gate: &'static EscrowLockGate,
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+) -> Result<()> {
+    let Some(place) = gate.enter() else {
+        return Err(MostroError::MostroCantDo(CantDoReason::TooManyRequests).into());
+    };
+    let (ctx, event, my_keys) = (ctx.clone(), event.clone(), my_keys.clone());
+    tokio::spawn(async move {
+        let _place = place;
+        let Ok(_slot) = gate.slots.acquire().await else {
+            return;
+        };
+        if let Err(err) = add_cashu_escrow_action(&ctx, msg.clone(), &event, &my_keys).await {
+            manage_errors(err, msg, event, &Action::AddCashuEscrow).await;
+        }
+    });
+    Ok(())
+}
 
 /// Route a validated action in Cashu mode (CF-5).
 ///
@@ -788,19 +868,7 @@ async fn dispatch_cashu(
         // loop moves on. The task reports a failure to the seller itself, as
         // the loop does for every other action, and `ESCROW_LOCK_SLOTS` caps
         // how many locks wait on mints at once.
-        Action::AddCashuEscrow => {
-            let (ctx, msg, event, my_keys) = (ctx.clone(), msg, event.clone(), my_keys.clone());
-            tokio::spawn(async move {
-                let Ok(_slot) = ESCROW_LOCK_SLOTS.acquire().await else {
-                    return;
-                };
-                if let Err(err) = add_cashu_escrow_action(&ctx, msg.clone(), &event, &my_keys).await
-                {
-                    manage_errors(err, msg, event, &Action::AddCashuEscrow).await;
-                }
-            });
-            Ok(())
-        }
+        Action::AddCashuEscrow => spawn_escrow_lock(&ESCROW_LOCKS, ctx, msg, event, my_keys),
         // Everything that advances or settles an order past the lock has no
         // handler yet during Track A — reject it cleanly. Later tracks
         // (release/cancel/dispute) replace these arms one at a time.

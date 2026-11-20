@@ -401,6 +401,30 @@ async fn escrow_lock_end_to_end_against_a_live_mint() {
     assert!(untouched.cashu_escrow_token.is_none());
     println!("  ✓ the same token cannot escrow a second order");
 
+    // --- Same proofs, another string --------------------------
+    // A memo changes the token string and nothing about the money behind it.
+    let rewritten = match Token::from_str(&token).expect("the minted token parses") {
+        Token::TokenV4(mut t) => {
+            t.memo = Some("same proofs, another string".to_string());
+            Token::TokenV4(t).to_string()
+        }
+        other => other.to_string(),
+    };
+    assert_ne!(rewritten, token, "the rewrite must change the string");
+    let third = seed_waiting_payment_order(&pool, &keys, amount, &mint_url).await;
+    let msg = lock_message(third.id, &rewritten, &mint_url, &keys);
+    let rewrapped = add_cashu_escrow_action(&ctx, msg, &seller_event(&keys), &keys.mostro).await;
+    assert!(
+        matches!(
+            rewrapped,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ),
+        "the same proofs must not escrow a third order, got {rewrapped:?}"
+    );
+    let untouched = Order::by_id(&pool, third.id).await.unwrap().unwrap();
+    assert_eq!(untouched.status, Status::WaitingPayment.to_string());
+    println!("  ✓ the same proofs in another string cannot escrow a third order");
+
     println!("\n  All checks passed. The escrow token is live at the mint:");
     println!("  {token}\n");
     println!("  Sweep it with the keys in {keys_path} (any 2 of the 3 sign),");

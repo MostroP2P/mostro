@@ -35,10 +35,11 @@ async fn update_order_status(
                     let won =
                         crate::db::cas_complete_pretrade_take(pool, &order_updated, false).await?;
                     if !won {
-                        crate::util::republish_winning_state_after_cas_miss(
+                        crate::util::republish_winning_state_after_cas_miss_for(
                             pool,
                             my_keys,
                             order_updated.id,
+                            crate::nip33::OrderPublication::Take,
                         )
                         .await;
                         return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));

@@ -2138,10 +2138,11 @@ async fn resume_take_after_bond(
                 )
                 .await?;
                 if !won {
-                    crate::util::republish_winning_state_after_cas_miss(
+                    crate::util::republish_winning_state_after_cas_miss_for(
                         pool,
                         my_keys,
                         order_updated.id,
+                        crate::nip33::OrderPublication::Take,
                     )
                     .await;
                     return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));

@@ -4019,6 +4019,34 @@ mod tests {
         assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
     }
 
+    /// A Cashu take leaves a sell order in `WaitingPayment`, and nothing after
+    /// it (`active`, `fiat-sent`) is published, so the take itself must
+    /// publish the order as `in-progress`. Without that the order goes from
+    /// `pending` straight to `success` on the wire (issue #1129). A published
+    /// revision is the only way the persisted `event_id` changes.
+    #[tokio::test]
+    async fn show_cashu_escrow_request_publishes_the_take_as_in_progress() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.event_id = "pending-revision".to_string();
+        let order = order.create(&pool).await.unwrap();
+
+        show_cashu_escrow_request(&pool, &keys, &buyer, &seller, order.clone(), Some(11))
+            .await
+            .expect("escrow request must succeed offline");
+
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_ne!(
+            db.event_id, "pending-revision",
+            "the take must publish a new kind-38383 revision"
+        );
+    }
+
     /// Two concurrent takes on the same pending order: the second one holds a
     /// stale `Pending` copy, and without the status claim its full-row write
     /// would drag the order back and null the columns it does not carry. It

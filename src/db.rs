@@ -6202,6 +6202,105 @@ mod tests {
         );
     }
 
+    /// The same two proofs written as two different token strings: a memo
+    /// changes the string, and the order of the proofs changes it again, but
+    /// the money behind them is the same.
+    fn one_proof_set_as_three_tokens() -> (String, String, String) {
+        use cdk::mint_url::MintUrl;
+        use cdk::nuts::nut00::Proof;
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::{CurrencyUnit, PublicKey, Token};
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use std::str::FromStr;
+
+        let proof = |secret: &str| Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::from(50u64),
+            secret: Secret::new(secret.to_string()),
+            c: PublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let mint = || MintUrl::from_str("https://mint.example.com").unwrap();
+        let (a, b) = (proof("secret-a"), proof("secret-b"));
+        let plain = Token::new(
+            mint(),
+            vec![a.clone(), b.clone()],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string();
+        let with_memo = Token::new(
+            mint(),
+            vec![a.clone(), b.clone()],
+            Some("again".to_string()),
+            CurrencyUnit::Sat,
+        )
+        .to_string();
+        let reordered = Token::new(mint(), vec![b, a], None, CurrencyUnit::Sat).to_string();
+        (plain, with_memo, reordered)
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_refuses_the_same_proofs_written_as_another_token() {
+        // uniqueness was decided on the token STRING, so a seller
+        // could re-serialize one proof set and back a second order with money
+        // that only pays out once.
+        let (plain, with_memo, reordered) = one_proof_set_as_three_tokens();
+        assert_ne!(plain, with_memo);
+        assert_ne!(plain, reordered);
+
+        let pool = setup_orders_db().await.unwrap();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let third = uuid::Uuid::new_v4();
+        for id in [first, second, third] {
+            insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
+        }
+        assert!(super::update_order_cashu_escrow(
+            &pool,
+            first,
+            "https://mint.example.com",
+            &plain,
+            1700000100,
+            Status::WaitingPayment,
+            Status::Active,
+        )
+        .await
+        .unwrap());
+
+        // The handler's early check sees the money is taken...
+        assert!(super::cashu_escrow_token_in_use(&pool, &with_memo, second)
+            .await
+            .unwrap());
+        assert!(super::cashu_escrow_token_in_use(&pool, &reordered, third)
+            .await
+            .unwrap());
+        // ...and so does the atomic write, for both rewrites.
+        for (id, token) in [(second, &with_memo), (third, &reordered)] {
+            let locked = super::update_order_cashu_escrow(
+                &pool,
+                id,
+                "https://mint.example.com",
+                token,
+                1700000200,
+                Status::WaitingPayment,
+                Status::Active,
+            )
+            .await
+            .unwrap();
+            assert!(!locked, "the same proofs must not back a second escrow");
+            let (_, stored, locked_at, status) = cashu_columns(&pool, id).await;
+            assert!(stored.is_none() && locked_at.is_none());
+            assert_eq!(status, Status::WaitingPayment.to_string());
+        }
+    }
+
     #[tokio::test]
     async fn cashu_escrow_token_in_use_ignores_the_order_being_locked() {
         // The reuse lookup answers "does SOME OTHER order hold this token?".

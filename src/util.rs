@@ -1273,7 +1273,7 @@ pub(crate) fn monotonic_rating_event_timestamp(
 /// the wire converges — or until [`MAX_ORDERBOOK_REPUBLISH_ATTEMPTS`] is
 /// reached.
 ///
-/// Each entry carries `(generation, attempts)`:
+/// Each entry carries `(generation, attempts, publication)`:
 ///
 /// - the publication generation that recorded the failure (see
 ///   [`ORDERBOOK_REGISTRY`]). A successful send clears an entry only if
@@ -1286,10 +1286,26 @@ pub(crate) fn monotonic_rating_event_timestamp(
 ///   rate-limiting, refusing the kind) would put every touched order into a
 ///   permanent republish cycle: each retry stamps a fresh `created_at` that
 ///   the *healthy* relays dutifully replace, churning the public book while
-///   converging nothing — the retry cannot reach the relay that failed.
+///   converging nothing — the retry cannot reach the relay that failed;
+/// - the [`OrderPublication`] the failed revision was built for. A take
+///   publishes a sell order in `waiting-payment` as `in-progress`, which an
+///   ordinary transition of the same row does not (issue #1129). The retry
+///   rebuilds the revision from the DB row, so without the intent a failed
+///   take would be retried as a transition that publishes nothing, and the
+///   relays would keep advertising the order as `pending`.
 static PENDING_ORDERBOOK_REPUBLISH: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<Uuid, (u64, u8)>>,
+    std::sync::Mutex<HashMap<Uuid, (u64, u8, OrderPublication)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The intent a queue entry keeps when two failures merge: a take is never
+/// downgraded, because the take is the revision that must reach the relays.
+fn merged_publication(kept: OrderPublication, new: OrderPublication) -> OrderPublication {
+    if kept == OrderPublication::Take || new == OrderPublication::Take {
+        OrderPublication::Take
+    } else {
+        OrderPublication::Transition
+    }
+}
 
 /// Failed publish attempts after which the reconciler gives up on an
 /// order and drops its queue entry. Bounds the churn of a persistent
@@ -1304,12 +1320,25 @@ pub(crate) const MAX_ORDERBOOK_REPUBLISH_ATTEMPTS: u8 = 5;
 /// attempt at `generation`. A newer failure already recorded for the
 /// order is never downgraded.
 pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) {
+    mark_orderbook_publish_failed_at_for(order_id, generation, OrderPublication::Transition);
+}
+
+/// [`mark_orderbook_publish_failed_at`] for a revision built for
+/// `publication`, so the reconciler retries it with the same intent.
+pub(crate) fn mark_orderbook_publish_failed_at_for(
+    order_id: Uuid,
+    generation: u64,
+    publication: OrderPublication,
+) {
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = queue.entry(order_id).or_insert((generation, 0));
+    let entry = queue
+        .entry(order_id)
+        .or_insert((generation, 0, publication));
     entry.0 = entry.0.max(generation);
     entry.1 = entry.1.saturating_add(1);
+    entry.2 = merged_publication(entry.2, publication);
 }
 
 /// Re-insert a drained entry without consuming an attempt, for reconciler
@@ -1317,13 +1346,21 @@ pub(crate) fn mark_orderbook_publish_failed_at(order_id: Uuid, generation: u64) 
 /// the order row could not be reloaded). Merges with any failure recorded
 /// concurrently: neither the generation nor the attempt count is ever
 /// downgraded.
-pub(crate) fn requeue_orderbook_publish_failure(order_id: Uuid, generation: u64, attempts: u8) {
+pub(crate) fn requeue_orderbook_publish_failure(
+    order_id: Uuid,
+    generation: u64,
+    attempts: u8,
+    publication: OrderPublication,
+) {
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = queue.entry(order_id).or_insert((generation, attempts));
+    let entry = queue
+        .entry(order_id)
+        .or_insert((generation, attempts, publication));
     entry.0 = entry.0.max(generation);
     entry.1 = entry.1.max(attempts);
+    entry.2 = merged_publication(entry.2, publication);
 }
 
 /// Queue `order_id` for republish stamped with a fresh generation, for
@@ -1350,7 +1387,7 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
     let mut queue = PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&(failed_at, _)) = queue.get(&order_id) {
+    if let Some(&(failed_at, _, _)) = queue.get(&order_id) {
         if failed_at <= generation {
             queue.remove(&order_id);
         }
@@ -1358,15 +1395,17 @@ pub(crate) fn clear_orderbook_publish_failure_up_to(order_id: Uuid, generation: 
 }
 
 /// Take the current set of orders awaiting republish (with the generation
-/// that recorded each failure and the attempts consumed so far), leaving
-/// the queue empty. Failed retries re-queue themselves via
-/// `update_order_event`.
-pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64, u8)> {
+/// that recorded each failure, the attempts consumed so far and the
+/// publication intent to retry with), leaving the queue empty. Failed
+/// retries re-queue themselves via `update_order_event`.
+pub(crate) fn take_failed_orderbook_publishes() -> Vec<(Uuid, u64, u8, OrderPublication)> {
     PENDING_ORDERBOOK_REPUBLISH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain()
-        .map(|(order_id, (generation, attempts))| (order_id, generation, attempts))
+        .map(|(order_id, (generation, attempts, publication))| {
+            (order_id, generation, attempts, publication)
+        })
         .collect()
 }
 
@@ -1402,7 +1441,17 @@ pub(crate) fn orderbook_publish_attempts(order_id: Uuid) -> Option<u8> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&order_id)
-        .map(|&(_, attempts)| attempts)
+        .map(|&(_, attempts, _)| attempts)
+}
+
+/// Test-only visibility into an entry's publication intent.
+#[cfg(test)]
+pub(crate) fn orderbook_publish_intent(order_id: Uuid) -> Option<OrderPublication> {
+    PENDING_ORDERBOOK_REPUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&order_id)
+        .map(|&(_, _, publication)| publication)
 }
 
 pub async fn update_order_event(
@@ -1466,13 +1515,14 @@ pub(crate) async fn update_order_event_if_quiescent(
     status: Status,
     order: &Order,
     quiet_secs: u64,
+    publication: OrderPublication,
 ) -> Result<Option<Order>, MostroError> {
     update_order_event_stamped(
         keys,
         status,
         order,
         StampPolicy::IfQuiescent { quiet_secs },
-        OrderPublication::Transition,
+        publication,
     )
     .await
 }
@@ -1569,7 +1619,7 @@ async fn update_order_event_stamped(
                         status,
                         report.failed
                     );
-                    mark_orderbook_publish_failed_at(order_id, generation);
+                    mark_orderbook_publish_failed_at_for(order_id, generation, publication);
                 })
                 .await;
                 if let Err(e) = published {
@@ -1582,7 +1632,7 @@ async fn update_order_event_stamped(
                     order_updated.id,
                     status
                 );
-                mark_orderbook_publish_failed_at(order.id, stamp.generation);
+                mark_orderbook_publish_failed_at_for(order.id, stamp.generation, publication);
             }
         }
     };
@@ -2928,7 +2978,7 @@ mod tests {
 
         // A drained entry stays drained until the next failure.
         let drained = take_failed_orderbook_publishes();
-        assert!(drained.iter().any(|(id, _, _)| *id == order.id));
+        assert!(drained.iter().any(|(id, ..)| *id == order.id));
         assert!(!is_orderbook_publish_queued(order.id));
     }
 
@@ -2949,13 +2999,13 @@ mod tests {
         );
 
         // A requeue preserves the count and never downgrades it.
-        requeue_orderbook_publish_failure(order_id, 2, 1);
+        requeue_orderbook_publish_failure(order_id, 2, 1, OrderPublication::Transition);
         assert_eq!(
             orderbook_publish_attempts(order_id),
             Some(2),
             "a requeue must not downgrade the consumed attempts"
         );
-        requeue_orderbook_publish_failure(order_id, 2, 4);
+        requeue_orderbook_publish_failure(order_id, 2, 4, OrderPublication::Transition);
         assert_eq!(
             orderbook_publish_attempts(order_id),
             Some(4),
@@ -2972,6 +3022,32 @@ mod tests {
             "a new failure after a success starts a fresh attempt budget"
         );
         clear_orderbook_publish_failure_up_to(order_id, 3);
+    }
+
+    /// A failed take keeps its intent through every merge, so the reconciler
+    /// retries it as the take (issue #1129): a later ordinary failure or a
+    /// requeue never downgrades it, and an ordinary failure on its own stays
+    /// an ordinary transition.
+    #[tokio::test]
+    async fn republish_queue_never_downgrades_a_failed_take() {
+        let _guard = ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+        let take = Uuid::new_v4();
+        let transition = Uuid::new_v4();
+
+        mark_orderbook_publish_failed_at_for(take, 1, OrderPublication::Take);
+        mark_orderbook_publish_failed_at(take, 2);
+        requeue_orderbook_publish_failure(take, 2, 2, OrderPublication::Transition);
+        mark_orderbook_publish_failed_at(transition, 1);
+
+        assert_eq!(orderbook_publish_intent(take), Some(OrderPublication::Take));
+        assert_eq!(
+            orderbook_publish_intent(transition),
+            Some(OrderPublication::Transition)
+        );
+        let drained = take_failed_orderbook_publishes();
+        assert!(drained
+            .iter()
+            .any(|&(id, _, _, publication)| id == take && publication == OrderPublication::Take));
     }
 
     // ───────────────── take-window gate ─────────────────

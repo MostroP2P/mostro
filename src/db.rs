@@ -1173,6 +1173,9 @@ pub async fn claim_order_status(
 /// recorded in `cashu_escrow_proofs` when an escrow locks, so a token
 /// re-serialised around the same proofs is reused too. A token
 /// that is split or merged into different proofs is a different escrow.
+/// A proof stays registered to its order after the order ends: the 2-of-3
+/// condition names that order's trade keys, so the token has no other use,
+/// and releasing rows would need a hook in every terminal path (tracks B–D).
 pub async fn cashu_escrow_token_in_use(
     pool: &SqlitePool,
     token: &str,
@@ -6263,10 +6266,10 @@ mod tests {
         );
     }
 
-    /// The same two proofs written as two different token strings: a memo
-    /// changes the string, and the order of the proofs changes it again, but
-    /// the money behind them is the same.
-    fn one_proof_set_as_three_tokens() -> (String, String, String) {
+    /// The same two proofs written as four different token strings: a memo,
+    /// another proof order and the V3 encoding each change the string, but the
+    /// money behind them is the same.
+    fn one_proof_set_as_four_tokens() -> (String, String, String, String) {
         use cdk::mint_url::MintUrl;
         use cdk::nuts::nut00::Proof;
         use cdk::nuts::nut02::Id;
@@ -6299,7 +6302,12 @@ mod tests {
         )
         .to_string();
         let reordered = Token::new(mint(), vec![b, a], None, CurrencyUnit::Sat).to_string();
-        (plain, with_memo, reordered)
+        // The legacy V3 encoding (`cashuA…`) of the very same proofs.
+        let v3 = match Token::from_str(&plain).unwrap() {
+            Token::TokenV4(t) => cdk::nuts::nut00::TokenV3::from(t).to_string(),
+            other => other.to_string(),
+        };
+        (plain, with_memo, reordered, v3)
     }
 
     #[tokio::test]
@@ -6307,15 +6315,17 @@ mod tests {
         // uniqueness was decided on the token STRING, so a seller
         // could re-serialize one proof set and back a second order with money
         // that only pays out once.
-        let (plain, with_memo, reordered) = one_proof_set_as_three_tokens();
+        let (plain, with_memo, reordered, v3) = one_proof_set_as_four_tokens();
         assert_ne!(plain, with_memo);
         assert_ne!(plain, reordered);
+        assert!(v3.starts_with("cashuA") && plain.starts_with("cashuB"));
 
         let pool = setup_orders_db().await.unwrap();
         let first = uuid::Uuid::new_v4();
         let second = uuid::Uuid::new_v4();
         let third = uuid::Uuid::new_v4();
-        for id in [first, second, third] {
+        let fourth = uuid::Uuid::new_v4();
+        for id in [first, second, third, fourth] {
             insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
         }
         assert!(super::update_order_cashu_escrow(
@@ -6337,8 +6347,11 @@ mod tests {
         assert!(super::cashu_escrow_token_in_use(&pool, &reordered, third)
             .await
             .unwrap());
-        // ...and so does the atomic write, for both rewrites.
-        for (id, token) in [(second, &with_memo), (third, &reordered)] {
+        assert!(super::cashu_escrow_token_in_use(&pool, &v3, fourth)
+            .await
+            .unwrap());
+        // ...and so does the atomic write, for every rewrite.
+        for (id, token) in [(second, &with_memo), (third, &reordered), (fourth, &v3)] {
             let locked = super::update_order_cashu_escrow(
                 &pool,
                 id,
@@ -6432,6 +6445,87 @@ mod tests {
             !lock(first, held).await,
             "already locked: a replay is a no-op"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cashu_escrow_two_concurrent_submissions_of_the_same_proofs_lock_one_order() {
+        use cdk::mint_url::MintUrl;
+        use cdk::nuts::nut00::Proof;
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::{CurrencyUnit, PublicKey, Token};
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
+        // A file database with several connections, so the two submissions
+        // really race (an in-memory pool serialises them on one connection).
+        let path = std::env::temp_dir().join(format!("mostro-escrow-{}.db", uuid::Uuid::new_v4()));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let token_of = |secret: &str, memo: &str| {
+            let proof = Proof {
+                keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+                amount: Amount::from(50u64),
+                secret: Secret::new(secret.to_string()),
+                c: PublicKey::from_str(
+                    "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+                )
+                .unwrap(),
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            };
+            Token::new(
+                MintUrl::from_str("https://mint.example.com").unwrap(),
+                vec![proof],
+                Some(memo.to_string()),
+                CurrencyUnit::Sat,
+            )
+            .to_string()
+        };
+
+        for round in 0..25 {
+            let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+            insert_cashu_test_order(&pool, a, &Status::WaitingPayment.to_string()).await;
+            insert_cashu_test_order(&pool, b, &Status::WaitingPayment.to_string()).await;
+            let secret = format!("race-{round}");
+            let (ta, tb) = (token_of(&secret, "a"), token_of(&secret, "b"));
+            let lock = |id, token: String| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    super::update_order_cashu_escrow(
+                        &pool,
+                        id,
+                        "https://mint.example.com",
+                        &token,
+                        1700000100,
+                        Status::WaitingPayment,
+                        Status::Active,
+                    )
+                    .await
+                    .unwrap()
+                })
+            };
+            let (ra, rb) = tokio::join!(lock(a, ta), lock(b, tb));
+            let won = [ra.unwrap(), rb.unwrap()];
+            assert_eq!(
+                won.iter().filter(|w| **w).count(),
+                1,
+                "round {round}: exactly one order may be funded by one proof"
+            );
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

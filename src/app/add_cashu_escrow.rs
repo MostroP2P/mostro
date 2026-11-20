@@ -248,6 +248,10 @@ pub async fn add_cashu_escrow_action(
     //     and go `Active` against a single redeemable escrow. Checked before
     //     the mint round-trip so the seller gets a clear reason cheaply; the
     //     CAS in step 8 repeats it atomically for the concurrent case.
+    //     A token that does not even parse has no proofs to compare, so it is
+    //     refused here instead of slipping past the proof-level check.
+    crate::cashu::escrow_proof_ys(&proof.token)
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidCashuToken))?;
     if cashu_escrow_token_in_use(pool, &proof.token, order.id).await? {
         tracing::warn!(
             "cashu lock: escrow token for order {} is already locked to another order — rejected",
@@ -623,6 +627,29 @@ mod tests {
             order_on_mint(&pool, Some("https://mint-a.example.com")).await;
         let proof = proof_on_mint(
             "https://MINT-A.example.com/",
+            buyer,
+            seller,
+            my_keys.public_key(),
+        );
+        let msg = lock_message(order.id, Some(proof));
+
+        let result = add_cashu_escrow_action(&ctx, msg, &unwrapped_from(seller), &my_keys).await;
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidCashuToken))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_token_is_refused_before_any_mint_round_trip() {
+        // No mints are attached: reaching step 7 would be an internal error,
+        // so a `CantDo` proves the token was refused at the proof check.
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let (order, seller, buyer, my_keys) =
+            order_on_mint(&pool, Some("https://mint-a.example.com")).await;
+        let proof = proof_on_mint(
+            "https://mint-a.example.com",
             buyer,
             seller,
             my_keys.public_key(),

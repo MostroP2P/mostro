@@ -86,6 +86,9 @@ pub async fn import_reputation_action(
     let replayed = if expired {
         // A restart can lose the reply until after expiration. Confirm only
         // this exact committed import; a reversal removes its receipt.
+        if is_banned(ctx, event).await? {
+            return Err(MostroCantDo(CantDoReason::NotAuthorized));
+        }
         if !is_recorded(ctx, &attestation, event).await? {
             return Err(MostroCantDo(CantDoReason::ExpiredReputationAttestation));
         }
@@ -164,6 +167,10 @@ async fn record_import(
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+    // A banned account brings no reputation in, as it cannot export any.
+    if user.is_banned != 0 {
+        return Err(MostroCantDo(CantDoReason::NotAuthorized));
+    }
 
     insert_reputation_import(
         &mut *tx,
@@ -185,6 +192,15 @@ async fn record_import(
     update_user_reputation(&mut *tx, &user).await?;
     tx.commit().await.map_err(db_err)?;
     Ok(user)
+}
+
+/// Whether the proved identity is banned. A missing row is not banned.
+async fn is_banned(ctx: &AppContext, event: &UnwrappedMessage) -> Result<bool, MostroError> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE pubkey = ?1 AND is_banned != 0)")
+        .bind(event.identity.to_hex())
+        .fetch_one(ctx.pool())
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
 /// Whether this attestation is already imported for the proved identity.
@@ -610,6 +626,22 @@ mod tests {
 
         assert_eq!(refused(result), CantDoReason::NotAuthorized);
         assert!(replies_to(retry.sender).await.is_empty());
+    }
+
+    /// An expired attestation for an identity with no user row is not a ban
+    /// case: it keeps its own refusal.
+    #[tokio::test]
+    async fn an_expired_unrecorded_attestation_for_an_unknown_identity_keeps_its_refusal() {
+        let f = fixture().await;
+        let identity = Keys::generate().public_key();
+        let created_at =
+            Timestamp::from(Timestamp::now().as_secs() - 2 * ATTESTATION_LIFETIME_SECS);
+        let json = attestation_at(&f.issuer, &identity, "acct-1", created_at);
+
+        let (msg, event) = request(&identity, &json);
+        let result = import_reputation_action(&f.ctx, msg, &event, f.ctx.keys()).await;
+
+        assert_eq!(refused(result), CantDoReason::ExpiredReputationAttestation);
     }
 
     #[tokio::test]

@@ -1062,6 +1062,15 @@ pub async fn update_order_cashu_escrow(
     expected_status: Status,
     new_status: Status,
 ) -> Result<bool, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    // A token that reached the lock already parsed in `verify_escrow_token`,
+    // so an unparsable one here has no proofs to register.
+    let ys = crate::cashu::escrow_proof_ys(token).unwrap_or_default();
+
+    // One transaction: the lock and the proofs it consumes land together or
+    // not at all, and the write lock taken by the UPDATE serialises two
+    // submissions that carry the same proofs.
+    let mut tx = pool.begin().await.map_err(db_err)?;
     let result = sqlx::query(
         r#"
             UPDATE orders
@@ -1083,11 +1092,34 @@ pub async fn update_order_cashu_escrow(
     .bind(new_status.to_string())
     .bind(order_id)
     .bind(expected_status.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    .map_err(db_err)?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
 
-    Ok(result.rows_affected() > 0)
+    for y in &ys {
+        let held_by_other: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM cashu_escrow_proofs WHERE y = ?1 AND order_id <> ?2")
+                .bind(y)
+                .bind(order_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        if held_by_other.is_some() {
+            // Dropping `tx` rolls the order update back: nothing was locked.
+            return Ok(false);
+        }
+        sqlx::query("INSERT OR IGNORE INTO cashu_escrow_proofs (y, order_id) VALUES (?1, ?2)")
+            .bind(y)
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(true)
 }
 
 /// Atomically claim an order's status transition (Track A **TA-2**).
@@ -1137,15 +1169,16 @@ pub async fn claim_order_status(
 /// [`update_order_cashu_escrow`] repeats the predicate inside the CAS so two
 /// concurrent submissions cannot both slip past this check.
 ///
-/// This is token-level (whole-token) uniqueness. Proof-level uniqueness —
-/// recording each `Y = hash_to_curve(secret)`, which also catches a token
-/// re-serialised or re-split around the same proofs — lands with the
-/// `cashu_fee_proofs` table in TA-1f (`docs/cashu/02-track-a-lock.md` §4A).
+/// Uniqueness is by proof, not by string: each `Y = hash_to_curve(secret)` is
+/// recorded in `cashu_escrow_proofs` when an escrow locks, so a token
+/// re-serialised around the same proofs is reused too. A token
+/// that is split or merged into different proofs is a different escrow.
 pub async fn cashu_escrow_token_in_use(
     pool: &SqlitePool,
     token: &str,
     exclude_order_id: Uuid,
 ) -> Result<bool, MostroError> {
+    let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
     // `SELECT 1` rather than a column: existence is the whole question, and
     // `orders.id` is stored as a BLOB uuid that would need decoding for nothing.
     let found: Option<(i64,)> = sqlx::query_as(
@@ -1160,9 +1193,26 @@ pub async fn cashu_escrow_token_in_use(
     .bind(exclude_order_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    .map_err(db_err)?;
+    if found.is_some() {
+        return Ok(true);
+    }
 
-    Ok(found.is_some())
+    // The same proofs under another string.
+    for y in crate::cashu::escrow_proof_ys(token).unwrap_or_default() {
+        let held: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM cashu_escrow_proofs WHERE y = ?1 AND order_id <> ?2 LIMIT 1",
+        )
+        .bind(y)
+        .bind(exclude_order_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+        if held.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Every order with a locked Cashu escrow, for restore/monitoring after a
@@ -2663,6 +2713,17 @@ mod tests {
                 slashed_reason varchar(16),
                 slashed_at integer,
                 created_at integer not null
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cashu_escrow_proofs (
+                y char(66) primary key not null,
+                order_id char(36) not null
             )
             "#,
         )
@@ -6228,13 +6289,8 @@ mod tests {
         };
         let mint = || MintUrl::from_str("https://mint.example.com").unwrap();
         let (a, b) = (proof("secret-a"), proof("secret-b"));
-        let plain = Token::new(
-            mint(),
-            vec![a.clone(), b.clone()],
-            None,
-            CurrencyUnit::Sat,
-        )
-        .to_string();
+        let plain =
+            Token::new(mint(), vec![a.clone(), b.clone()], None, CurrencyUnit::Sat).to_string();
         let with_memo = Token::new(
             mint(),
             vec![a.clone(), b.clone()],
@@ -6299,6 +6355,83 @@ mod tests {
             assert!(stored.is_none() && locked_at.is_none());
             assert_eq!(status, Status::WaitingPayment.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn cashu_escrow_refuses_a_token_that_shares_one_proof_and_rolls_back() {
+        use cdk::mint_url::MintUrl;
+        use cdk::nuts::nut00::Proof;
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::{CurrencyUnit, PublicKey, Token};
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use std::str::FromStr;
+
+        let token_of = |secrets: &[&str]| {
+            let proofs = secrets
+                .iter()
+                .map(|s| Proof {
+                    keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+                    amount: Amount::from(50u64),
+                    secret: Secret::new(s.to_string()),
+                    c: PublicKey::from_str(
+                        "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+                    )
+                    .unwrap(),
+                    witness: None,
+                    dleq: None,
+                    p2pk_e: None,
+                })
+                .collect();
+            Token::new(
+                MintUrl::from_str("https://mint.example.com").unwrap(),
+                proofs,
+                None,
+                CurrencyUnit::Sat,
+            )
+            .to_string()
+        };
+        let held = token_of(&["held-1", "held-2"]);
+        let overlapping = token_of(&["fresh-1", "held-2"]);
+        let disjoint = token_of(&["fresh-1", "fresh-2"]);
+
+        let pool = setup_orders_db().await.unwrap();
+        let (first, second, third) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        for id in [first, second, third] {
+            insert_cashu_test_order(&pool, id, &Status::WaitingPayment.to_string()).await;
+        }
+        let lock = |id, token: String| {
+            let pool = pool.clone();
+            async move {
+                super::update_order_cashu_escrow(
+                    &pool,
+                    id,
+                    "https://mint.example.com",
+                    &token,
+                    1700000100,
+                    Status::WaitingPayment,
+                    Status::Active,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert!(lock(first, held.clone()).await);
+        // One shared proof is enough to refuse, and the refusal leaves nothing
+        // behind: the unshared proof is still free for another order.
+        assert!(!lock(second, overlapping).await);
+        let (_, stored, _, _) = cashu_columns(&pool, second).await;
+        assert!(stored.is_none());
+        assert!(lock(third, disjoint).await);
+        // The order that holds the proofs may lock again with its own token.
+        assert!(
+            !lock(first, held).await,
+            "already locked: a replay is a no-op"
+        );
     }
 
     #[tokio::test]

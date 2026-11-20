@@ -2234,6 +2234,45 @@ mod tests {
         let _ = crate::util::take_failed_orderbook_publishes();
     }
 
+    /// Escrow can fund within the reconciler's quiet window, so a failed take
+    /// may be retried when the order is already `active`. The trade is still
+    /// running and its take never reached the relays: the retry must publish
+    /// `in-progress`, not skip the order (issue #1129).
+    #[tokio::test]
+    async fn reconciler_retries_a_failed_take_after_the_order_went_active() {
+        use crate::nip33::OrderPublication;
+
+        let ctx = migrated_ctx().await;
+        let keys = ctx.keys().clone();
+        let _guard = crate::util::ORDERBOOK_QUEUE_TEST_LOCK.lock().await;
+
+        let order = Order {
+            id: Uuid::new_v4(),
+            kind: Kind::Sell.to_string(),
+            status: Status::Active.to_string(),
+            fiat_code: "USD".to_string(),
+            payment_method: "bank".to_string(),
+            expires_at: nostr_sdk::prelude::Timestamp::now().as_secs() as i64 + 3_600,
+            ..Default::default()
+        };
+        let order = order.create(ctx.pool()).await.unwrap();
+        crate::util::mark_orderbook_publish_failed_at_for(order.id, 1, OrderPublication::Take);
+
+        reconcile_orderbook_once(ctx.pool(), &keys).await;
+
+        let probe = crate::util::stamp_orderbook_event(
+            order.id,
+            nostr_sdk::prelude::Timestamp::from(1_700_000_000),
+        );
+        assert_ne!(
+            probe.created_at.as_secs(),
+            1_700_000_000,
+            "a failed take retried in active must be republished, as in-progress"
+        );
+        // Leave the shared queue clean for other tests.
+        let _ = crate::util::take_failed_orderbook_publishes();
+    }
+
     /// The drained entry is re-seeded before the republish attempt, so a
     /// failed send increments the consumed-attempt count instead of
     /// restarting it at 1 — and a quiescence skip consumes nothing.

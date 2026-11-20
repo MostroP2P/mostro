@@ -399,6 +399,21 @@ fn create_status_tags(
         // principle 8). A malicious taker who never pays cannot park
         // the order off the book — concurrent takers race to lock.
         Status::WaitingTakerBond => Ok((true, Status::Pending)),
+        // A take retried by the orderbook reconciler is rebuilt from the
+        // current row, which may already have moved past the waiting status
+        // the take left — escrow can fund within the reconciler's quiet
+        // window. The trade is still running and its take has not reached
+        // the relays, so it publishes as `in-progress` (issue #1129).
+        // Terminal statuses above keep their own mapping.
+        Status::Active
+        | Status::FiatSent
+        | Status::SettledHoldInvoice
+        | Status::Dispute
+        | Status::InProgress
+            if at_take =>
+        {
+            Ok((true, Status::InProgress))
+        }
         _ => Ok((false, status)),
     }
 }
@@ -2562,10 +2577,39 @@ mod tests {
             create_status_tags(&order, OrderPublication::Take).unwrap(),
             (true, Status::Pending)
         );
+        // A take retried after the trade moved on — escrow funded, fiat sent,
+        // a dispute — still publishes `in-progress`: the trade is running and
+        // its take never reached the relays.
+        for running in [
+            Status::Active,
+            Status::FiatSent,
+            Status::SettledHoldInvoice,
+            Status::Dispute,
+            Status::InProgress,
+        ] {
+            order.status = running.to_string();
+            assert_eq!(
+                create_status_tags(&order, OrderPublication::Take).unwrap(),
+                (true, Status::InProgress),
+                "a take retried in {running:?}"
+            );
+        }
+        // An ordinary transition into those statuses stays silent.
         order.status = Status::Active.to_string();
         assert_eq!(
-            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            create_status_tags(&order, OrderPublication::Transition).unwrap(),
             (false, Status::Active)
+        );
+        // Terminal statuses keep their own mapping under a take.
+        order.status = Status::Success.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            (true, Status::Success)
+        );
+        order.status = Status::Canceled.to_string();
+        assert_eq!(
+            create_status_tags(&order, OrderPublication::Take).unwrap(),
+            (true, Status::Canceled)
         );
     }
 

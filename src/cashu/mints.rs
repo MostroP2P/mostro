@@ -303,6 +303,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_cooldown_list_drops_expired_entries_and_never_passes_its_cap() {
+        let mints = CashuMints::new(false);
+        let old = Instant::now()
+            .checked_sub(MINT_COOLDOWN + Duration::from_secs(1))
+            .unwrap();
+        {
+            let mut cooling = mints.cooling.write().await;
+            cooling.insert("https://expired.example.com".into(), old);
+            cooling.insert("https://fresh.example.com".into(), Instant::now());
+        }
+        mints.start_cooling("https://new.example.com").await;
+        {
+            let cooling = mints.cooling.read().await;
+            assert!(!cooling.contains_key("https://expired.example.com"));
+            assert!(cooling.contains_key("https://fresh.example.com"));
+            assert!(cooling.contains_key("https://new.example.com"));
+        }
+
+        // Full of live entries: one more is not added.
+        {
+            let mut cooling = mints.cooling.write().await;
+            cooling.clear();
+            for i in 0..MAX_CACHED_MINTS {
+                cooling.insert(format!("https://m{i}.example.com"), Instant::now());
+            }
+        }
+        mints
+            .start_cooling("https://one-too-many.example.com")
+            .await;
+        let cooling = mints.cooling.read().await;
+        assert_eq!(cooling.len(), MAX_CACHED_MINTS);
+        assert!(!cooling.contains_key("https://one-too-many.example.com"));
+    }
+
+    #[tokio::test]
     async fn a_malformed_url_does_not_start_a_cooldown() {
         let mints = CashuMints::new(false);
         assert!(mints.client_for("ftp://mint.example.com").await.is_err());

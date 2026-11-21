@@ -976,4 +976,15 @@ mod tests {
         ));
         held.abort();
     }
+
+    /// A place in the line frees up as soon as its lock ends.
+    #[test]
+    fn a_place_in_the_line_frees_up_when_its_lock_ends() {
+        let gate: &'static crate::app::EscrowLockGate =
+            Box::leak(Box::new(crate::app::EscrowLockGate::new(1, 1)));
+        let place = gate.enter().expect("the only place");
+        assert!(gate.enter().is_none(), "no second place while one is held");
+        drop(place);
+        assert!(gate.enter().is_some(), "the place is free again");
+    }
 }

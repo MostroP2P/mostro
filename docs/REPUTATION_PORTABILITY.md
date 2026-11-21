@@ -295,7 +295,10 @@ daemon's ordinary protocol transport. The destination daemon:
    message without an identity proof is refused; there is no fallback to the
    trade key.
 6. Loads the user row keyed by that proved identity; the import is applied to
-   that row and no other.
+   that row and no other. A banned account is refused with `cant-do`
+   `not_authorized` (it cannot export either, section 5.2, where the reason is
+   `not-eligible-for-reputation-export`); this includes an exact retry of an
+   import it made before the ban.
 7. Checks that neither `(issuer, subject)` nor `(issuer, identity)` has been
    imported before on this instance. The first stops a source account from
    seeding two identities here, even after a rebind or if an issuer broke its

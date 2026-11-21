@@ -58,6 +58,12 @@ pub async fn take_buy_action(
         .not_sent_from_maker(event.sender)
         .map_err(MostroCantDo)?;
 
+    // The trade key differs on every order, so the check above misses the
+    // maker taking from another one: compare the identities too.
+    if order.master_buyer_pubkey.as_deref() == Some(event.identity.to_string().as_str()) {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
+    }
+
     // Anti-abuse bond (Phase 1, concurrent-bonds model). The take
     // handler doesn't release prior bonds at retake-time anymore —
     // multiple `Requested` taker bonds coexist on the order and the
@@ -411,6 +417,38 @@ mod tests {
             &ctx,
             take_buy_msg(order.id, Some(1)),
             &taker_event(maker),
+            &Keys::generate(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(MostroCantDo(CantDoReason::InvalidPubkey))
+        ));
+    }
+
+    /// The maker's identity cannot take its own order from another trade
+    /// key: every order uses a fresh trade key, so the sender differs from
+    /// `creator_pubkey` while the identity is the order's master buyer.
+    #[tokio::test]
+    async fn take_buy_action_rejects_maker_identity_with_another_trade_key() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let identity = Keys::generate().public_key();
+        let maker_trade_key = Keys::generate().public_key();
+        let taker_trade_key = Keys::generate().public_key();
+
+        let mut order = pending_buy_order(maker_trade_key);
+        order.master_buyer_pubkey = Some(identity.to_string());
+        let order = order.create(ctx.pool()).await.unwrap();
+
+        let mut event = taker_event(taker_trade_key);
+        event.identity = identity;
+
+        let result = take_buy_action(
+            &ctx,
+            take_buy_msg(order.id, Some(2)),
+            &event,
             &Keys::generate(),
         )
         .await;

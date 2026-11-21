@@ -118,7 +118,7 @@ uncovered = "ortsom has no reputation scenario; covered by unit tests and the tw
 
 [[rule]]
 name = "cashu"
-paths = ["src/cashu/**", "src/app/add_cashu_escrow.rs"]
+paths = ["src/cashu/**", "src/cashu_restore.rs", "src/app/add_cashu_escrow.rs"]
 uncovered = "covered by cashu.yml, not by ortsom"
 
 [[rule]]

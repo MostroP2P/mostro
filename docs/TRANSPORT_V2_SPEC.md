@@ -284,7 +284,9 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
     the daemon decrypts. This is where spam concentrates; PoW here plus
     relay-side rate limiting are the toll.
 - **Dedup as defense in depth:** a `REPLAY_WINDOW_SECS` (60 s) guard drops a
-  re-sent identical event id before decryption. The existing 10-second
+  re-sent identical event id before decryption. Ids are kept in arrival
+  order and expired lazily from the front, so the per-event dedup cost stays
+  O(1) amortized even under a flood of distinct ids. The existing 10-second
   freshness window (post-decrypt, on the inner `created_at`) still applies as
   the precise stale-event check.
 - **Validation order is load-bearing.** `accept_event` runs PoW → kind →

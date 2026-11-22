@@ -24,7 +24,7 @@
 //! `PRICE_MANAGER` / `MOSTRO_CONFIG`); the cache is an inner `RwLock` and the
 //! replay guard a `Mutex`, matching the daemon's single-consumer event loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use nostr_sdk::prelude::EventId;
@@ -49,32 +49,63 @@ pub enum InstallError {
 }
 
 /// Short-window dedup of event ids (defense in depth, §6 Phase 2).
+///
+/// `order` and `seen` always hold the same ids: `order` keeps them in arrival
+/// order (oldest at the front) so expiry is a cheap front-pop, and `seen`
+/// answers the membership check in O(1).
 struct ReplayGuard {
-    seen: HashMap<EventId, i64>,
+    /// `(first_seen_at, id)` in arrival order.
+    order: VecDeque<(i64, EventId)>,
+    /// The ids currently in `order`.
+    seen: HashSet<EventId>,
     window_secs: i64,
 }
 
 impl ReplayGuard {
     fn new(window_secs: i64) -> Self {
         Self {
-            seen: HashMap::new(),
+            order: VecDeque::new(),
+            seen: HashSet::new(),
             window_secs,
         }
     }
 
     /// Record `id` as seen at `now` and report whether it was **already**
     /// present within the window (i.e. a replay the caller should drop).
-    /// Expired entries are pruned on the way through so the map stays bounded
-    /// by the in-window event rate.
+    ///
+    /// Expired entries are pruned lazily from the front of `order`: the scan
+    /// stops at the first in-window entry, and each id is pushed and popped
+    /// exactly once, so pruning is O(1) amortized per call. (A full-map
+    /// `retain` per call made a flood of N distinct in-window ids cost O(N²).)
+    ///
+    /// The window runs from an id's **first** sighting: a replay is dropped
+    /// without re-recording it, so repeating an id does not keep it alive.
+    /// That is enough because the event loop's 10-second freshness check
+    /// rejects anything older than a fraction of the window anyway.
+    ///
+    /// If the clock steps backwards, `order` is no longer strictly sorted;
+    /// pruning then merely stops early and the entries are reclaimed once the
+    /// ones ahead of them expire — never a false replay.
     ///
     /// Caller contract: `id` must belong to an event whose signature already
     /// verified — see [`SpamGate::is_replay`].
     fn check_and_record(&mut self, id: EventId, now: i64) -> bool {
         let cutoff = now - self.window_secs;
-        self.seen.retain(|_, &mut seen_at| seen_at >= cutoff);
-        // `insert` returns the previous value if the key was present — a
-        // non-expired prior sighting means this is a replay.
-        self.seen.insert(id, now).is_some()
+        while let Some(&(seen_at, old_id)) = self.order.front() {
+            if seen_at >= cutoff {
+                break;
+            }
+            self.order.pop_front();
+            self.seen.remove(&old_id);
+        }
+
+        // `insert` returns false if the id is already present — a non-expired
+        // prior sighting means this is a replay.
+        if !self.seen.insert(id) {
+            return true;
+        }
+        self.order.push_back((now, id));
+        false
     }
 }
 
@@ -402,5 +433,62 @@ mod tests {
             1,
             "stale entries must be pruned, leaving only the fresh sighting"
         );
+        assert_eq!(
+            guard.order.len(),
+            1,
+            "the arrival queue must be pruned in step with the set"
+        );
+    }
+
+    #[test]
+    fn entry_at_exact_cutoff_is_still_a_replay() {
+        let mut guard = ReplayGuard::new(60);
+        let id = an_event_id("boundary");
+        assert!(!guard.check_and_record(id, 1_000));
+        // now - window == seen_at: still inside the window (inclusive).
+        assert!(guard.check_and_record(id, 1_060));
+        // One second later it has expired.
+        assert!(!guard.check_and_record(id, 1_061));
+    }
+
+    #[test]
+    fn replay_does_not_extend_the_window() {
+        let mut guard = ReplayGuard::new(60);
+        let id = an_event_id("no-refresh");
+        assert!(!guard.check_and_record(id, 1_000));
+        assert!(guard.check_and_record(id, 1_050), "replay inside window");
+        // The window counts from the first sighting, so the replay at 1_050
+        // did not keep the id alive past 1_060.
+        assert!(!guard.check_and_record(id, 1_061));
+        assert_eq!(guard.order.len(), 1, "a replay is never queued twice");
+    }
+
+    #[test]
+    fn prune_stops_at_first_in_window_entry() {
+        let mut guard = ReplayGuard::new(60);
+        let old = an_event_id("old");
+        let young = an_event_id("young");
+        guard.check_and_record(old, 1_000);
+        guard.check_and_record(young, 1_040);
+        // At 1_070 only `old` (1_000 < cutoff 1_010) has expired.
+        let probe = an_event_id("probe");
+        assert!(!guard.check_and_record(probe, 1_070));
+        assert!(!guard.seen.contains(&old), "expired entry pruned");
+        assert!(guard.check_and_record(young, 1_070), "in-window entry kept");
+        assert_eq!(guard.order.len(), 2);
+    }
+
+    #[test]
+    fn backwards_clock_never_yields_false_replay() {
+        let mut guard = ReplayGuard::new(60);
+        let a = an_event_id("ahead");
+        let b = an_event_id("behind");
+        assert!(!guard.check_and_record(a, 2_000));
+        // Clock steps back: `b` is queued behind a newer entry.
+        assert!(!guard.check_and_record(b, 1_900));
+        // Far in the future both expire; sets and queue stay consistent.
+        assert!(!guard.check_and_record(a, 5_000));
+        assert!(!guard.check_and_record(b, 5_000));
+        assert_eq!(guard.order.len(), guard.seen.len());
     }
 }

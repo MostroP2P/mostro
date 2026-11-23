@@ -1533,7 +1533,7 @@ mod tests {
             .expect("wrap kind-14 event")
         }
 
-        async fn accept(ctx: &AppContext, event: &Event, mostro: &Keys) -> bool {
+        pub(super) async fn accept(ctx: &AppContext, event: &Event, mostro: &Keys) -> bool {
             accept_event(
                 ctx,
                 event,
@@ -1635,7 +1635,7 @@ mod tests {
         /// Dual-key event (identity signs the inner tuple, trade key authors
         /// the event): the shape in which `check_trade_index` registers a
         /// first-time identity.
-        fn dual_key_event(mostro: &Keys, identity: &Keys, trade: &Keys) -> Event {
+        pub(super) fn dual_key_event(mostro: &Keys, identity: &Keys, trade: &Keys) -> Event {
             let message = create_test_message(Action::NewOrder, Some(1));
             let opts = WrapOptions {
                 signed: true,
@@ -1683,6 +1683,65 @@ mod tests {
                 cant_do_reasons_for(&trade.public_key()).await,
                 vec![CantDoReason::MaintenanceMode]
             );
+        }
+    }
+
+    /// The Cashu entry gate runs in [`accept_event`] before
+    /// `check_trade_index`, like the maintenance gate: a refused `NewOrder`
+    /// must not register a first-time identity, or the same request retried
+    /// once the gate opens fails with `InvalidTradeIndex`.
+    mod cashu_entry_gate_tests {
+        use super::maintenance_gate_tests::{accept, dual_key_event};
+        use super::*;
+        use crate::config::types::CashuSettings;
+        use crate::db::is_user_present;
+
+        async fn cashu_intake_ctx(unsafe_allow_incomplete_trades: bool) -> AppContext {
+            let ctx = create_migrated_ctx().await;
+            let mut settings = crate::app::context::test_utils::test_settings();
+            settings.cashu = Some(CashuSettings {
+                enabled: true,
+                unsafe_allow_incomplete_trades,
+                ..Default::default()
+            });
+            crate::app::context::test_utils::TestContextBuilder::new()
+                .with_pool(ctx.pool_arc())
+                .with_settings(settings)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn refused_cashu_entry_does_not_register_the_identity() {
+            let mostro = create_test_keys();
+
+            let closed = cashu_intake_ctx(false).await;
+            let (identity, trade) = (create_test_keys(), create_test_keys());
+            let event = dual_key_event(&mostro, &identity, &trade);
+            assert!(!accept(&closed, &event, &mostro).await);
+            assert!(
+                is_user_present(closed.pool(), identity.public_key().to_string())
+                    .await
+                    .is_err(),
+                "a refused Cashu NewOrder must not register the identity"
+            );
+            assert_eq!(
+                cant_do_reasons_for(&trade.public_key()).await,
+                vec![CantDoReason::InvalidAction]
+            );
+
+            // Control: with the development override the same request
+            // reaches `check_trade_index` and registers the identity.
+            let open = cashu_intake_ctx(true).await;
+            let (identity, trade) = (create_test_keys(), create_test_keys());
+            let event = dual_key_event(&mostro, &identity, &trade);
+            accept(&open, &event, &mostro).await;
+            assert!(
+                is_user_present(open.pool(), identity.public_key().to_string())
+                    .await
+                    .is_ok(),
+                "control: the open gate lets check_trade_index register the user"
+            );
+            assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
         }
     }
 

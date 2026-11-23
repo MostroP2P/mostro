@@ -329,6 +329,20 @@ async fn handle_message_action(
     }
 }
 
+/// Does the Cashu entry gate refuse this action? Only on a Cashu node without
+/// `[cashu].unsafe_allow_incomplete_trades`, and only for the actions that
+/// open a trade; Lightning mode never has `[cashu].enabled`.
+fn cashu_entry_closed(ctx: &AppContext, action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell
+    ) && ctx
+        .settings()
+        .cashu
+        .as_ref()
+        .is_some_and(|cfg| cfg.enabled && !cfg.unsafe_allow_incomplete_trades)
+}
+
 /// Decode and fully validate one relay event into a dispatchable
 /// `(action, message, unwrapped)` triple, or `None` if it must be skipped
 /// (failed PoW, wrong kind, invalid event signature, spam-gate drop, decrypt
@@ -487,6 +501,25 @@ async fn accept_event(
         );
         manage_errors(
             MostroError::MostroCantDo(CantDoReason::MaintenanceMode),
+            message.clone(),
+            unwrapped.clone(),
+            &inner_message.action,
+        )
+        .await;
+        return None;
+    }
+    // Cashu entry gate (see `dispatch_cashu`): runs before
+    // `check_trade_index` for the same reason as the maintenance gate.
+    // `AddCashuEscrow` never touches the trade index, so it is gated in
+    // `dispatch_cashu` only.
+    if cashu_entry_closed(ctx, &inner_message.action) {
+        tracing::info!(
+            "Cashu entry gate: rejecting {:?} from {}",
+            inner_message.action,
+            unwrapped.sender
+        );
+        manage_errors(
+            MostroError::MostroCantDo(CantDoReason::InvalidAction),
             message.clone(),
             unwrapped.clone(),
             &inner_message.action,
@@ -783,6 +816,10 @@ async fn dispatch_cashu(
     // restart, and behaviour near the locktime. Handing the token to the buyer
     // alone is not an exit: without a P_S or P_M signature there is no spend
     // path when the seller disappears.
+    //
+    // `accept_event` already refuses NewOrder/TakeBuy/TakeSell before
+    // `check_trade_index` (`cashu_entry_closed`); this check is the second
+    // layer, and the only one for AddCashuEscrow.
     //
     // Read per context, not from the process-global config, so tests can pin
     // the gate both ways.

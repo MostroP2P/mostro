@@ -62,7 +62,7 @@ use crate::app::user_info::user_info;
 use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
-use crate::spam_gate::SpamGate;
+use crate::spam_gate::{SpamGate, REPLAY_WINDOW_SECS};
 use crate::util::enqueue_cant_do_msg;
 use crate::Result;
 
@@ -381,6 +381,13 @@ async fn accept_event(
     // (fail-open).
     if let Some(gate) = gate {
         let now = chrono::Utc::now().timestamp();
+        // The guard forgets an id after its window, so an event that would
+        // still be fresh by then could be dispatched twice. Must stay ahead
+        // of `is_replay`, and share its `now`.
+        if is_too_far_ahead(event.created_at, now) {
+            tracing::info!("Dropping event {} dated too far ahead", event.id);
+            return None;
+        }
         // Dedup: drop a re-sent identical event (defense in
         // depth against replay floods). Safe here and not
         // earlier: the id is only recorded once the signature
@@ -535,10 +542,25 @@ async fn accept_event(
     Some((action, message, unwrapped))
 }
 
-/// Events older than 10 seconds are discarded to prevent replay attacks.
+/// How old (seconds) an event may be and still be accepted.
+const FRESHNESS_SECS: i64 = 10;
+
+/// How far ahead (seconds) of our clock an event may be dated. The replay
+/// guard remembers an id for `REPLAY_WINDOW_SECS` from its first sighting, and
+/// an event stays fresh until `created_at + FRESHNESS_SECS`; this is the
+/// largest skew for which the first always covers the second.
+const MAX_FUTURE_SKEW_SECS: i64 = REPLAY_WINDOW_SECS - FRESHNESS_SECS;
+
+/// Whether an event would outlive its replay-guard entry.
+fn is_too_far_ahead(created_at: Timestamp, now: i64) -> bool {
+    created_at.as_secs() > now.saturating_add(MAX_FUTURE_SKEW_SECS) as u64
+}
+
+/// Events older than [`FRESHNESS_SECS`] are discarded to prevent replay
+/// attacks.
 fn is_stale(created_at: Timestamp) -> bool {
     let since_time = chrono::Utc::now()
-        .checked_sub_signed(chrono::Duration::seconds(10))
+        .checked_sub_signed(chrono::Duration::seconds(FRESHNESS_SECS))
         .unwrap()
         .timestamp() as u64;
     created_at.as_secs() < since_time
@@ -1218,6 +1240,44 @@ mod tests {
             )
             .await
             .is_some()
+        }
+
+        /// [`follow_up_from`], re-signed `ahead` seconds in the future.
+        fn follow_up_dated_ahead(trade: &Keys, mostro: &Keys, ahead: u64) -> Event {
+            let event = follow_up_from(trade, mostro);
+            EventBuilder::new(event.kind, event.content.clone())
+                .tags(event.tags.clone())
+                .custom_created_at(Timestamp::from_secs(Timestamp::now().as_secs() + ahead))
+                .finalize(trade)
+                .expect("sign future-dated event")
+        }
+
+        #[test]
+        fn future_skew_limit_is_inclusive() {
+            let now = 1_000_000;
+            let at = |secs: i64| Timestamp::from_secs((now + secs) as u64);
+            assert!(!is_too_far_ahead(at(MAX_FUTURE_SKEW_SECS), now));
+            assert!(is_too_far_ahead(at(MAX_FUTURE_SKEW_SECS + 1), now));
+            assert!(is_too_far_ahead(Timestamp::from_secs(u64::MAX), now));
+        }
+
+        /// A future-dated event stays fresh after the replay guard forgets
+        /// its id, so it must never be admitted in the first place.
+        #[tokio::test]
+        async fn event_dated_past_the_replay_window_is_dropped() {
+            let ctx = create_migrated_ctx().await;
+            let (mostro, trade) = (create_test_keys(), create_test_keys());
+            let gate = SpamGate::new(REPLAY_WINDOW_SECS);
+            gate.add_known(trade.public_key().to_string());
+
+            let far = follow_up_dated_ahead(&trade, &mostro, 120);
+            assert!(!accepted(&ctx, &far, &mostro, &gate).await);
+            // Dropped before the guard: its id was not recorded.
+            assert!(!gate.is_replay(far.id, chrono::Utc::now().timestamp()));
+
+            // A client clock slightly ahead is still served.
+            let near = follow_up_dated_ahead(&trade, &mostro, 30);
+            assert!(accepted(&ctx, &near, &mostro, &gate).await);
         }
 
         async fn dispatch(

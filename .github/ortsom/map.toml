@@ -10,7 +10,9 @@
 
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
-ortsom_ref = "v0.3.4"
+# TEMPORARY: the head of MostroP2P/ortsom#55 (the range family, #51). Swap
+# for the Ortsom tag that contains #53-#55 once they merge.
+ortsom_ref = "63c23ba0931434936d810c2ba16fe9ddb8a61222"
 # Run the regtest stack with anti-abuse bonds (`ortsom stack up
 # --with-bonds`), so the `bond` scenarios run instead of being skipped.
 # Part of a baseline's identity, like `ortsom_ref`: a pull request is only
@@ -39,12 +41,16 @@ paths = [
   "src/app/fiat_sent.rs", "src/app/release.rs", "src/app/order.rs",
   "src/app/orders.rs", "src/app/dev_fee.rs",
 ]
-tags = ["happy-path"]
+# `range`: release.rs builds the child (get_child_order, create_base_order,
+# handle_child_order), take_sell/take_buy enforce the range bounds, and
+# fiat_sent/release carry NextTrade. The range family is what exercises them
+# across disputes, cancels, expiry, failed payouts and bonds (#1126, #1133).
+tags = ["happy-path", "range"]
 
 [[rule]]
 name = "pricing"
 paths = ["src/price/**", "src/bitcoin_price.rs"]
-scenarios = ["market_price_order", "range_order"]
+scenarios = ["market_price_order", "range_order", "range_child_fee"]
 
 [[rule]]
 name = "maintenance mode"
@@ -91,6 +97,16 @@ tags = ["payment-failure", "happy-path"]
 name = "message intake"
 paths = ["src/messages.rs", "src/spam_gate.rs", "src/nip33.rs", "src/util.rs"]
 tags = ["adversarial"]
+
+# src/util.rs also matches "message intake"; rules add up. It holds the
+# range bounds check and sizes a range maker bond against max_amount.
+[[rule]]
+name = "range helpers in util"
+paths = ["src/util.rs"]
+scenarios = [
+  "range_order", "range_take_out_of_bounds", "range_child_take_out_of_bounds",
+  "range_child_fee", "range_maker_bond_sized_by_max",
+]
 
 [[rule]]
 name = "bonds"
@@ -203,3 +219,16 @@ why = "bond_cltv_delta at its floor, hold_invoice_cltv_delta + 145"
 overlay = "variants/bond-cltv-at-limit.toml"
 paths = ["src/app/bond/**", "src/lightning/**", "src/config/**", "settings.tpl.toml"]
 scenarios = ["bond_released_on_success"]
+
+[[variant]]
+name = "bond-maker-and-taker"
+why = "anti_abuse_bond.apply_to = \"both\": range maker bonds (sized by max_amount, held across slices)"
+overlay = "variants/bond-maker-and-taker.toml"
+paths = [
+  "src/app/bond/**", "src/app/release.rs", "src/app/take_sell.rs", "src/app/take_buy.rs",
+  "src/app/order.rs", "src/util.rs", "src/config/**", "settings.tpl.toml",
+]
+# range_bond_slash_on_child runs on the main stack (a taker bond is enough);
+# its slash path waits out the taker window and would crowd the variant's
+# 15 min suite cap (run_variants.py SUITE_TIMEOUT_SECS).
+scenarios = ["range_maker_bond_sized_by_max", "range_bond_released_across_slices"]

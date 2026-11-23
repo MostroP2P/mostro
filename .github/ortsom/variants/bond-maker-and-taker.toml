@@ -1,0 +1,6 @@
+# Bonds from makers too. Ortsom's --with-bonds uses apply_to = "take", so
+# without this the range maker-bond scenarios always skip: a range maker
+# bond is sized against max_amount (src/util.rs) and held across the
+# range's slices until it closes (MostroP2P/ortsom#55).
+[anti_abuse_bond]
+apply_to = "both"

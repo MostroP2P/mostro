@@ -310,7 +310,7 @@ jobs:
       - name: Run the settings variants
         if: steps.stack.outputs.stack == 'ok'
         working-directory: ortsom
-        # Five variants take about ten minutes; run_variants.py caps each
+        # Six variants take about fifteen minutes; run_variants.py caps each
         # one, and records each as it finishes.
         timeout-minutes: 60
         run: |

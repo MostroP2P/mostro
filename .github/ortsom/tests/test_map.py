@@ -62,6 +62,25 @@ class MapTest(unittest.TestCase):
         result = sel.select(["src/scheduler.rs"], load_map(), registry)
         self.assertEqual(result["mode"], "full")
 
+    def test_release_changes_run_the_whole_range_family(self):
+        # release.rs builds a range order's child (get_child_order,
+        # create_base_order); the range family follows that child through
+        # disputes, cancels, expiry, failed payouts and bonds (#1126, #1133).
+        registry = load_registry()
+        range_family = {s["name"] for s in registry if "range" in s["tags"]}
+        self.assertGreater(len(range_family), 1, "the registry has no range family")
+        result = sel.select(["src/app/release.rs"], load_map(), registry)
+        self.assertTrue(range_family <= set(result["scenarios"]), range_family - set(result["scenarios"]))
+        self.assertIn("range_order", result["scenarios"])
+
+    def test_util_changes_run_the_range_helpers_and_maker_bonds(self):
+        # src/util.rs sizes a range maker bond against max_amount and holds
+        # the range bounds; maker bonds only exist under the variant.
+        result = sel.select(["src/util.rs"], load_map(), load_registry())
+        self.assertIn("range_maker_bond_sized_by_max", result["scenarios"])
+        self.assertIn("range_take_out_of_bounds", result["scenarios"])
+        self.assertIn("bond-maker-and-taker", {v["name"] for v in result["variants"]})
+
     def test_every_tag_and_scenario_exists_in_the_registry(self):
         sel.check_references(load_map(), load_registry())
 
@@ -72,7 +91,9 @@ class MapTest(unittest.TestCase):
         for changed in (["settings.tpl.toml"], ["src/config/types.rs"]):
             result = sel.select(changed, load_map(), registry)
             names = {v["name"] for v in result["variants"]}
-            self.assertTrue({"price-pegged-only", "bond-hold-cltv-298"} <= names, changed)
+            self.assertTrue(
+                {"price-pegged-only", "bond-hold-cltv-298", "bond-maker-and-taker"} <= names, changed
+            )
             self.assertEqual((result["unmapped_files"], result["uncovered_files"]), ([], {}), changed)
 
     def test_every_overlay_file_is_a_variant_and_every_variant_has_one(self):

@@ -30,6 +30,7 @@ pub async fn start_scheduler(ctx: AppContext) {
     // Mode-agnostic jobs run in both Lightning and Cashu mode.
     job_expire_pending_older_orders(ctx.clone()).await;
     job_update_rate_events(ctx.clone()).await;
+    job_prune_payer_declarations(ctx.clone()).await;
 
     // Lightning-only jobs: they settle/cancel hold invoices, retry LN
     // payments, pay the dev fee over LN, and service anti-abuse bonds — all of
@@ -66,6 +67,29 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_refresh_active_pubkeys(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// How often declarations of finished orders are deleted.
+const PRUNE_PAYER_DECLARATIONS_SECS: u64 = 60;
+
+/// Delete the buyer's payment-account hash once its order is over. Runs on
+/// every node, in both modes and whatever `[payer_history]` says: it only
+/// deletes, and it removes rows left behind when the feature is turned off
+/// (`docs/PAYER_HISTORY_ANTI_TRIANGULATION.md` §10.6).
+async fn job_prune_payer_declarations(ctx: AppContext) {
+    tokio::spawn(async move {
+        loop {
+            match crate::app::payer::db::prune_declarations_for_terminal_orders(ctx.pool()).await {
+                Ok(0) => {}
+                Ok(n) => info!("payer history: pruned {n} declaration(s) of finished orders"),
+                Err(e) => warn!("payer history: failed to prune declarations: {e}"),
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                PRUNE_PAYER_DECLARATIONS_SECS,
+            ))
+            .await;
+        }
+    });
 }
 
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey

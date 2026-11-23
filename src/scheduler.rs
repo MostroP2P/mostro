@@ -3294,6 +3294,55 @@ mod tests {
         );
     }
 
+    /// A buyer's payment-account hash is kept only while its order is open:
+    /// once the order is over, the scheduler must delete it, whatever
+    /// `[payer_history]` says.
+    #[tokio::test]
+    async fn scheduler_deletes_payer_declarations_of_finished_orders() {
+        let ctx = migrated_ctx().await;
+        let mut ids = Vec::new();
+        for status in [Status::Canceled, Status::Active] {
+            let order = Order {
+                id: Uuid::new_v4(),
+                status: status.to_string(),
+                kind: mostro_core::order::Kind::Sell.to_string(),
+                fiat_code: "USD".to_string(),
+                creator_pubkey: hex_key(),
+                buyer_pubkey: Some(hex_key()),
+                amount: 21_000,
+                fiat_amount: 40,
+                ..Default::default()
+            }
+            .create(ctx.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO order_payer_declarations (order_id, payment_hash, declared_at) \
+                 VALUES (?1, ?2, 1)",
+            )
+            .bind(order.id)
+            .bind("ab".repeat(32))
+            .execute(ctx.pool())
+            .await
+            .unwrap();
+            ids.push(order.id);
+        }
+
+        tokio::time::pause();
+        start_scheduler(ctx.clone()).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(150)).await;
+
+        let left: Vec<Uuid> = sqlx::query_scalar("SELECT order_id FROM order_payer_declarations")
+            .fetch_all(ctx.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            left,
+            vec![ids[1]],
+            "only the declaration of the order still open may remain"
+        );
+    }
+
     /// The info job must republish as soon as the maintenance flag flips,
     /// not at the next interval tick.
     #[tokio::test]

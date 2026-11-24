@@ -121,6 +121,13 @@ async fn classify_zero_row_cas(
     }
 }
 
+/// Whether a failed verification means the mint itself is not answering
+/// (a timeout, or a request it refused: down, saturated, 5xx) rather than the
+/// seller sending a bad token. Only then is the mint left alone for a while.
+fn mint_needs_rest(e: &CashuError) -> bool {
+    matches!(e, CashuError::MintConnection(_) | CashuError::Client(_))
+}
+
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
 ///
 /// On success the order advances `WaitingPayment → Active` in one atomic write
@@ -281,7 +288,7 @@ pub async fn add_cashu_escrow_action(
     {
         // A mint that connected and then went quiet mid-lock costs the next
         // lock the same wait: leave it alone for a while.
-        if matches!(e, CashuError::MintConnection(_)) {
+        if mint_needs_rest(&e) {
             if let Some(mints) = ctx.cashu_mints() {
                 mints.mark_unreachable(&order_mint).await;
             }
@@ -693,6 +700,20 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidCashuToken))
         ));
+    }
+
+    /// A mint that times out or refuses a request is left alone for the
+    /// cooldown; a bad token is the seller's fault and never rests a mint.
+    #[test]
+    fn only_a_mint_that_does_not_answer_is_left_alone() {
+        let refused: CashuError =
+            cdk::error::Error::UnknownErrorResponse("mint refused".into()).into();
+        assert!(mint_needs_rest(&refused));
+        assert!(mint_needs_rest(&CashuError::MintConnection(
+            "timed out".into()
+        )));
+        assert!(!mint_needs_rest(&CashuError::Token("bad token".into())));
+        assert!(!mint_needs_rest(&CashuError::Condition("bad shape".into())));
     }
 
     /// Step 3b: a seller retrying after the lock committed but the

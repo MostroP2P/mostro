@@ -557,6 +557,39 @@ mod tests {
         (order, seller, buyer, Keys::generate())
     }
 
+    /// A token that parses (one proof, a random secret), so a lock gets past
+    /// any check of the token's shape and reaches the mint round trip these
+    /// tests are about. Its proof is not signed by any mint.
+    fn parseable_token() -> String {
+        use cdk::mint_url::MintUrl;
+        use cdk::nuts::nut00::{Proof, Token};
+        use cdk::nuts::nut01::PublicKey as CashuPublicKey;
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::CurrencyUnit;
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use std::str::FromStr;
+        let proof = Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::from(1u64),
+            secret: Secret::generate(),
+            c: CashuPublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        Token::new(
+            MintUrl::from_str("https://mint.example.com").unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string()
+    }
+
     fn proof_on_mint(
         mint: &str,
         buyer: PublicKey,
@@ -565,6 +598,23 @@ mod tests {
     ) -> Payload {
         Payload::CashuLockProof(CashuLockProof::new(
             "cashuBnotarealtoken".to_string(),
+            mint.to_string(),
+            buyer.to_string(),
+            seller.to_string(),
+            mostro.to_string(),
+        ))
+    }
+
+    /// Like [`proof_on_mint`], with a token that parses, so the lock gets
+    /// past any check of the token's shape and reaches the mint round trip.
+    fn readable_proof_on_mint(
+        mint: &str,
+        buyer: PublicKey,
+        seller: PublicKey,
+        mostro: PublicKey,
+    ) -> Payload {
+        Payload::CashuLockProof(CashuLockProof::new(
+            parseable_token(),
             mint.to_string(),
             buyer.to_string(),
             seller.to_string(),
@@ -867,7 +917,7 @@ mod tests {
         let ctx = build_ctx(&pool)
             .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
         let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(&mint)).await;
-        let proof = proof_on_mint(&mint, buyer, seller, my_keys.public_key());
+        let proof = readable_proof_on_mint(&mint, buyer, seller, my_keys.public_key());
         let msg = lock_message(order.id, Some(proof));
 
         let dispatched = tokio::time::timeout(
@@ -901,7 +951,12 @@ mod tests {
         let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(mint)).await;
         let msg = lock_message(
             order.id,
-            Some(proof_on_mint(mint, buyer, seller, my_keys.public_key())),
+            Some(readable_proof_on_mint(
+                mint,
+                buyer,
+                seller,
+                my_keys.public_key(),
+            )),
         );
         let reasons = || async {
             crate::config::MESSAGE_QUEUES
@@ -962,7 +1017,12 @@ mod tests {
         let send = || {
             let msg = lock_message(
                 order.id,
-                Some(proof_on_mint(&mint, buyer, seller, my_keys.public_key())),
+                Some(readable_proof_on_mint(
+                    &mint,
+                    buyer,
+                    seller,
+                    my_keys.public_key(),
+                )),
             );
             crate::app::spawn_escrow_lock(gate, &ctx, msg, &unwrapped_from(seller), &my_keys)
         };

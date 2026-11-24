@@ -90,16 +90,18 @@ impl CashuMints {
         if let Some(client) = self.clients.read().await.get(&key) {
             return Ok(client.clone());
         }
-        if self.is_cooling(&key).await {
-            return Err(Error::MintConnection(format!(
-                "{key}: did not answer a moment ago, not trying again yet"
-            )));
-        }
         let Some(_attempt) = self.begin_attempt(&key) else {
             return Err(Error::MintConnection(format!(
                 "{key}: a connection attempt is already running, try again shortly"
             )));
         };
+        // Read the cooldown only once the attempt is ours: a failure that
+        // finished meanwhile has already written its cooldown entry.
+        if self.is_cooling(&key).await {
+            return Err(Error::MintConnection(format!(
+                "{key}: did not answer a moment ago, not trying again yet"
+            )));
+        }
         match self.connect(&key).await {
             Ok(client) => Ok(self.keep(key, client).await),
             Err(e) => {
@@ -335,6 +337,35 @@ mod tests {
         let cooling = mints.cooling.read().await;
         assert_eq!(cooling.len(), MAX_CACHED_MINTS);
         assert!(!cooling.contains_key("https://one-too-many.example.com"));
+    }
+
+    #[tokio::test]
+    async fn the_cooldown_is_read_only_after_the_attempt_is_claimed() {
+        let mints = CashuMints::new(false);
+        let url = "https://mint.example.com";
+        let key = normalize_mint_url(url).unwrap();
+        mints.start_cooling(&key).await;
+
+        // Someone else holds the attempt: a caller is turned away by the
+        // attempt, never by a cooldown read taken before claiming it.
+        let held = mints.begin_attempt(&key).expect("attempt is free");
+        let err = mints.client_for(url).await.err();
+        assert!(
+            matches!(err, Some(Error::MintConnection(ref m)) if m.contains("already running")),
+            "got {err:?}"
+        );
+        drop(held);
+
+        // Nobody holds it: the cooldown refuses, and the claim is released.
+        let err = mints.client_for(url).await.err();
+        assert!(
+            matches!(err, Some(Error::MintConnection(ref m)) if m.contains("not trying again")),
+            "got {err:?}"
+        );
+        assert!(
+            mints.begin_attempt(&key).is_some(),
+            "the attempt was left claimed"
+        );
     }
 
     #[tokio::test]

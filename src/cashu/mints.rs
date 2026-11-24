@@ -143,6 +143,11 @@ impl CashuMints {
 
     /// A mint that connected and then stopped answering during a lock: forget
     /// its client and leave it alone for [`MINT_COOLDOWN`].
+    ///
+    /// On a closed node (`mint_urls` set) the only mint is the configured one,
+    /// so a single timeout here refuses every seller's lock until the cooldown
+    /// ends. That is the intended trade: during an outage each lock would
+    /// otherwise wait out the whole request timeout.
     pub async fn mark_unreachable(&self, mint_url: &str) {
         let Ok(key) = normalize_mint_url(mint_url) else {
             return;

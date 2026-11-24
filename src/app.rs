@@ -866,7 +866,7 @@ async fn dispatch_cashu(
         // times over. Run inline, that would stall the one-at-a-time event loop
         // for every other message, so the lock runs in its own task and the
         // loop moves on. The task reports a failure to the seller itself, as
-        // the loop does for every other action, and `ESCROW_LOCK_SLOTS` caps
+        // the loop does for every other action, and `ESCROW_LOCKS` caps
         // how many locks wait on mints at once.
         Action::AddCashuEscrow => spawn_escrow_lock(&ESCROW_LOCKS, ctx, msg, event, my_keys),
         // Everything that advances or settles an order past the lock has no

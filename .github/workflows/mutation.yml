@@ -53,30 +53,28 @@ jobs:
           # Ensure base branch ref exists locally for reliable diffing
           git fetch origin "${{ github.base_ref }}":"refs/remotes/origin/${{ github.base_ref }}"
 
-          # Collect changed Rust source files (exclude test-only and workflow files)
-          changed_rs=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.rs' | grep -v '_test\.rs$' || true)
-          if [ -z "$changed_rs" ]; then
+          # Collect changed Rust source files (exclude test-only files), as
+          # NUL-separated paths so any filename arrives as written.
+          mapfile -d '' -t changed_rs < <(git diff -z --name-only origin/${{ github.base_ref }}...HEAD -- '*.rs' ':!*_test.rs')
+          if [ ${#changed_rs[@]} -eq 0 ]; then
             echo "No Rust source files changed in this PR"
             exit 0
           fi
 
           echo "Running mutation testing for changed files:"
-          echo "$changed_rs"
+          printf '%s\n' "${changed_rs[@]}"
 
-          # These filenames come from a PR diff, so they are
-          # attacker-controlled. Built as a bash array (never joined into a
-          # string) and passed with "${file_args[@]}" so a crafted filename
-          # can only ever be one --file value, never extra argv tokens — an
-          # unquoted string of them is word-split by the shell, which turns
-          # a crafted filename into extra flags for cargo-mutants/cargo/rustc.
-          # This deliberately bypasses `make mutation-test`, whose $(ARGS) is
-          # a plain string splice safe only for hand-typed input, so it
-          # repeats that target's environment here (see the Makefile for why
-          # each variable is set).
+          # Defense in depth, not a security boundary (this job already runs
+          # the PR's code): each filename stays one --file value, never
+          # word-split into extra flags, and `--file=` keeps a name starting
+          # with `-` a value (cargo-mutants still reads it as a glob, so
+          # `*`, `?` or `[` in a name act as patterns). This bypasses `make mutation-test`, whose
+          # $(ARGS) is a plain string splice, so it repeats that target's
+          # environment here (see the Makefile for why).
           file_args=()
-          while IFS= read -r f; do
-            file_args+=(--file "$f")
-          done <<< "$changed_rs"
+          for f in "${changed_rs[@]}"; do
+            file_args+=("--file=$f")
+          done
 
           # Keep these two in sync with the mutation-test target in Makefile.
           CARGO_MUTANTS_JOBS=1 MOSTRO_TEST_LN_PORT=18080 \

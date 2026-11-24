@@ -32,7 +32,7 @@ import select_scenarios
 GATE_DIR = Path(__file__).resolve().parent
 RESTART_DAEMON_FAILED = 4
 # One variant runs a handful of scenarios in about two minutes. These caps
-# keep one hung variant from using the step's budget (60 min for five).
+# keep one hung variant from using the step's budget (60 min for six).
 SUITE_TIMEOUT_SECS = 15 * 60
 STEP_TIMEOUT_SECS = 5 * 60
 

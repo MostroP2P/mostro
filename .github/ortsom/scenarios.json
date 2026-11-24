@@ -279,12 +279,245 @@
     "timeout_secs": 900
   },
   {
+    "name": "range_bond_released_across_slices",
+    "tags": [
+      "range",
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 600
+  },
+  {
+    "name": "range_bond_slash_on_child",
+    "tags": [
+      "range",
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 900
+  },
+  {
+    "name": "range_buy_spawns_child",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_child_after_buyer_dispute",
+    "tags": [
+      "range",
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_child_after_coop_cancel_request",
+    "tags": [
+      "range",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_child_after_failed_payout",
+    "tags": [
+      "range",
+      "payment-failure"
+    ],
+    "requires": [
+      "fault_injection"
+    ],
+    "timeout_secs": 900
+  },
+  {
+    "name": "range_child_after_seller_dispute",
+    "tags": [
+      "range",
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_child_expiration",
+    "tags": [
+      "range",
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
+    "name": "range_child_fee",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 360
+  },
+  {
+    "name": "range_child_full_trade",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 360
+  },
+  {
+    "name": "range_child_maker_cancel",
+    "tags": [
+      "range",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_child_pending_expires",
+    "tags": [
+      "range",
+      "expiration"
+    ],
+    "requires": [],
+    "timeout_secs": 900
+  },
+  {
+    "name": "range_child_rating",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 420
+  },
+  {
+    "name": "range_child_rejects_previous_slice_keys",
+    "tags": [
+      "range",
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 420
+  },
+  {
+    "name": "range_child_take_out_of_bounds",
+    "tags": [
+      "range",
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 360
+  },
+  {
+    "name": "range_child_taker_abandons",
+    "tags": [
+      "range",
+      "cancellation"
+    ],
+    "requires": [],
+    "timeout_secs": 600
+  },
+  {
+    "name": "range_dispute_admin_cancel_ends_range",
+    "tags": [
+      "range",
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_dispute_admin_settle_ends_range",
+    "tags": [
+      "range",
+      "dispute"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_exhausted_chain",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 480
+  },
+  {
+    "name": "range_maker_bond_sized_by_max",
+    "tags": [
+      "range",
+      "bond"
+    ],
+    "requires": [
+      "anti_abuse_bond"
+    ],
+    "timeout_secs": 300
+  },
+  {
     "name": "range_order",
     "tags": [
       "happy-path"
     ],
     "requires": [],
     "timeout_secs": 240
+  },
+  {
+    "name": "range_release_without_next_trade",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_remainder_below_min",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_remainder_equals_min",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_sell_spawns_child",
+    "tags": [
+      "range",
+      "happy-path"
+    ],
+    "requires": [],
+    "timeout_secs": 300
+  },
+  {
+    "name": "range_take_out_of_bounds",
+    "tags": [
+      "range",
+      "adversarial"
+    ],
+    "requires": [],
+    "timeout_secs": 300
   },
   {
     "name": "unauthorized_actor",

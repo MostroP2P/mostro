@@ -10,9 +10,7 @@
 
 [settings]
 # Ortsom revision the gate runs. Bumped by PR, like any dependency.
-# TEMPORARY: the head of MostroP2P/ortsom#55 (the range family, #51). Swap
-# for the Ortsom tag that contains #53-#55 once they merge.
-ortsom_ref = "5e49311b52ba136a291689c20acb69dedcad754a"
+ortsom_ref = "v0.3.5"
 # Run the regtest stack with anti-abuse bonds (`ortsom stack up
 # --with-bonds`), so the `bond` scenarios run instead of being skipped.
 # Part of a baseline's identity, like `ortsom_ref`: a pull request is only

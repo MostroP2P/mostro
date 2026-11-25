@@ -576,6 +576,17 @@ never trade at all; the first Cashu attempt hit exactly this bug in code).
 | `AddInvoice` | **never** — the buyer-invoice step does not exist in cashu mode (02 §2) | permanently `InvalidAction` (documented decision) |
 | `AddBondInvoice` | **never** — bonds ⊕ cashu are mutually exclusive (§4.5) | permanently `InvalidAction` |
 
+**Entry gate until the post-lock tracks land.** Track A routes `NewOrder`,
+`TakeBuy`, `TakeSell` and `AddCashuEscrow`, but a node must not open trades it
+cannot finish. Those four actions are therefore refused with
+`CantDo(InvalidAction)` unless the operator sets
+`[cashu].unsafe_allow_incomplete_trades = true` (development only, off by
+default). `accept_event` refuses `NewOrder`/`TakeBuy`/`TakeSell` before
+`check_trade_index`, so a refused request does not register the identity or its
+trade index; `dispatch_cashu` checks again and is the only gate for
+`AddCashuEscrow`. The gate is removed once Tracks B, C and D, and a timeout for
+taken-but-unfunded orders, have shipped.
+
 **Backwards-compatibility proof obligation.** Extracting `accept_event` /
 `finalize_dispatch` is a pure refactor of `run`. The merge gate is: the existing
 `app.rs` test module (`check_trade_index_tests`, `handle_message_action_tests`,

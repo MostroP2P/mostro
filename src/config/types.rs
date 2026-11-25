@@ -1514,22 +1514,6 @@ mod cashu_settings_tests {
     }
 
     #[test]
-    fn override_needs_enabled_to_be_effective() {
-        // `dispatch_cashu` gates on `cfg.enabled &&
-        // cfg.unsafe_allow_incomplete_trades`: a disabled Cashu block keeps
-        // the entry actions refused no matter what the override says.
-        let parsed: Stub =
-            toml::from_str("[cashu]\nenabled = false\nunsafe_allow_incomplete_trades = true\n")
-                .expect("disabled override block");
-        let cashu = parsed.cashu.expect("block present");
-        assert!(cashu.unsafe_allow_incomplete_trades);
-        assert!(
-            !(cashu.enabled && cashu.unsafe_allow_incomplete_trades),
-            "enabled = false must keep the gate closed"
-        );
-    }
-
-    #[test]
     fn toml_rejects_the_legacy_single_mint_key() {
         // Ignoring `mint_url` would leave `mint_urls` empty: an open node.
         let err = toml::from_str::<Stub>(

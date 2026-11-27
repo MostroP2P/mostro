@@ -121,6 +121,13 @@ async fn classify_zero_row_cas(
     }
 }
 
+/// Whether a failed verification means the mint itself is not answering
+/// (a timeout, or a request it refused: down, saturated, 5xx) rather than the
+/// seller sending a bad token. Only then is the mint left alone for a while.
+fn mint_needs_rest(e: &CashuError) -> bool {
+    matches!(e, CashuError::MintConnection(_) | CashuError::Client(_))
+}
+
 /// Handle a seller's `AddCashuEscrow` submission (Track A §4).
 ///
 /// On success the order advances `WaitingPayment → Active` in one atomic write
@@ -275,10 +282,19 @@ pub async fn add_cashu_escrow_action(
         .map(|c| c.escrow_locktime_days)
         .unwrap_or(15) as u64;
     let min_locktime = (now as u64).saturating_add(locktime_days.saturating_mul(SECONDS_PER_DAY));
-    cashu_client
+    if let Err(e) = cashu_client
         .verify_escrow_token(&proof.token, p_b, p_s, p_m, expected_amount, min_locktime)
         .await
-        .map_err(|e| MostroCantDo(cashu_reason(&e)))?;
+    {
+        // A mint that connected and then went quiet mid-lock costs the next
+        // lock the same wait: leave it alone for a while.
+        if mint_needs_rest(&e) {
+            if let Some(mints) = ctx.cashu_mints() {
+                mints.mark_unreachable(&order_mint).await;
+            }
+        }
+        return Err(MostroCantDo(cashu_reason(&e)));
+    }
 
     // 8. Atomically persist the escrow and advance the status in one write. A
     //    `false` return is classified by `classify_zero_row_cas`: a benign
@@ -548,6 +564,39 @@ mod tests {
         (order, seller, buyer, Keys::generate())
     }
 
+    /// A token that parses (one proof, a random secret), so a lock gets past
+    /// any check of the token's shape and reaches the mint round trip these
+    /// tests are about. Its proof is not signed by any mint.
+    fn parseable_token() -> String {
+        use cdk::mint_url::MintUrl;
+        use cdk::nuts::nut00::{Proof, Token};
+        use cdk::nuts::nut01::PublicKey as CashuPublicKey;
+        use cdk::nuts::nut02::Id;
+        use cdk::nuts::CurrencyUnit;
+        use cdk::secret::Secret;
+        use cdk::Amount;
+        use std::str::FromStr;
+        let proof = Proof {
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            amount: Amount::from(1u64),
+            secret: Secret::generate(),
+            c: CashuPublicKey::from_str(
+                "02698c4e2b5f9534cd0687d87513c759790cf829aa5739184a3e3735471fbda904",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        Token::new(
+            MintUrl::from_str("https://mint.example.com").unwrap(),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string()
+    }
+
     fn proof_on_mint(
         mint: &str,
         buyer: PublicKey,
@@ -556,6 +605,23 @@ mod tests {
     ) -> Payload {
         Payload::CashuLockProof(CashuLockProof::new(
             "cashuBnotarealtoken".to_string(),
+            mint.to_string(),
+            buyer.to_string(),
+            seller.to_string(),
+            mostro.to_string(),
+        ))
+    }
+
+    /// Like [`proof_on_mint`], with a token that parses, so the lock gets
+    /// past any check of the token's shape and reaches the mint round trip.
+    fn readable_proof_on_mint(
+        mint: &str,
+        buyer: PublicKey,
+        seller: PublicKey,
+        mostro: PublicKey,
+    ) -> Payload {
+        Payload::CashuLockProof(CashuLockProof::new(
+            parseable_token(),
             mint.to_string(),
             buyer.to_string(),
             seller.to_string(),
@@ -634,6 +700,20 @@ mod tests {
             result,
             Err(MostroCantDo(CantDoReason::InvalidCashuToken))
         ));
+    }
+
+    /// A mint that times out or refuses a request is left alone for the
+    /// cooldown; a bad token is the seller's fault and never rests a mint.
+    #[test]
+    fn only_a_mint_that_does_not_answer_is_left_alone() {
+        let refused: CashuError =
+            cdk::error::Error::UnknownErrorResponse("mint refused".into()).into();
+        assert!(mint_needs_rest(&refused));
+        assert!(mint_needs_rest(&CashuError::MintConnection(
+            "timed out".into()
+        )));
+        assert!(!mint_needs_rest(&CashuError::Token("bad token".into())));
+        assert!(!mint_needs_rest(&CashuError::Condition("bad shape".into())));
     }
 
     /// Step 3b: a seller retrying after the lock committed but the
@@ -832,5 +912,160 @@ mod tests {
             matches!(result, Err(MostroCantDo(_))),
             "a locked order past Active must be rejected, not re-notified"
         );
+    }
+
+    /// A mint that accepts the connection and never answers.
+    async fn silent_mint() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        (url, held)
+    }
+
+    /// The Cashu event loop handles one message at a time, so a lock that
+    /// waits on a mint holds up every other message. Dispatching an
+    /// `AddCashuEscrow` for an order on a silent mint must hand control back
+    /// at once instead of waiting out the mint's timeout.
+    #[tokio::test]
+    async fn a_silent_mint_does_not_hold_up_the_message_loop() {
+        let (mint, held) = silent_mint().await;
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(&mint)).await;
+        let proof = readable_proof_on_mint(&mint, buyer, seller, my_keys.public_key());
+        let msg = lock_message(order.id, Some(proof));
+
+        let dispatched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::app::dispatch_cashu(
+                &Action::AddCashuEscrow,
+                msg,
+                &unwrapped_from(seller),
+                &my_keys,
+                &ctx,
+            ),
+        )
+        .await;
+        held.abort();
+        assert!(
+            dispatched.is_ok(),
+            "dispatching a lock must not wait for the mint to answer"
+        );
+    }
+
+    /// The seller's rejection is sent by the task that ran the lock, and a
+    /// lock waits for a free slot when every slot is busy: it neither blocks
+    /// the loop nor gets lost.
+    #[tokio::test]
+    async fn a_lock_waits_for_a_free_slot_and_still_reports_its_failure() {
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        // Nothing listens on port 1: the connection is refused at once.
+        let mint = "http://127.0.0.1:1";
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(mint)).await;
+        let msg = lock_message(
+            order.id,
+            Some(readable_proof_on_mint(
+                mint,
+                buyer,
+                seller,
+                my_keys.public_key(),
+            )),
+        );
+        let reasons = || async {
+            crate::config::MESSAGE_QUEUES
+                .queue_order_cantdo
+                .read()
+                .await
+                .iter()
+                .filter(|(_, to)| *to == seller)
+                .filter_map(|(m, _)| match &m.get_inner_message_kind().payload {
+                    Some(Payload::CantDo(Some(r))) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Every slot busy: the dispatch still returns, and nothing is sent yet.
+        let busy = crate::app::ESCROW_LOCKS.acquire_all_slots_for_test().await;
+        crate::app::dispatch_cashu(
+            &Action::AddCashuEscrow,
+            msg,
+            &unwrapped_from(seller),
+            &my_keys,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            reasons().await.is_empty(),
+            "no slot free: the lock must wait"
+        );
+
+        // A slot frees up: the lock runs and the seller hears why it failed.
+        drop(busy);
+        let mut heard = Vec::new();
+        for _ in 0..50 {
+            heard = reasons().await;
+            if !heard.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(heard, vec![CantDoReason::CashuMintUnavailable]);
+    }
+
+    /// The line of locks has a size: past `max_pending` running or waiting
+    /// locks a new one is refused at once with `TooManyRequests`, and a place
+    /// frees up when a lock ends.
+    #[tokio::test]
+    async fn locks_past_the_pending_limit_are_refused_at_once() {
+        let gate: &'static crate::app::EscrowLockGate =
+            Box::leak(Box::new(crate::app::EscrowLockGate::new(1, 2)));
+        let (mint, held) = silent_mint().await;
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool)
+            .with_cashu_mints(Arc::new(crate::cashu::mints::CashuMints::new(false)));
+        let (order, seller, buyer, my_keys) = order_on_mint(&pool, Some(&mint)).await;
+        let send = || {
+            let msg = lock_message(
+                order.id,
+                Some(readable_proof_on_mint(
+                    &mint,
+                    buyer,
+                    seller,
+                    my_keys.public_key(),
+                )),
+            );
+            crate::app::spawn_escrow_lock(gate, &ctx, msg, &unwrapped_from(seller), &my_keys)
+        };
+
+        send().expect("first lock takes a place");
+        send().expect("second lock takes the last place");
+        let refused = send().expect_err("a third lock has no place");
+        assert!(matches!(
+            refused.downcast_ref::<MostroError>(),
+            Some(MostroCantDo(CantDoReason::TooManyRequests))
+        ));
+        held.abort();
+    }
+
+    /// A place in the line frees up as soon as its lock ends.
+    #[test]
+    fn a_place_in_the_line_frees_up_when_its_lock_ends() {
+        let gate: &'static crate::app::EscrowLockGate =
+            Box::leak(Box::new(crate::app::EscrowLockGate::new(1, 1)));
+        let place = gate.enter().expect("the only place");
+        assert!(gate.enter().is_none(), "no second place while one is held");
+        drop(place);
+        assert!(gate.enter().is_some(), "the place is free again");
     }
 }

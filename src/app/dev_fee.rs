@@ -1383,8 +1383,13 @@ pub async fn send_dev_fee_payment(
                     }
                     PaymentStatus::Failed => {
                         error!(
-                            "Dev fee payment failed for order {} ({} sats) - failure_reason: {}",
-                            order.id, order.dev_fee, msg.payment.failure_reason
+                            "Dev fee payment failed for order {} ({} sats): {}",
+                            order.id,
+                            order.dev_fee,
+                            crate::lightning::failure::PayoutFailure::from_payment(
+                                &msg.payment,
+                                crate::lightning::routing_fee_cap_sats(order.dev_fee),
+                            )
                         );
                         return Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
                             "payment failed: reason {}",

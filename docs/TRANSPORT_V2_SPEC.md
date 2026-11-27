@@ -284,11 +284,16 @@ transport, whose outer key is a throwaway with no pre-validatable signal.
     the daemon decrypts. This is where spam concentrates; PoW here plus
     relay-side rate limiting are the toll.
 - **Dedup as defense in depth:** a `REPLAY_WINDOW_SECS` (60 s) guard drops a
-  re-sent identical event id before decryption. The existing 10-second
+  re-sent identical event id before decryption. Ids are kept
+  sorted by first sighting and expired oldest first, so the per-event dedup
+  cost stays O(log n) amortized even under a flood of distinct ids. The existing 10-second
   freshness window (post-decrypt, on the inner `created_at`) still applies as
-  the precise stale-event check.
+  the precise stale-event check. Events dated more than 50 s ahead
+  (`REPLAY_WINDOW_SECS` minus the freshness window) are dropped before the
+  dedup: they would still be fresh once the guard has forgotten their id.
 - **Validation order is load-bearing.** `accept_event` runs PoW → kind →
-  **event signature** → gate (replay dedup, then the lane check) →
+  **event signature** → gate (future-skew check, replay dedup, then the lane
+  check) →
   `unwrap_incoming` (decrypt). The signature check must stay ahead of the
   gate: a nostr event id commits to `[0, pubkey, created_at, kind, tags,
   content]` and *not* to `sig`, so a copy of a victim's event with only `sig`

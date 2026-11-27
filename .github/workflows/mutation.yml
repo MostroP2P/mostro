@@ -53,22 +53,32 @@ jobs:
           # Ensure base branch ref exists locally for reliable diffing
           git fetch origin "${{ github.base_ref }}":"refs/remotes/origin/${{ github.base_ref }}"
 
-          # Collect changed Rust source files (exclude test-only and workflow files)
-          changed_rs=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.rs' | grep -v '_test\.rs$' || true)
-          if [ -z "$changed_rs" ]; then
+          # Collect changed Rust source files (exclude test-only files), as
+          # NUL-separated paths so any filename arrives as written.
+          mapfile -d '' -t changed_rs < <(git diff -z --name-only origin/${{ github.base_ref }}...HEAD -- '*.rs' ':!*_test.rs')
+          if [ ${#changed_rs[@]} -eq 0 ]; then
             echo "No Rust source files changed in this PR"
             exit 0
           fi
 
-          # Build --file flags for each changed file
-          file_args=""
-          for f in $changed_rs; do
-            file_args="$file_args --file $f"
+          echo "Running mutation testing for changed files:"
+          printf '%s\n' "${changed_rs[@]}"
+
+          # Defense in depth, not a security boundary (this job already runs
+          # the PR's code): each filename stays one --file value, never
+          # word-split into extra flags, and `--file=` keeps a name starting
+          # with `-` a value (cargo-mutants still reads it as a glob, so
+          # `*`, `?` or `[` in a name act as patterns). This bypasses `make mutation-test`, whose
+          # $(ARGS) is a plain string splice, so it repeats that target's
+          # environment here (see the Makefile for why).
+          file_args=()
+          for f in "${changed_rs[@]}"; do
+            file_args+=("--file=$f")
           done
 
-          echo "Running mutation testing for changed files:"
-          echo "$changed_rs"
-          cargo mutants $file_args
+          # Keep these two in sync with the mutation-test target in Makefile.
+          CARGO_MUTANTS_JOBS=1 MOSTRO_TEST_LN_PORT=18080 \
+            cargo mutants "${file_args[@]}"
 
       - name: Upload mutation report
         uses: actions/upload-artifact@v4
@@ -195,7 +205,7 @@ jobs:
           tool: cargo-mutants
 
       - name: Run full mutation testing
-        run: cargo mutants
+        run: make mutation-test
         # Note: Do NOT fail on low score initially (report only mode)
         continue-on-error: true
 

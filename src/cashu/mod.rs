@@ -642,6 +642,25 @@ pub fn cashu_pubkey_from_xonly_hex(xonly_hex: &str) -> Result<PublicKey, Error> 
         .map_err(|e| Error::Condition(format!("pubkey convert: {e}")))
 }
 
+/// The identity of every proof in `token`: `Y = hash_to_curve(secret)` as
+/// lowercase hex, the same point the mint reports spent state under.
+///
+/// Two token strings that carry the same proofs (another memo, another proof
+/// order, V3 or V4) yield the same set, so escrow uniqueness is decided here
+/// and not on the string.
+pub fn escrow_proof_ys(token: &str) -> Result<Vec<String>, Error> {
+    let token = Token::from_str(token).map_err(|e| Error::Token(e.to_string()))?;
+    token
+        .token_secrets()
+        .iter()
+        .map(|s| {
+            cdk::dhke::hash_to_curve(s.as_bytes())
+                .map(|y| y.to_string())
+                .map_err(|e| Error::Token(format!("proof Y: {e}")))
+        })
+        .collect()
+}
+
 pub mod mint_policy;
 pub mod mints;
 pub mod transport;

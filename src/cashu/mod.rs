@@ -405,29 +405,58 @@ impl CashuClient {
         // the mint's keyset offline, closing that hole.
         self.verify_token_dleq(&token).await?;
 
-        // 5: every proof must be unspent at the mint. Derive the checkstate
-        // Y points from the proof secrets (Y = hash_to_curve(secret)).
-        let secrets = token.token_secrets();
-        let ys = secrets
+        // 5: every proof must be unspent at the mint.
+        if self
+            .proof_states(&token)
+            .await?
+            .iter()
+            .any(|state| *state != State::Unspent)
+        {
+            return Err(Error::Token("one or more proofs are not unspent".into()));
+        }
+
+        Ok(token)
+    }
+
+    /// Whether **every** proof of a stored escrow token is still unspent at
+    /// the mint (NUT-07). Used by the restore/monitor path (Track A TA-3) to
+    /// surface any in-flight escrow that was redeemed or double-spent while
+    /// the daemon was down.
+    ///
+    /// This intentionally does **not** re-run the full `verify_escrow_token`
+    /// acceptance check (condition/DLEQ/amount): those were validated when the
+    /// lock was accepted and the token is immutable. It only answers "is this
+    /// locked token still live?". `Ok(false)` means the mint reported a proof
+    /// spent or pending; a reply the mint cut short is an error, not a verdict.
+    pub async fn check_token_unspent(&self, token_str: &str) -> Result<bool, Error> {
+        let token = Token::from_str(token_str).map_err(|e| Error::Token(e.to_string()))?;
+        if token.token_secrets().is_empty() {
+            return Err(Error::Token("Token contains no secrets".into()));
+        }
+        let states = self.proof_states(&token).await?;
+        Ok(states.iter().all(|state| *state == State::Unspent))
+    }
+
+    /// The NUT-07 state of every proof of `token`. Fails closed when the mint
+    /// returns fewer states than proofs queried: a missing entry must never
+    /// be treated as implicitly `Unspent`.
+    async fn proof_states(&self, token: &Token) -> Result<Vec<State>, Error> {
+        // Y = hash_to_curve(secret), as NUT-07 queries them.
+        let ys = token
+            .token_secrets()
             .iter()
             .map(|s| cdk::dhke::hash_to_curve(s.as_bytes()))
             .collect::<Result<Vec<PublicKey>, _>>()
             .map_err(|e| Error::Token(format!("proof Y: {e}")))?;
         let expected_states = ys.len();
         let states = self.check_state(ys).await?;
-        // Fail closed if the mint returns fewer states than proofs queried:
-        // a missing entry must never be treated as implicitly `Unspent`.
         if states.states.len() != expected_states {
             return Err(Error::Token(format!(
                 "checkstate returned {} states for {expected_states} proofs",
                 states.states.len()
             )));
         }
-        if states.states.iter().any(|s| s.state != State::Unspent) {
-            return Err(Error::Token("one or more proofs are not unspent".into()));
-        }
-
-        Ok(token)
+        Ok(states.states.into_iter().map(|s| s.state).collect())
     }
 
     /// Check the state of proofs against the mint's `/v1/checkstate`

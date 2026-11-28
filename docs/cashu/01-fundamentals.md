@@ -545,7 +545,11 @@ an order"*:
   yet: `NewOrder`, `TakeBuy`, `TakeSell`, `AddInvoice`, `FiatSent`, `Release`,
   `Cancel`, `Dispute`, `RateUser`, `AddCashuEscrow`, `AdminCancel`,
   `AdminSettle`, `AddBondInvoice`, and any other admin/dispute action. The feature
-  tracks replace these arms one at a time, in their own files.
+  tracks replace these arms one at a time, in their own files. This is the
+  foundation decision: Track A has since routed `NewOrder`, `TakeBuy`,
+  `TakeSell` and `AddCashuEscrow`, and they now reach their handlers only
+  behind the development override described in **Entry gate until the
+  post-lock tracks land** below; by default they are still refused.
 
 Rationale: allowing, say, `NewOrder` would populate the order book with orders
 that can never be taken to completion (no escrow), producing orphan/half-state
@@ -575,6 +579,17 @@ never trade at all; the first Cashu attempt hit exactly this bug in code).
 | `AdminOrderInfo` | **already allowed** (#1107) — read-only | `admin_order_info_action` with no Lightning client |
 | `AddInvoice` | **never** — the buyer-invoice step does not exist in cashu mode (02 §2) | permanently `InvalidAction` (documented decision) |
 | `AddBondInvoice` | **never** — bonds ⊕ cashu are mutually exclusive (§4.5) | permanently `InvalidAction` |
+
+**Entry gate until the post-lock tracks land.** Track A routes `NewOrder`,
+`TakeBuy`, `TakeSell` and `AddCashuEscrow`, but a node must not open trades it
+cannot finish. Those four actions are therefore refused with
+`CantDo(InvalidAction)` unless the operator sets
+`[cashu].unsafe_allow_incomplete_trades = true` (development only, off by
+default). `accept_event` refuses `NewOrder`/`TakeBuy`/`TakeSell` before
+`check_trade_index`, so a refused request does not register the identity or its
+trade index; `dispatch_cashu` checks again and is the only gate for
+`AddCashuEscrow`. The gate is removed once Tracks B, C and D, and a timeout for
+taken-but-unfunded orders, have shipped.
 
 **Backwards-compatibility proof obligation.** Extracting `accept_event` /
 `finalize_dispatch` is a pure refactor of `run`. The merge gate is: the existing

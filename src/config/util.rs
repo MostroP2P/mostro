@@ -956,6 +956,7 @@ mod cashu_validation_tests {
             enabled: true,
             mint_urls: vec![mint_url.to_string()],
             escrow_locktime_days: days,
+            ..Default::default()
         }
     }
 
@@ -1093,6 +1094,7 @@ mod startup_validation_tests {
             enabled: true,
             mint_urls: vec!["https://mint.example.com".to_string()],
             escrow_locktime_days: 15,
+            ..Default::default()
         }
     }
 

@@ -223,9 +223,10 @@ async fn main() -> Result<()> {
     // hand off to the Cashu event loop. Makers choose a mint per order, so an
     // unreachable mint is a warning, not a reason to refuse to boot: orders
     // on it fail to lock until it is back (issue #1046). Order creation,
-    // taking and escrow funding are gated in `dispatch_cashu` behind
-    // `[cashu].unsafe_allow_incomplete_trades` (off by default) until the
-    // post-lock lifecycle lands; the warnings below spell out what is live.
+    // taking and escrow funding are gated (in `accept_event` and
+    // `dispatch_cashu`) behind `[cashu].unsafe_allow_incomplete_trades` (off
+    // by default) until the post-lock lifecycle lands; the warnings below
+    // spell out what is live.
     // The default Lightning path below is left byte-for-byte unchanged.
     if Settings::is_cashu_enabled() {
         // The `mint_urls` entries were validated at config load (CF-1); this
@@ -243,7 +244,7 @@ async fn main() -> Result<()> {
                 mint_urls.join(", ")
             );
         }
-        // Say out loud what the dispatch gate does with the lifecycle still
+        // Say out loud what the entry gate does with the lifecycle still
         // incomplete: with the default settings the node refuses to create,
         // take or fund Cashu trades; only the development override routes
         // those actions to their handlers.

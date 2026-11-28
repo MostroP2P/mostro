@@ -329,18 +329,27 @@ async fn handle_message_action(
     }
 }
 
-/// Does the Cashu entry gate refuse this action? Only on a Cashu node without
-/// `[cashu].unsafe_allow_incomplete_trades`, and only for the actions that
-/// open a trade; Lightning mode never has `[cashu].enabled`.
+/// Is the Cashu entry gate open? Only on a Cashu node whose operator set the
+/// development override `[cashu].unsafe_allow_incomplete_trades`. Read per
+/// context, not from the process-global config, so tests can pin it both
+/// ways. Both layers of the gate ([`accept_event`] and [`dispatch_cashu`])
+/// read the override through this function.
+fn cashu_entry_open(ctx: &AppContext) -> bool {
+    ctx.settings()
+        .cashu
+        .as_ref()
+        .is_some_and(|cfg| cfg.enabled && cfg.unsafe_allow_incomplete_trades)
+}
+
+/// Does the Cashu entry gate refuse this action? Only on a Cashu node with the
+/// gate closed, and only for the actions that open a trade; a Lightning node
+/// (no `[cashu]` block, or `enabled = false`) is never gated.
 fn cashu_entry_closed(ctx: &AppContext, action: &Action) -> bool {
     matches!(
         action,
         Action::NewOrder | Action::TakeBuy | Action::TakeSell
-    ) && ctx
-        .settings()
-        .cashu
-        .as_ref()
-        .is_some_and(|cfg| cfg.enabled && !cfg.unsafe_allow_incomplete_trades)
+    ) && ctx.settings().cashu.as_ref().is_some_and(|cfg| cfg.enabled)
+        && !cashu_entry_open(ctx)
 }
 
 /// Decode and fully validate one relay event into a dispatchable
@@ -738,10 +747,13 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
 /// [`handle_message_action`] — there is no `ln_client` in Cashu mode. It
 /// differs from `run` in exactly one line: the dispatch call.
 ///
-/// Order creation, taking and escrow funding are gated inside
-/// [`dispatch_cashu`] by `[cashu].unsafe_allow_incomplete_trades`; with the
-/// default (closed) gate they are refused with `CantDo(InvalidAction)`, like
-/// every other lifecycle action whose feature track has not landed yet.
+/// Order creation, taking and escrow funding are gated by
+/// `[cashu].unsafe_allow_incomplete_trades`: [`accept_event`] refuses
+/// `NewOrder`/`TakeBuy`/`TakeSell` before `check_trade_index`, and
+/// [`dispatch_cashu`] checks again and is the only gate for `AddCashuEscrow`.
+/// With the default (closed) gate they are refused with
+/// `CantDo(InvalidAction)`, like every other lifecycle action whose feature
+/// track has not landed yet.
 pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     let my_keys = ctx.keys();
     let client = ctx.nostr_client();
@@ -820,14 +832,7 @@ async fn dispatch_cashu(
     // `accept_event` already refuses NewOrder/TakeBuy/TakeSell before
     // `check_trade_index` (`cashu_entry_closed`); this check is the second
     // layer, and the only one for AddCashuEscrow.
-    //
-    // Read per context, not from the process-global config, so tests can pin
-    // the gate both ways.
-    let allow_incomplete = ctx
-        .settings()
-        .cashu
-        .as_ref()
-        .is_some_and(|cfg| cfg.enabled && cfg.unsafe_allow_incomplete_trades);
+    let allow_incomplete = cashu_entry_open(ctx);
 
     match action {
         // Escrow-independent, read-only / session actions — safe in Cashu mode.

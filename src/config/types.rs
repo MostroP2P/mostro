@@ -271,10 +271,11 @@ pub struct CashuSettings {
     /// DEVELOPMENT-ONLY override. The post-lock Cashu lifecycle is
     /// incomplete: no release, no cooperative cancellation, no dispute
     /// path (hence no `P_M` signature delivery), and no timeout for
-    /// taken-but-unfunded orders. While that holds, `dispatch_cashu`
-    /// refuses `NewOrder`, `TakeBuy`, `TakeSell` and `AddCashuEscrow`
-    /// with `CantDo(InvalidAction)` so the node cannot accept escrow it
-    /// has no protocol-level exit from. Setting this flag to `true`
+    /// taken-but-unfunded orders. While that holds, the node refuses
+    /// `NewOrder`, `TakeBuy`, `TakeSell` (in `accept_event`, before
+    /// `check_trade_index`) and `AddCashuEscrow` (in `dispatch_cashu`)
+    /// with `CantDo(InvalidAction)` so it cannot accept escrow it has no
+    /// protocol-level exit from. Setting this flag to `true`
     /// (together with `enabled = true`) restores that routing for
     /// development and testing only. It is not a production safety
     /// measure and not the buyer's acceptance of risk: a funded token

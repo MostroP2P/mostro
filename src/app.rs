@@ -2790,36 +2790,6 @@ mod tests {
             }
         }
 
-        /// The same refusal with `unsafe_allow_incomplete_trades = false`
-        /// spelled out in the config: the explicit default gates identically
-        /// to the absent key.
-        #[tokio::test]
-        async fn blocks_entry_actions_with_the_flag_explicitly_false() {
-            let ctx = cashu_ctx(CashuSettings {
-                enabled: true,
-                unsafe_allow_incomplete_trades: false,
-                ..Default::default()
-            })
-            .await;
-            let my_keys = create_test_keys();
-            let event = create_test_unwrapped_message();
-
-            for action in [
-                Action::NewOrder,
-                Action::TakeBuy,
-                Action::TakeSell,
-                Action::AddCashuEscrow,
-            ] {
-                let msg = create_test_message(action.clone(), None);
-                let result = dispatch_cashu(&action, msg, &event, &my_keys, &ctx).await;
-                assert!(
-                    is_invalid_action(result),
-                    "{action:?} must be blocked with InvalidAction when the \
-                     development flag is explicitly false"
-                );
-            }
-        }
-
         /// The gate also requires `enabled`: the override alone never opens
         /// it (`cfg.enabled && cfg.unsafe_allow_incomplete_trades`).
         #[tokio::test]

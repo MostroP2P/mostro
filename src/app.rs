@@ -1732,15 +1732,23 @@ mod tests {
         use super::*;
         use crate::config::types::CashuSettings;
         use crate::db::is_user_present;
+        use mostro_core::transport::{wrap_message_nip44, WrapOptions};
+
+        const ENTRY_ACTIONS: [Action; 3] = [Action::NewOrder, Action::TakeBuy, Action::TakeSell];
 
         async fn cashu_intake_ctx(unsafe_allow_incomplete_trades: bool) -> AppContext {
-            let ctx = create_migrated_ctx().await;
-            let mut settings = crate::app::context::test_utils::test_settings();
-            settings.cashu = Some(CashuSettings {
+            cashu_block_ctx(CashuSettings {
                 enabled: true,
                 unsafe_allow_incomplete_trades,
                 ..Default::default()
-            });
+            })
+            .await
+        }
+
+        async fn cashu_block_ctx(cashu: CashuSettings) -> AppContext {
+            let ctx = create_migrated_ctx().await;
+            let mut settings = crate::app::context::test_utils::test_settings();
+            settings.cashu = Some(cashu);
             crate::app::context::test_utils::TestContextBuilder::new()
                 .with_pool(ctx.pool_arc())
                 .with_settings(settings)
@@ -1779,6 +1787,85 @@ mod tests {
                 "control: the open gate lets check_trade_index register the user"
             );
             assert!(cant_do_reasons_for(&trade.public_key()).await.is_empty());
+        }
+
+        /// [`dual_key_event`] for any action: identity signs the inner tuple
+        /// with trade index 1, the trade key authors the event.
+        fn dual_key_event_for(
+            action: Action,
+            mostro: &Keys,
+            identity: &Keys,
+            trade: &Keys,
+        ) -> Event {
+            let message = create_test_message(action, Some(1));
+            let opts = WrapOptions {
+                signed: true,
+                ..WrapOptions::default()
+            };
+            wrap_message_nip44(&message, identity, trade, mostro.public_key(), opts)
+                .expect("wrap signed kind-14 event")
+        }
+
+        /// The intake gate covers all three trade-index actions, not only
+        /// `NewOrder`: each is refused before `check_trade_index` registers
+        /// the identity.
+        #[tokio::test]
+        async fn refuses_every_entry_action_before_the_trade_index() {
+            let mostro = create_test_keys();
+            let closed = cashu_intake_ctx(false).await;
+
+            for action in ENTRY_ACTIONS {
+                let (identity, trade) = (create_test_keys(), create_test_keys());
+                let event = dual_key_event_for(action.clone(), &mostro, &identity, &trade);
+                assert!(
+                    !accept(&closed, &event, &mostro).await,
+                    "{action:?} must be refused by the closed Cashu entry gate"
+                );
+                assert!(
+                    is_user_present(closed.pool(), identity.public_key().to_string())
+                        .await
+                        .is_err(),
+                    "a refused Cashu {action:?} must not register the identity"
+                );
+                assert_eq!(
+                    cant_do_reasons_for(&trade.public_key()).await,
+                    vec![CantDoReason::InvalidAction],
+                    "{action:?} must be answered with InvalidAction"
+                );
+            }
+        }
+
+        /// A `[cashu]` block with `enabled = false` is a Lightning node: the
+        /// intake gate must not fire, whatever the override says, so each
+        /// entry action reaches `check_trade_index` and registers the
+        /// identity.
+        #[tokio::test]
+        async fn disabled_cashu_block_leaves_intake_open() {
+            let mostro = create_test_keys();
+            let ctx = cashu_block_ctx(CashuSettings {
+                enabled: false,
+                ..Default::default()
+            })
+            .await;
+
+            for action in ENTRY_ACTIONS {
+                let (identity, trade) = (create_test_keys(), create_test_keys());
+                let event = dual_key_event_for(action.clone(), &mostro, &identity, &trade);
+                accept(&ctx, &event, &mostro).await;
+                assert!(
+                    is_user_present(ctx.pool(), identity.public_key().to_string())
+                        .await
+                        .is_ok(),
+                    "{action:?} on a node with [cashu] enabled = false must reach \
+                     check_trade_index"
+                );
+                assert!(
+                    !cant_do_reasons_for(&trade.public_key())
+                        .await
+                        .contains(&CantDoReason::InvalidAction),
+                    "{action:?} must not be refused by the Cashu entry gate in Lightning mode"
+                );
+            }
         }
     }
 

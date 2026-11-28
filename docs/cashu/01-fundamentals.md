@@ -545,7 +545,11 @@ an order"*:
   yet: `NewOrder`, `TakeBuy`, `TakeSell`, `AddInvoice`, `FiatSent`, `Release`,
   `Cancel`, `Dispute`, `RateUser`, `AddCashuEscrow`, `AdminCancel`,
   `AdminSettle`, `AddBondInvoice`, and any other admin/dispute action. The feature
-  tracks replace these arms one at a time, in their own files.
+  tracks replace these arms one at a time, in their own files. This is the
+  foundation decision: Track A has since routed `NewOrder`, `TakeBuy`,
+  `TakeSell` and `AddCashuEscrow`, and they now reach their handlers only
+  behind the development override described in **Entry gate until the
+  post-lock tracks land** below; by default they are still refused.
 
 Rationale: allowing, say, `NewOrder` would populate the order book with orders
 that can never be taken to completion (no escrow), producing orphan/half-state
